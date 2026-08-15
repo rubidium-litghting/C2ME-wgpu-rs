@@ -1,0 +1,12 @@
+{
+  "parent": "c2me.mixins.json",
+  "required": true,
+  "package": "com.rubidiumlighting.c2me.opts.accel.wgpu.mixin",
+  "plugin": "com.ishland.c2me.base.common.ModuleMixinPlugin",
+  "mixins": [
+    "MixinChunkGenerating"
+  ],
+  "mixinextras": {
+    "minVersion": "0.5.0-beta.5"
+  }
+}

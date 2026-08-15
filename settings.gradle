@@ -1,0 +1,44 @@
+pluginManagement {
+    repositories {
+        maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
+        gradlePluginPortal()
+    }
+}
+
+rootProject.name = 'c2me-opts-accel-wgpu'
+
+// Optional composite build — if a local C2ME-fabric checkout is present
+// (sibling dir, $C2ME_FABRIC_HOME, or ~/文档/C2ME-fabric), use it via
+// includeBuild so developers get live code. Otherwise, fall back to the
+// remote Maven artifacts from repo.codemc.io (so anyone can build from
+// source without cloning the C2ME monorepo).
+def c2meHome = System.getenv('C2ME_FABRIC_HOME')
+if (c2meHome == null) {
+    def sibling = new File(rootDir, '../C2ME-fabric').absoluteFile
+    def localInHome = new File(System.getProperty('user.home'), '文档/C2ME-fabric').absoluteFile
+    if (sibling.isDirectory()) {
+        c2meHome = sibling.path
+    } else if (localInHome.isDirectory()) {
+        c2meHome = localInHome.path
+    }
+}
+
+if (c2meHome != null && new File(c2meHome).isDirectory()) {
+    println "[settings.gradle] Using local C2ME-fabric composite build: $c2meHome"
+    includeBuild(c2meHome) {
+        dependencySubstitution {
+            // Codemc / official release coordinates
+            substitute module('com.ishland.c2me:c2me-base')                 using project(':c2me-base')
+            substitute module('com.ishland.c2me:c2me-opts-dfc')             using project(':c2me-opts-dfc')
+            // JitPack GitHub-build coordinates (so local checkout wins even if
+            // the user configured c2me_resolution=jitpack in gradle.properties)
+            substitute module('com.github.RelativityMC.C2ME-fabric:c2me-base')     using project(':c2me-base')
+            substitute module('com.github.RelativityMC.C2ME-fabric:c2me-opts-dfc') using project(':c2me-opts-dfc')
+        }
+    }
+} else {
+    println "[settings.gradle] No local C2ME-fabric found; resolving c2me-* from remote Maven"
+}

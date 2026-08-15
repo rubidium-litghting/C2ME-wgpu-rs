@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "c2me-opts-accel-wgpu",
+  "version": "${version}",
+  "name": "C2ME wgpu Accelerator",
+  "description": "GPU-accelerated world generation using wgpu (Vulkan/Metal/DX12/WebGPU) — standalone companion mod for C2ME",
+  "environment": "*",
+  "mixins": [
+    "c2me-opts-accel-wgpu.mixins.json"
+  ],
+  "depends": {
+    "minecraft": ">=26.2",
+    "fabricloader": ">=0.18.3",
+    "java": ">=25",
+    "c2me-base": "*",
+    "c2me-opts-dfc": "*"
+  },
+
+  "authors": [
+    "RubidiumLighting"
+  ],
+  "license": "MIT",
+  "custom": {
+    "modmenu": {
+      "parent": "c2me"
+    }
+  }
+}

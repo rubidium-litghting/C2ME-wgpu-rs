@@ -1,0 +1,31 @@
+[package]
+name = "c2me-wgpu"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["RubidiumLighting"]
+description = "C2ME's wgpu acceleration module, with fp32 as the primary target."
+
+[lib]
+name = "c2me_wgpu"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wgpu = "30"
+pollster = "1"
+anyhow = "1"
+bitflags = "2"
+rustc-hash = "2"
+lz4_flex = "0.14"
+crc32fast = "1"
+bytemuck = { version = "1", features = ["derive"] }
+crossbeam = "0.8"
+parking_lot = "0.12"
+
+[dev-dependencies]
+rand = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
