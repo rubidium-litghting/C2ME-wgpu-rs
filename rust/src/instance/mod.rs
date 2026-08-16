@@ -29,7 +29,12 @@ pub mod adapter_pick;
 pub mod features;
 pub mod workarounds;
 
+use std::sync::OnceLock;
+use wgpu::wgt::DeviceDescriptor;
 use crate::Result;
+use workarounds::Workarounds;
+
+static INSTANCE: OnceLock<WgpuInstance> = OnceLock::new();
 
 /// Singleton wgpu instance + picked device + queue.
 ///
@@ -38,28 +43,60 @@ use crate::Result;
 /// across all WorldContexts (one per Minecraft world).
 pub struct WgpuInstance {
     /// Placeholder only. Real impl stores:
-    ///   pub instance: wgpu::Instance,
-    ///   pub adapter: wgpu::Adapter,
-    ///   pub device: wgpu::Device,
-    ///   pub queue: wgpu::Queue,
-    ///   pub adapter_info: wgpu::AdapterInfo,
-    ///   pub workarounds: workarounds::Workarounds,
+    pub instance: wgpu::Instance,
+    pub adapter: wgpu::Adapter,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub adapter_info: wgpu::AdapterInfo,
+    pub workarounds: workarounds::Workarounds,
     _priv: (),
 }
 
 impl WgpuInstance {
-    /// Create a new instance: enumerate adapters, pick best (Discrete >
-    /// Integrated > CPU), verify required features, apply workarounds.
-    ///
-    /// Skeleton: this is a no-op stub returning Ok. Real impl runs
-    ///   pollster::block_on(instance.request_adapter(...)) etc.
-    pub fn new() -> Result<Self> {
-        // TODO:
-        //   1. build wgpu::Instance with default Backends (PRIMARY: Vulkan/Metal/DX12)
-        //   2. call adapter_pick::pick_best(instance)
-        //   3. call features::check_required(&adapter) -> return MissingCapability if fail
-        //   4. adapter.request_device with required_features/limits
-        //   5. workarounds::detect(&adapter.get_info())
-        Ok(Self { _priv: () })
+    /// 获取全局单例。已初始化则直接返回引用，未初始化则进行初始化。
+    /// 初始化失败时返回 Err，下次调用会重新尝试。
+    pub fn instance() -> Result<&'static Self> {
+        if let Some(inst) = INSTANCE.get() {
+            return Ok(inst);
+        }
+        let inst = Self::init()?;
+        // 竞争情况：两个线程同时 init，set 最多一个成功，失败者的 inst 被 drop
+        let _ = INSTANCE.set(inst);
+        Ok(INSTANCE.get().expect("INSTANCE must be Some after set"))
+    }
+
+    fn init() -> Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = adapter_pick::pick_best(&instance)?;
+        
+        features::check_required(&adapter)?;
+        let adapter_info = adapter.get_info();
+        let workarounds = Workarounds::detect(&adapter_info);
+        if workarounds.any() {
+            eprintln!("[c2me-wgpu-rs] enabled workarounds for {} ({}): {:?}", adapter_info.name, adapter_info.driver, workarounds);
+        }
+
+        let (device, queue) = pollster::block_on(
+        adapter.request_device(&DeviceDescriptor{
+            required_features: wgpu::Features::PIPELINE_CACHE,
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            label: None,
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))?;
+        
+        Ok(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+            adapter_info,
+            workarounds,
+            _priv: (),
+        })
     }
 }

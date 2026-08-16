@@ -29,9 +29,10 @@
 //!   • Returns i32 status → 0 PENDING / 1 DONE / 2 ERROR / -1 INVALID_HANDLE
 //!   • All pointer pairs are (ptr, len). No bare un-sized pointers allowed.
 
-use std::ffi::c_char;
+use std::ffi::{c_char, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::OnceLock;
 
 use crate::error::write_err;
 use crate::instance::WgpuInstance;
@@ -59,8 +60,8 @@ pub unsafe extern "C" fn c2me_wgpu_create_instance(
     err_buf: *mut c_char,
     err_buf_len: usize,
 ) -> i64 {
-    match WgpuInstance::new() {
-        Ok(inst) => Box::into_raw(Box::new(inst)) as i64,
+    match WgpuInstance::instance() {
+        Ok(_) => 1,
         Err(e) => {
             let msg = format!("{}", e);
             unsafe { write_err(err_buf, err_buf_len, &msg) };
@@ -88,7 +89,11 @@ pub unsafe extern "C" fn c2me_wgpu_world_new(
         unsafe { write_err(err_buf, err_buf_len, "invalid instance handle (null)") };
         return 0;
     }
-    let _instance = unsafe { &*(instance_h as *const WgpuInstance) };
+    // instance_h 现在是哑参数，实际通过单例 API 取实例
+    let Ok(_instance) = WgpuInstance::instance() else {
+        unsafe { write_err(err_buf, err_buf_len, "instance not initialized") };
+        return 0;
+    };
 
     // Build a slice from the Java ByteBuffer MemorySegment.
     let blob_slice: &[u8] = if config_blob_ptr.is_null() {
@@ -211,8 +216,15 @@ pub unsafe extern "C" fn c2me_wgpu_take_result_blob(
 /// Returns a statically-allocated UTF-8 C string. Caller must NOT free.
 #[unsafe(no_mangle)]
 pub extern "C" fn c2me_wgpu_get_gpu_name() -> *const c_char {
-    // Skeleton hard-coded. Real impl reads WgpuInstance.adapter.get_info().name.
-    b"c2me-wgpu (skeleton stub)\0".as_ptr() as *const c_char
+    static GPU_NAME: OnceLock<CString> = OnceLock::new();
+
+    let Ok(inst) = WgpuInstance::instance() else {
+        return b"unknown\0".as_ptr() as *const c_char;
+    };
+    let s = GPU_NAME.get_or_init(|| {
+        CString::new(inst.adapter_info.name.as_str()).unwrap_or_default()
+    });
+    s.as_ptr()
 }
 
 // ---------------------------------------------------------------------------

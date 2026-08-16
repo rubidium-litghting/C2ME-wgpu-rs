@@ -36,11 +36,19 @@ use crate::Result;
 
 /// Run all 4 mandatory capability checks against an adapter.
 /// Returns Ok on pass, Err(MissingCapability(name)) on first failure.
-pub fn check_required() -> Result<()> {
-    // TODO skeleton: take adapter limits + features and check:
-    //   if adapter.limits().max_storage_buffer_binding_size < 256 * 1024 * 1024 -> fail
-    //   if adapter.limits().max_compute_workgroups_per_dimension < 65535 -> fail
-    //   if adapter.limits().max_buffer_address_space_bits < 31 -> fail
-    //   if !adapter.features().contains(Features::PIPELINE_CACHE) -> fail
+pub fn check_required(adapter: &wgpu::Adapter) -> Result<()> {
+    if adapter.limits().max_compute_workgroups_per_dimension < 65535 {
+        return Err(anyhow::anyhow!("max_compute_workgroups_per_dimension < 65535"));
+    }
+    // 地址空间 ≥ 31 位 ⟺ max_buffer_size ≥ 2 GiB (1<<31 字节)。
+    if adapter.limits().max_buffer_size < (1 << 31) {
+        return Err(anyhow::anyhow!("max_buffer_size < 2 GiB (31-bit address space required)"));
+    }
+    if adapter.limits().max_storage_buffer_binding_size < 256 * 1024 * 1024 {
+        return Err(anyhow::anyhow!("max_storage_buffer_binding_size < 256 * 1024 * 1024"));
+    }
+    if !adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
+        return Err(anyhow::anyhow!("Features::PIPELINE_CACHE not present"));
+    }
     Ok(())
 }

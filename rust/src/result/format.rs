@@ -32,8 +32,6 @@
 //! 0x88    ...   payload (MC-native-stride f32 arrays written by mc_stride.rs)
 //! end-4   4     CRC32 (over entire blob except these 4 tail bytes)
 
-use crate::Result;
-
 /// Magic header: "WG00" in little-endian (b'W' b'G' b'0' b'0').
 /// Matches Java-side HEADER sentinel value.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"WG00");

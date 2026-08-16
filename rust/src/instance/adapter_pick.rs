@@ -22,21 +22,46 @@
  * THE SOFTWARE.
  */
 
-//! Adapter selection policy: DiscreteGPU > IntegratedGPU > VirtualGpu > CPU.
+//! Adapter selection policy: IntegratedGPU > DiscreteGPU > VirtualGpu.
+//!
+//! 设计意图：优先用核显生成地形，独显留给 Minecraft 渲染管线，避免 GPU
+//! 资源争用导致渲染掉帧。仅在没有核显时才回退到独显。
+//!
+//! 不回退到 CPU 后端：C2ME-fabric 主项目本身已有成熟的 CPU 优化路径，
+//! 本 wgpu 加速模块只负责 GPU 加速。没有可用 GPU 时应返回 Err 让上层
+//! 自动回退到 C2ME 的 CPU 路径，而不是用 wgpu 的 CPU 后端（那个走的是
+//! software rasterizer，比原生 CPU 路径慢得多）。
 //!
 //! User can override via `C2ME_WGPU_ADAPTER_NAME` env var (substring match).
 
 use crate::Result;
+use std::env;
 
 /// Pick the "best" adapter from a wgpu::Instance.
 ///
 /// # Panics
 /// Skeleton-only, does no I/O yet.
-pub fn pick_best() -> Result<()> {
-    // TODO skeleton:
-    //   let adapters = instance.enumerate_adapters();
-    //   if let Some(name) = env::var("C2ME_WGPU_ADAPTER_NAME") -> match first adapter whose info.name contains name
-    //   else -> group by type, pick in order DiscreteGpu > IntegratedGpu > VirtualGpu > Cpu
-    //   if none -> return Err(RequestAdapter("no adapters"))
-    Ok(())
+pub fn pick_best(instance: &wgpu::Instance) -> Result<wgpu::Adapter> {
+    let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::PRIMARY));
+    if let Ok(name) = env::var("C2ME_WGPU_ADAPTER_NAME") {
+        if let Some(adapter) = adapters.iter().find(|&adp| adp.get_info().name.contains(&name)) {
+            return Ok(adapter.clone());
+        }else {
+            eprintln!("[c2me-wgpu-rs] No adapter found with name: {}", name);
+        }
+    }
+    let priority_order = [
+        wgpu::DeviceType::IntegratedGpu,
+        wgpu::DeviceType::DiscreteGpu,
+        wgpu::DeviceType::VirtualGpu,
+    ];
+
+    for target_type in priority_order {
+        if let Some(adapter) = adapters.iter().find(|adp| {
+            adp.get_info().device_type == target_type
+        }) {
+            return Ok(adapter.clone());
+        }
+    }
+    Err(anyhow::anyhow!("No suitable adapter found"))
 }
