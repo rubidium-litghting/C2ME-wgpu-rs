@@ -110,6 +110,7 @@ dependencies = [
  "crc32fast",
  "crossbeam",
  "lz4_flex",
+ "naga",
  "parking_lot",
  "pollster",
  "rand",

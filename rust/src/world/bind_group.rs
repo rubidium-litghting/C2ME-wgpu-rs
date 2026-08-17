@@ -28,15 +28,82 @@
 //!   @binding(2) out_bufs     storage,read_write 16 density channel output
 //!
 //! All fields are pure f32 / i32 at @align(4) — no f64, no padding mismatches.
-//! Java/Rust/WGSL three-way assertion of every offset at startup.
+//! Java/Rust/WGSL three-way assertion of every offset at startup (see
+//! `constants.rs::_ASSERT_OFFSETS`).
+//!
+//! ## Phase 3 finalisation
+//!
+//! `create_layout` + `create_pipeline_layout` together produce the
+//! `wgpu::PipelineLayout` consumed by `pipeline_cache::get_or_compile`
+//! when it builds a `wgpu::ComputePipeline`. Both are derived from the
+//! *static* bind group layout described in the BINDINGS_HEADER constant
+//! in `codegen/wgsl_gen.rs` — they MUST stay in sync.
+//!
+//! Future per-world `wgpu::BindGroup` construction (binding concrete
+//! buffers to these slots) is deferred to the scheduler phase — that's
+//! when we know how many chunks are in the batch and can size `out_buf`
+//! accordingly.
 
 use crate::Result;
 
-pub fn create_layout() -> Result<()> {
-    // TODO:
-    //   device.create_bind_group_layout with 3 entries:
-    //     0: StorageBuffer (read)
-    //     1: StorageBuffer (read)
-    //     2: StorageBuffer (read_write)
-    Ok(())
+/// Bind group layout for `@group(0)` — 3 storage buffer bindings.
+///
+/// This must mirror the `BINDINGS_HEADER` const in
+/// `codegen/wgsl_gen.rs`:
+///   * binding 0: `var<storage, read> params: WorldgenParams`
+///   * binding 1: `var<storage, read> permutations: array<i32>`
+///   * binding 2: `var<storage, read_write> out_buf: array<f32>`
+pub fn create_layout(device: &wgpu::Device) -> Result<wgpu::BindGroupLayout> {
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("c2me_wgpu_bg_layout"),
+        entries: &[
+            // binding 0: params (read-only storage)
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // binding 1: permutation tables (read-only storage)
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // binding 2: output density buffer (read-write storage)
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    Ok(layout)
+}
+
+/// Wrap the bind group layout into a pipeline layout (single bind group).
+pub fn create_pipeline_layout(
+    device: &wgpu::Device,
+    bg_layout: &wgpu::BindGroupLayout,
+) -> Result<wgpu::PipelineLayout> {
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("c2me_wgpu_pipeline_layout"),
+        bind_group_layouts: &[Some(bg_layout)],
+        immediate_size: 0,
+    });
+    Ok(pipeline_layout)
 }

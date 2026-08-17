@@ -13,7 +13,7 @@
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
  *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, express OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
  * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
@@ -32,11 +32,15 @@
 use std::ffi::{c_char, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::HashMap;
 
 use crate::error::write_err;
 use crate::instance::WgpuInstance;
 use crate::result::ResultBlob;
+use crate::scheduler::batcher::{Batch, ChunkPos, Priority};
+use crate::scheduler::executor::{ExecutorThread, ExecutorConfig};
+use crate::scheduler::PendingQueue;
 use crate::world::WorldContext;
 
 /// Status constants (must match Java side WgpuThinBinding).
@@ -45,9 +49,47 @@ pub const STATUS_DONE: i32 = 1;
 pub const STATUS_ERROR: i32 = 2;
 pub const STATUS_INVALID_HANDLE: i32 = -1;
 
-// ---------------------------------------------------------------------------
-// Handle validity helpers: real impl stores handle in a slotmap / generational slab.
-// Skeleton just uses raw Box::into_raw() pointers with null-checks.
+/// Global pending queue — accumulates chunk requests before flushing.
+static PENDING_QUEUE: OnceLock<Mutex<PendingQueue>> = OnceLock::new();
+
+/// Global handle table: maps i64 handle → Arc<WorldContext>.
+static HANDLE_TABLE: OnceLock<Mutex<HashMap<i64, Arc<WorldContext>>>> = OnceLock::new();
+
+fn get_handle_table() -> &'static Mutex<HashMap<i64, Arc<WorldContext>>> {
+    HANDLE_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_pending_queue() -> &'static Mutex<PendingQueue> {
+    PENDING_QUEUE.get_or_init(|| Mutex::new(PendingQueue::default()))
+}
+
+fn get_or_create_executor() -> Result<&'static Mutex<ExecutorThread>, String> {
+    use std::sync::OnceLock;
+    static EXECUTOR_LOCK: OnceLock<Mutex<ExecutorThread>> = OnceLock::new();
+
+    // Check if already initialized
+    if let Some(lock) = EXECUTOR_LOCK.get() {
+        return Ok(lock);
+    }
+
+    // Try to initialize
+    let instance = WgpuInstance::instance().map_err(|e| format!("WgpuInstance not initialised: {e}"))?;
+    let device = Arc::new(instance.device.clone());
+    let queue = Arc::new(instance.queue.clone());
+    let config = ExecutorConfig::default();
+
+    let executor = ExecutorThread::spawn(device, queue, config)
+        .map_err(|e| format!("executor spawn failed: {e}"))?;
+
+    match EXECUTOR_LOCK.set(Mutex::new(executor)) {
+        Ok(()) => {}
+        Err(_) => {
+            // Race: another thread initialized it, just return the existing one
+        }
+    }
+
+    Ok(EXECUTOR_LOCK.get().unwrap())
+}
 
 // ---------------------------------------------------------------------------
 // ① Create singleton WgpuInstance (adapter pick + feature check).
@@ -89,13 +131,11 @@ pub unsafe extern "C" fn c2me_wgpu_world_new(
         unsafe { write_err(err_buf, err_buf_len, "invalid instance handle (null)") };
         return 0;
     }
-    // instance_h 现在是哑参数，实际通过单例 API 取实例
-    let Ok(_instance) = WgpuInstance::instance() else {
+    let Ok(instance) = WgpuInstance::instance() else {
         unsafe { write_err(err_buf, err_buf_len, "instance not initialized") };
         return 0;
     };
 
-    // Build a slice from the Java ByteBuffer MemorySegment.
     let blob_slice: &[u8] = if config_blob_ptr.is_null() {
         if config_blob_len != 0 {
             unsafe { write_err(err_buf, err_buf_len, "config_blob_ptr is null but len > 0") };
@@ -106,18 +146,36 @@ pub unsafe extern "C" fn c2me_wgpu_world_new(
         unsafe { std::slice::from_raw_parts(config_blob_ptr, config_blob_len) }
     };
 
-    match WorldContext::new(blob_slice) {
-        Ok(ctx) => Box::into_raw(Box::new(ctx)) as i64,
+    let mut ctx = match WorldContext::new(blob_slice) {
+        Ok(c) => c,
         Err(e) => {
             let msg = format!("{}", e);
             unsafe { write_err(err_buf, err_buf_len, &msg) };
-            0
+            return 0;
         }
+    };
+
+    if let Err(e) = ctx.compile_pipeline(&instance.device) {
+        let msg = format!("pipeline compile failed: {e}");
+        unsafe { write_err(err_buf, err_buf_len, &msg) };
+        return 0;
     }
+
+    // Store in global handle table as Arc<WorldContext>.
+    let world_arc = Arc::new(ctx);
+    let handle = Arc::into_raw(world_arc.clone()) as i64;
+    let mut table = get_handle_table().lock().unwrap();
+    table.insert(handle, world_arc);
+    handle
 }
 
 // ---------------------------------------------------------------------------
 // ③ Submit a batch of chunk (cx, cz) positions for GPU computation.
+///
+/// Real implementation: pushes each chunk into the global PendingQueue,
+/// flushes the queue into a Batch, then dispatches the Batch through
+/// the executor thread. Returns a BatchRequest handle that can be
+/// polled for completion status.
 ///
 /// # Safety
 /// `positions_ptr` must point to `position_count * 2` packed i32 values:
@@ -134,7 +192,18 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
         unsafe { write_err(err_buf, err_buf_len, "invalid world handle (null)") };
         return 0;
     }
-    let _world = unsafe { &*(world_h as *const WorldContext) };
+
+    // Retrieve the Arc<WorldContext> from the handle table.
+    let world_arc = {
+        let table = get_handle_table().lock().unwrap();
+        match table.get(&world_h) {
+            Some(arc) => arc.clone(),
+            None => {
+                unsafe { write_err(err_buf, err_buf_len, "invalid world handle (not found in table)") };
+                return 0;
+            }
+        }
+    };
 
     let positions: &[i32] = if positions_ptr.is_null() {
         if position_count != 0 {
@@ -147,14 +216,103 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
         unsafe { std::slice::from_raw_parts(positions_ptr, n) }
     };
 
-    // Skeleton: immediately manufacture a fake "completed" BatchRequest with
-    // an empty result blob. Real impl: push into scheduler batcher mpsc queue.
-    let req = Box::new(BatchRequest {
-        status: AtomicI32::new(STATUS_DONE),
-        result: Some(ResultBlob::new_empty()),
-    });
-    let _ = positions; // silence unused in skeleton
-    Box::into_raw(req) as i64
+    // 1. Push each chunk into the pending queue.
+    let queue = get_pending_queue();
+    let batch = {
+        let mut queue_guard = match queue.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                let msg = format!("pending queue lock failed: {e}");
+                unsafe { write_err(err_buf, err_buf_len, &msg) };
+                return 0;
+            }
+        };
+
+        for i in 0..position_count as usize {
+            let cx = positions[i * 2];
+            let cz = positions[i * 2 + 1];
+            let pos = ChunkPos { cx, cz, priority: Priority::Normal };
+            if let Err(e) = queue_guard.push(pos) {
+                let msg = format!("pending queue push failed: {e}");
+                unsafe { write_err(err_buf, err_buf_len, &msg) };
+                return 0;
+            }
+        }
+
+        // 2. Flush the queue into a batch.
+        queue_guard.flush().unwrap_or_else(|| Batch {
+            positions: Vec::new(),
+            max_priority: Priority::Background,
+        })
+    };
+
+    if batch.positions.is_empty() {
+        let req = Box::new(BatchRequest {
+            status: AtomicI32::new(STATUS_DONE),
+            result: Some(ResultBlob::new_empty()),
+        });
+        return Box::into_raw(req) as i64;
+    }
+
+    // 3. Dispatch the batch through the executor thread.
+    let executor = match get_or_create_executor() {
+        Ok(e) => e,
+        Err(e) => {
+            unsafe { write_err(err_buf, err_buf_len, &e) };
+            return 0;
+        }
+    };
+
+    let executor_result = executor.lock()
+        .map_err(|e| {
+            unsafe { write_err(err_buf, err_buf_len, &format!("executor lock: {e}")) };
+            return 0;
+        })
+        .unwrap()
+        .request_chunks(world_arc, batch);
+
+    match executor_result {
+        Ok(executed) => {
+            // Merge all per-chunk results into one combined blob
+            let mut all_f32s: Vec<f32> = Vec::new();
+            let mut combined_offsets = [0u64; 16];
+            let mut chunk_idx = 0u16;
+
+            for (_key, blob) in &executed.results {
+                let chunk_f32s = decode_blob_f32s(blob);
+                if chunk_f32s.is_empty() { continue; }
+                // Compute offset for each channel
+                for ch in 0..16 {
+                    if combined_offsets[ch] == 0 && chunk_f32s.len() >= (ch + 1) * 4096 {
+                        combined_offsets[ch] = (chunk_idx as u64) * 16 * 16 * 16 * 4;
+                    }
+                }
+                all_f32s.extend_from_slice(&chunk_f32s);
+                chunk_idx += 1;
+            }
+
+            let result_blob = if all_f32s.is_empty() {
+                ResultBlob::new_empty()
+            } else {
+                ResultBlob::from_f32_data(&all_f32s, combined_offsets, chunk_idx)
+            };
+
+            let req = Box::new(BatchRequest {
+                status: AtomicI32::new(STATUS_DONE),
+                result: Some(result_blob),
+            });
+            Box::into_raw(req) as i64
+        }
+        Err(e) => {
+            let msg = format!("executor batch failed: {e}");
+            unsafe { write_err(err_buf, err_buf_len, &msg) };
+            let req = Box::new(BatchRequest {
+                status: AtomicI32::new(STATUS_ERROR),
+                result: Some(ResultBlob::new_empty()),
+            });
+            Box::into_raw(req) as i64
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +322,6 @@ pub extern "C" fn c2me_wgpu_poll_status(request_h: i64) -> i32 {
     if request_h == 0 {
         return STATUS_INVALID_HANDLE;
     }
-    // Safety: caller guarantees handle came from request_chunks and not yet freed.
     let req = unsafe { &*(request_h as *const BatchRequest) };
     req.status.load(Ordering::Acquire)
 }
@@ -172,11 +329,10 @@ pub extern "C" fn c2me_wgpu_poll_status(request_h: i64) -> i32 {
 // ---------------------------------------------------------------------------
 // ⑤ Consume a completed BatchRequest and write out the (ptr, len) of the
 //   MC-native-stride density result blob.
-//
-// After this returns successfully, the handle is freed and must not be reused.
-// Caller reads blob via MemorySegment.reinterpret(len); blob is valid until
-// the caller drops the segment (Rust keeps backing allocation behind the
-// returned pointer via a static/leaked Arc; TODO real ownership model).
+///
+/// After this returns successfully, the handle is freed and must not be reused.
+/// Caller reads blob via MemorySegment.reinterpret(len); blob is valid until
+/// the caller drops the segment.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_take_result_blob(
     request_h: i64,
@@ -189,19 +345,16 @@ pub unsafe extern "C" fn c2me_wgpu_take_result_blob(
     if out_ptr.is_null() || out_len.is_null() {
         return STATUS_ERROR;
     }
-    // Take ownership of the Box.
     let mut req: Box<BatchRequest> = unsafe { Box::from_raw(request_h as *mut BatchRequest) };
     let status = req.status.load(Ordering::Acquire);
     if status != STATUS_DONE {
-        // Leak nothing; re-box and drop. But since we just took ownership,
-        // it's already consumed. Return ERROR status.
         return STATUS_ERROR;
     }
     let Some(blob) = req.result.take() else {
-        return -1; // result already taken (double-take protection)
+        return -1;
     };
     if !blob.verify_crc() {
-        return 2; // blob corrupt
+        return 2;
     }
     let (ptr, len) = blob.into_raw_parts();
     unsafe {
@@ -212,7 +365,7 @@ pub unsafe extern "C" fn c2me_wgpu_take_result_blob(
 }
 
 // ---------------------------------------------------------------------------
-// Extra helper (not in §3 spec; used by Java ModuleEntryPoint to log GPU name).
+// Extra helper: GPU name.
 /// Returns a statically-allocated UTF-8 C string. Caller must NOT free.
 #[unsafe(no_mangle)]
 pub extern "C" fn c2me_wgpu_get_gpu_name() -> *const c_char {
@@ -228,9 +381,27 @@ pub extern "C" fn c2me_wgpu_get_gpu_name() -> *const c_char {
 }
 
 // ---------------------------------------------------------------------------
-// Internal: a BatchRequest tracks one GPU batch. Real impl lives in scheduler.
+// Internal helpers
 
-#[allow(dead_code)]
+/// Extract f32 data from a ResultBlob (skip the header + offsets).
+fn decode_blob_f32s(blob: &ResultBlob) -> Vec<f32> {
+    let bytes = blob.as_bytes();
+    if bytes.len() < 136 { // 8 header + 128 offsets
+        return Vec::new();
+    }
+    let payload_start = 8 + 16 * 8; // after header + offsets
+    let payload_end = bytes.len().saturating_sub(4); // before CRC
+    if payload_start >= payload_end {
+        return Vec::new();
+    }
+    let payload = &bytes[payload_start..payload_end];
+    payload
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect()
+}
+
+/// A BatchRequest tracks one GPU batch.
 pub(crate) struct BatchRequest {
     pub status: AtomicI32,
     pub result: Option<ResultBlob>,

@@ -26,9 +26,14 @@
 //!
 //! Order matters:
 //!   1. constant_folding — evaluate pure-constant subtrees (e.g. 3+4 → 7)
-//!   2. cse              — hash-cons identical subtrees into shared references
-//!   3. dce              — drop channels / nodes that Root does not reference
-//!   4. normalize        — canonical forms, e.g. Mul(x, Add(a,b)) ordering
+//!   2. normalize        — canonical forms, e.g. commutative child ordering
+//!   3. cse              — hash-cons structurally equal subtrees so the
+//!                         emitter can reuse WGSL expressions
+//!   4. dce              — drop nodes that Root channels never reference
+//!
+//! The normalize → cse dependency is strict: if CSE runs BEFORE normalization,
+//! `Add(InputX, 2)` and `Add(2, InputX)` have two different fingerprints and
+//! won't actually share anything.
 
 pub mod constant_folding;
 pub mod cse;
@@ -40,9 +45,9 @@ use crate::Result;
 
 /// Run all 4 passes in order on a Root node, returning the optimized AST.
 pub fn run_pipeline(root: AstNode) -> Result<AstNode> {
-    let n = constant_folding::fold(root);
+    let n = constant_folding::fold(root)?;
+    let n = normalize::canonicalize(n);
     let n = cse::eliminate(n);
     let n = dce::strip_dead(n);
-    let n = normalize::canonicalize(n);
     Ok(n)
 }

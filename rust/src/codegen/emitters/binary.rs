@@ -26,6 +26,7 @@ use crate::ast::AstNode;
 use crate::codegen::emitters::emit_node;
 use crate::codegen::wgsl_gen::GenCtx;
 use crate::Result;
+use anyhow::anyhow;
 
 pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
     match node {
@@ -35,7 +36,7 @@ pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
         AstNode::Div(a, b) => bin(ctx, a, b, "/"),
         AstNode::Min(a, b) => bin_fn(ctx, a, b, "min"),
         AstNode::Max(a, b) => bin_fn(ctx, a, b, "max"),
-        _ => unreachable!("binary emitter got non-binary node"),
+        _ => Err(anyhow!("binary emitter got non-binary node: {node:?}")),
     }
 }
 

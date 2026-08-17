@@ -31,6 +31,7 @@
 pub mod wgsl_gen;
 pub mod fingerprint;
 pub mod emitters;
+pub mod validate;
 
 /// The big math library — 1200+ lines, included verbatim into every shader
 /// build via `include_str!`.

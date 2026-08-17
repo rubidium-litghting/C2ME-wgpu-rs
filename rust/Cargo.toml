@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 wgpu = "30"
+naga = "30"
 pollster = "1"
 anyhow = "1"
 bitflags = "2"

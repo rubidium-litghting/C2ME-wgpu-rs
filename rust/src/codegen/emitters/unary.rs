@@ -26,6 +26,7 @@ use crate::ast::AstNode;
 use crate::codegen::emitters::emit_node;
 use crate::codegen::wgsl_gen::GenCtx;
 use crate::Result;
+use anyhow::anyhow;
 
 pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
     match node {
@@ -50,7 +51,7 @@ pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
             ctx.emit(format!("let {var}: f32 = floorDiv({va}, {vb});"));
             Ok(var)
         }
-        _ => unreachable!(),
+        _ => return Err(anyhow!("unary emitter got non-unary node: {node:?}")),
     }
 }
 fn un(ctx: &mut GenCtx, a: &AstNode, f: &str) -> Result<String> {

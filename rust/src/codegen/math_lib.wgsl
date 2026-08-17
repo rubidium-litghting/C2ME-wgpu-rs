@@ -17,6 +17,24 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 
 fn clamp01(x: f32) -> f32 { return clamp(x, 0.0, 1.0); }
 
+// Trilinear interpolation across the 8 corners of a unit cube.
+// Corners are indexed:
+//   c000 c100 c010 c110 c001 c101 c011 c111
+// where bit 0 = +x, bit 1 = +y, bit 2 = +z.
+fn trilinear_lerp(
+    c000: f32, c100: f32, c010: f32, c110: f32,
+    c001: f32, c101: f32, c011: f32, c111: f32,
+    tx: f32, ty: f32, tz: f32,
+) -> f32 {
+    let x00 = lerp(c000, c100, tx);
+    let x10 = lerp(c010, c110, tx);
+    let x01 = lerp(c001, c101, tx);
+    let x11 = lerp(c011, c111, tx);
+    let y0 = lerp(x00, x10, ty);
+    let y1 = lerp(x01, x11, ty);
+    return lerp(y0, y1, tz);
+}
+
 // WARNING: WGSL / GLSL floor is "towards -inf"; Rust / C is "towards zero".
 // Java Math.floorDiv and Math.floorMod match WGSL floor — but only for the
 // divisor positive case. These wrappers reproduce the exact Java edge case:
@@ -42,14 +60,18 @@ struct KahanSum {
 };
 
 fn kahan_zero() -> KahanSum {
-    return KahanSum(0.0, 0.0);
+    return KahanSum(0.0f, 0.0f);
 }
 
 fn kahan_add(s: ptr<function, KahanSum>, v: f32) {
-    let y = v - (*s).corr;
-    let t = (*s).sum + y;
-    (*s).corr = (t - (*s).sum) - y;
-    (*s).sum = t;
+    // WGSL: function-ptr member access only works for reads. To mutate,
+    // we must load → modify → store.
+    var t: KahanSum = *s;
+    let y = v - t.corr;
+    let nsum = t.sum + y;
+    t.corr = (nsum - t.sum) - y;
+    t.sum = nsum;
+    *s = t;
 }
 
 fn kahan_result(s: KahanSum) -> f32 { return s.sum; }
@@ -57,7 +79,7 @@ fn kahan_result(s: KahanSum) -> f32 { return s.sum; }
 // Optional extended precision pair — used only for very-long-distance noise
 // where offset + f32 still drifts beyond 1e-4. Disabled below x < 100_000 to
 // save registers.
-struct DD { hi: f32, lo: f32, }
+struct DD { hi: f32, lo: f32 }
 
 // ----------------------------------------------------------------------------
 // 铁律①: Local-offset coordinate helper.
@@ -101,29 +123,27 @@ fn noise_simplex3d(seed: i32, x: f32, y: f32, z: f32) -> f32 {
 }
 
 // N-octave Perlin with Kahan summation (铁律②).
-// amplitudes[] and lacunaritys[] are uniform arrays.
-fn noise_perlin_octaves_kahan(
-    seed: i32,
-    octaves: i32,
-    amplitudes: ptr<function, f32>,
-    lacunaritys: ptr<function, f32>,
-    x: f32, y: f32, z: f32,
-) -> f32 {
-    var acc = kahan_zero();
-    var fx = x;
-    var fz = z;
-    var fy = y;
-    for (var i: i32 = 0; i < octaves; i++) {
-        let amp = *(amplitudes + i);
-        let lac = *(lacunaritys + i);
-        let v = noise_perlin3d(seed + i, fx, fy, fz) * amp;
-        kahan_add(&acc, v);
-        fx *= lac;
-        fy *= lac;
-        fz *= lac;
-    }
-    return kahan_result(acc);
-}
+//
+// NOTE on the WGSL address-space model: WGSL function-scope pointers can only
+// point to a single element (no runtime-array base-pointer math à la C). The
+// octaves/amplitudes/lacunaritys are known at shader-emit time from the
+// PerlinSampler AST node, so the Rust `noise_perlin.rs` emitter INLINES this
+// loop into the caller scope — reading amplitudes/lacunaritys from a
+// compile-time-sized `let amps: array<f32, N> = (...);` binding and indexing
+// with `amps[i]`.  That skips the need for a runtime array-pointer signature
+// here entirely.  Reference (manual-inlined) form:
+//
+//   var acc: KahanSum = kahan_zero();
+//   var fx = x; var fy = y; var fz = z;
+//   for (var i: u32 = 0u; i < 8u; i++) {  // octaves hard-coded, break when done
+//       if (i32(i) >= octaves) { break; }
+//       let amp = amplitudes[i];
+//       let lac = lacunaritys[i];
+//       let v = noise_perlin3d(seed + i32(i), fx, fy, fz) * amp;
+//       kahan_add(&acc, v);
+//       fx *= lac; fy *= lac; fz *= lac;
+//   }
+//   return kahan_result(acc);
 
 // InterpolatedNoiseSampler — MC's weird cache-interpolated 2D-over-3D noise.
 fn noise_interpolated_sampler(_seed: i32, _x: f32, _y: f32, _z: f32) -> f32 { return 0.0; }
@@ -174,7 +194,7 @@ fn biome_access_4corner(
     c00: f32, c10: f32, c01: f32, c11: f32,
     tx: f32, tz: f32,
 ) -> f32 {
-    let acc = kahan_zero();
+    var acc: KahanSum = kahan_zero();
     let w00 = (1.0 - tx) * (1.0 - tz); kahan_add(&acc, c00 * w00);
     let w10 = (tx)       * (1.0 - tz); kahan_add(&acc, c10 * w10);
     let w01 = (1.0 - tx) * (tz);       kahan_add(&acc, c01 * w01);

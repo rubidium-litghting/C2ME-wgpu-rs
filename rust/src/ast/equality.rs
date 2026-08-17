@@ -29,16 +29,16 @@
 //! beyond the process lifetime or a single cache file that stores its own
 //! stronger integrity check.
 
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 
 use rustc_hash::FxHasher;
 
 use crate::ast::AstNode;
 
 /// Hash an AST subtree using FxHash32.
-pub fn hash_ast(_node: &AstNode) -> u32 {
-    let hasher = FxHasher::default();
-    //_node.hash(&mut hasher);
+pub fn hash_ast(node: &AstNode) -> u32 {
+    let mut hasher = FxHasher::default();
+    node.hash(&mut hasher);
     hasher.finish() as u32
 }
 

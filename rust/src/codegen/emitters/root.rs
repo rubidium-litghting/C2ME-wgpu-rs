@@ -29,12 +29,30 @@
 //! that the coordinate emitter returns references to.
 
 use crate::ast::AstNode;
+use crate::codegen::emitters::emit_node;
 use crate::codegen::wgsl_gen::GenCtx;
 use crate::Result;
+use anyhow::anyhow;
 
-pub fn emit(node: &AstNode, _ctx: &mut GenCtx) -> Result<String> {
-    let AstNode::Root(channels) = node else { unreachable!() };
-    // Skeleton: ensure 16 channels exist (exact count enforced later in real impl)
-    assert!(channels.len() <= 16, "Root node has more than 16 channels");
-    Ok("root_bound".into())
+/// Emit each Root channel via `emit_node`, then write its value into
+/// `out_buf[channel_idx * cells_per_chunk + cell_idx]` (channel-major
+/// stride, matching `mc_stride.rs::cell_index`). Assumes `main_entry`
+/// scope already declares `cell_idx` and `cells_per_chunk` (provided by
+/// the prologue constants in `wgsl_gen.rs`).
+pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
+    let AstNode::Root(channels) = node else {
+        return Err(anyhow!("root emitter: expected AstNode::Root, got {node:?}"));
+    };
+
+    for (i, child) in channels.iter().enumerate() {
+        let var = emit_node(child, ctx)?;
+        let chan_u32 = i as u32;
+        ctx.emit(format!(
+            "  out_buf[{chan_u32}u * cells_per_chunk + cell_idx] = {var};"
+        ));
+    }
+
+    // Root is an aggregate — no single value. The sentinel below should
+    // never be referenced (Root only ever appears at the AST top).
+    Ok("__root_aggregate".into())
 }
