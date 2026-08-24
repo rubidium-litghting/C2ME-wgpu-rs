@@ -137,4 +137,3 @@ rust/target/
 rust/Cargo.lock.bak
 **/*.rs.bk
 # Personnal Development Files
-计划.txt

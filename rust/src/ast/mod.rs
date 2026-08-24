@@ -37,38 +37,38 @@ pub mod equality;
 pub mod opto;
 
 pub const TAG_CONSTANT: u8 = 0x01;
-pub const TAG_INPUT_X:  u8 = 0x02;
-pub const TAG_INPUT_Y:  u8 = 0x03;
-pub const TAG_INPUT_Z:  u8 = 0x04;
-pub const TAG_ADD:      u8 = 0x10;
-pub const TAG_SUB:      u8 = 0x11;
-pub const TAG_MUL:      u8 = 0x12;
-pub const TAG_DIV:      u8 = 0x13;
-pub const TAG_MIN:      u8 = 0x14;
-pub const TAG_MAX:      u8 = 0x15;
-pub const TAG_ABS:      u8 = 0x20;
-pub const TAG_SQUARE:   u8 = 0x21;
-pub const TAG_CUBE:     u8 = 0x22;
-pub const TAG_SQRT:     u8 = 0x23;
-pub const TAG_FLOOR_DIV:u8 = 0x24;
-pub const TAG_PERLIN:   u8 = 0x80;
+pub const TAG_INPUT_X: u8 = 0x02;
+pub const TAG_INPUT_Y: u8 = 0x03;
+pub const TAG_INPUT_Z: u8 = 0x04;
+pub const TAG_ADD: u8 = 0x10;
+pub const TAG_SUB: u8 = 0x11;
+pub const TAG_MUL: u8 = 0x12;
+pub const TAG_DIV: u8 = 0x13;
+pub const TAG_MIN: u8 = 0x14;
+pub const TAG_MAX: u8 = 0x15;
+pub const TAG_ABS: u8 = 0x20;
+pub const TAG_SQUARE: u8 = 0x21;
+pub const TAG_CUBE: u8 = 0x22;
+pub const TAG_SQRT: u8 = 0x23;
+pub const TAG_FLOOR_DIV: u8 = 0x24;
+pub const TAG_PERLIN: u8 = 0x80;
 pub const TAG_DOUBLE_PERLIN: u8 = 0x81;
-pub const TAG_SIMPLEX_2D:    u8 = 0x82;
-pub const TAG_SIMPLEX_3D:    u8 = 0x83;
-pub const TAG_INTERP_NOISE:  u8 = 0x90;
-pub const TAG_END_ISLANDS:   u8 = 0xA0;
-pub const TAG_BEARDIFIER:    u8 = 0xA1;
-pub const TAG_SPLINE:        u8 = 0xB0;
-pub const TAG_RANGE_CHOICE:  u8 = 0xB1;
-pub const TAG_INTERVAL_SEL:  u8 = 0xB2;
-pub const TAG_Y_CLAMPED_GRAD:u8 = 0xB3;
-pub const TAG_CACHE_FLAT:    u8 = 0xC0;
-pub const TAG_CACHE_2D:      u8 = 0xC1;
-pub const TAG_CACHE_INTERP:  u8 = 0xC2;
+pub const TAG_SIMPLEX_2D: u8 = 0x82;
+pub const TAG_SIMPLEX_3D: u8 = 0x83;
+pub const TAG_INTERP_NOISE: u8 = 0x90;
+pub const TAG_END_ISLANDS: u8 = 0xA0;
+pub const TAG_BEARDIFIER: u8 = 0xA1;
+pub const TAG_SPLINE: u8 = 0xB0;
+pub const TAG_RANGE_CHOICE: u8 = 0xB1;
+pub const TAG_INTERVAL_SEL: u8 = 0xB2;
+pub const TAG_Y_CLAMPED_GRAD: u8 = 0xB3;
+pub const TAG_CACHE_FLAT: u8 = 0xC0;
+pub const TAG_CACHE_2D: u8 = 0xC1;
+pub const TAG_CACHE_INTERP: u8 = 0xC2;
 pub const TAG_FIND_TOP_SURF: u8 = 0xD0;
-pub const TAG_AQUIFER:       u8 = 0xE0;
-pub const TAG_BIOME_TREE:    u8 = 0xF0;
-pub const TAG_ROOT:          u8 = 0xFE;
+pub const TAG_AQUIFER: u8 = 0xE0;
+pub const TAG_BIOME_TREE: u8 = 0xF0;
+pub const TAG_ROOT: u8 = 0xFE;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AstNode {
@@ -106,24 +106,25 @@ pub enum AstNode {
         a: Box<AstNode>, // PerlinSampler A
         b: Box<AstNode>, // PerlinSampler B
     },
-    SimplexNoise2D { seed: i64 },
-    SimplexNoise3D { seed: i64 },
+    SimplexNoise2D {
+        seed: i64,
+    },
+    SimplexNoise3D {
+        seed: i64,
+    },
     InterpolatedNoiseSampler {
-        // TODO: full struct; see protocol appendix §4
-        _placeholder: (),
+        child: Box<AstNode>,
     },
 
     // ── Structure terrain ───────────────────────────────────────────────
     EndIslands(Box<AstNode>),
     Beardifier {
-        // TODO: full struct
-        _placeholder: (),
+        struct_index: i32,
     },
 
     // ── Shape / Selection ───────────────────────────────────────────────
     Spline {
-        // TODO: spline control points + min/max
-        _placeholder: (),
+        points: Vec<(f32, f32)>,
     },
     RangeChoice {
         input: Box<AstNode>,
@@ -134,12 +135,18 @@ pub enum AstNode {
         out_of_bounds_hi: Box<AstNode>,
     },
     IntervalSelect {
-        // 6 child nodes per protocol
-        _placeholder: (),
+        input: Box<AstNode>,
+        min: Box<AstNode>,
+        max: Box<AstNode>,
+        in_bounds: Box<AstNode>,
+        out_of_bounds_lo: Box<AstNode>,
+        out_of_bounds_hi: Box<AstNode>,
     },
     YClampedGradient {
-        // TODO: y_min, y_max offsets + slope
-        _placeholder: (),
+        y_min: i32,
+        y_max: i32,
+        input: Box<AstNode>,
+        gradient: Box<AstNode>,
     },
 
     // ── Caches ──────────────────────────────────────────────────────────
@@ -155,14 +162,14 @@ pub enum AstNode {
         max_y: i32,
     },
     Aquifer {
-        // TODO: full struct (noise_level + params)
-        _placeholder: (),
+        density: Box<AstNode>,
+        fluid_level: Box<AstNode>,
     },
 
     // ── Biome ───────────────────────────────────────────────────────────
     BiomeTree {
         // MultiNoiseBiomeSource flattened decision tree
-        _placeholder: (),
+        seed: i64,
     },
 
     // ── Root ────────────────────────────────────────────────────────────
@@ -255,7 +262,12 @@ impl Hash for AstNode {
             }
 
             // ── Noise samplers ──────────────────────────────────────────────
-            AstNode::PerlinSampler { seed, octaves, amplitudes, lacunaritys } => {
+            AstNode::PerlinSampler {
+                seed,
+                octaves,
+                amplitudes,
+                lacunaritys,
+            } => {
                 TAG_PERLIN.hash(state);
                 seed.hash(state);
                 octaves.hash(state);
@@ -281,24 +293,38 @@ impl Hash for AstNode {
                 TAG_SIMPLEX_3D.hash(state);
                 seed.hash(state);
             }
-            AstNode::InterpolatedNoiseSampler { _placeholder } => {
-                TAG_INTERP_NOISE.hash(state);
-            }
+            AstNode::InterpolatedNoiseSampler { child } => {
+        0x90u8.hash(state);
+        child.hash(state);
+    }
 
             // ── Structure terrain ───────────────────────────────────────────
             AstNode::EndIslands(a) => {
                 TAG_END_ISLANDS.hash(state);
                 a.hash(state);
             }
-            AstNode::Beardifier { _placeholder } => {
-                TAG_BEARDIFIER.hash(state);
-            }
+            AstNode::Beardifier { struct_index } => {
+        0xA1u8.hash(state);
+        struct_index.hash(state);
+    }
 
             // ── Shape / Selection ───────────────────────────────────────────
-            AstNode::Spline { _placeholder } => {
-                TAG_SPLINE.hash(state);
-            }
-            AstNode::RangeChoice { input, min, max, in_bounds, out_of_bounds_lo, out_of_bounds_hi } => {
+            AstNode::Spline { points } => {
+        0xB0u8.hash(state);
+        points.len().hash(state);
+        for (x, y) in points {
+            f32_to_hash_bits(*x).hash(state);
+            f32_to_hash_bits(*y).hash(state);
+        }
+    }
+            AstNode::RangeChoice {
+                input,
+                min,
+                max,
+                in_bounds,
+                out_of_bounds_lo,
+                out_of_bounds_hi,
+            } => {
                 TAG_RANGE_CHOICE.hash(state);
                 input.hash(state);
                 min.hash(state);
@@ -307,12 +333,22 @@ impl Hash for AstNode {
                 out_of_bounds_lo.hash(state);
                 out_of_bounds_hi.hash(state);
             }
-            AstNode::IntervalSelect { _placeholder } => {
-                TAG_INTERVAL_SEL.hash(state);
-            }
-            AstNode::YClampedGradient { _placeholder } => {
-                TAG_Y_CLAMPED_GRAD.hash(state);
-            }
+            AstNode::IntervalSelect { input, min, max, in_bounds, out_of_bounds_lo, out_of_bounds_hi } => {
+        0xB2u8.hash(state);
+        input.hash(state);
+        min.hash(state);
+        max.hash(state);
+        in_bounds.hash(state);
+        out_of_bounds_lo.hash(state);
+        out_of_bounds_hi.hash(state);
+    }
+            AstNode::YClampedGradient { y_min, y_max, input, gradient } => {
+        0xB3u8.hash(state);
+        y_min.hash(state);
+        y_max.hash(state);
+        input.hash(state);
+        gradient.hash(state);
+    }
 
             // ── Caches ──────────────────────────────────────────────────────
             AstNode::CacheFlat(a) => {
@@ -329,21 +365,29 @@ impl Hash for AstNode {
             }
 
             // ── Surface / Aquifer ───────────────────────────────────────────
-            AstNode::FindTopSurface { density, initial, min_y, max_y } => {
+            AstNode::FindTopSurface {
+                density,
+                initial,
+                min_y,
+                max_y,
+            } => {
                 TAG_FIND_TOP_SURF.hash(state);
                 density.hash(state);
                 initial.hash(state);
                 min_y.hash(state);
                 max_y.hash(state);
             }
-            AstNode::Aquifer { _placeholder } => {
-                TAG_AQUIFER.hash(state);
-            }
+            AstNode::Aquifer { density, fluid_level } => {
+        0xE0u8.hash(state);
+        density.hash(state);
+        fluid_level.hash(state);
+    }
 
             // ── Biome ───────────────────────────────────────────────────────
-            AstNode::BiomeTree { _placeholder } => {
-                TAG_BIOME_TREE.hash(state);
-            }
+            AstNode::BiomeTree { seed } => {
+        0xF0u8.hash(state);
+        seed.hash(state);
+    }
 
             // ── Root ────────────────────────────────────────────────────────
             AstNode::Root(channels) => {
@@ -360,8 +404,8 @@ impl Hash for AstNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::hash::{Hash, Hasher};
     use rustc_hash::FxHasher;
+    use std::hash::{Hash, Hasher};
 
     fn hash_one(n: &AstNode) -> u64 {
         let mut h = FxHasher::default();
@@ -371,8 +415,11 @@ mod tests {
 
     fn assert_hash_eq_if_partial_eq(a: &AstNode, b: &AstNode) {
         if a == b {
-            assert_eq!(hash_one(a), hash_one(b),
-                "Hash/PartialEq inconsistency: a==b but hash(a)!=hash(b)");
+            assert_eq!(
+                hash_one(a),
+                hash_one(b),
+                "Hash/PartialEq inconsistency: a==b but hash(a)!=hash(b)"
+            );
         }
     }
 
@@ -403,12 +450,14 @@ mod tests {
     #[test]
     fn perlin_vec_length_sensitive() {
         let p1 = AstNode::PerlinSampler {
-            seed: 0, octaves: 1,
+            seed: 0,
+            octaves: 1,
             amplitudes: vec![1.0],
             lacunaritys: vec![2.0],
         };
         let p2 = AstNode::PerlinSampler {
-            seed: 0, octaves: 2,
+            seed: 0,
+            octaves: 2,
             amplitudes: vec![1.0, 0.5],
             lacunaritys: vec![2.0, 2.0],
         };

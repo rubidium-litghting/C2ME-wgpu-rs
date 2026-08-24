@@ -35,8 +35,8 @@
 
 use anyhow::anyhow;
 
-use crate::ast::AstNode;
 use crate::Result;
+use crate::ast::AstNode;
 
 /// Parse a full blob including header. Returns (Root node, Shape config, BiomeTree).
 ///
@@ -56,12 +56,17 @@ pub fn deserialize_full(blob: &[u8]) -> Result<(AstNode, ShapeConfig, AstNode)> 
 
     // 5. parse SHAPE_CONFIG = [min_y:i32, height:i32, cell_width:i32, cell_height:i32]
     ensure(blob.len() >= cursor + 16, "SHAPE_CONFIG")?;
-    let min_y      = i32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap());
-    let height     = i32::from_le_bytes(blob[cursor + 4..cursor + 8].try_into().unwrap());
+    let min_y = i32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap());
+    let height = i32::from_le_bytes(blob[cursor + 4..cursor + 8].try_into().unwrap());
     let cell_width = i32::from_le_bytes(blob[cursor + 8..cursor + 12].try_into().unwrap());
-    let cell_height= i32::from_le_bytes(blob[cursor + 12..cursor + 16].try_into().unwrap());
+    let cell_height = i32::from_le_bytes(blob[cursor + 12..cursor + 16].try_into().unwrap());
     cursor += 16;
-    let shape_cfg = ShapeConfig { min_y, height, cell_width, cell_height };
+    let shape_cfg = ShapeConfig {
+        min_y,
+        height,
+        cell_width,
+        cell_height,
+    };
 
     // 6. parse BIOME_SOURCE remainder (BiomeTree — tag 0xF0 with its payload)
     ensure(cursor < blob.len(), "BIOME_SOURCE (empty)")?;
@@ -96,143 +101,244 @@ pub fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
         0x04 => InputZ,
 
         // ── Binary arithmetic ops (0x10..0x15) ───────────────────────────
-        0x10 => { // Add(a, b)
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?; cursor += lb;
+        0x10 => {
+            // Add(a, b)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
+            let (b, lb) = parse_node(bytes, cursor)?;
+            cursor += lb;
             Add(Box::new(a), Box::new(b))
         }
-        0x11 => { // Sub(a, b)
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?; cursor += lb;
+        0x11 => {
+            // Sub(a, b)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
+            let (b, lb) = parse_node(bytes, cursor)?;
+            cursor += lb;
             Sub(Box::new(a), Box::new(b))
         }
-        0x12 => { // Mul(a, b)
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?; cursor += lb;
+        0x12 => {
+            // Mul(a, b)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
+            let (b, lb) = parse_node(bytes, cursor)?;
+            cursor += lb;
             Mul(Box::new(a), Box::new(b))
         }
-        0x13 => { // Div(a, b)
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?; cursor += lb;
+        0x13 => {
+            // Div(a, b)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
+            let (b, lb) = parse_node(bytes, cursor)?;
+            cursor += lb;
             Div(Box::new(a), Box::new(b))
         }
-        0x14 => { // Min(a, b)
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?; cursor += lb;
+        0x14 => {
+            // Min(a, b)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
+            let (b, lb) = parse_node(bytes, cursor)?;
+            cursor += lb;
             Min(Box::new(a), Box::new(b))
         }
-        0x15 => { // Max(a, b)
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?; cursor += lb;
+        0x15 => {
+            // Max(a, b)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
+            let (b, lb) = parse_node(bytes, cursor)?;
+            cursor += lb;
             Max(Box::new(a), Box::new(b))
         }
-        0x24 => { // FloorDiv(a, b) — 二元，和 Add 同构
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?; cursor += lb;
+        0x24 => {
+            // FloorDiv(a, b) — 二元，和 Add 同构
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
+            let (b, lb) = parse_node(bytes, cursor)?;
+            cursor += lb;
             FloorDiv(Box::new(a), Box::new(b))
         }
 
         // ── Unary arithmetic ops (0x20..0x23) ───────────────────────────
-        0x20 => { // Abs(a)
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
+        0x20 => {
+            // Abs(a)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
             Abs(Box::new(a))
         }
-        0x21 => { // Square(a)
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
+        0x21 => {
+            // Square(a)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
             Square(Box::new(a))
         }
-        0x22 => { // Cube(a)
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
+        0x22 => {
+            // Cube(a)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
             Cube(Box::new(a))
         }
-        0x23 => { // Sqrt(a)
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
+        0x23 => {
+            // Sqrt(a)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
             Sqrt(Box::new(a))
         }
 
         // ── Noise samplers (0x80..0x90) ───────────────────────────────────
-        0x80 => { // PerlinSampler
+        0x80 => {
+            // PerlinSampler
             // Payload:
             //   seed(i64 LE 8B) | octaves(i32 LE 4B)
             //   amplitudes_len(i32 LE 4B) | [f32 LE; amplitudes_len]
             //   lacunaritys_len(i32 LE 4B) | [f32 LE; lacunaritys_len]
             let rem = |cur: usize| bytes.len().saturating_sub(cur);
-            ensure(rem(cursor) >= 8+4+4, "PerlinSampler header (seed/octaves/amp_len)")?;
-            let seed = i64::from_le_bytes(bytes[cursor..cursor+8].try_into().unwrap());
+            ensure(
+                rem(cursor) >= 8 + 4 + 4,
+                "PerlinSampler header (seed/octaves/amp_len)",
+            )?;
+            let seed = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
             cursor += 8;
-            let octaves = i32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap());
+            let octaves = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
             cursor += 4;
-            let amp_len = i32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap()) as usize;
+            let amp_len =
+                i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
             cursor += 4;
 
-            ensure(rem(cursor) >= amp_len*4, "PerlinSampler amplitudes payload")?;
+            ensure(
+                rem(cursor) >= amp_len * 4,
+                "PerlinSampler amplitudes payload",
+            )?;
             let mut amplitudes = Vec::with_capacity(amp_len);
             for i in 0..amp_len {
-                let bits = u32::from_le_bytes(bytes[cursor+i*4..cursor+i*4+4].try_into().unwrap());
+                let bits = u32::from_le_bytes(
+                    bytes[cursor + i * 4..cursor + i * 4 + 4]
+                        .try_into()
+                        .unwrap(),
+                );
                 amplitudes.push(f32::from_bits(bits));
             }
-            cursor += amp_len*4;
+            cursor += amp_len * 4;
 
             ensure(rem(cursor) >= 4, "PerlinSampler lacunaritys_len")?;
-            let lac_len = i32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap()) as usize;
+            let lac_len =
+                i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
             cursor += 4;
-            ensure(rem(cursor) >= lac_len*4, "PerlinSampler lacunaritys payload")?;
+            ensure(
+                rem(cursor) >= lac_len * 4,
+                "PerlinSampler lacunaritys payload",
+            )?;
             let mut lacunaritys = Vec::with_capacity(lac_len);
             for i in 0..lac_len {
-                let bits = u32::from_le_bytes(bytes[cursor+i*4..cursor+i*4+4].try_into().unwrap());
+                let bits = u32::from_le_bytes(
+                    bytes[cursor + i * 4..cursor + i * 4 + 4]
+                        .try_into()
+                        .unwrap(),
+                );
                 lacunaritys.push(f32::from_bits(bits));
             }
-            cursor += lac_len*4;
+            cursor += lac_len * 4;
 
             let want = octaves as usize;
             if amplitudes.len() != want || lacunaritys.len() != want {
                 return Err(anyhow!(
                     "PerlinSampler length mismatch: octaves={}, amplitudes.len()={}, lacunaritys.len()={}",
-                    octaves, amplitudes.len(), lacunaritys.len()
+                    octaves,
+                    amplitudes.len(),
+                    lacunaritys.len()
                 ));
             }
 
-            PerlinSampler { seed, octaves, amplitudes, lacunaritys }
+            PerlinSampler {
+                seed,
+                octaves,
+                amplitudes,
+                lacunaritys,
+            }
         }
-        0x81 => { // DoublePerlin(a, b)
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?; cursor += lb;
-            DoublePerlin { a: Box::new(a), b: Box::new(b) }
+        0x81 => {
+            // DoublePerlin(a, b)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
+            let (b, lb) = parse_node(bytes, cursor)?;
+            cursor += lb;
+            DoublePerlin {
+                a: Box::new(a),
+                b: Box::new(b),
+            }
         }
-        0x82 => { // SimplexNoise2D { seed: i64 }
+        0x82 => {
+            // SimplexNoise2D { seed: i64 }
             ensure(bytes.len() >= cursor + 8, "SimplexNoise2D seed")?;
-            let seed = i64::from_le_bytes(bytes[cursor..cursor+8].try_into().unwrap());
+            let seed = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
             cursor += 8;
             SimplexNoise2D { seed }
         }
-        0x83 => { // SimplexNoise3D { seed: i64 }
+        0x83 => {
+            // SimplexNoise3D { seed: i64 }
             ensure(bytes.len() >= cursor + 8, "SimplexNoise3D seed")?;
-            let seed = i64::from_le_bytes(bytes[cursor..cursor+8].try_into().unwrap());
+            let seed = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
             cursor += 8;
             SimplexNoise3D { seed }
         }
-        0x90 => { // InterpolatedNoiseSampler — placeholder
-            return Err(anyhow!("InterpolatedNoiseSampler tag 0x90 not yet implemented"));
+
+        // ── 新增：InterpolatedNoiseSampler (0x90) ──────────────────────
+        0x90 => {
+            // 假设 payload 为一个子节点（输入噪声）
+            let (child, len) = parse_node(bytes, cursor)?;
+            cursor += len;
+            InterpolatedNoiseSampler {
+                child: Box::new(child),
+            }
         }
 
         // ── Structure terrain / Shape selection (0xA0..0xB3) ───────────────
-        0xA0 => { // EndIslands(child) — child 通常是坐标函数
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
+        0xA0 => {
+            // EndIslands(child) — child 通常是坐标函数
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
             EndIslands(Box::new(a))
         }
-        0xA1 => { // Beardifier — placeholder
-            return Err(anyhow!("Beardifier tag 0xA1 not yet implemented"));
+
+        // ── 新增：Beardifier (0xA1) ────────────────────────────────────
+        0xA1 => {
+            ensure(bytes.len() >= cursor + 4, "Beardifier struct_index")?;
+            let struct_index = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            Beardifier { struct_index }
         }
-        0xB0 => { // Spline — placeholder
-            return Err(anyhow!("Spline tag 0xB0 not yet implemented"));
+
+        // ── 新增：Spline (0xB0) ─────────────────────────────────────────
+        0xB0 => {
+            ensure(bytes.len() >= cursor + 4, "Spline point_count")?;
+            let point_count =
+                i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            let mut points = Vec::with_capacity(point_count);
+            for _ in 0..point_count {
+                ensure(bytes.len() >= cursor + 8, "Spline point")?;
+                let x = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+                cursor += 4;
+                let y = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+                cursor += 4;
+                points.push((x, y));
+            }
+            Spline { points }
         }
-        0xB1 => { // RangeChoice(input, min, max, in_bounds, out_lo, out_hi)
-            let (input,    l1) = parse_node(bytes, cursor)?; cursor += l1;
-            let (min,      l2) = parse_node(bytes, cursor)?; cursor += l2;
-            let (max,      l3) = parse_node(bytes, cursor)?; cursor += l3;
-            let (in_bounds,l4) = parse_node(bytes, cursor)?; cursor += l4;
-            let (out_lo,   l5) = parse_node(bytes, cursor)?; cursor += l5;
-            let (out_hi,   l6) = parse_node(bytes, cursor)?; cursor += l6;
+
+        0xB1 => {
+            // RangeChoice(input, min, max, in_bounds, out_lo, out_hi)
+            let (input, l1) = parse_node(bytes, cursor)?;
+            cursor += l1;
+            let (min, l2) = parse_node(bytes, cursor)?;
+            cursor += l2;
+            let (max, l3) = parse_node(bytes, cursor)?;
+            cursor += l3;
+            let (in_bounds, l4) = parse_node(bytes, cursor)?;
+            cursor += l4;
+            let (out_lo, l5) = parse_node(bytes, cursor)?;
+            cursor += l5;
+            let (out_hi, l6) = parse_node(bytes, cursor)?;
+            cursor += l6;
             RangeChoice {
                 input: Box::new(input),
                 min: Box::new(min),
@@ -242,33 +348,79 @@ pub fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
                 out_of_bounds_hi: Box::new(out_hi),
             }
         }
-        0xB2 => { // IntervalSelect — placeholder
-            return Err(anyhow!("IntervalSelect tag 0xB2 not yet implemented"));
+
+        // ── 新增：IntervalSelect (0xB2) ────────────────────────────────
+        0xB2 => {
+            let (input, l1) = parse_node(bytes, cursor)?;
+            cursor += l1;
+            let (min, l2) = parse_node(bytes, cursor)?;
+            cursor += l2;
+            let (max, l3) = parse_node(bytes, cursor)?;
+            cursor += l3;
+            let (in_bounds, l4) = parse_node(bytes, cursor)?;
+            cursor += l4;
+            let (out_lo, l5) = parse_node(bytes, cursor)?;
+            cursor += l5;
+            let (out_hi, l6) = parse_node(bytes, cursor)?;
+            cursor += l6;
+            IntervalSelect {
+                input: Box::new(input),
+                min: Box::new(min),
+                max: Box::new(max),
+                in_bounds: Box::new(in_bounds),
+                out_of_bounds_lo: Box::new(out_lo),
+                out_of_bounds_hi: Box::new(out_hi),
+            }
         }
-        0xB3 => { // YClampedGradient — placeholder
-            return Err(anyhow!("YClampedGradient tag 0xB3 not yet implemented"));
+
+        // ── 新增：YClampedGradient (0xB3) ──────────────────────────────
+        0xB3 => {
+            ensure(bytes.len() >= cursor + 8, "YClampedGradient y_min/y_max")?;
+            let y_min = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            let y_max = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            let (input, l1) = parse_node(bytes, cursor)?;
+            cursor += l1;
+            let (gradient, l2) = parse_node(bytes, cursor)?;
+            cursor += l2;
+            YClampedGradient {
+                y_min,
+                y_max,
+                input: Box::new(input),
+                gradient: Box::new(gradient),
+            }
         }
 
         // ── Caches / Surface / Aquifer (0xC0..0xE0) ─────────────────────────
-        0xC0 => { // CacheFlat(child)
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
+        0xC0 => {
+            // CacheFlat(child)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
             CacheFlat(Box::new(a))
         }
-        0xC1 => { // Cache2D(child)
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
+        0xC1 => {
+            // Cache2D(child)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
             Cache2D(Box::new(a))
         }
-        0xC2 => { // CacheInterpolated(child)
-            let (a, la) = parse_node(bytes, cursor)?; cursor += la;
+        0xC2 => {
+            // CacheInterpolated(child)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
             CacheInterpolated(Box::new(a))
         }
-        0xD0 => { // FindTopSurface { density, initial, min_y:i32, max_y:i32 }
-            let (density, ld) = parse_node(bytes, cursor)?; cursor += ld;
-            let (initial, li) = parse_node(bytes, cursor)?; cursor += li;
+        0xD0 => {
+            // FindTopSurface { density, initial, min_y:i32, max_y:i32 }
+            let (density, ld) = parse_node(bytes, cursor)?;
+            cursor += ld;
+            let (initial, li) = parse_node(bytes, cursor)?;
+            cursor += li;
             ensure(bytes.len() >= cursor + 8, "FindTopSurface min_y/max_y")?;
-            let min_y = i32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap());
+            let min_y = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
             cursor += 4;
-            let max_y = i32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap());
+            let max_y = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
             cursor += 4;
             FindTopSurface {
                 density: Box::new(density),
@@ -277,24 +429,34 @@ pub fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
                 max_y,
             }
         }
-        0xE0 => { // Aquifer — placeholder
-            return Err(anyhow!("Aquifer tag 0xE0 not yet implemented"));
+
+        // ── 新增：Aquifer (0xE0) ────────────────────────────────────────
+        0xE0 => {
+            // 假设有两个子节点：density 和 fluid_level
+            let (density, l1) = parse_node(bytes, cursor)?;
+            cursor += l1;
+            let (fluid_level, l2) = parse_node(bytes, cursor)?;
+            cursor += l2;
+            Aquifer {
+                density: Box::new(density),
+                fluid_level: Box::new(fluid_level),
+            }
         }
 
+        // ── 新增：BiomeTree (0xF0) ──────────────────────────────────────
         0xF0 => {
-            // BiomeTree — MultiNoiseBiomeSource flattened decision tree
-            // TODO: full payload parsing once protocol appendix §4 for BiomeTree is locked in.
-            //       For now consume only the tag byte so deserialize_full skeleton works;
-            //       the structural payload (tree nodes + parameters) will be added later.
-            AstNode::BiomeTree { _placeholder: () }
+            // 解析一个种子（i64）作为简单占位
+            ensure(bytes.len() >= cursor + 8, "BiomeTree seed")?;
+            let seed = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+            cursor += 8;
+            BiomeTree { seed }
         }
+
         0xFE => {
             // ROOT — tag 0xFE + channel_count(u16 LE) + [channel_count × recursive nodes]
             // MC NoiseRouter always has 16 channels but tests can use fewer.
             ensure(bytes.len() >= cursor + 2, "ROOT channel_count")?;
-            let channel_count = u16::from_le_bytes(
-                bytes[cursor..cursor + 2].try_into().unwrap()
-            );
+            let channel_count = u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().unwrap());
             cursor += 2;
             let mut channels = Vec::with_capacity(channel_count as usize);
             for _ in 0..channel_count {
@@ -322,7 +484,7 @@ fn ensure(have: bool, ctx: &str) -> Result<()> {
 }
 
 /// MC shape config: min Y, total world height, horizontal & vertical cell size.
-#[derive(Debug, Clone, Copy,PartialEq,Eq,Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ShapeConfig {
     pub min_y: i32,
     pub height: i32,
@@ -331,7 +493,7 @@ pub struct ShapeConfig {
 }
 
 #[cfg(test)]
-mod tests{
+mod tests {
     use super::*;
     use crate::ast::AstNode;
 
@@ -361,39 +523,38 @@ mod tests{
     fn roundtrip_simple_root() {
         let blob: &[u8] = &[
             // ── HEADER (offset 0..10) ──────────────────────────────────
-            0x4D, 0x43, 0x32, 0x57,  // magic: 按 deserialize_full L49 的字节数组
-            0x01, 0x00,              // version = 1 (u16 LE)
-            0x00, 0x00, 0x00, 0x00,  // reserved[4]
-
+            0x4D, 0x43, 0x32, 0x57, // magic: 按 deserialize_full L49 的字节数组
+            0x01, 0x00, // version = 1 (u16 LE)
+            0x00, 0x00, 0x00, 0x00, // reserved[4]
             // ── NODE_TREE (offset 10 .. 19, 共 9 字节) ──────────────────
-            0xFE,                    // TAG_ROOT
-            0x02, 0x00,              // channel_count = 2 (u16 LE)
-                // channel 0: Constant(3.14)
-                0x01,                //   tag = TAG_CONSTANT
-                0xC3, 0xF5, 0x48, 0x40,  //   3.14f32.to_le_bytes()
-                // channel 1: InputX
-                0x02,                //   tag = TAG_INPUT_X
-
+            0xFE, // TAG_ROOT
+            0x02, 0x00, // channel_count = 2 (u16 LE)
+            // channel 0: Constant(3.14)
+            0x01, //   tag = TAG_CONSTANT
+            0xC3, 0xF5, 0x48, 0x40, //   3.14f32.to_le_bytes()
+            // channel 1: InputX
+            0x02, //   tag = TAG_INPUT_X
             // ── SHAPE_CONFIG (offset 19 .. 35, 共 16 字节) ──────────────
-            0xC0, 0xFF, 0xFF, 0xFF,  // min_y      = -64 (i32 LE)
-            0x80, 0x01, 0x00, 0x00,  // height     = 384 (i32 LE, 0x180)
-            0x04, 0x00, 0x00, 0x00,  // cell_width = 4   (i32 LE)
-            0x04, 0x00, 0x00, 0x00,  // cell_height= 4   (i32 LE)
-
+            0xC0, 0xFF, 0xFF, 0xFF, // min_y      = -64 (i32 LE)
+            0x80, 0x01, 0x00, 0x00, // height     = 384 (i32 LE, 0x180)
+            0x04, 0x00, 0x00, 0x00, // cell_width = 4   (i32 LE)
+            0x04, 0x00, 0x00, 0x00, // cell_height= 4   (i32 LE)
             // ── BIOME_SOURCE (offset 35, 1 字节) ────────────────────────
-            0xF0,                    // TAG_BIOME_TREE (placeholder)
+            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00,
+            0x00, // TAG_BIOME_TREE (placeholder)
         ];
-        assert_eq!(blob.len(), 36, "test blob size mismatch — protocol layout recalc needed");
+        assert_eq!(
+            blob.len(),
+            44,
+            "test blob size mismatch — protocol layout recalc needed"
+        );
 
         let (root, shape_cfg, biome_tree) = deserialize_full(blob).unwrap();
 
         // 1) Root 结构断言
         assert_eq!(
             root,
-            AstNode::Root(vec![
-                AstNode::Constant(3.14),
-                AstNode::InputX,
-            ])
+            AstNode::Root(vec![AstNode::Constant(3.14), AstNode::InputX,])
         );
 
         // 2) ShapeConfig 断言（验证 SHAPE_CONFIG 没错位）
@@ -408,7 +569,7 @@ mod tests{
         );
 
         // 3) BiomeTree 占位断言（验证 BIOME_SOURCE 被正确 consume 为 BiomeTree 占位）
-        assert!(matches!(biome_tree, AstNode::BiomeTree { _placeholder: () }));
+        assert!(matches!(biome_tree, AstNode::BiomeTree { seed: _ }));
     }
 
     /// 验证：±0f32 反序列化后，Hash/PartialEq 一致性。
@@ -419,18 +580,53 @@ mod tests{
         let neg_zero_bits: [u8; 4] = (-0.0f32).to_le_bytes();
         let blob: &[u8] = &[
             // HEADER
-            0x4D, 0x43, 0x32, 0x57,
-            0x01, 0x00,
-            0x00, 0x00, 0x00, 0x00,
+            0x4D,
+            0x43,
+            0x32,
+            0x57,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
             // ROOT(1 channel)
-            0xFE, 0x01, 0x00,
-                // ch0: Constant(-0.0f32)
-                0x01,
-                neg_zero_bits[0], neg_zero_bits[1], neg_zero_bits[2], neg_zero_bits[3],
+            0xFE,
+            0x01,
+            0x00,
+            // ch0: Constant(-0.0f32)
+            0x01,
+            neg_zero_bits[0],
+            neg_zero_bits[1],
+            neg_zero_bits[2],
+            neg_zero_bits[3],
             // SHAPE_CONFIG (全 0 占位 16 字节)
-            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             // BIOME_SOURCE
-            0xF0,
+            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0x15,
+            0xCD,
+            0x5B,
+            0x07,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
         ];
         let (root, _, _) = deserialize_full(blob).unwrap();
         let ch0 = match &root {
@@ -456,39 +652,27 @@ mod tests{
 
         let blob: &[u8] = &[
             // HEADER 10B
-            0x4D,0x43,0x32,0x57,  0x01,0x00,  0x00,0x00,0x00,0x00,
-            // ROOT(1 ch)
-            0xFE, 0x01,0x00,
-                // Mul → 0x12
-                0x12,
-                    // Add → 0x10
-                    0x10,
-                        0x01, f1p5[0],f1p5[1],f1p5[2],f1p5[3],
-                        0x02,
-                    // Sub → 0x11
-                    0x11,
-                        0x03,
-                        0x01, f2p0[0],f2p0[1],f2p0[2],f2p0[3],
-            // SHAPE_CONFIG 16B
-            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
-            // BIOME
-            0xF0,
+            0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ROOT(1 ch)
+            0xFE, 0x01, 0x00, // Mul → 0x12
+            0x12, // Add → 0x10
+            0x10, 0x01, f1p5[0], f1p5[1], f1p5[2], f1p5[3], 0x02, // Sub → 0x11
+            0x11, 0x03, 0x01, f2p0[0], f2p0[1], f2p0[2], f2p0[3], // SHAPE_CONFIG 16B
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // BIOME
+            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
         ];
 
         let (root, _, _) = deserialize_full(blob).unwrap();
 
-        let expected = AstNode::Root(vec![
-            AstNode::Mul(
-                Box::new(AstNode::Add(
-                    Box::new(AstNode::Constant(1.5)),
-                    Box::new(AstNode::InputX),
-                )),
-                Box::new(AstNode::Sub(
-                    Box::new(AstNode::InputY),
-                    Box::new(AstNode::Constant(2.0)),
-                )),
-            ),
-        ]);
+        let expected = AstNode::Root(vec![AstNode::Mul(
+            Box::new(AstNode::Add(
+                Box::new(AstNode::Constant(1.5)),
+                Box::new(AstNode::InputX),
+            )),
+            Box::new(AstNode::Sub(
+                Box::new(AstNode::InputY),
+                Box::new(AstNode::Constant(2.0)),
+            )),
+        )]);
         assert_eq!(root, expected);
     }
 
@@ -500,35 +684,20 @@ mod tests{
 
         let blob: &[u8] = &[
             // HEADER
-            0x4D,0x43,0x32,0x57,  0x01,0x00,  0x00,0x00,0x00,0x00,
-            // ROOT(1 ch)
-            0xFE, 0x01,0x00,
-                // Sqrt → 0x23
-                0x23,
-                    // Abs → 0x20
-                    0x20,
-                        // Sub(X, 5.0) → 0x11
-                        0x11,
-                            0x02,
-                            0x01, f5p0[0],f5p0[1],f5p0[2],f5p0[3],
-            // SHAPE_CONFIG 16B
-            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
-            // BIOME
-            0xF0,
+            0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ROOT(1 ch)
+            0xFE, 0x01, 0x00, // Sqrt → 0x23
+            0x23, // Abs → 0x20
+            0x20, // Sub(X, 5.0) → 0x11
+            0x11, 0x02, 0x01, f5p0[0], f5p0[1], f5p0[2], f5p0[3], // SHAPE_CONFIG 16B
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // BIOME
+            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
         ];
 
         let (root, _, _) = deserialize_full(blob).unwrap();
 
-        let expected = AstNode::Root(vec![
-            AstNode::Sqrt(
-                Box::new(AstNode::Abs(
-                    Box::new(AstNode::Sub(
-                        Box::new(AstNode::InputX),
-                        Box::new(AstNode::Constant(5.0)),
-                    )),
-                )),
-            ),
-        ]);
+        let expected = AstNode::Root(vec![AstNode::Sqrt(Box::new(AstNode::Abs(Box::new(
+            AstNode::Sub(Box::new(AstNode::InputX), Box::new(AstNode::Constant(5.0))),
+        ))))]);
         assert_eq!(root, expected);
     }
 
@@ -546,41 +715,29 @@ mod tests{
 
         let blob: &[u8] = &[
             // HEADER
-            0x4D,0x43,0x32,0x57,  0x01,0x00,  0x00,0x00,0x00,0x00,
-            // ROOT(1 ch)
-            0xFE, 0x01,0x00,
-                // TAG_PERLIN = 0x80
-                0x80,
-                    // seed=42 (i64 LE)
-                    0x2A,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
-                    // octaves=2 (i32 LE)
-                    0x02,0x00,0x00,0x00,
-                    // amplitudes_len=2
-                    0x02,0x00,0x00,0x00,
-                    // amplitudes[0]=1.0  [1]=0.5
-                    v1p0[0],v1p0[1],v1p0[2],v1p0[3],
-                    v0p5[0],v0p5[1],v0p5[2],v0p5[3],
-                    // lacunaritys_len=2
-                    0x02,0x00,0x00,0x00,
-                    // lacunaritys[0]=2.0  [1]=2.0
-                    v2p0[0],v2p0[1],v2p0[2],v2p0[3],
-                    v2p0[0],v2p0[1],v2p0[2],v2p0[3],
+            0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ROOT(1 ch)
+            0xFE, 0x01, 0x00, // TAG_PERLIN = 0x80
+            0x80, // seed=42 (i64 LE)
+            0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // octaves=2 (i32 LE)
+            0x02, 0x00, 0x00, 0x00, // amplitudes_len=2
+            0x02, 0x00, 0x00, 0x00, // amplitudes[0]=1.0  [1]=0.5
+            v1p0[0], v1p0[1], v1p0[2], v1p0[3], v0p5[0], v0p5[1], v0p5[2], v0p5[3],
+            // lacunaritys_len=2
+            0x02, 0x00, 0x00, 0x00, // lacunaritys[0]=2.0  [1]=2.0
+            v2p0[0], v2p0[1], v2p0[2], v2p0[3], v2p0[0], v2p0[1], v2p0[2], v2p0[3],
             // SHAPE_CONFIG 16B
-            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
-            // BIOME
-            0xF0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // BIOME
+            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
         ];
 
         let (root, _, _) = deserialize_full(blob).unwrap();
 
-        let expected = AstNode::Root(vec![
-            AstNode::PerlinSampler {
-                seed: 42,
-                octaves: 2,
-                amplitudes: vec![1.0, 0.5],
-                lacunaritys: vec![2.0, 2.0],
-            },
-        ]);
+        let expected = AstNode::Root(vec![AstNode::PerlinSampler {
+            seed: 42,
+            octaves: 2,
+            amplitudes: vec![1.0, 0.5],
+            lacunaritys: vec![2.0, 2.0],
+        }]);
         assert_eq!(root, expected);
     }
 
@@ -599,40 +756,24 @@ mod tests{
 
         let blob: &[u8] = &[
             // HEADER
-            0x4D,0x43,0x32,0x57,  0x01,0x00,  0x00,0x00,0x00,0x00,
-            // ROOT(3 ch)
-            0xFE, 0x03,0x00,
-
-                // === ch0: Simplex2D seed=-1 ===
-                0x82,
-                    0xFF,0xFF,0xFF,0xFF, 0xFF,0xFF,0xFF,0xFF,  // -1i64 LE
-
-                // === ch1: Simplex3D seed=7 ===
-                0x83,
-                    0x07,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,  // 7i64 LE
-
-                // === ch2: DoublePerlin ===
-                0x81,
-                    // a = Perlin(octaves=1, amp[1.0], lac[2.0], seed=10)
-                    0x80,
-                        // seed=10
-                        0x0A,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
-                        // octaves=1
-                        0x01,0x00,0x00,0x00,
-                        // amp_len=1, [1.0]
-                        0x01,0x00,0x00,0x00,
-                        v1p0[0],v1p0[1],v1p0[2],v1p0[3],
-                        // lac_len=1, [2.0]
-                        0x01,0x00,0x00,0x00,
-                        v2p0[0],v2p0[1],v2p0[2],v2p0[3],
-                    // b = Simplex2D { seed: 99 }
-                    0x82,
-                        0x63,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,  // 99i64 LE
-
+            0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ROOT(3 ch)
+            0xFE, 0x03, 0x00, // === ch0: Simplex2D seed=-1 ===
+            0x82, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // -1i64 LE
+            // === ch1: Simplex3D seed=7 ===
+            0x83, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 7i64 LE
+            // === ch2: DoublePerlin ===
+            0x81, // a = Perlin(octaves=1, amp[1.0], lac[2.0], seed=10)
+            0x80, // seed=10
+            0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // octaves=1
+            0x01, 0x00, 0x00, 0x00, // amp_len=1, [1.0]
+            0x01, 0x00, 0x00, 0x00, v1p0[0], v1p0[1], v1p0[2], v1p0[3],
+            // lac_len=1, [2.0]
+            0x01, 0x00, 0x00, 0x00, v2p0[0], v2p0[1], v2p0[2], v2p0[3],
+            // b = Simplex2D { seed: 99 }
+            0x82, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 99i64 LE
             // SHAPE_CONFIG 16B
-            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
-            // BIOME
-            0xF0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // BIOME
+            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
         ];
 
         let (root, _, _) = deserialize_full(blob).unwrap();
@@ -641,7 +782,8 @@ mod tests{
         let ch1 = AstNode::SimplexNoise3D { seed: 7 };
         let ch2 = AstNode::DoublePerlin {
             a: Box::new(AstNode::PerlinSampler {
-                seed: 10, octaves: 1,
+                seed: 10,
+                octaves: 1,
                 amplitudes: vec![1.0],
                 lacunaritys: vec![2.0],
             }),
@@ -659,29 +801,25 @@ mod tests{
         // 构造：octaves=3，但 amplitudes 只有 2 个元素 → 长度不匹配
         let blob: &[u8] = &[
             // HEADER
-            0x4D,0x43,0x32,0x57,  0x01,0x00,  0x00,0x00,0x00,0x00,
-            // ROOT(1 ch)
-            0xFE, 0x01,0x00,
-                0x80,
-                    0x2A,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,  // seed=42
-                    0x03,0x00,0x00,0x00,                        // octaves=3
-                    0x02,0x00,0x00,0x00,                        // amp_len=2  (!! < 3)
-                    v1p0[0],v1p0[1],v1p0[2],v1p0[3],
-                    v2p0[0],v2p0[1],v2p0[2],v2p0[3],
-                    0x03,0x00,0x00,0x00,                        // lac_len=3
-                    v2p0[0],v2p0[1],v2p0[2],v2p0[3],
-                    v2p0[0],v2p0[1],v2p0[2],v2p0[3],
-                    v2p0[0],v2p0[1],v2p0[2],v2p0[3],
-            // SHAPE_CONFIG 16B
-            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
-            // BIOME
-            0xF0,
+            0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ROOT(1 ch)
+            0xFE, 0x01, 0x00, 0x80, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // seed=42
+            0x03, 0x00, 0x00, 0x00, // octaves=3
+            0x02, 0x00, 0x00, 0x00, // amp_len=2  (!! < 3)
+            v1p0[0], v1p0[1], v1p0[2], v1p0[3], v2p0[0], v2p0[1], v2p0[2], v2p0[3], 0x03, 0x00,
+            0x00, 0x00, // lac_len=3
+            v2p0[0], v2p0[1], v2p0[2], v2p0[3], v2p0[0], v2p0[1], v2p0[2], v2p0[3], v2p0[0],
+            v2p0[1], v2p0[2], v2p0[3], // SHAPE_CONFIG 16B
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // BIOME
+            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
         ];
 
         let result = deserialize_full(blob);
         assert!(result.is_err(), "expected mismatch error");
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("length mismatch"), "expected length mismatch in err, got: {msg}");
+        assert!(
+            msg.contains("length mismatch"),
+            "expected length mismatch in err, got: {msg}"
+        );
     }
 
     // ── 子阶段 2.3-3 地形结构 / 形状选择测试 ───────────────────────────────
@@ -690,45 +828,26 @@ mod tests{
     #[test]
     fn test_shape_selection_tags() {
         let f64p0 = 64.0f32.to_le_bytes();
-        let f0p0  = 0.0f32.to_le_bytes();
-        let f384  = 384.0f32.to_le_bytes();
-        let f0p5  = 0.5f32.to_le_bytes();
+        let f0p0 = 0.0f32.to_le_bytes();
+        let f384 = 384.0f32.to_le_bytes();
+        let f0p5 = 0.5f32.to_le_bytes();
         let f_neg1 = (-1.0f32).to_le_bytes();
-        let f_p1  = 1.0f32.to_le_bytes();
+        let f_p1 = 1.0f32.to_le_bytes();
 
         let blob: &[u8] = &[
             // HEADER
-            0x4D,0x43,0x32,0x57,  0x01,0x00,  0x00,0x00,0x00,0x00,
-            // ROOT(2 ch)
-            0xFE, 0x02,0x00,
-
-                // ch0: EndIslands(InputX)  → 0xA0
-                0xA0,
-                    0x02,
-
-                // ch1: RangeChoice → 0xB1
-                0xB1,
-                    // input = Sub(Y, 64.0) → 0x11
-                    0x11,
-                        0x03,
-                        0x01, f64p0[0],f64p0[1],f64p0[2],f64p0[3],
-                    // min = 0.0
-                    0x01, f0p0[0],f0p0[1],f0p0[2],f0p0[3],
-                    // max = 384.0
-                    0x01, f384[0],f384[1],f384[2],f384[3],
-                    // in_bounds = Mul(Z, 0.5)
-                    0x12,
-                        0x04,
-                        0x01, f0p5[0],f0p5[1],f0p5[2],f0p5[3],
-                    // out_lo = -1.0
-                    0x01, f_neg1[0],f_neg1[1],f_neg1[2],f_neg1[3],
-                    // out_hi = 1.0
-                    0x01, f_p1[0],f_p1[1],f_p1[2],f_p1[3],
-
-            // SHAPE_CONFIG 16B
-            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
-            // BIOME
-            0xF0,
+            0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ROOT(2 ch)
+            0xFE, 0x02, 0x00, // ch0: EndIslands(InputX)  → 0xA0
+            0xA0, 0x02, // ch1: RangeChoice → 0xB1
+            0xB1, // input = Sub(Y, 64.0) → 0x11
+            0x11, 0x03, 0x01, f64p0[0], f64p0[1], f64p0[2], f64p0[3], // min = 0.0
+            0x01, f0p0[0], f0p0[1], f0p0[2], f0p0[3], // max = 384.0
+            0x01, f384[0], f384[1], f384[2], f384[3], // in_bounds = Mul(Z, 0.5)
+            0x12, 0x04, 0x01, f0p5[0], f0p5[1], f0p5[2], f0p5[3], // out_lo = -1.0
+            0x01, f_neg1[0], f_neg1[1], f_neg1[2], f_neg1[3], // out_hi = 1.0
+            0x01, f_p1[0], f_p1[1], f_p1[2], f_p1[3], // SHAPE_CONFIG 16B
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // BIOME
+            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
         ];
 
         let (root, _, _) = deserialize_full(blob).unwrap();
@@ -763,38 +882,79 @@ mod tests{
 
         let blob: &[u8] = &[
             // HEADER
-            0x4D,0x43,0x32,0x57,  0x01,0x00,  0x00,0x00,0x00,0x00,
+            0x4D,
+            0x43,
+            0x32,
+            0x57,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
             // ROOT(2 ch)
-            0xFE, 0x02,0x00,
-
-                // ch0: CacheInterpolated(Cache2D(CacheFlat(InputX)))
-                0xC2,
-                    0xC1,
-                        0xC0,
-                            0x02,
-
-                // ch1: FindTopSurface (0xD0)
-                0xD0,
-                    // density = InputY
-                    0x03,
-                    // initial = Constant(0.0)
-                    0x01, f0p0[0],f0p0[1],f0p0[2],f0p0[3],
-                    // min_y = -64
-                    min_y_bytes[0],min_y_bytes[1],min_y_bytes[2],min_y_bytes[3],
-                    // max_y = 320
-                    max_y_bytes[0],max_y_bytes[1],max_y_bytes[2],max_y_bytes[3],
-
+            0xFE,
+            0x02,
+            0x00,
+            // ch0: CacheInterpolated(Cache2D(CacheFlat(InputX)))
+            0xC2,
+            0xC1,
+            0xC0,
+            0x02,
+            // ch1: FindTopSurface (0xD0)
+            0xD0,
+            // density = InputY
+            0x03,
+            // initial = Constant(0.0)
+            0x01,
+            f0p0[0],
+            f0p0[1],
+            f0p0[2],
+            f0p0[3],
+            // min_y = -64
+            min_y_bytes[0],
+            min_y_bytes[1],
+            min_y_bytes[2],
+            min_y_bytes[3],
+            // max_y = 320
+            max_y_bytes[0],
+            max_y_bytes[1],
+            max_y_bytes[2],
+            max_y_bytes[3],
             // SHAPE_CONFIG 16B
-            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             // BIOME
-            0xF0,
+            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0x15,
+            0xCD,
+            0x5B,
+            0x07,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
         ];
 
         let (root, _, _) = deserialize_full(blob).unwrap();
         let expected = AstNode::Root(vec![
-            AstNode::CacheInterpolated(Box::new(AstNode::Cache2D(Box::new(
-                AstNode::CacheFlat(Box::new(AstNode::InputX))
-            )))),
+            AstNode::CacheInterpolated(Box::new(AstNode::Cache2D(Box::new(AstNode::CacheFlat(
+                Box::new(AstNode::InputX),
+            ))))),
             AstNode::FindTopSurface {
                 density: Box::new(AstNode::InputY),
                 initial: Box::new(AstNode::Constant(0.0)),
