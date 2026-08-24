@@ -61,7 +61,7 @@ impl StagingChain {
         }
     }
 
-    /// 返回 (staging_buffer, slot_handle) 供 executor 使用
+    /// 返回 (staging_buffer, slot_handle)
     pub fn acquire_slot(&mut self) -> Option<(wgpu::Buffer, SlotHandle)> {
         let idx = self.free_queue.pop_front()?;
         let slot = &mut self.slots[idx];
@@ -85,15 +85,25 @@ impl StagingChain {
             let _ = tx.send(result);
         });
 
-        // 轮询直到映射完成，每次等待 50ms
-        while let Ok(_) = rx.try_recv() {
+        loop {
+            match rx.try_recv() {
+                Ok(inner) => {
+                    match inner {
+                        Ok(()) => break,
+                        Err(e) => panic!("map_async error: {:?}", e),
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("map_async channel disconnected");
+                }
+                _ => ()
+            }
+
             let _ = device.poll(wgpu::PollType::Wait {
                 submission_index: None,
                 timeout: Some(Duration::from_millis(50)),
             });
         }
-        let result = rx.recv().unwrap();
-        result.expect("failed to map staging buffer");
 
         let mapped = slice.get_mapped_range().unwrap();
         let cpu_copy = mapped.as_ref().to_vec();
