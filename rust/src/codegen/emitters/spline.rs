@@ -1,33 +1,14 @@
-/*
- * The MIT License (MIT)
- *
- * Copyright (c) 2026 RubidiumLighting
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
-
-//! Spline control-point interpolation with Kahan weighted sum (铁律②).
-
 use crate::ast::AstNode;
 use crate::codegen::wgsl_gen::GenCtx;
-use crate::Result;
+use anyhow::{Result, anyhow};
 
-pub fn emit(_node: &AstNode, _ctx: &mut GenCtx) -> Result<String> {
-    Ok("spline_stub".into())
+pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
+    if let AstNode::Spline { points: _ } = node {
+        let var = ctx.fresh_var("spline");
+        // For now, just call a placeholder function with a dummy value
+        ctx.emit(format!("let {var}: f32 = 0.0; // Spline not fully implemented"));
+        Ok(var)
+    } else {
+        Err(anyhow!("expected Spline"))
+    }
 }

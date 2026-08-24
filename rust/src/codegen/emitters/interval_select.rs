@@ -1,31 +1,21 @@
-/*
- * The MIT License (MIT)
- *
- * Copyright (c) 2026 RubidiumLighting
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
-
 use crate::ast::AstNode;
 use crate::codegen::wgsl_gen::GenCtx;
-use crate::Result;
+use anyhow::{Result, anyhow};
 
-pub fn emit(_node: &AstNode, _ctx: &mut GenCtx) -> Result<String> {
-    Ok("interval_select_stub".into())
+pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
+    if let AstNode::IntervalSelect { input, min, max, in_bounds, out_of_bounds_lo, out_of_bounds_hi } = node {
+        let input_var = super::emit_node(input, ctx)?;
+        let min_var = super::emit_node(min, ctx)?;
+        let max_var = super::emit_node(max, ctx)?;
+        let in_var = super::emit_node(in_bounds, ctx)?;
+        let lo_var = super::emit_node(out_of_bounds_lo, ctx)?;
+        let hi_var = super::emit_node(out_of_bounds_hi, ctx)?;
+        let var = ctx.fresh_var("interval");
+        ctx.emit(format!(
+            "let {var}: f32 = select(select({hi_var}, {lo_var}, {input_var} < {min_var}), {in_var}, {input_var} <= {max_var});"
+        ));
+        Ok(var)
+    } else {
+        Err(anyhow!("expected IntervalSelect"))
+    }
 }

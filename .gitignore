@@ -137,3 +137,6 @@ rust/target/
 rust/Cargo.lock.bak
 **/*.rs.bk
 # Personnal Development Files
+
+# Native libraries
+src/main/resources/natives/linux-x86_64/libc2me_wgpu.so
