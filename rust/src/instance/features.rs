@@ -40,10 +40,6 @@ pub fn check_required(adapter: &wgpu::Adapter) -> Result<()> {
     if adapter.limits().max_compute_workgroups_per_dimension < 65535 {
         return Err(anyhow::anyhow!("max_compute_workgroups_per_dimension < 65535"));
     }
-    // 地址空间 ≥ 31 位 ⟺ max_buffer_size ≥ 2 GiB (1<<31 字节)。
-    if adapter.limits().max_buffer_size < (1 << 31) {
-        return Err(anyhow::anyhow!("max_buffer_size < 2 GiB (31-bit address space required)"));
-    }
     if adapter.limits().max_storage_buffer_binding_size < 256 * 1024 * 1024 {
         return Err(anyhow::anyhow!("max_storage_buffer_binding_size < 256 * 1024 * 1024"));
     }

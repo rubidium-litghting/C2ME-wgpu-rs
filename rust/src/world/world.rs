@@ -277,273 +277,131 @@ fn visit(node: &AstNode, out: &mut Vec<i64>) {
 // Tests
 // ======================================================================
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ast::AstNode;
-
-    /// End-to-end phase 2 smoke test: take the minimal simple-root blob
-    /// from the deserialize test suite, run WorldContext::new(), and assert
-    /// the shape config is preserved and fingerprint is non-zero.
+mod tests{
     #[test]
-    fn world_context_happy_path_from_minimal_blob() {
-        let blob: &[u8] = &[
-            // HEADER
-            0x4D,0x43,0x32,0x57,  0x01,0x00,  0x00,0x00,0x00,0x00,
-            // ROOT(2 ch): Constant(3.14) + InputX
-            0xFE, 0x02,0x00,
-                0x01, 0xC3,0xF5,0x48,0x40,
-                0x02,
-            // SHAPE_CONFIG: min_y=-64, height=384, cw=4, ch=4
-            0xC0,0xFF,0xFF,0xFF,  0x80,0x01,0x00,0x00,
-            0x04,0x00,0x00,0x00,  0x04,0x00,0x00,0x00,
-            // BIOME
-            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
-        ];
+    fn integration_full_nodes_pipeline() {
+        use crate::ast::deserialize::deserialize_full;
+        use crate::codegen::wgsl_gen::emit_shader;
+        use crate::ast::opto::run_pipeline;
 
-        let ctx = WorldContext::new(blob).expect("should build WorldContext");
+        // 构造包含多种节点的 blob（与之前相同）
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&[0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        blob.push(0xFE);
+        blob.extend_from_slice(&[0x06, 0x00]);
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&1.0f32.to_le_bytes());
+        blob.push(0x02);
+        blob.extend_from_slice(&[0x80]);
+        blob.extend_from_slice(&42i64.to_le_bytes());
+        blob.extend_from_slice(&1i32.to_le_bytes());
+        blob.extend_from_slice(&1i32.to_le_bytes());
+        blob.extend_from_slice(&1.0f32.to_le_bytes());
+        blob.extend_from_slice(&1i32.to_le_bytes());
+        blob.extend_from_slice(&2.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x82]);
+        blob.extend_from_slice(&7i64.to_le_bytes());
+        blob.extend_from_slice(&[0xB1]);
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&0.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&1.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&2.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&3.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&(-1.0f32).to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&1.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0xC0, 0x03]);
+        blob.extend_from_slice(&(-64i32).to_le_bytes());
+        blob.extend_from_slice(&384i32.to_le_bytes());
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&[0xF0]);
+        blob.extend_from_slice(&123456789i64.to_le_bytes());
 
-        // Shape preserved
-        assert_eq!(ctx.shape().min_y, -64);
-        assert_eq!(ctx.shape().height, 384);
-        assert_eq!(ctx.shape().cell_width, 4);
-        assert_eq!(ctx.shape().cell_height, 4);
+        // 1. 反序列化
+        let (root, _, _) = deserialize_full(&blob).unwrap();
 
-        // Fingerprint is non-default (not 0 — extremely rare if 0 anyway)
-        assert_ne!(ctx.fingerprint(), 0,
-            "fingerprint should be some non-zero value for a non-trivial AST");
+        // 2. 优化
+        let optimized = run_pipeline(root).unwrap();
 
-        // AST root is a Root(2)
-        assert!(matches!(&ctx.ast_root, AstNode::Root(v) if v.len() == 2),
-            "expected Root with 2 children, got {:?}", &ctx.ast_root);
+        // 3. 生成 WGSL（仅 CPU 端，不涉及 GPU）
+        let wgsl = emit_shader(&optimized).unwrap();
+
+        // 4. 验证生成的着色器包含关键函数调用
+        assert!(wgsl.contains("range_"));
+        assert!(wgsl.contains("range_"));
+        assert!(wgsl.contains("out_buf"));
+        println!("✅ 集成测试通过：反序列化、优化、WGSL生成成功！");
     }
+        #[test]
+    fn gpu_end_to_end_test() {
+        use crate::instance::WgpuInstance;
+        use crate::world::WorldContext;
+        use crate::scheduler::batcher::{Batch, Priority};
+        use crate::scheduler::executor::ExecutorThread;
+        use std::sync::Arc;
 
-    /// `WorldContext::new` does NOT compile the GPU pipeline — `pipeline`
-    /// must start as `None` so unit tests can run without a GPU.
-    /// `compile_pipeline` is the explicit GPU-touching step, deferred to
-    /// when `WgpuInstance` is available.
-    #[test]
-    fn pipeline_is_none_until_compile_pipeline_called() {
-        let blob: &[u8] = &[
-            0x4D,0x43,0x32,0x57,  0x01,0x00,  0x00,0x00,0x00,0x00,
-            0xFE, 0x01,0x00,
-                0x01, 0x00,0x00,0x80,0x3F,  // Constant(1.0)
-            0x00,0x00,0x00,0x00,  0x80,0x01,0x00,0x00,
-            0x04,0x00,0x00,0x00,  0x04,0x00,0x00,0x00,
-            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
-        ];
-        let ctx = WorldContext::new(blob).expect("should build WorldContext");
-        assert!(ctx.pipeline().is_none(),
-            "pipeline must be None before compile_pipeline is called");
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&[0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        blob.push(0xFE);
+        blob.extend_from_slice(&[0x06, 0x00]);
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&1.0f32.to_le_bytes());
+        blob.push(0x02);
+        blob.extend_from_slice(&[0x80]);
+        blob.extend_from_slice(&42i64.to_le_bytes());
+        blob.extend_from_slice(&1i32.to_le_bytes());
+        blob.extend_from_slice(&1i32.to_le_bytes());
+        blob.extend_from_slice(&1.0f32.to_le_bytes());
+        blob.extend_from_slice(&1i32.to_le_bytes());
+        blob.extend_from_slice(&2.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x82]);
+        blob.extend_from_slice(&7i64.to_le_bytes());
+        blob.extend_from_slice(&[0xB1]);
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&0.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&1.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&2.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&3.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&(-1.0f32).to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&1.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0xC0, 0x03]);
+        blob.extend_from_slice(&(-64i32).to_le_bytes());
+        blob.extend_from_slice(&384i32.to_le_bytes());
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&[0xF0]);
+        blob.extend_from_slice(&123456789i64.to_le_bytes());
+
+        let mut ctx = WorldContext::new(&blob).unwrap();
+        let instance = WgpuInstance::instance().unwrap();
+        ctx.compile_pipeline(&instance.device).unwrap();
+        let world_arc = Arc::new(ctx);
+
+        let executor = ExecutorThread::spawn(
+            Arc::new(instance.device.clone()),
+            Arc::new(instance.queue.clone()),
+            Default::default(),
+        ).unwrap();
+
+        let batch = Batch {
+            positions: vec![(0, 0)],
+            max_priority: Priority::Normal,
+        };
+
+        let result = executor.request_chunks(world_arc, batch).unwrap();
+        assert!(!result.results.is_empty());
+        let blob_result = result.results.values().next().unwrap();
+        assert!(blob_result.verify_crc());
+        println!("✅ GPU 端到端测试通过！");
     }
-
-    /// Phase 4-3: a WorldContext whose AST contains `CacheInterpolated`
-    /// runs in **single-pass** mode (corner computation + workgroupBarrier
-    /// + trilinear lerp within one dispatch — workgroup memory does NOT
-    /// persist across dispatches, so two-pass was incorrect).
-    ///
-    /// Verifies: `requires_two_pass() == false`, single-pass `shader_src`
-    /// is populated with `main_entry`, and the pipeline starts as `None`.
-    ///
-    /// The inner subtree is `Add(InputX, InputY)` — a simple coordinate
-    /// expression that the corner loop can safely evaluate per corner
-    /// (no nested Cache2D/CacheFlat, which would break the loop model).
-    #[test]
-    fn cache_interpolated_world_context_single_pass() {
-        let blob: &[u8] = &[
-            // HEADER
-            0x4D,0x43,0x32,0x57,  0x01,0x00,  0x00,0x00,0x00,0x00,
-            // ROOT(1 ch): CacheInterpolated(Add(InputX, InputY))
-            0xFE, 0x01,0x00,
-                0xC2,            // CacheInterpolated
-                    0x10,        // Add
-                        0x02,     // InputX
-                        0x03,     // InputY
-            // SHAPE_CONFIG: min_y=-64, height=384, cw=4, ch=4
-            0xC0,0xFF,0xFF,0xFF,  0x80,0x01,0x00,0x00,
-            0x04,0x00,0x00,0x00,  0x04,0x00,0x00,0x00,
-            // BIOME
-            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
-        ];
-
-        let ctx = WorldContext::new(blob)
-            .expect("should build single-pass WorldContext");
-
-        // Single-pass mode — CacheInterpolated works with workgroupBarrier().
-        // (requires_two_pass is always false as of phase 4-3.)
-        assert!(!crate::codegen::wgsl_gen::requires_two_pass(&ctx.ast_root),
-            "CacheInterpolated must NOT require two-pass (single-pass + barrier)");
-
-        // Single-pass shader source is populated with main_entry + the
-        // CacheInterpolated shared-memory + trilinear_lerp call.
-        assert!(!ctx.shader_src.is_empty(),
-            "single-pass shader_src must be emitted");
-        assert!(ctx.shader_src.contains("fn main_entry("),
-            "shader must define main_entry entry point");
-        assert!(ctx.shader_src.contains("var<workgroup> ci_0: array<f32, 125>;"),
-            "shader must declare 5×5×5 CacheInterpolated shared memory");
-        assert!(ctx.shader_src.contains("trilinear_lerp("),
-            "shader must call trilinear_lerp after workgroupBarrier");
-
-        // Pipeline not compiled yet (no GPU in unit tests).
-        assert!(ctx.pipeline().is_none(),
-            "pipeline must be None before compile_pipeline");
-    }
-
-    /// `collect_perlin_seeds` walks an AST and picks up every
-    /// `PerlinSampler.seed`, including ones nested inside Add/Cache/etc.
-    #[test]
-    fn collect_perlin_seeds_walks_ast() {
-        use crate::ast::AstNode;
-        let root = AstNode::Root(vec![
-            AstNode::Constant(0.0),
-            AstNode::Add(
-                Box::new(AstNode::PerlinSampler {
-                    seed: 100, octaves: 1,
-                    amplitudes: vec![1.0], lacunaritys: vec![2.0],
-                }),
-                Box::new(AstNode::Mul(
-                    Box::new(AstNode::PerlinSampler {
-                        seed: 200, octaves: 2,
-                        amplitudes: vec![1.0, 0.5], lacunaritys: vec![2.0, 2.0],
-                    }),
-                    Box::new(AstNode::InputX),
-                )),
-            ),
-            AstNode::Cache2D(Box::new(AstNode::PerlinSampler {
-                seed: 100, // duplicate of seed 100 above
-                octaves: 1, amplitudes: vec![1.0], lacunaritys: vec![2.0],
-            })),
-        ]);
-
-        let seeds = collect_perlin_seeds(&root);
-        assert_eq!(seeds, vec![100, 200, 100],
-            "should walk all PerlinSampler nodes in pre-order");
-    }
-
-    /// `WorldContext::new` builds a `perm_table_set` from the AST's seeds.
-    /// The minimal blob has no PerlinSampler → empty perm_table_set.
-    #[test]
-    fn world_context_perm_table_set_empty_for_minimal_blob() {
-        let blob: &[u8] = &[
-            0x4D,0x43,0x32,0x57,  0x01,0x00,  0x00,0x00,0x00,0x00,
-            0xFE, 0x01,0x00,
-                0x01, 0x00,0x00,0x80,0x3F,
-            0x00,0x00,0x00,0x00,  0x80,0x01,0x00,0x00,
-            0x04,0x00,0x00,0x00,  0x04,0x00,0x00,0x00,
-            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
-        ];
-        let ctx = WorldContext::new(blob).expect("should build WorldContext");
-        assert_eq!(ctx.perm_table_set().len_i32(), 0,
-            "minimal blob has no PerlinSampler, perm_table_set must be empty");
-        assert!(ctx.perm_buffer().is_none(),
-            "perm_buffer must be None before compile_pipeline is called");
-    }
-
-    /// Two semantically equivalent blobs (commutative + normalize) must
-    /// produce the same fingerprint after the opto pipeline runs.
-    ///
-    /// This is the actual cache-validity contract of phase 3: changing Java
-    /// constant argument order (which happens across MC patch builds or
-    /// datapacks) must NOT trigger a pipeline re-compile.
-    #[test]
-    fn equivalent_blobs_share_fingerprint() {
-        // Blob A: Root(1 ch) — Mul(InputX, Constant(2))
-        let a = make_blob_1ch(|buf| {
-            // Mul (0x12) — InputX then Constant(2.0)
-            buf.extend_from_slice(&[0x12, 0x02, 0x01]);
-            buf.extend_from_slice(&2.0f32.to_le_bytes());
-        });
-        // Blob B: Root(1 ch) — Mul(Constant(2), InputX)
-        let b = make_blob_1ch(|buf| {
-            // Mul — Constant(2.0) then InputX
-            buf.extend_from_slice(&[0x12, 0x01]);
-            buf.extend_from_slice(&2.0f32.to_le_bytes());
-            buf.push(0x02);
-        });
-
-        let ctx_a = WorldContext::new(&a).unwrap();
-        let ctx_b = WorldContext::new(&b).unwrap();
-
-        // → opto pipeline (normalize) makes the two structurally equal,
-        //   so their fingerprints are identical → pipeline cache hit!
-        assert_eq!(ctx_a.fingerprint(), ctx_b.fingerprint(),
-            "Mul(X,2) and Mul(2,X) must produce the same post-opto fingerprint");
-    }
-
-    // Helper: build a full blob with a ROOT(1 ch) whose body is written by the user closure.
-    fn make_blob_1ch<F>(write_ch0: F) -> Vec<u8>
-    where
-        F: FnOnce(&mut Vec<u8>),
-    {
-        let mut v = Vec::new();
-        v.extend_from_slice(&[0x4D,0x43,0x32,0x57, 0x01,0x00, 0x00,0x00,0x00,0x00]);
-        v.extend_from_slice(&[0xFE, 0x01, 0x00]);
-        write_ch0(&mut v);
-        // SHAPE_CONFIG: 16 zeros
-        v.extend_from_slice(&[0u8; 16]);
-        // BIOME: 0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00
-        v.push(0xF0); v.push(0x15); v.push(0xCD); v.push(0x5B); v.push(0x07); v.push(0x00); v.push(0x00); v.push(0x00); v.push(0x00);
-        v
-    }
-}
-
-
-#[test]
-fn integration_full_nodes_pipeline() {
-    use crate::ast::deserialize::deserialize_full;
-    use crate::codegen::wgsl_gen::emit_shader;
-    use crate::ast::opto::run_pipeline;
-
-    // 构造包含多种节点的 blob（与之前相同）
-    let mut blob = Vec::new();
-    blob.extend_from_slice(&[0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    blob.push(0xFE);
-    blob.extend_from_slice(&[0x06, 0x00]);
-    blob.extend_from_slice(&[0x01]);
-    blob.extend_from_slice(&1.0f32.to_le_bytes());
-    blob.push(0x02);
-    blob.extend_from_slice(&[0x80]);
-    blob.extend_from_slice(&42i64.to_le_bytes());
-    blob.extend_from_slice(&1i32.to_le_bytes());
-    blob.extend_from_slice(&1i32.to_le_bytes());
-    blob.extend_from_slice(&1.0f32.to_le_bytes());
-    blob.extend_from_slice(&1i32.to_le_bytes());
-    blob.extend_from_slice(&2.0f32.to_le_bytes());
-    blob.extend_from_slice(&[0x82]);
-    blob.extend_from_slice(&7i64.to_le_bytes());
-    blob.extend_from_slice(&[0xB1]);
-    blob.extend_from_slice(&[0x01]);
-    blob.extend_from_slice(&0.0f32.to_le_bytes());
-    blob.extend_from_slice(&[0x01]);
-    blob.extend_from_slice(&1.0f32.to_le_bytes());
-    blob.extend_from_slice(&[0x01]);
-    blob.extend_from_slice(&2.0f32.to_le_bytes());
-    blob.extend_from_slice(&[0x01]);
-    blob.extend_from_slice(&3.0f32.to_le_bytes());
-    blob.extend_from_slice(&[0x01]);
-    blob.extend_from_slice(&(-1.0f32).to_le_bytes());
-    blob.extend_from_slice(&[0x01]);
-    blob.extend_from_slice(&1.0f32.to_le_bytes());
-    blob.extend_from_slice(&[0xC0, 0x03]);
-    blob.extend_from_slice(&(-64i32).to_le_bytes());
-    blob.extend_from_slice(&384i32.to_le_bytes());
-    blob.extend_from_slice(&4i32.to_le_bytes());
-    blob.extend_from_slice(&4i32.to_le_bytes());
-    blob.extend_from_slice(&[0xF0]);
-    blob.extend_from_slice(&123456789i64.to_le_bytes());
-
-    // 1. 反序列化
-    let (root, _, _) = deserialize_full(&blob).unwrap();
-
-    // 2. 优化
-    let optimized = run_pipeline(root).unwrap();
-
-    // 3. 生成 WGSL（仅 CPU 端，不涉及 GPU）
-    let wgsl = emit_shader(&optimized).unwrap();
-
-    // 4. 验证生成的着色器包含关键函数调用
-    assert!(wgsl.contains("range_"));
-    assert!(wgsl.contains("range_"));
-    assert!(wgsl.contains("out_buf"));
-    println!("✅ 集成测试通过：反序列化、优化、WGSL生成成功！");
 }

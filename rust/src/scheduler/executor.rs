@@ -164,7 +164,7 @@ impl SingleBatchExecutor {
         let output_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("c2me_wgpu_out_buf"),
             size: total_bytes as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::MAP_READ,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -216,7 +216,7 @@ impl SingleBatchExecutor {
         encoder.copy_buffer_to_buffer(
             &output_buf,
             0,
-            staging_buf,
+            &staging_buf,
             0,
             total_bytes as u64,
         );
