@@ -1,4 +1,5 @@
 pub mod aquifer;
+pub mod range_choice;
 pub mod beardifier;
 pub mod binary;
 pub mod biome_tree;
@@ -11,7 +12,7 @@ pub mod interval_select;
 pub mod noise_interpolated;
 pub mod noise_perlin;
 pub mod noise_simplex;
-pub mod range_choice;
+
 pub mod root;
 pub mod spline;
 pub mod unary;

@@ -487,3 +487,63 @@ mod tests {
     }
 }
 
+
+#[test]
+fn integration_full_nodes_pipeline() {
+    use crate::ast::deserialize::deserialize_full;
+    use crate::codegen::wgsl_gen::emit_shader;
+    use crate::ast::opto::run_pipeline;
+
+    // 构造包含多种节点的 blob（与之前相同）
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&[0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    blob.push(0xFE);
+    blob.extend_from_slice(&[0x06, 0x00]);
+    blob.extend_from_slice(&[0x01]);
+    blob.extend_from_slice(&1.0f32.to_le_bytes());
+    blob.push(0x02);
+    blob.extend_from_slice(&[0x80]);
+    blob.extend_from_slice(&42i64.to_le_bytes());
+    blob.extend_from_slice(&1i32.to_le_bytes());
+    blob.extend_from_slice(&1i32.to_le_bytes());
+    blob.extend_from_slice(&1.0f32.to_le_bytes());
+    blob.extend_from_slice(&1i32.to_le_bytes());
+    blob.extend_from_slice(&2.0f32.to_le_bytes());
+    blob.extend_from_slice(&[0x82]);
+    blob.extend_from_slice(&7i64.to_le_bytes());
+    blob.extend_from_slice(&[0xB1]);
+    blob.extend_from_slice(&[0x01]);
+    blob.extend_from_slice(&0.0f32.to_le_bytes());
+    blob.extend_from_slice(&[0x01]);
+    blob.extend_from_slice(&1.0f32.to_le_bytes());
+    blob.extend_from_slice(&[0x01]);
+    blob.extend_from_slice(&2.0f32.to_le_bytes());
+    blob.extend_from_slice(&[0x01]);
+    blob.extend_from_slice(&3.0f32.to_le_bytes());
+    blob.extend_from_slice(&[0x01]);
+    blob.extend_from_slice(&(-1.0f32).to_le_bytes());
+    blob.extend_from_slice(&[0x01]);
+    blob.extend_from_slice(&1.0f32.to_le_bytes());
+    blob.extend_from_slice(&[0xC0, 0x03]);
+    blob.extend_from_slice(&(-64i32).to_le_bytes());
+    blob.extend_from_slice(&384i32.to_le_bytes());
+    blob.extend_from_slice(&4i32.to_le_bytes());
+    blob.extend_from_slice(&4i32.to_le_bytes());
+    blob.extend_from_slice(&[0xF0]);
+    blob.extend_from_slice(&123456789i64.to_le_bytes());
+
+    // 1. 反序列化
+    let (root, _, _) = deserialize_full(&blob).unwrap();
+
+    // 2. 优化
+    let optimized = run_pipeline(root).unwrap();
+
+    // 3. 生成 WGSL（仅 CPU 端，不涉及 GPU）
+    let wgsl = emit_shader(&optimized).unwrap();
+
+    // 4. 验证生成的着色器包含关键函数调用
+    assert!(wgsl.contains("range_"));
+    assert!(wgsl.contains("range_"));
+    assert!(wgsl.contains("out_buf"));
+    println!("✅ 集成测试通过：反序列化、优化、WGSL生成成功！");
+}
