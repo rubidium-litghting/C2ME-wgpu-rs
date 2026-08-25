@@ -404,4 +404,108 @@ mod tests{
         assert!(blob_result.verify_crc());
         println!("✅ GPU 端到端测试通过！");
     }
+    
+    #[test]
+    fn gpu_performance_benchmark() {
+        use crate::instance::WgpuInstance;
+        use crate::world::WorldContext;
+        use crate::scheduler::batcher::{Batch, Priority};
+        use crate::scheduler::executor::ExecutorThread;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        // 构造一个包含多种节点的 blob（与之前相同）
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&[0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        blob.push(0xFE);
+        blob.extend_from_slice(&[0x06, 0x00]);
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&1.0f32.to_le_bytes());
+        blob.push(0x02);
+        blob.extend_from_slice(&[0x80]);
+        blob.extend_from_slice(&42i64.to_le_bytes());
+        blob.extend_from_slice(&1i32.to_le_bytes());
+        blob.extend_from_slice(&1i32.to_le_bytes());
+        blob.extend_from_slice(&1.0f32.to_le_bytes());
+        blob.extend_from_slice(&1i32.to_le_bytes());
+        blob.extend_from_slice(&2.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x82]);
+        blob.extend_from_slice(&7i64.to_le_bytes());
+        blob.extend_from_slice(&[0xB1]);
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&0.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&1.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&2.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&3.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&(-1.0f32).to_le_bytes());
+        blob.extend_from_slice(&[0x01]);
+        blob.extend_from_slice(&1.0f32.to_le_bytes());
+        blob.extend_from_slice(&[0xC0, 0x03]);
+        blob.extend_from_slice(&(-64i32).to_le_bytes());
+        blob.extend_from_slice(&384i32.to_le_bytes());
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&[0xF0]);
+        blob.extend_from_slice(&123456789i64.to_le_bytes());
+
+        // 创建 WorldContext 并编译 pipeline
+        let mut ctx = WorldContext::new(&blob).unwrap();
+        let instance = WgpuInstance::instance().unwrap();
+        ctx.compile_pipeline(&instance.device).unwrap();
+        let world_arc = Arc::new(ctx);
+
+        // 创建执行器线程
+        let executor = ExecutorThread::spawn(
+            Arc::new(instance.device.clone()),
+            Arc::new(instance.queue.clone()),
+            Default::default(),
+        ).unwrap();
+
+        // 生成 64x64 = 4096 个区块坐标 (cx, cz) 从 (0,0) 到 (63,63)
+        let mut all_positions = Vec::new();
+        for cx in 0..64 {
+            for cz in 0..64 {
+                all_positions.push((cx, cz));
+            }
+        }
+
+        // 分批处理，每批最多 64 个区块
+        let batch_size = 64;
+        let total_batches = (all_positions.len() + batch_size - 1) / batch_size;
+
+        let start = Instant::now();
+        let mut total_chunks = 0;
+
+        for batch_idx in 0..total_batches {
+            let start_pos = batch_idx * batch_size;
+            let end_pos = (start_pos + batch_size).min(all_positions.len());
+            let chunk_slice = &all_positions[start_pos..end_pos];
+
+            let batch = Batch {
+                positions: chunk_slice.to_vec(),
+                max_priority: Priority::Normal,
+            };
+
+            let _result = executor.request_chunks(world_arc.clone(), batch).unwrap();
+            total_chunks += chunk_slice.len();
+        }
+
+        let elapsed = start.elapsed();
+        let total_seconds = elapsed.as_secs_f64();
+        let chunks_per_second = total_chunks as f64 / total_seconds;
+
+        println!(
+            "✅ 性能测试完成：生成 {} 个区块，耗时 {:.3}s，吞吐量 {:.1} 区块/秒",
+            total_chunks, total_seconds, chunks_per_second
+        );
+
+        // 如果时间太短，给出提示
+        if total_seconds < 1.0 {
+            println!("⚠️ 总耗时较短，建议增加区块数量以获得更稳定的平均数据。");
+        }
+    }
 }

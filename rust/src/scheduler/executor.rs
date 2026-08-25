@@ -94,7 +94,7 @@ impl SingleBatchExecutor {
         queue: Arc<wgpu::Queue>,
         config: ExecutorConfig,
     ) -> Result<Self, String> {
-        let max_buffer_size = 512 * 1024;
+        let max_buffer_size = 8 * 1024 * 1024;
         let staging = StagingChain::new(&device, config.staging_capacity, max_buffer_size);
 
         let bind_group_layout = bind_group::create_layout(&device)
