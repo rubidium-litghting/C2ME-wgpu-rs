@@ -25,16 +25,16 @@
 //! Per-Minecraft-world context: AST + optimized WGSL + compiled pipeline
 //! + the bind-group layout for params/permutations/output-buffers.
 
+use crate::Result;
 use crate::ast::AstNode;
-use crate::ast::deserialize::{deserialize_full, ShapeConfig};
-use crate::ast::opto;
+use crate::ast::deserialize::{ShapeConfig, deserialize_full};
 use crate::ast::equality::hash_ast;
-use crate::codegen::wgsl_gen::{self, Pass};
+use crate::ast::opto;
 use crate::codegen::validate::validate_wgsl;
+use crate::codegen::wgsl_gen::{self, Pass};
 use crate::world::bind_group;
 use crate::world::constants::PermutationTableSet;
 use crate::world::pipeline_cache;
-use crate::Result;
 use wgpu::util::DeviceExt;
 
 pub struct WorldContext {
@@ -97,9 +97,8 @@ impl WorldContext {
         //    to synchronise corner computation and trilinear lerp within one
         //    dispatch (var<workgroup> memory does NOT persist across dispatches).
         let shader_src = wgsl_gen::emit_shader(&ast_root)?;
-        validate_wgsl(&shader_src).map_err(|e| {
-            anyhow::anyhow!("emitted WGSL failed naga validation:\n{e}")
-        })?;
+        validate_wgsl(&shader_src)
+            .map_err(|e| anyhow::anyhow!("emitted WGSL failed naga validation:\n{e}"))?;
 
         // 5. Scan AST for all PerlinSampler seeds and build the packed
         //    permutation-table buffer (CPU-side; upload happens in step 6).
@@ -139,7 +138,11 @@ impl WorldContext {
         let pipeline_layout = bind_group::create_pipeline_layout(device, &bg_layout)?;
 
         let pipeline = pipeline_cache::get_or_compile(
-            self.fingerprint, Pass::Single, &self.shader_src, device, &pipeline_layout,
+            self.fingerprint,
+            Pass::Single,
+            &self.shader_src,
+            device,
+            &pipeline_layout,
         )?;
         self.pipeline = Some(pipeline);
 
@@ -213,20 +216,23 @@ fn collect_perlin_seeds(root: &AstNode) -> Vec<i64> {
 
 fn visit(node: &AstNode, out: &mut Vec<i64>) {
     match node {
+        AstNode::NoiseSampler { .. } => {}
         AstNode::PerlinSampler { seed, .. } => {
             out.push(*seed);
         }
         // Binary ops.
-        AstNode::Add(a, b) | AstNode::Sub(a, b)
-        | AstNode::Mul(a, b) | AstNode::Div(a, b)
-        | AstNode::Min(a, b) | AstNode::Max(a, b)
+        AstNode::Add(a, b)
+        | AstNode::Sub(a, b)
+        | AstNode::Mul(a, b)
+        | AstNode::Div(a, b)
+        | AstNode::Min(a, b)
+        | AstNode::Max(a, b)
         | AstNode::FloorDiv(a, b) => {
             visit(a, out);
             visit(b, out);
         }
         // Unary ops.
-        AstNode::Abs(x) | AstNode::Square(x)
-        | AstNode::Cube(x) | AstNode::Sqrt(x) => {
+        AstNode::Abs(x) | AstNode::Square(x) | AstNode::Cube(x) | AstNode::Sqrt(x) => {
             visit(x, out);
         }
         // Noise samplers.
@@ -236,12 +242,18 @@ fn visit(node: &AstNode, out: &mut Vec<i64>) {
         }
         AstNode::EndIslands(inner) => visit(inner, out),
         // Cache wrappers.
-        AstNode::CacheFlat(x) | AstNode::Cache2D(x)
-        | AstNode::CacheInterpolated(x) => {
+        AstNode::CacheFlat(x) | AstNode::Cache2D(x) | AstNode::CacheInterpolated(x) => {
             visit(x, out);
         }
         // Selection / surface nodes with child subtrees.
-        AstNode::RangeChoice { input, min, max, in_bounds, out_of_bounds_lo, out_of_bounds_hi } => {
+        AstNode::RangeChoice {
+            input,
+            min,
+            max,
+            in_bounds,
+            out_of_bounds_lo,
+            out_of_bounds_hi,
+        } => {
             visit(input, out);
             visit(min, out);
             visit(max, out);
@@ -249,7 +261,9 @@ fn visit(node: &AstNode, out: &mut Vec<i64>) {
             visit(out_of_bounds_lo, out);
             visit(out_of_bounds_hi, out);
         }
-        AstNode::FindTopSurface { density, initial, .. } => {
+        AstNode::FindTopSurface {
+            density, initial, ..
+        } => {
             visit(density, out);
             visit(initial, out);
         }
@@ -261,8 +275,11 @@ fn visit(node: &AstNode, out: &mut Vec<i64>) {
         }
         // Leaves — no children to recurse into.
         AstNode::Constant(_)
-        | AstNode::InputX | AstNode::InputY | AstNode::InputZ
-        | AstNode::SimplexNoise2D { .. } | AstNode::SimplexNoise3D { .. }
+        | AstNode::InputX
+        | AstNode::InputY
+        | AstNode::InputZ
+        | AstNode::SimplexNoise2D { .. }
+        | AstNode::SimplexNoise3D { .. }
         | AstNode::Beardifier { .. }
         | AstNode::Spline { .. }
         | AstNode::IntervalSelect { .. }
@@ -277,12 +294,12 @@ fn visit(node: &AstNode, out: &mut Vec<i64>) {
 // Tests
 // ======================================================================
 #[cfg(test)]
-mod tests{
+mod tests {
     #[test]
     fn integration_full_nodes_pipeline() {
         use crate::ast::deserialize::deserialize_full;
-        use crate::codegen::wgsl_gen::emit_shader;
         use crate::ast::opto::run_pipeline;
+        use crate::codegen::wgsl_gen::emit_shader;
 
         // 构造包含多种节点的 blob（与之前相同）
         let mut blob = Vec::new();
@@ -337,12 +354,12 @@ mod tests{
         assert!(wgsl.contains("out_buf"));
         println!("✅ 集成测试通过：反序列化、优化、WGSL生成成功！");
     }
-        #[test]
+    #[test]
     fn gpu_end_to_end_test() {
         use crate::instance::WgpuInstance;
-        use crate::world::WorldContext;
         use crate::scheduler::batcher::{Batch, Priority};
         use crate::scheduler::executor::ExecutorThread;
+        use crate::world::WorldContext;
         use std::sync::Arc;
 
         let mut blob = Vec::new();
@@ -391,7 +408,8 @@ mod tests{
             Arc::new(instance.device.clone()),
             Arc::new(instance.queue.clone()),
             Default::default(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let batch = Batch {
             positions: vec![(0, 0)],
@@ -404,13 +422,13 @@ mod tests{
         assert!(blob_result.verify_crc());
         println!("✅ GPU 端到端测试通过！");
     }
-    
+
     #[test]
     fn gpu_performance_benchmark() {
         use crate::instance::WgpuInstance;
-        use crate::world::WorldContext;
         use crate::scheduler::batcher::{Batch, Priority};
         use crate::scheduler::executor::ExecutorThread;
+        use crate::world::WorldContext;
         use std::sync::Arc;
         use std::time::Instant;
 
@@ -463,7 +481,8 @@ mod tests{
             Arc::new(instance.device.clone()),
             Arc::new(instance.queue.clone()),
             Default::default(),
-        ).unwrap();
+        )
+        .unwrap();
 
         // 生成 64x64 = 4096 个区块坐标 (cx, cz) 从 (0,0) 到 (63,63)
         let mut all_positions = Vec::new();

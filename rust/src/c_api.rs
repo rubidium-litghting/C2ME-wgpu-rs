@@ -369,15 +369,16 @@ pub unsafe extern "C" fn c2me_wgpu_take_result_blob(
 /// Returns a statically-allocated UTF-8 C string. Caller must NOT free.
 #[unsafe(no_mangle)]
 pub extern "C" fn c2me_wgpu_get_gpu_name() -> *const c_char {
-    static GPU_NAME: OnceLock<CString> = OnceLock::new();
-
-    let Ok(inst) = WgpuInstance::instance() else {
-        return b"unknown\0".as_ptr() as *const c_char;
+    let name = match WgpuInstance::instance() {
+        Ok(inst) => inst.adapter_info.name.clone(),
+        Err(_) => "unknown".to_string(),
     };
-    let s = GPU_NAME.get_or_init(|| {
-        CString::new(inst.adapter_info.name.as_str()).unwrap_or_default()
-    });
-    s.as_ptr()
+    // 使用 CString 并泄漏，返回指向静态内存的指针
+    let c_str = CString::new(name).unwrap_or_else(|_| CString::new("unknown").unwrap());
+    let ptr = c_str.as_ptr();
+    // 泄漏 CString 防止释放（整个程序生命周期内有效）
+    std::mem::forget(c_str);
+    ptr
 }
 
 // ---------------------------------------------------------------------------

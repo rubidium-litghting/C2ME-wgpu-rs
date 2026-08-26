@@ -1,6 +1,6 @@
 plugins {
     id 'java-library'
-    id 'fabric-loom' version '1.17-SNAPSHOT'
+    id 'net.fabricmc.fabric-loom' version '1.17-SNAPSHOT'
     id 'net.fabricmc.fabric-loom-repositories' version '1.17-SNAPSHOT'
     id 'maven-publish'
     id 'dev.yumi.gradle.licenser' version '4.0.0'
@@ -61,15 +61,14 @@ def c2meVersion  = project.hasProperty('c2me_resolution') && project.c2me_resolu
 
 dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
-    mappings "org.relativitymc:modern-yarn:${project.yarn_mappings}:v2"
-    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
 
     // C2ME modules.
     // When a local C2ME-fabric checkout exists, settings.gradle includeBuild
     // substitutes these coordinates with live Gradle projects regardless of
     // c2me_resolution setting.
-    modApi "${c2meGroup}:c2me-base:${c2meVersion}"
-    modApi "${c2meGroup}:c2me-opts-dfc:${c2meVersion}"
+    //modApi "${c2meGroup}:c2me-base:${c2meVersion}"
+    //modApi "${c2meGroup}:c2me-opts-dfc:${c2meVersion}"
 
     // Shared runtime libs — keep aligned with C2ME-fabric/gradle.properties versions
     implementation "com.ibm.async:asyncutil:${async_util_version}"
@@ -152,5 +151,3 @@ publishing {
         // mavenLocal()
     }
 }
-
-remapJar { addNestedDependencies = true }

@@ -34,8 +34,8 @@
 //!   - `+0.0` vs `-0.0` are treated as numerically equal by f32 PartialEq,
 //!     so `Constant(-0.0) + Constant(1.0)` correctly folds to `Constant(1.0)`.
 
-use crate::ast::AstNode;
 use crate::Result;
+use crate::ast::AstNode;
 
 pub fn fold(root: AstNode) -> Result<AstNode> {
     Ok(rec(root))
@@ -121,24 +121,36 @@ fn rec(node: AstNode) -> AstNode {
         // Unary arithmetic -----------------------------------------------
         Abs(a) => {
             let fa = rec(*a);
-            if let Constant(x) = fa { Constant(f32::abs(x)) }
-            else { Abs(Box::new(fa)) }
+            if let Constant(x) = fa {
+                Constant(f32::abs(x))
+            } else {
+                Abs(Box::new(fa))
+            }
         }
         Square(a) => {
             let fa = rec(*a);
-            if let Constant(x) = fa { Constant(x * x) }
-            else { Square(Box::new(fa)) }
+            if let Constant(x) = fa {
+                Constant(x * x)
+            } else {
+                Square(Box::new(fa))
+            }
         }
         Cube(a) => {
             let fa = rec(*a);
-            if let Constant(x) = fa { Constant(x * x * x) }
-            else { Cube(Box::new(fa)) }
+            if let Constant(x) = fa {
+                Constant(x * x * x)
+            } else {
+                Cube(Box::new(fa))
+            }
         }
         Sqrt(a) => {
             let fa = rec(*a);
             if let Constant(x) = fa {
-                if x < 0.0 { Sqrt(Box::new(Constant(x))) }
-                else { Constant(f32::sqrt(x)) }
+                if x < 0.0 {
+                    Sqrt(Box::new(Constant(x)))
+                } else {
+                    Constant(f32::sqrt(x))
+                }
             } else {
                 Sqrt(Box::new(fa))
             }
@@ -162,25 +174,36 @@ fn rec(node: AstNode) -> AstNode {
         // Nodes with variable AstNode children — recurse but never fold
         // the node itself (semantic meaning depends on coordinate input
         // or wrapper identity).
+        AstNode::NoiseSampler { .. } => node, // 或使用通配符
         DoublePerlin { a, b } => DoublePerlin {
             a: Box::new(rec(*a)),
             b: Box::new(rec(*b)),
         },
         EndIslands(a) => EndIslands(Box::new(rec(*a))),
         RangeChoice {
-            input, min, max, in_bounds, out_of_bounds_lo, out_of_bounds_hi,
+            input,
+            min,
+            max,
+            in_bounds,
+            out_of_bounds_lo,
+            out_of_bounds_hi,
         } => RangeChoice {
-            input:            Box::new(rec(*input)),
-            min:              Box::new(rec(*min)),
-            max:              Box::new(rec(*max)),
-            in_bounds:        Box::new(rec(*in_bounds)),
+            input: Box::new(rec(*input)),
+            min: Box::new(rec(*min)),
+            max: Box::new(rec(*max)),
+            in_bounds: Box::new(rec(*in_bounds)),
             out_of_bounds_lo: Box::new(rec(*out_of_bounds_lo)),
             out_of_bounds_hi: Box::new(rec(*out_of_bounds_hi)),
         },
-        CacheFlat(a)             => CacheFlat(Box::new(rec(*a))),
-        Cache2D(a)               => Cache2D(Box::new(rec(*a))),
-        CacheInterpolated(a)     => CacheInterpolated(Box::new(rec(*a))),
-        FindTopSurface { density, initial, min_y, max_y } => FindTopSurface {
+        CacheFlat(a) => CacheFlat(Box::new(rec(*a))),
+        Cache2D(a) => Cache2D(Box::new(rec(*a))),
+        CacheInterpolated(a) => CacheInterpolated(Box::new(rec(*a))),
+        FindTopSurface {
+            density,
+            initial,
+            min_y,
+            max_y,
+        } => FindTopSurface {
             density: Box::new(rec(*density)),
             initial: Box::new(rec(*initial)),
             min_y,
@@ -199,7 +222,9 @@ mod tests {
     use super::*;
     use AstNode::*;
 
-    fn boxed(n: AstNode) -> Box<AstNode> { Box::new(n) }
+    fn boxed(n: AstNode) -> Box<AstNode> {
+        Box::new(n)
+    }
 
     #[test]
     fn fold_scalar_constants() {
@@ -254,7 +279,10 @@ mod tests {
         let n = Div(boxed(Constant(5.0)), boxed(Constant(0.0)));
         let out = fold(n.clone()).unwrap();
         // Must remain a Div node (not Constant), check variant discriminant
-        assert!(matches!(out, Div(_, _)), "expected Div preserved, got {out:?}");
+        assert!(
+            matches!(out, Div(_, _)),
+            "expected Div preserved, got {out:?}"
+        );
 
         // FloorDiv / 0 → keep
         let n = FloorDiv(boxed(Constant(5.0)), boxed(Constant(0.0)));

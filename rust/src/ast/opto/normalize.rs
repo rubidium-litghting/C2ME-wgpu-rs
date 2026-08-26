@@ -47,6 +47,7 @@ pub fn canonicalize(root: AstNode) -> AstNode {
 fn rec(node: AstNode) -> AstNode {
     use AstNode::*;
     match node {
+        AstNode::NoiseSampler { .. } => node, // 或使用通配符
         // Leaves ----------------------------------------------------------
         Constant(_) | InputX | InputY | InputZ => node,
 
@@ -62,10 +63,10 @@ fn rec(node: AstNode) -> AstNode {
         FloorDiv(a, b) => FloorDiv(Box::new(rec(*a)), Box::new(rec(*b))),
 
         // Unaries: post-order only ---------------------------------------
-        Abs(a)   => Abs(Box::new(rec(*a))),
-        Square(a)=> Square(Box::new(rec(*a))),
-        Cube(a)  => Cube(Box::new(rec(*a))),
-        Sqrt(a)  => Sqrt(Box::new(rec(*a))),
+        Abs(a) => Abs(Box::new(rec(*a))),
+        Square(a) => Square(Box::new(rec(*a))),
+        Cube(a) => Cube(Box::new(rec(*a))),
+        Sqrt(a) => Sqrt(Box::new(rec(*a))),
 
         // Noise / placeholders (no variable AstNode children) ------------
         n @ PerlinSampler { .. }
@@ -86,19 +87,29 @@ fn rec(node: AstNode) -> AstNode {
         },
         EndIslands(a) => EndIslands(Box::new(rec(*a))),
         RangeChoice {
-            input, min, max, in_bounds, out_of_bounds_lo, out_of_bounds_hi,
+            input,
+            min,
+            max,
+            in_bounds,
+            out_of_bounds_lo,
+            out_of_bounds_hi,
         } => RangeChoice {
-            input:            Box::new(rec(*input)),
-            min:              Box::new(rec(*min)),
-            max:              Box::new(rec(*max)),
-            in_bounds:        Box::new(rec(*in_bounds)),
+            input: Box::new(rec(*input)),
+            min: Box::new(rec(*min)),
+            max: Box::new(rec(*max)),
+            in_bounds: Box::new(rec(*in_bounds)),
             out_of_bounds_lo: Box::new(rec(*out_of_bounds_lo)),
             out_of_bounds_hi: Box::new(rec(*out_of_bounds_hi)),
         },
-        CacheFlat(a)             => CacheFlat(Box::new(rec(*a))),
-        Cache2D(a)               => Cache2D(Box::new(rec(*a))),
-        CacheInterpolated(a)     => CacheInterpolated(Box::new(rec(*a))),
-        FindTopSurface { density, initial, min_y, max_y } => FindTopSurface {
+        CacheFlat(a) => CacheFlat(Box::new(rec(*a))),
+        Cache2D(a) => Cache2D(Box::new(rec(*a))),
+        CacheInterpolated(a) => CacheInterpolated(Box::new(rec(*a))),
+        FindTopSurface {
+            density,
+            initial,
+            min_y,
+            max_y,
+        } => FindTopSurface {
             density: Box::new(rec(*density)),
             initial: Box::new(rec(*initial)),
             min_y,
@@ -137,7 +148,9 @@ mod tests {
     use super::*;
     use AstNode::*;
 
-    fn boxed(n: AstNode) -> Box<AstNode> { Box::new(n) }
+    fn boxed(n: AstNode) -> Box<AstNode> {
+        Box::new(n)
+    }
 
     /// Basic canonicalization: the two operand orders collapse into one.
     #[test]
@@ -147,7 +160,10 @@ mod tests {
         assert_ne!(a, b, "before canonicalize the two trees must differ");
         let ca = canonicalize(a);
         let cb = canonicalize(b);
-        assert_eq!(ca, cb, "after canonicalize they must be structurally identical");
+        assert_eq!(
+            ca, cb,
+            "after canonicalize they must be structurally identical"
+        );
     }
 
     /// Normalization is stable: applying canonicalize twice must give the

@@ -37,6 +37,7 @@ use anyhow::anyhow;
 
 use crate::Result;
 use crate::ast::AstNode;
+use crate::ast::NoiseType;
 
 /// Parse a full blob including header. Returns (Root node, Shape config, BiomeTree).
 ///
@@ -279,6 +280,28 @@ pub fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
             let seed = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
             cursor += 8;
             SimplexNoise3D { seed }
+        }
+        0x84 => {
+            // Payload: [type:u8] [seed:i64 LE] [xz_scale:f32 LE] [y_scale:f32 LE]
+            ensure(bytes.len() >= cursor + 1 + 8 + 4 + 4, "NoiseSampler")?;
+            let noise_type = match bytes[cursor] {
+                0 => NoiseType::Perlin,
+                1 => NoiseType::Simplex,
+                _ => return Err(anyhow!("unknown noise type in NoiseSampler")),
+            };
+            cursor += 1;
+            let seed = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+            cursor += 8;
+            let xz_scale = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            let y_scale = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            NoiseSampler {
+                noise_type,
+                seed,
+                xz_scale,
+                y_scale,
+            }
         }
 
         // ── 新增：InterpolatedNoiseSampler (0x90) ──────────────────────
@@ -618,7 +641,15 @@ mod tests {
             0,
             0,
             // BIOME_SOURCE
-            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0xF0,
+            0x15,
+            0xCD,
+            0x5B,
+            0x07,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
             0x15,
             0xCD,
             0x5B,
@@ -939,7 +970,15 @@ mod tests {
             0,
             0,
             // BIOME
-            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
+            0xF0,
+            0x15,
+            0xCD,
+            0x5B,
+            0x07,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
             0x15,
             0xCD,
             0x5B,

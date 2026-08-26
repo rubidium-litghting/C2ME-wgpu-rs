@@ -24,7 +24,7 @@
 
 package com.rubidiumlighting.c2me.opts.accel.wgpu;
 
-import com.ishland.c2me.base.common.config.ConfigSystem;
+//import com.ishland.c2me.base.common.config.ConfigSystem;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -35,7 +35,7 @@ public class ModuleEntryPoint {
     private static final boolean enabled;
 
     static {
-        boolean configured = new ConfigSystem.ConfigAccessor()
+        /*boolean configured = new ConfigSystem.ConfigAccessor()
                 .key("worldGenOptimizations.wgpuAcceleration.enabled")
                 .comment("""
                         Enable GPU-accelerated world generation using wgpu.
@@ -43,9 +43,8 @@ public class ModuleEntryPoint {
                         fall back to the vanilla CPU path with a warning log.
                         """)
                 .getBoolean(true, false);
-
+        */
         boolean actuallyEnabled = false;
-        if (configured) {
             try {
                 actuallyEnabled = NativeLoader.isAvailable();
                 if (actuallyEnabled) {
@@ -67,7 +66,6 @@ public class ModuleEntryPoint {
                 LOGGER.warn("[c2me-wgpu] Failed to initialize wgpu acceleration, falling back to CPU", t);
                 actuallyEnabled = false;
             }
-        }
         enabled = actuallyEnabled;
     }
 

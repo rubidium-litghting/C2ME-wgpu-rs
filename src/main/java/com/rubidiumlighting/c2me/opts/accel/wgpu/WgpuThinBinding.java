@@ -30,6 +30,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.nio.ByteBuffer;
+//import java.lang.foreign.Arena;
 
 /**
  * Thin Panama FFM binding to the Rust wgpu shared library.
@@ -139,17 +140,37 @@ public class WgpuThinBinding {
 
     public static String getGpuName() {
         try {
-            MemorySegment nameSeg = (MemorySegment) MH_get_gpu_name.invokeExact();
-            if (nameSeg == null || nameSeg.address() == 0) return "Unknown";
-            return nameSeg.getString(0);
+            var result = MH_get_gpu_name.invoke();
+            if (result instanceof MemorySegment) {
+                var segment = (MemorySegment) result;
+                if (segment.address() == 0) {
+                    return "unknown (null address)";
+                }
+                // 如果 byteSize 为 0，重新创建一个段，假设长度 256
+                if (segment.byteSize() == 0) {
+                    segment = MemorySegment.ofAddress(segment.address())
+                            .reinterpret(256, Arena.global(), null);
+                }
+                try {
+                    return segment.getString(0);
+                } catch (IndexOutOfBoundsException | IllegalArgumentException e) {
+                    return "unknown (invalid string)";
+                }
+            } else {
+                return "unknown (not a MemorySegment)";
+            }
         } catch (Throwable t) {
-            if (t instanceof RuntimeException re) throw re;
-            throw new RuntimeException(t);
+            t.printStackTrace();
+            return "unknown (exception)";
         }
     }
 
     public static long getInstanceHandle() {
         return instanceHandle;
+    }
+
+    public static boolean isAvailable() {
+        return NativeLoader.isAvailable();
     }
 
     /**

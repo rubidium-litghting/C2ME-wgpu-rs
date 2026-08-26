@@ -88,8 +88,12 @@ where
     let map_box = |b: Box<AstNode>, f: &mut F| Box::new(f(*b));
 
     match node {
+        AstNode::NoiseSampler { .. } => node, // 或使用通配符
         // Leaves with no variable AstNode children -----------------------
-        Constant(_) | InputX | InputY | InputZ
+        Constant(_)
+        | InputX
+        | InputY
+        | InputZ
         | PerlinSampler { .. }
         | SimplexNoise2D { .. }
         | SimplexNoise3D { .. }
@@ -102,19 +106,19 @@ where
         | BiomeTree { .. } => node,
 
         // Binary arithmetic ----------------------------------------------
-        Add(a, b)  => Add(map_box(a, &mut f), map_box(b, &mut f)),
-        Sub(a, b)  => Sub(map_box(a, &mut f), map_box(b, &mut f)),
-        Mul(a, b)  => Mul(map_box(a, &mut f), map_box(b, &mut f)),
-        Div(a, b)  => Div(map_box(a, &mut f), map_box(b, &mut f)),
-        Min(a, b)  => Min(map_box(a, &mut f), map_box(b, &mut f)),
-        Max(a, b)  => Max(map_box(a, &mut f), map_box(b, &mut f)),
+        Add(a, b) => Add(map_box(a, &mut f), map_box(b, &mut f)),
+        Sub(a, b) => Sub(map_box(a, &mut f), map_box(b, &mut f)),
+        Mul(a, b) => Mul(map_box(a, &mut f), map_box(b, &mut f)),
+        Div(a, b) => Div(map_box(a, &mut f), map_box(b, &mut f)),
+        Min(a, b) => Min(map_box(a, &mut f), map_box(b, &mut f)),
+        Max(a, b) => Max(map_box(a, &mut f), map_box(b, &mut f)),
         FloorDiv(a, b) => FloorDiv(map_box(a, &mut f), map_box(b, &mut f)),
 
         // Unary arithmetic -----------------------------------------------
-        Abs(a)     => Abs(map_box(a, &mut f)),
-        Square(a)  => Square(map_box(a, &mut f)),
-        Cube(a)    => Cube(map_box(a, &mut f)),
-        Sqrt(a)    => Sqrt(map_box(a, &mut f)),
+        Abs(a) => Abs(map_box(a, &mut f)),
+        Square(a) => Square(map_box(a, &mut f)),
+        Cube(a) => Cube(map_box(a, &mut f)),
+        Sqrt(a) => Sqrt(map_box(a, &mut f)),
 
         // Structured nodes with children ---------------------------------
         DoublePerlin { a, b } => DoublePerlin {
@@ -122,21 +126,34 @@ where
             b: map_box(b, &mut f),
         },
         EndIslands(a) => EndIslands(map_box(a, &mut f)),
-        RangeChoice { input, min, max, in_bounds, out_of_bounds_lo, out_of_bounds_hi } => RangeChoice {
-            input:            map_box(input, &mut f),
-            min:              map_box(min, &mut f),
-            max:              map_box(max, &mut f),
-            in_bounds:        map_box(in_bounds, &mut f),
+        RangeChoice {
+            input,
+            min,
+            max,
+            in_bounds,
+            out_of_bounds_lo,
+            out_of_bounds_hi,
+        } => RangeChoice {
+            input: map_box(input, &mut f),
+            min: map_box(min, &mut f),
+            max: map_box(max, &mut f),
+            in_bounds: map_box(in_bounds, &mut f),
             out_of_bounds_lo: map_box(out_of_bounds_lo, &mut f),
             out_of_bounds_hi: map_box(out_of_bounds_hi, &mut f),
         },
-        CacheFlat(a)             => CacheFlat(map_box(a, &mut f)),
-        Cache2D(a)               => Cache2D(map_box(a, &mut f)),
-        CacheInterpolated(a)     => CacheInterpolated(map_box(a, &mut f)),
-        FindTopSurface { density, initial, min_y, max_y } => FindTopSurface {
+        CacheFlat(a) => CacheFlat(map_box(a, &mut f)),
+        Cache2D(a) => Cache2D(map_box(a, &mut f)),
+        CacheInterpolated(a) => CacheInterpolated(map_box(a, &mut f)),
+        FindTopSurface {
+            density,
+            initial,
+            min_y,
+            max_y,
+        } => FindTopSurface {
             density: map_box(density, &mut f),
             initial: map_box(initial, &mut f),
-            min_y, max_y,
+            min_y,
+            max_y,
         },
 
         Root(channels) => Root(channels.into_iter().map(&mut f).collect()),
@@ -151,7 +168,9 @@ mod tests {
     use super::*;
     use AstNode::*;
 
-    fn boxed(n: AstNode) -> Box<AstNode> { Box::new(n) }
+    fn boxed(n: AstNode) -> Box<AstNode> {
+        Box::new(n)
+    }
 
     /// Simple case: two structurally equal but separately-constructed
     /// subtrees inside a Root — after CSE, both children resolve to the
@@ -218,8 +237,11 @@ mod tests {
     fn different_types_not_merged() {
         let x = Add(boxed(InputX), boxed(InputY));
         let y = Mul(boxed(InputX), boxed(InputY));
-        assert_ne!(fingerprint(&x), fingerprint(&y),
-            "Add and Mul with same children must have different fingerprints");
+        assert_ne!(
+            fingerprint(&x),
+            fingerprint(&y),
+            "Add and Mul with same children must have different fingerprints"
+        );
         let root = Root(vec![x, y]);
         let after = eliminate(root);
         if let Root(v) = after {
