@@ -154,6 +154,19 @@ impl PermutationTableSet {
         set
     }
 
+    /// Build from REAL permutation tables shipped by the Java side
+    /// (PERM_RESOURCE trailer). Entry `i` occupies buffer indices
+    /// `[i*256, (i+1)*256)`; `perm_offset` in `NoiseSampler` == `i * 256`.
+    pub fn from_entries(entries: &[crate::ast::deserialize::PermEntry]) -> Self {
+        let mut set = Self::default();
+        for (i, e) in entries.iter().enumerate() {
+            let offset = (i * 256) as i32;
+            set.buffer.extend(e.perm.iter().map(|&x| x as i32));
+            set.offsets.insert(i as i64, offset);
+        }
+        set
+    }
+
     /// Look up the i32 index (NOT byte offset) where a seed's permutation
     /// table starts in `buffer`. Returns `None` if the seed wasn't in the
     /// set used to build this `PermutationTableSet`.

@@ -103,7 +103,7 @@ fn maintain_precision(value: f32) -> f32 {
 }
 
 // ---------- 核心 Perlin (使用指定置换表) ----------
-fn perlin3d_with_perm(perm_table: array<u32, 256>, x: f32, y: f32, z: f32) -> f32 {
+fn perlin3d_with_perm(perm_offset: i32, x: f32, y: f32, z: f32) -> f32 {
     let ix = i32(floor(x));
     let iy = i32(floor(y));
     let iz = i32(floor(z));
@@ -114,21 +114,22 @@ fn perlin3d_with_perm(perm_table: array<u32, 256>, x: f32, y: f32, z: f32) -> f3
     let xi = ix & 255;
     let yi = iy & 255;
     let zi = iz & 255;
-    let p = perm_table;
-    let a  = i32(p[xi]);
-    let b  = i32(p[(xi + 1) & 255]);
-    let aa = i32(p[(a + yi) & 255]);
-    let ab = i32(p[(a + yi + 1) & 255]);
-    let ba = i32(p[(b + yi) & 255]);
-    let bb = i32(p[(b + yi + 1) & 255]);
-    let aaa = i32(p[(aa + zi) & 255]);
-    let aab = i32(p[(aa + zi + 1) & 255]);
-    let aba = i32(p[(ab + zi) & 255]);
-    let abb = i32(p[(ab + zi + 1) & 255]);
-    let baa = i32(p[(ba + zi) & 255]);
-    let bab = i32(p[(ba + zi + 1) & 255]);
-    let bba = i32(p[(bb + zi) & 255]);
-    let bbb = i32(p[(bb + zi + 1) & 255]);
+    // Read this sampler's 256-entry table starting at perm_offset.
+    let p = perm_offset;
+    let a  = i32(perm[p + xi]);
+    let b  = i32(perm[p + (xi + 1) & 255]);
+    let aa = i32(perm[p + (a + yi) & 255]);
+    let ab = i32(perm[p + (a + yi + 1) & 255]);
+    let ba = i32(perm[p + (b + yi) & 255]);
+    let bb = i32(perm[p + (b + yi + 1) & 255]);
+    let aaa = i32(perm[p + (aa + zi) & 255]);
+    let aab = i32(perm[p + (aa + zi + 1) & 255]);
+    let aba = i32(perm[p + (ab + zi) & 255]);
+    let abb = i32(perm[p + (ab + zi + 1) & 255]);
+    let baa = i32(perm[p + (ba + zi) & 255]);
+    let bab = i32(perm[p + (ba + zi + 1) & 255]);
+    let bba = i32(perm[p + (bb + zi) & 255]);
+    let bbb = i32(perm[p + (bb + zi + 1) & 255]);
 
     let g000 = GRAD3[aaa & 15];
     let g100 = GRAD3[baa & 15];
@@ -159,23 +160,23 @@ fn perlin3d_with_perm(perm_table: array<u32, 256>, x: f32, y: f32, z: f32) -> f3
 }
 
 // 带 origin 偏移的版本
-fn perlin3d_with_perm_and_origin(perm_table: array<u32, 256>, origin: vec3<f32>, x: f32, y: f32, z: f32) -> f32 {
+fn perlin3d_with_perm_and_origin(perm_offset: i32, origin: vec3<f32>, x: f32, y: f32, z: f32) -> f32 {
     let px = maintain_precision(x + origin.x);
     let py = maintain_precision(y + origin.y);
     let pz = maintain_precision(z + origin.z);
-    return perlin3d_with_perm(perm_table, px, py, pz);
+    return perlin3d_with_perm(perm_offset, px, py, pz);
 }
 
 // ---------- 公开 API (使用全局 perm) ----------
-fn noise_perlin3d(seed: i32, x: f32, y: f32, z: f32) -> f32 {
+fn noise_perlin3d(perm_offset: i32, x: f32, y: f32, z: f32) -> f32 {
     let px = maintain_precision(x);
     let py = maintain_precision(y);
     let pz = maintain_precision(z);
-    return perlin3d_with_perm(perm, px, py, pz);
+    return perlin3d_with_perm(perm_offset, px, py, pz);
 }
 
-fn noise_perlin2d(seed: i32, x: f32, y: f32) -> f32 {
-    return noise_perlin3d(seed, x, y, 0.0);
+fn noise_perlin2d(perm_offset: i32, x: f32, y: f32) -> f32 {
+    return noise_perlin3d(perm_offset, x, y, 0.0);
 }
 
 // ----------------------------------------------------------------------------
@@ -414,7 +415,7 @@ fn interpolated_noise_sampler_simplex(
 //   fade_local_x : 用于 y 方向 fade 的原始 y 分数（即 h，不是 local_y）
 // 返回噪声值
 fn perlin3d_with_perm_batched(
-    perm_table: array<u32, 256>,
+    perm_offset: i32,
     ix: i32, iy: i32, iz: i32,
     local_x: f32, local_y: f32, local_z: f32,
     fade_local_x: f32
@@ -423,22 +424,22 @@ fn perlin3d_with_perm_batched(
     let xi = ix & 255;
     let yi = iy & 255;
     let zi = iz & 255;
-    let p = perm_table;
+    let p = perm_offset;
 
-    let a  = i32(p[xi]);
-    let b  = i32(p[(xi + 1) & 255]);
-    let aa = i32(p[(a + yi) & 255]);
-    let ab = i32(p[(a + yi + 1) & 255]);
-    let ba = i32(p[(b + yi) & 255]);
-    let bb = i32(p[(b + yi + 1) & 255]);
-    let aaa = i32(p[(aa + zi) & 255]);
-    let aab = i32(p[(aa + zi + 1) & 255]);
-    let aba = i32(p[(ab + zi) & 255]);
-    let abb = i32(p[(ab + zi + 1) & 255]);
-    let baa = i32(p[(ba + zi) & 255]);
-    let bab = i32(p[(ba + zi + 1) & 255]);
-    let bba = i32(p[(bb + zi) & 255]);
-    let bbb = i32(p[(bb + zi + 1) & 255]);
+    let a  = i32(perm[p + xi]);
+    let b  = i32(perm[p + (xi + 1) & 255]);
+    let aa = i32(perm[p + (a + yi) & 255]);
+    let ab = i32(perm[p + (a + yi + 1) & 255]);
+    let ba = i32(perm[p + (b + yi) & 255]);
+    let bb = i32(perm[p + (b + yi + 1) & 255]);
+    let aaa = i32(perm[p + (aa + zi) & 255]);
+    let aab = i32(perm[p + (aa + zi + 1) & 255]);
+    let aba = i32(perm[p + (ab + zi) & 255]);
+    let abb = i32(perm[p + (ab + zi + 1) & 255]);
+    let baa = i32(perm[p + (ba + zi) & 255]);
+    let bab = i32(perm[p + (ba + zi + 1) & 255]);
+    let bba = i32(perm[p + (bb + zi) & 255]);
+    let bbb = i32(perm[p + (bb + zi + 1) & 255]);
 
     // 2. 梯度向量
     let g000 = GRAD3[aaa & 15];
@@ -479,7 +480,7 @@ fn perlin3d_with_perm_batched(
 // ---------- 带 yScale / yMax 的公开采样 ----------
 // 完全匹配原版 PerlinNoiseSampler.sample(x,y,z,yScale,yMax)
 fn perlin3d_with_y_scale(
-    perm_table: array<u32, 256>,
+    perm_offset: i32,
     origin: vec3<f32>,
     x: f32, y: f32, z: f32,
     y_scale: f32,
@@ -507,7 +508,7 @@ fn perlin3d_with_y_scale(
 
     // 调用批处理核心
     return perlin3d_with_perm_batched(
-        perm_table,
+        perm_offset,
         i32(i), i32(j), i32(k),
         g,           // local_x
         h - o,       // local_y (减去分层偏移)

@@ -96,7 +96,7 @@ impl SingleBatchExecutor {
     ) -> Result<Self, String> {
         // One chunk = 16 channels × 16×16×16 cells × 4 bytes = 256 KiB.
         // Staging must hold a full batch (config.max_batch_size chunks).
-        let bytes_per_chunk: usize = 16 * 16 * 16 * 16 * 4;
+        let bytes_per_chunk: usize = 16 * 1536 * 4;
         let max_buffer_size = bytes_per_chunk * config.max_batch_size.max(1);
         let staging = StagingChain::new(&device, config.staging_capacity, max_buffer_size);
 
@@ -130,7 +130,7 @@ impl SingleBatchExecutor {
 
         let t0 = std::time::Instant::now();
         let num_chunks = batch.positions.len() as u32;
-        let f32_per_chunk = 16 * 16 * 16 * 16; // 16 channels × 16×16×16 cells
+        let f32_per_chunk = 16 * 1536; // 16 channels × (4×96×4 cells)
         let total_f32s = (num_chunks as usize) * f32_per_chunk;
         let total_bytes = total_f32s * 4;
 
@@ -211,8 +211,17 @@ impl SingleBatchExecutor {
             cpass.set_pipeline(pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
 
-            let workgroup_count = (num_chunks + 63) / 64;
-            cpass.dispatch_workgroups(workgroup_count, 1, 1);
+            // Cell grid per chunk = (16/cell_width, height/cell_height, 16/cell_width).
+            // Workgroup size is (4,4,4), so dispatch that many workgroups.
+            let cw = (shape.cell_width.max(1) as u32);
+            let chh = (shape.cell_height.max(1) as u32);
+            let ccx = 16 / cw;
+            let ccz = 16 / cw;
+            let ccy = (shape.height as u32) / chh;
+            let wg_x = (ccx + 3) / 4;
+            let wg_y = (ccy + 3) / 4;
+            let wg_z = (ccz + 3) / 4;
+            cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
         }
 
         // Copy output buffer → staging buffer for CPU readback
@@ -258,7 +267,7 @@ impl SingleBatchExecutor {
             .collect();
 
         let mut result_map = FxHashMap::default();
-        const CELLS_PER_CHANNEL: usize = 16 * 16 * 16;
+        const CELLS_PER_CHANNEL: usize = 4 * 96 * 4;
         let mut channel_offsets = [0u64; 16];
         for (ch, off) in channel_offsets.iter_mut().enumerate() {
             *off = (ch * CELLS_PER_CHANNEL * 4) as u64;

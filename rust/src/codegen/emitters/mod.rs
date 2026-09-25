@@ -25,9 +25,18 @@ use anyhow::{Result, anyhow};
 /// 统一节点分发函数。每个 emitter 模块都必须实现 `pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String>`。
 pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
     match node {
-        AstNode::NoiseSampler { .. } => {
-            // TODO: implement noise sampler emitter
-            Ok("0.0".to_string()) // 临时占位
+        AstNode::NoiseSampler { perm_offset, xz_scale, y_scale, .. } => {
+            // Phase 2a: sample the FIRST octave's permutation table only
+            // (single Perlin, no DoublePerlin two-octave blend). Enough to
+            // prove the perm buffer reaches the GPU and yields non-zero values.
+            let var = ctx.fresh_var("ns");
+            ctx.emit(format!(
+                "let {var}: f32 = noise_perlin3d({perm_offset}i, cell_x * {xz:.9e}, cell_y * {ys:.9e}, cell_z * {xz:.9e});",
+                perm_offset = perm_offset,
+                xz = xz_scale,
+                ys = y_scale,
+            ));
+            Ok(var)
         }
         AstNode::Constant(_) => constant::emit(node, ctx),
         AstNode::InputX | AstNode::InputY | AstNode::InputZ => coordinate::emit(node, ctx),

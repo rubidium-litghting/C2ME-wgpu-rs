@@ -46,6 +46,8 @@ public class NoiseRouterBlobifier {
     private static final IdentityHashMap<Object, Void> SEEN_PERM = new IdentityHashMap<>();
     private static final List<Object> PERM_SAMPLERS = new ArrayList<>();
     private static Object lastDperlin = null;
+    /** IdentityHashMap: DoublePerlinNoiseSampler -> first Perlin index in PERM_SAMPLERS. */
+    private static final IdentityHashMap<Object, Integer> DPS_FIRST_INDEX = new IdentityHashMap<>();
     private static NoiseConfig CURRENT_NOISE_CONFIG = null;
 
     // ── Tags ────────────────────────────────────────────────────────
@@ -84,6 +86,7 @@ public class NoiseRouterBlobifier {
         ByteBuffer buf = ByteBuffer.allocate(4 * 1024 * 1024).order(ByteOrder.LITTLE_ENDIAN);
         SEEN_PERM.clear();
         PERM_SAMPLERS.clear();
+        DPS_FIRST_INDEX.clear();
         // ── HEADER (10B) ─────────────────────────────────────────
         buf.put((byte) 0x4D);
         buf.put((byte) 0x43);
@@ -244,9 +247,18 @@ public class NoiseRouterBlobifier {
             return;
         }
 
-        // ── Collect noise samplers before the Phase-2 placeholder ──
+        // ── Noise: emit TAG_NOISE_SAMPLER with perm_offset ─────
         if (df instanceof DensityFunctionTypes.Noise tn) {
-            registerNoiseSampler(tn.noise());
+            int idx = registerNoiseSampler(tn.noise());
+            buf.put(TAG_NOISE_SAMPLER);
+            buf.put((byte) 0);                        // type: Perlin
+            buf.putInt(idx >= 0 ? idx * 256 : 0);     // perm_offset (i32 LE)
+            // MC applies DOMAIN_SCALE=1.0181268882175227 inside
+            // DoublePerlinNoiseSampler to de-align integer grid coords.
+            final double DOMAIN_SCALE = 1.0181268882175227;
+            buf.putFloat((float) (tn.xzScale() * DOMAIN_SCALE));
+            buf.putFloat((float) (tn.yScale() * DOMAIN_SCALE));
+            return;
         }
 
         // ── Phase-2 placeholders (noise chain) ──────────────────
@@ -341,7 +353,7 @@ public class NoiseRouterBlobifier {
         }
     }
 
-    private static void registerNoiseSampler(DensityFunction.Noise n) {
+    private static int registerNoiseSampler(DensityFunction.Noise n) {
         // 1) Prefer the already-instantiated sampler (populated when the router
         //    comes from NoiseConfig; null for the raw settings template).
         Object dperlin = n.noise();
@@ -357,20 +369,27 @@ public class NoiseRouterBlobifier {
             }
         }
         if (!(dperlin instanceof DoublePerlinNoiseSampler)) {
-            return;
+            return -1;
         }
-        if (dperlin == lastDperlin) return;
-        lastDperlin = dperlin;
+        Integer cached = DPS_FIRST_INDEX.get(dperlin);
+        if (cached != null) return cached;
+        int firstIdx = -1;
         try {
             for (Field f : dperlin.getClass().getDeclaredFields()) {
                 if (OctavePerlinNoiseSampler.class.isAssignableFrom(f.getType())) {
                     f.setAccessible(true);
+                    int before = PERM_SAMPLERS.size();
                     registerOctaveSampler(f.get(dperlin));
+                    if (firstIdx < 0 && PERM_SAMPLERS.size() > before) {
+                        firstIdx = before;
+                    }
                 }
             }
         } catch (Throwable t) {
             System.err.println("[c2me-wgpu] registerNoiseSampler failed: " + t);
         }
+        DPS_FIRST_INDEX.put(dperlin, firstIdx);
+        return firstIdx;
     }
 
     public static class ShapeConfig {

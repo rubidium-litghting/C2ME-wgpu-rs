@@ -112,7 +112,10 @@ pub enum AstNode {
     },
     NoiseSampler {
         noise_type: NoiseType,
-        seed: i64,
+        /// Index into the flat permutation buffer (binding 1); each entry is
+        /// a 256-u32 table. Replaces `seed` because MC 1.21.1 discards the
+        /// seed after table construction.
+        perm_offset: i32,
         xz_scale: f32,
         y_scale: f32,
     },
@@ -296,14 +299,14 @@ impl Hash for AstNode {
             }
             AstNode::NoiseSampler {
                 noise_type,
-                seed,
+                perm_offset,
                 xz_scale,
                 y_scale,
             } => {
-                TAG_NOISE_SAMPLER.hash(state); // 需要定义常量，或用 0x84u8
+                TAG_NOISE_SAMPLER.hash(state);
                 0x84u8.hash(state);
                 noise_type.hash(state);
-                seed.hash(state);
+                perm_offset.hash(state);
                 xz_scale.to_bits().hash(state);
                 y_scale.to_bits().hash(state);
             }

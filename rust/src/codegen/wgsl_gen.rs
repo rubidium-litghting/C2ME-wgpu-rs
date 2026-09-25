@@ -235,7 +235,7 @@ struct WorldgenParams {
 };
 
 @group(0) @binding(0) var<storage, read>        params:       WorldgenParams;
-@group(0) @binding(1) var<storage, read>        perm: array<u32, 256>;
+@group(0) @binding(1) var<storage, read>        perm: array<u32>;
 @group(0) @binding(2) var<storage, read_write>  out_buf:      array<f32>;
 "#;
 

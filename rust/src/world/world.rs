@@ -106,10 +106,15 @@ impl WorldContext {
         validate_wgsl(&shader_src)
             .map_err(|e| anyhow::anyhow!("emitted WGSL failed naga validation:\n{e}"))?;
 
-        // 5. Scan AST for all PerlinSampler seeds and build the packed
-        //    permutation-table buffer (CPU-side; upload happens in step 6).
-        let seeds = collect_perlin_seeds(&ast_root);
-        let perm_table_set = PermutationTableSet::from_seeds(seeds);
+        // 5. Build the packed permutation-table buffer.
+        //    Prefer the REAL tables from the Java PERM_RESOURCE trailer; fall
+        //    back to seed-derived tables when absent (unit tests / old blobs).
+        let perm_table_set = if perm_entries.is_empty() {
+            let seeds = collect_perlin_seeds(&ast_root);
+            PermutationTableSet::from_seeds(seeds)
+        } else {
+            PermutationTableSet::from_entries(&perm_entries)
+        };
 
         Ok(Self {
             ast_root,

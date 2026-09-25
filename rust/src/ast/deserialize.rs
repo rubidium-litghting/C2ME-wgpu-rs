@@ -338,23 +338,23 @@ pub fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
             SimplexNoise3D { seed }
         }
         0x84 => {
-            // Payload: [type:u8] [seed:i64 LE] [xz_scale:f32 LE] [y_scale:f32 LE]
-            ensure(bytes.len() >= cursor + 1 + 8 + 4 + 4, "NoiseSampler")?;
+            // Payload: [type:u8] [perm_offset:i32 LE] [xz_scale:f32 LE] [y_scale:f32 LE]
+            ensure(bytes.len() >= cursor + 1 + 4 + 4 + 4, "NoiseSampler")?;
             let noise_type = match bytes[cursor] {
                 0 => NoiseType::Perlin,
                 1 => NoiseType::Simplex,
                 _ => return Err(anyhow!("unknown noise type in NoiseSampler")),
             };
             cursor += 1;
-            let seed = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-            cursor += 8;
+            let perm_offset = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
             let xz_scale = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
             cursor += 4;
             let y_scale = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
             cursor += 4;
             NoiseSampler {
                 noise_type,
-                seed,
+                perm_offset,
                 xz_scale,
                 y_scale,
             }
