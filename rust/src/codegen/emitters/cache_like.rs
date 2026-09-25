@@ -166,7 +166,7 @@ fn emit_cache_flat(inner: &AstNode, ctx: &mut GenCtx) -> Result<String> {
 /// CacheInterpolated — cell-corner trilinear lerp within a single dispatch.
 ///
 /// See module-level doc for the full algorithm description.
-fn emit_cache_interp(inner: &AstNode, ctx: &mut GenCtx) -> Result<String> {
+pub(crate) fn emit_cache_interp(inner: &AstNode, ctx: &mut GenCtx) -> Result<String> {
     // Single-pass mode is the ONLY supported mode for CacheInterpolated:
     //   * Pass A (corner computation) + workgroupBarrier() + Pass B
     //     (trilinear lerp) must run in the SAME dispatch — `var<workgroup>`
@@ -216,6 +216,7 @@ fn emit_cache_interp(inner: &AstNode, ctx: &mut GenCtx) -> Result<String> {
     // CacheInterpolated) — if it did, their `lx/ly/lz` indexing would be
     // wrong inside this loop.
     ctx.emit("// CacheInterpolated phase 1: compute assigned cell-corners.");
+    ctx.emit("{");
     ctx.emit("let dx_max: u32 = select(0u, 1u, lx == 3u);");
     ctx.emit("let dy_max: u32 = select(0u, 1u, ly == 3u);");
     ctx.emit("let dz_max: u32 = select(0u, 1u, lz == 3u);");
@@ -241,6 +242,7 @@ fn emit_cache_interp(inner: &AstNode, ctx: &mut GenCtx) -> Result<String> {
     ctx.emit("      }");
     ctx.emit("    }");
     ctx.emit("  }");
+    ctx.emit("}");
     ctx.emit("}");
 
     // ── Phase 2: trilinear interpolation from shared memory ────────────

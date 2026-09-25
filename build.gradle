@@ -1,8 +1,8 @@
 plugins {
     id 'java-library'
-    id 'net.fabricmc.fabric-loom' version '1.17-SNAPSHOT'
-    id 'net.fabricmc.fabric-loom-repositories' version '1.17-SNAPSHOT'
+    id 'fabric-loom' version '1.13-SNAPSHOT'
     id 'maven-publish'
+
     id 'dev.yumi.gradle.licenser' version '4.0.0'
     id 'io.github.tomtzook.gradle-cmake' version '1.2.2' apply false  // native-math style: for Rust cdylib builds later
 }
@@ -18,6 +18,9 @@ group = project.maven_group
 version = project.mod_version
 
 java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
     sourceCompatibility = JavaVersion.VERSION_25
     targetCompatibility = JavaVersion.VERSION_25
     withSourcesJar()
@@ -61,14 +64,14 @@ def c2meVersion  = project.hasProperty('c2me_resolution') && project.c2me_resolu
 
 dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
-    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
-
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
     // C2ME modules.
     // When a local C2ME-fabric checkout exists, settings.gradle includeBuild
     // substitutes these coordinates with live Gradle projects regardless of
     // c2me_resolution setting.
-    //modApi "${c2meGroup}:c2me-base:${c2meVersion}"
-    //modApi "${c2meGroup}:c2me-opts-dfc:${c2meVersion}"
+    compileOnly "${c2meGroup}:c2me-base:${c2meVersion}"
+    compileOnly "${c2meGroup}:c2me-opts-dfc:${c2meVersion}"
 
     // Shared runtime libs — keep aligned with C2ME-fabric/gradle.properties versions
     implementation "com.ibm.async:asyncutil:${async_util_version}"
@@ -90,8 +93,11 @@ test {
 // ---------------------------------------------------------------------------
 
 loom {
-    // Access widener lives inside c2me-base, which we depend on.
-    enableTransitiveAccessWideners = true
+    // Reuse c2me-base's access widener directly (source path via composite build).
+    // This widens DensityFunctionTypes$* inner classes so our instanceof matches
+    // work, and avoids the namespace-mismatch of transitive AW analysis.
+    accessWidenerPath = file("../C2ME-fabric/c2me-base/src/main/resources/c2me-base.accesswidener")
+    enableTransitiveAccessWideners = false
 
     runs {
         server { ideConfigGenerated true }
@@ -123,21 +129,91 @@ processResources {
 }
 
 // ---------------------------------------------------------------------------
-// Rust cdylib build (placeholder hook; enable when you wire a cargo Gradle
-// plugin or call `cargo build --release` in CI and copy the lib into the JAR
-// natives/<os>-<arch>/ folder).
+// Rust cdylib build
 //
-// Layout expected by Java NativeLoader:
-//   src/main/resources/natives/linux-x86_64/libc2me_wgpu.so
-//   src/main/resources/natives/macos-x86_64/libc2me_wgpu.dylib
-//   src/main/resources/natives/macos-aarch64/libc2me_wgpu.dylib
-//   src/main/resources/natives/windows-x86_64/c2me_wgpu.dll
+// Compiles the Rust crate with `cargo build --release` and stages the native
+// library under build/rust-natives/, which is registered as an extra resource
+// directory. The library ends up in the JAR at:
+//   natives/<os>-<arch>/libc2me_wgpu.so    (Linux)
+//   natives/<os>-<arch>/libc2me_wgpu.dylib (macOS)
+//   natives/<os>-<arch>/c2me_wgpu.dll      (Windows)
+// which is exactly where NativeLoader looks it up.
+//
+// Output goes to build/ (NOT src/) so no source-scanning task (sourcesJar,
+// checkLicense, ...) picks it up as an implicit input.
+//
+// Use `-PskipRust` to skip the Rust build (e.g. CI without a Rust toolchain).
 // ---------------------------------------------------------------------------
 
-// tasks.register('rustBuild') {
-//     doLast { exec { commandLine 'cargo', 'build', '--release', '-p', 'c2me-wgpu' } }
-// }
-// processResources.dependsOn rustBuild
+def rustDir = file('rust')
+
+def normalizeOs(String v) {
+    v = v.toLowerCase(Locale.US).replaceAll("[^a-z0-9]+", "")
+    if (v.startsWith("linux")) return "linux"
+    if (v.startsWith("macosx") || v.startsWith("osx") || v.startsWith("darwin")) return "macos"
+    if (v.startsWith("windows")) return "windows"
+    return "unknown"
+}
+
+def normalizeArch(String v) {
+    v = v.toLowerCase(Locale.US).replaceAll("[^a-z0-9]+", "")
+    if (v.matches('^(x8664|amd64|ia32e|em64t|x64)$')) return "x86_64"
+    if (v.matches('^(x8632|x86|i[3-6]86|ia32|x32)$')) return "x86_32"
+    if (v == "aarch64") return "aarch64"
+    return "unknown"
+}
+
+def rustOs = normalizeOs(System.getProperty("os.name", ""))
+def rustArch = normalizeArch(System.getProperty("os.arch", ""))
+def rustLibName = System.mapLibraryName("c2me_wgpu")
+def rustNativesRoot = layout.buildDirectory.dir("rust-natives").get().asFile
+def rustStageDir = new File(rustNativesRoot, "natives/${rustOs}-${rustArch}")
+
+if (!project.hasProperty('skipRust') || !project.property('skipRust').toBoolean()) {
+    tasks.register('rustBuild') {
+        group = 'build'
+        description = 'Compile the Rust wgpu native library and stage it for JAR packaging.'
+        inputs.dir(new File(rustDir, 'src'))
+        inputs.file(new File(rustDir, 'Cargo.toml'))
+        inputs.file(new File(rustDir, 'Cargo.lock'))
+        outputs.dir(rustStageDir)
+
+        doLast {
+            logger.lifecycle("[c2me-wgpu] Running cargo build --release in ${rustDir}")
+            def proc = new ProcessBuilder('cargo', 'build', '--release')
+                    .directory(rustDir)
+                    .inheritIO()
+                    .start()
+            int code = proc.waitFor()
+            if (code != 0) {
+                throw new GradleException("cargo build --release failed with exit code ${code}")
+            }
+            def built = new File(rustDir, "target/release/${rustLibName}")
+            if (!built.exists()) {
+                throw new GradleException("Rust library not found after build: ${built}")
+            }
+            rustStageDir.mkdirs()
+            copy {
+                from built
+                into rustStageDir
+            }
+            logger.lifecycle("[c2me-wgpu] Staged native library -> ${rustStageDir}/${rustLibName}")
+        }
+    }
+    processResources.dependsOn rustBuild
+    sourcesJar.dependsOn rustBuild
+    checkLicenseMain.dependsOn rustBuild
+
+    // Package the staged natives into the JAR explicitly (avoids registering
+    // build/rust-natives as a source set, which would confuse license/source scans).
+    processResources {
+        from(rustNativesRoot) {
+            into ''
+        }
+    }
+} else {
+    logger.lifecycle("[c2me-wgpu] -PskipRust set: skipping Rust native build")
+}
 
 // ---------------------------------------------------------------------------
 // Maven publish (useful for snapshot artifacts locally).

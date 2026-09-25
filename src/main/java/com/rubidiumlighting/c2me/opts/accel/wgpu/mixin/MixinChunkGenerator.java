@@ -26,15 +26,17 @@ package com.rubidiumlighting.c2me.opts.accel.wgpu.mixin;
 
 import com.rubidiumlighting.c2me.opts.accel.wgpu.NoiseRouterBlobifier;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuThinBinding;
-import net.minecraft.core.Holder;
-import net.minecraft.server.level.WorldGenRegion;
-import net.minecraft.world.level.StructureManager;
-import net.minecraft.world.level.chunk.ChunkAccess;
-import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
-import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
-import net.minecraft.world.level.levelgen.NoiseRouter;
-import net.minecraft.world.level.levelgen.RandomState;
-import net.minecraft.world.level.levelgen.blending.Blender;
+import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
+import net.minecraft.registry.entry.RegistryEntry;
+import net.minecraft.world.chunk.Chunk;
+import net.minecraft.world.chunk.ChunkSection;
+import net.minecraft.world.gen.StructureAccessor;
+import net.minecraft.world.gen.chunk.Blender;
+import net.minecraft.world.gen.chunk.ChunkGeneratorSettings;
+import net.minecraft.world.gen.chunk.NoiseChunkGenerator;
+import net.minecraft.world.gen.noise.NoiseConfig;
+import net.minecraft.world.gen.noise.NoiseRouter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.spongepowered.asm.mixin.Mixin;
@@ -42,56 +44,138 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
-import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
-@Mixin(NoiseBasedChunkGenerator.class)
+@Mixin(NoiseChunkGenerator.class)
 public abstract class MixinChunkGenerator {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu");
+    private static final AtomicBoolean WORLD_INIT_ATTEMPTED = new AtomicBoolean(false);
+    private static final AtomicLong WORLD_HANDLE = new AtomicLong(0L);
 
-    @Inject(method = "fillFromNoise", at = @At("HEAD"), cancellable = true)
-    private void onFillFromNoise(Blender blender, RandomState randomState,
-                                 StructureManager structureManager, ChunkAccess chunk,
-                                 CallbackInfoReturnable<CompletableFuture<ChunkAccess>> cir) {
+    @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
+    private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,
+                                 StructureAccessor structureAccessor, Chunk chunk,
+                                 CallbackInfoReturnable<CompletableFuture<Chunk>> cir) {
         if (!WgpuThinBinding.isAvailable()) {
             return;
         }
 
         try {
-            NoiseBasedChunkGenerator self = (NoiseBasedChunkGenerator) (Object) this;
+            // ── one-time world init ──────────────────────────────
+            if (WORLD_INIT_ATTEMPTED.compareAndSet(false, true)) {
+                // Use settings.noiseRouter(): the RAW, un-compiled node tree.
+                // (noiseConfig.getNoiseRouter() returns c2me-opts-dfc's compiled
+                // JVM bytecode, which cannot be serialized.)
+                NoiseChunkGenerator self = (NoiseChunkGenerator) (Object) this;
+                NoiseRouter router = getNoiseRouter(self);
+                if (router == null) {
+                    LOGGER.warn("[c2me-wgpu] NoiseRouter is null, falling back to CPU");
+                    return;
+                }
+                NoiseRouterBlobifier.ShapeConfig shape = new NoiseRouterBlobifier.ShapeConfig(-64, 384, 4, 4);
+                ByteBuffer blob = NoiseRouterBlobifier.blobify(router, shape, noiseConfig);
+                LOGGER.info("[c2me-wgpu] first chunk [{} {}], blob size={} bytes",
+                        chunk.getPos().x, chunk.getPos().z, blob.remaining());
+                trySendToRust(blob);
+            }
 
-            NoiseRouter router = getNoiseRouter(self);
-            if (router == null) {
-                LOGGER.warn("[c2me-wgpu] NoiseRouter is null, falling back to CPU");
+            long world = WORLD_HANDLE.get();
+            if (world == 0L) {
                 return;
             }
 
-            LOGGER.info("[c2me-wgpu] 🔥 onFillFromNoise intercepted! chunk={}", chunk.getPos());
+            // ── per-chunk GPU compute + write-back ───────────────
+            long req = WgpuThinBinding.requestChunks(world,
+                    new int[]{chunk.getPos().x, chunk.getPos().z});
+            if (req == 0L) {
+                return;
+            }
+            int st = WgpuThinBinding.pollStatus(req);
+            if (st != WgpuThinBinding.STATUS_DONE) {
+                return;
+            }
+            java.lang.foreign.MemorySegment seg = WgpuThinBinding.takeResultBlob(req);
+            writeDensityToChunk(chunk, seg);
 
-            NoiseRouterBlobifier.ShapeConfig shape = new NoiseRouterBlobifier.ShapeConfig(-64, 384, 4, 4);
-            ByteBuffer blob = NoiseRouterBlobifier.blobify(router, shape);
-            LOGGER.info("[c2me-wgpu] ✅ blobify completed, blob size={} bytes", blob.remaining());
-
-            // TODO: 调用 WgpuThinBinding 执行 GPU compute 并将结果写回 chunk
-            // 目前仅验证序列化链路，不 cancel 原版生成以避免坏档
-            // cir.cancel(); // ← 当 GPU 写回逻辑完成后取消注释
-
-        } catch (Exception e) {
-            LOGGER.error("[c2me-wgpu] ❌ Failed to use GPU acceleration, falling back to CPU", e);
+            // Cancel vanilla generation and hand back the (now filled) chunk.
+            cir.setReturnValue(CompletableFuture.completedFuture(chunk));
+        } catch (Throwable t) {
+            LOGGER.error("[c2me-wgpu] GPU populateNoise failed, falling back to CPU", t);
         }
     }
 
-    private NoiseRouter getNoiseRouter(NoiseBasedChunkGenerator generator) {
+    private static void trySendToRust(ByteBuffer blob) {
         try {
-            Field settingsField = generator.getClass().getDeclaredField("settings");
-            settingsField.setAccessible(true);
-            Holder<NoiseGeneratorSettings> holder = (Holder<NoiseGeneratorSettings>) settingsField.get(generator);
-            NoiseGeneratorSettings settings = holder.value();
-            Field noiseRouterField = settings.getClass().getDeclaredField("noiseRouter");
-            noiseRouterField.setAccessible(true);
-            return (NoiseRouter) noiseRouterField.get(settings);
+            long inst = WgpuThinBinding.getInstanceHandle();
+            long world = WgpuThinBinding.worldNew(inst, blob);
+            WORLD_HANDLE.set(world);
+            LOGGER.info("[c2me-wgpu] Rust WorldContext created, handle={}", world);
+        } catch (Throwable t) {
+            LOGGER.error("[c2me-wgpu] Rust world_new failed; staying on CPU path", t);
+        }
+    }
+
+    /**
+     * Write the GPU finalDensity channel (channel 11) to {@code chunk} as
+     * STONE / AIR. Cell grid = (16/cellW) × (height/cellH) × (16/cellW)
+     * = 4 × 96 × 4 = 1536 cells; each cell covers cellW×cellH×cellW blocks.
+     */
+    private static void writeDensityToChunk(Chunk chunk, java.lang.foreign.MemorySegment seg) {
+        final int CHANNEL = 11;                 // finalDensity
+        final int CELLS_PER_CHANNEL = 4 * 96 * 4;
+        final int PAYLOAD_BASE = 0x88;
+        final int CELL_W = 4;
+        final int CELL_H = 4;
+        final int CELLS_X = 4;
+        final int CELLS_Y = 96;
+        final int CELLS_Z = 4;
+        final int MIN_Y = -64;
+
+        long need = PAYLOAD_BASE + (long) (CHANNEL + 1) * CELLS_PER_CHANNEL * 4;
+        if (seg.byteSize() < need) {
+            return;
+        }
+
+        java.nio.ByteBuffer bb = seg.asByteBuffer();
+        bb.order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        int base = PAYLOAD_BASE + CHANNEL * CELLS_PER_CHANNEL * 4;
+
+        BlockState stone = Blocks.STONE.getDefaultState();
+        BlockState air = Blocks.AIR.getDefaultState();
+
+        for (int cy = 0; cy < CELLS_Y; cy++) {
+            for (int cz = 0; cz < CELLS_Z; cz++) {
+                for (int cx = 0; cx < CELLS_X; cx++) {
+                    int idx = cx + cz * CELLS_X + cy * CELLS_X * CELLS_Z;
+                    float d = bb.getFloat(base + idx * 4);
+                    BlockState bs = (d > 0.0f) ? stone : air;
+                    for (int dy = 0; dy < CELL_H; dy++) {
+                        int by = MIN_Y + cy * CELL_H + dy;
+                        int secIdx = chunk.getSectionIndex(by);
+                        if (secIdx < 0 || secIdx >= chunk.getSectionArray().length) continue;
+                        ChunkSection sec = chunk.getSection(secIdx);
+                        for (int dz = 0; dz < CELL_W; dz++) {
+                            int bz = cz * CELL_W + dz;
+                            for (int dx = 0; dx < CELL_W; dx++) {
+                                int bx = cx * CELL_W + dx;
+                                sec.setBlockState(bx & 15, by & 15, bz & 15, bs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private NoiseRouter getNoiseRouter(NoiseChunkGenerator generator) {
+        try {
+            RegistryEntry<ChunkGeneratorSettings> entry = generator.getSettings();
+            ChunkGeneratorSettings settings = entry.value();
+            return settings.noiseRouter();
         } catch (Exception e) {
             LOGGER.error("Failed to get NoiseRouter", e);
             return null;

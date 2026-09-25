@@ -43,7 +43,27 @@ use crate::ast::NoiseType;
 ///
 /// Protocol layout (计划.txt §4):
 ///   [HEADER 10B] [NODE_TREE (recursive)] [SHAPE_CONFIG 16B] [BIOME_SOURCE (BiomeTree)]
+/// A single Perlin permutation table + its origin offset, as shipped in the
+/// optional PERM_RESOURCE trailer appended by the Java side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermEntry {
+    pub perm: [u32; 256],
+    pub origin: [f64; 3],
+}
+
+/// Magic of the PERM_RESOURCE trailer: "PWPM" little-endian.
+pub const PERM_MAGIC: u32 = 0x4D52_5750;
+
 pub fn deserialize_full(blob: &[u8]) -> Result<(AstNode, ShapeConfig, AstNode)> {
+    let (root, shape, biome, _perm) = deserialize_full_with_perm(blob)?;
+    Ok((root, shape, biome))
+}
+
+/// Like [`deserialize_full`] but also decodes the optional PERM_RESOURCE
+/// trailer. Returns an empty Vec when the trailer is absent.
+pub fn deserialize_full_with_perm(
+    blob: &[u8],
+) -> Result<(AstNode, ShapeConfig, AstNode, Vec<PermEntry>)> {
     // 1. check blob.len() >= 10, else Deserialize("truncated header")
     ensure(blob.len() >= 10, "header")?;
     // 2. read u32 magic at offset 0, assert == 0x4D433257
@@ -76,8 +96,44 @@ pub fn deserialize_full(blob: &[u8]) -> Result<(AstNode, ShapeConfig, AstNode)> 
     // (allow trailing bytes for future extension; protocol doesn't forbid them)
     let _ = cursor;
 
-    // 7. return (root, shape_cfg, biome_tree)
-    Ok((root, shape_cfg, biome_tree))
+    // 7. optional PERM_RESOURCE trailer
+    let perm_entries = parse_perm_resource(blob, cursor).unwrap_or_default();
+
+    Ok((root, shape_cfg, biome_tree, perm_entries))
+}
+
+/// Parse the optional PERM_RESOURCE trailer starting at `offset`.
+/// Returns empty Vec when no trailer is present.
+fn parse_perm_resource(blob: &[u8], offset: usize) -> Result<Vec<PermEntry>> {
+    if offset + 8 > blob.len() {
+        return Ok(Vec::new());
+    }
+    let magic = u32::from_le_bytes(blob[offset..offset + 4].try_into().unwrap());
+    if magic != PERM_MAGIC {
+        return Ok(Vec::new());
+    }
+    let count = u32::from_le_bytes(blob[offset + 4..offset + 8].try_into().unwrap()) as usize;
+    let mut cursor = offset + 8;
+    let entry_size = 256 * 4 + 3 * 8;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if cursor + entry_size > blob.len() {
+            break;
+        }
+        let mut perm = [0u32; 256];
+        for (i, slot) in perm.iter_mut().enumerate() {
+            let p = cursor + i * 4;
+            *slot = u32::from_le_bytes(blob[p..p + 4].try_into().unwrap());
+        }
+        cursor += 256 * 4;
+        let mut origin = [0f64; 3];
+        for slot in origin.iter_mut() {
+            *slot = f64::from_le_bytes(blob[cursor..cursor + 8].try_into().unwrap());
+            cursor += 8;
+        }
+        out.push(PermEntry { perm, origin });
+    }
+    Ok(out)
 }
 
 /// Recursively parse one `[tag:u8][payload]` node starting at bytes[offset..].

@@ -94,7 +94,10 @@ impl SingleBatchExecutor {
         queue: Arc<wgpu::Queue>,
         config: ExecutorConfig,
     ) -> Result<Self, String> {
-        let max_buffer_size = 8 * 1024 * 1024;
+        // One chunk = 16 channels × 16×16×16 cells × 4 bytes = 256 KiB.
+        // Staging must hold a full batch (config.max_batch_size chunks).
+        let bytes_per_chunk: usize = 16 * 16 * 16 * 16 * 4;
+        let max_buffer_size = bytes_per_chunk * config.max_batch_size.max(1);
         let staging = StagingChain::new(&device, config.staging_capacity, max_buffer_size);
 
         let bind_group_layout = bind_group::create_layout(&device)
@@ -127,7 +130,7 @@ impl SingleBatchExecutor {
 
         let t0 = std::time::Instant::now();
         let num_chunks = batch.positions.len() as u32;
-        let f32_per_chunk = 16 * 16 * 16; // 16 channels × 16×16×16 cells
+        let f32_per_chunk = 16 * 16 * 16 * 16; // 16 channels × 16×16×16 cells
         let total_f32s = (num_chunks as usize) * f32_per_chunk;
         let total_bytes = total_f32s * 4;
 
@@ -255,8 +258,12 @@ impl SingleBatchExecutor {
             .collect();
 
         let mut result_map = FxHashMap::default();
-        let channel_offsets = [0u64; 16];
-        let chunk_size_f32 = 16 * 16 * 16;
+        const CELLS_PER_CHANNEL: usize = 16 * 16 * 16;
+        let mut channel_offsets = [0u64; 16];
+        for (ch, off) in channel_offsets.iter_mut().enumerate() {
+            *off = (ch * CELLS_PER_CHANNEL * 4) as u64;
+        }
+        let chunk_size_f32 = 16 * CELLS_PER_CHANNEL;
 
         for (i, &pos) in batch.positions.iter().enumerate() {
             let start = i * chunk_size_f32;

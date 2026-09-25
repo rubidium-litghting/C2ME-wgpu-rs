@@ -21,25 +21,34 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 package com.rubidiumlighting.c2me.opts.accel.wgpu;
 
+import net.minecraft.util.math.noise.DoublePerlinNoiseSampler;
+import net.minecraft.util.math.noise.OctavePerlinNoiseSampler;
+import net.minecraft.util.math.noise.PerlinNoiseSampler;
+import net.minecraft.world.gen.densityfunction.DensityFunction;
+import net.minecraft.world.gen.densityfunction.DensityFunctionTypes;
+import net.minecraft.world.gen.noise.NoiseConfig;
+import net.minecraft.world.gen.noise.NoiseRouter;
+
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.IdentityHashMap;
-import java.util.Map;
+import java.util.List;
 
-import net.minecraft.world.level.levelgen.DensityFunction;
-import net.minecraft.world.level.levelgen.DensityFunctions;
-import net.minecraft.world.level.levelgen.NoiseRouter;
-
-/**
- * 将 26.2 的 NoiseRouter 序列化为二进制格式，使用反射访问私有字段。
- */
 public class NoiseRouterBlobifier {
 
-    // 标签常量
+    // ── Permutation resource collection ─────────────────────────────
+    private static final int PERM_MAGIC = 0x4D525750; // "PWPM"
+    private static final IdentityHashMap<Object, Void> SEEN_PERM = new IdentityHashMap<>();
+    private static final List<Object> PERM_SAMPLERS = new ArrayList<>();
+    private static Object lastDperlin = null;
+    private static NoiseConfig CURRENT_NOISE_CONFIG = null;
+
+    // ── Tags ────────────────────────────────────────────────────────
     private static final byte TAG_CONSTANT = 0x01;
     private static final byte TAG_INPUT_X = 0x02;
     private static final byte TAG_INPUT_Y = 0x03;
@@ -50,38 +59,43 @@ public class NoiseRouterBlobifier {
     private static final byte TAG_DIV = 0x13;
     private static final byte TAG_MIN = 0x14;
     private static final byte TAG_MAX = 0x15;
-    private static final byte TAG_FLOOR_DIV = 0x24;
     private static final byte TAG_ABS = 0x20;
     private static final byte TAG_SQUARE = 0x21;
     private static final byte TAG_CUBE = 0x22;
     private static final byte TAG_SQRT = 0x23;
+    private static final byte TAG_FLOOR_DIV = 0x24;
     private static final byte TAG_NOISE_SAMPLER = (byte) 0x84;
+    private static final byte TAG_INTERP_NOISE = (byte) 0x90;
     private static final byte TAG_END_ISLANDS = (byte) 0xA0;
+    private static final byte TAG_BEARDIFIER = (byte) 0xA1;
     private static final byte TAG_RANGE_CHOICE = (byte) 0xB1;
-    private static final byte TAG_FIND_TOP_SURFACE = (byte) 0xD0;
+    private static final byte TAG_INTERVAL_SEL = (byte) 0xB2;
+    private static final byte TAG_Y_CLAMPED_GRAD = (byte) 0xB3;
+    private static final byte TAG_CACHE_FLAT = (byte) 0xC0;
+    private static final byte TAG_CACHE_2D = (byte) 0xC1;
+    private static final byte TAG_CACHE_INTERP = (byte) 0xC2;
+    private static final byte TAG_FIND_TOP_SURF = (byte) 0xD0;
+    private static final byte TAG_AQUIFER = (byte) 0xE0;
+    private static final byte TAG_BIOME_TREE = (byte) 0xF0;
     private static final byte TAG_ROOT = (byte) 0xFE;
-    private static final byte TAG_SHIFTED_NOISE = 0x32;
-    private static final byte TAG_CLAMP = 0x33;
-    private static final byte TAG_MARKER = 0x34;
 
-    private static final Map<DensityFunction, Void> visited = new IdentityHashMap<>();
-
-    // 缓存类名以加速
-    private static final String CONSTANT_CLASS = "net.minecraft.world.level.levelgen.DensityFunctions$Constant";
-    private static final String MUL_OR_ADD_CLASS = "net.minecraft.world.level.levelgen.DensityFunctions$MulOrAdd";
-    private static final String NOISE_CLASS = "net.minecraft.world.level.levelgen.DensityFunctions$Noise";
-    private static final String RANGE_CHOICE_CLASS = "net.minecraft.world.level.levelgen.DensityFunctions$RangeChoice";
-    private static final String FIND_TOP_SURFACE_CLASS = "net.minecraft.world.level.levelgen.DensityFunctions$FindTopSurface";
-    private static final String END_ISLAND_CLASS = "net.minecraft.world.level.levelgen.DensityFunctions$EndIslandDensityFunction";
-
-    public static ByteBuffer blobify(NoiseRouter router, ShapeConfig shape) {
-        visited.clear();
-        ByteBuffer buf = ByteBuffer.allocate(4096).order(ByteOrder.LITTLE_ENDIAN);
-        buf.putInt(0x4D433257);
+    public static ByteBuffer blobify(NoiseRouter router, ShapeConfig shape, NoiseConfig noiseConfig) {
+        CURRENT_NOISE_CONFIG = noiseConfig;
+        ByteBuffer buf = ByteBuffer.allocate(4 * 1024 * 1024).order(ByteOrder.LITTLE_ENDIAN);
+        SEEN_PERM.clear();
+        PERM_SAMPLERS.clear();
+        // ── HEADER (10B) ─────────────────────────────────────────
+        buf.put((byte) 0x4D);
+        buf.put((byte) 0x43);
+        buf.put((byte) 0x32);
+        buf.put((byte) 0x57);
         buf.putShort((short) 1);
         buf.putInt(0);
 
-        // 序列化 15 个密度函数
+        // ── ROOT + 15 channels ──────────────────────────────────
+        buf.put(TAG_ROOT);
+        buf.putShort((short) 15);
+
         writeDF(buf, router.barrierNoise());
         writeDF(buf, router.fluidLevelFloodednessNoise());
         writeDF(buf, router.fluidLevelSpreadNoise());
@@ -92,340 +106,270 @@ public class NoiseRouterBlobifier {
         writeDF(buf, router.erosion());
         writeDF(buf, router.depth());
         writeDF(buf, router.ridges());
-        writeDF(buf, router.preliminarySurfaceLevel());
+        writeDF(buf, router.initialDensityWithoutJaggedness());
         writeDF(buf, router.finalDensity());
         writeDF(buf, router.veinToggle());
         writeDF(buf, router.veinRidged());
         writeDF(buf, router.veinGap());
 
+        // ── SHAPE_CONFIG (16B) ──────────────────────────────────
         buf.putInt(shape.minY);
         buf.putInt(shape.height);
         buf.putInt(shape.cellWidth);
         buf.putInt(shape.cellHeight);
 
-        // BIOME_SOURCE: 占位 BiomeTree
-        buf.put((byte) 0xF0);
+        // ── BIOME_SOURCE placeholder ────────────────────────────
+        buf.put(TAG_BIOME_TREE);
         buf.putLong(0);
+
+        // ── PERM_RESOURCE (appended; Rust stores for later use) ─
+        writePermResource(buf);
 
         buf.flip();
         return buf;
     }
 
+    private static void writeConstant(ByteBuffer buf, float value) {
+        buf.put(TAG_CONSTANT);
+        buf.putFloat(value);
+    }
+
     private static void writeDF(ByteBuffer buf, DensityFunction df) {
-        System.out.println("[c2me-wgpu] writeDF: " + df.getClass().getName());
         if (df == null) {
-            buf.put(TAG_CONSTANT);
-            buf.putFloat(0.0f);
+            writeConstant(buf, 0.0f);
             return;
         }
-        // 使用类名判断
-        String className = df.getClass().getName();
-        try {
-            if (className.equals(CONSTANT_CLASS)) {
-                double val = getDoubleField(df, "value");
-                buf.put(TAG_CONSTANT);
-                buf.putFloat((float) val);
-            } else if (className.equals(MUL_OR_ADD_CLASS)) {
-                // 读取 specificType, input, argument
-                Object type = getField(df, "specificType");
-                String typeName = type.toString(); // 可能是 "ADD" 或 "MUL"
-                if ("ADD".equals(typeName)) {
-                    buf.put(TAG_ADD);
-                } else if ("MUL".equals(typeName)) {
-                    buf.put(TAG_MUL);
-                } else {
-                    throw new UnsupportedOperationException("MulOrAdd type: " + typeName);
-                }
-                DensityFunction input = (DensityFunction) getField(df, "input");
-                double argument = getDoubleField(df, "argument");
-                writeDF(buf, input);
-                buf.put(TAG_CONSTANT);
-                buf.putFloat((float) argument);
-            } else if (className.equals(NOISE_CLASS)) {
-                Object noiseHolder = getField(df, "noise");
-                double xzScale = getDoubleField(df, "xzScale");
-                double yScale = getDoubleField(df, "yScale");
-                byte noiseType = 0;
-                long seed = 0;
-                // 判断 noiseHolder 类型
-                String holderClassName = noiseHolder.getClass().getName();
-                if (holderClassName.contains("PerlinNoise")) {
-                    noiseType = 0;
-                    seed = getSeedFromNoise(noiseHolder);
-                } else if (holderClassName.contains("SimplexNoise")) {
-                    noiseType = 1;
-                    seed = getSeedFromNoise(noiseHolder);
-                } else {
-                    noiseType = 0;
-                    seed = 0;
-                }
-                buf.put(TAG_NOISE_SAMPLER);
-                buf.put(noiseType);
-                buf.putLong(seed);
-                buf.putFloat((float) xzScale);
-                buf.putFloat((float) yScale);
-            } else if (className.equals(RANGE_CHOICE_CLASS)) {
-                DensityFunction input = (DensityFunction) getField(df, "input");
-                double minInclusive = getDoubleField(df, "minInclusive");
-                double maxExclusive = getDoubleField(df, "maxExclusive");
-                DensityFunction whenInRange = (DensityFunction) getField(df, "whenInRange");
-                DensityFunction whenOutOfRange = (DensityFunction) getField(df, "whenOutOfRange");
-                buf.put(TAG_RANGE_CHOICE);
-                writeDF(buf, input);
-                // 用常量包装 min 和 max
-                buf.put(TAG_CONSTANT);
-                buf.putFloat((float) minInclusive);
-                buf.put(TAG_CONSTANT);
-                buf.putFloat((float) maxExclusive);
-                writeDF(buf, whenInRange);
-                writeDF(buf, whenOutOfRange);
-                // 多写一个 out_hi，用 whenOutOfRange 替代
-                writeDF(buf, whenOutOfRange);
-            } else if (className.equals(FIND_TOP_SURFACE_CLASS)) {
-                DensityFunction density = (DensityFunction) getField(df, "density");
-                DensityFunction upperBound = (DensityFunction) getField(df, "upperBound");
-                int lowerBound = getIntField(df, "lowerBound");
-                int cellHeight = getIntField(df, "cellHeight");
-                buf.put(TAG_FIND_TOP_SURFACE);
-                writeDF(buf, density);
-                writeDF(buf, upperBound);
-                buf.putInt(lowerBound);
-                buf.putInt(cellHeight);
-            } else if (className.equals(END_ISLAND_CLASS)) {
-                buf.put(TAG_END_ISLANDS);
-                buf.put(TAG_INPUT_X);
-            } else if (className.equals("net.minecraft.world.level.levelgen.DensityFunctions$Clamp")) {
-                // 字段: input, minValue, maxValue
-                try {
-                    DensityFunction input = (DensityFunction) getField(df, "input");
-                    double minValue = getDoubleField(df, "minValue");
-                    double maxValue = getDoubleField(df, "maxValue");
-                    buf.put(TAG_CLAMP);
-                    writeDF(buf, input);
-                    // min 和 max 作为常量子节点
-                    buf.put(TAG_CONSTANT);
-                    buf.putFloat((float) minValue);
-                    buf.put(TAG_CONSTANT);
-                    buf.putFloat((float) maxValue);
-                } catch (Exception e) {
-                    System.err.println("[c2me-wgpu] ❌ Failed to serialize Clamp: " + e.getMessage());
-                    buf.put(TAG_CONSTANT);
-                    buf.putFloat(0.0f);
-                }
-            } else if (className.equals("net.minecraft.world.level.levelgen.DensityFunctions$Marker")) {
-                // Marker 只是一个包装器，递归其 wrapped
-                try {
-                    DensityFunction wrapped = (DensityFunction) getField(df, "wrapped");
-                    buf.put(TAG_MARKER);
-                    writeDF(buf, wrapped);
-                } catch (Exception e) {
-                    System.err.println("[c2me-wgpu] ❌ Failed to serialize Marker: " + e.getMessage());
-                    buf.put(TAG_CONSTANT);
-                    buf.putFloat(0.0f);
-                }
-            } else if (className.equals("net.minecraft.world.level.levelgen.DensityFunctions$HolderHolder")) {
-                try {
-                    Object holder = getField(df, "holder");
-                    java.lang.reflect.Method valueMethod = holder.getClass().getMethod("value");
-                    DensityFunction unwrapped = (DensityFunction) valueMethod.invoke(holder);
-                    writeDF(buf, unwrapped);
-                } catch (Exception e) {
-                    System.err.println("[c2me-wgpu] ❌ Failed to unwrap HolderHolder: " + e.getMessage());
-                    buf.put(TAG_CONSTANT);
-                    buf.putFloat(0.0f);
-                }
-            } else if (className.equals("net.minecraft.world.level.levelgen.DensityFunctions$Add")) {
-                buf.put(TAG_ADD);
-                writeDF(buf, (DensityFunction) getField(df, "argument1"));
-                writeDF(buf, (DensityFunction) getField(df, "argument2"));
-            } else if (className.equals("net.minecraft.world.level.levelgen.DensityFunctions$Mul")) {
-                buf.put(TAG_MUL);
-                writeDF(buf, (DensityFunction) getField(df, "argument1"));
-                writeDF(buf, (DensityFunction) getField(df, "argument2"));
-            } else if (className.equals("net.minecraft.world.level.levelgen.DensityFunctions$Min")) {
-                buf.put(TAG_MIN);
-                writeDF(buf, (DensityFunction) getField(df, "argument1"));
-                writeDF(buf, (DensityFunction) getField(df, "argument2"));
-            } else if (className.equals("net.minecraft.world.level.levelgen.DensityFunctions$Max")) {
-                buf.put(TAG_MAX);
-                writeDF(buf, (DensityFunction) getField(df, "argument1"));
-                writeDF(buf, (DensityFunction) getField(df, "argument2"));
-            } else if (className.contains("Ap2")) {
-                try {
-                    // 获取操作类型
-                    Object type = null;
-                    try {
-                        // 尝试获取字段 "type"
-                        Field typeField = df.getClass().getDeclaredField("type");
-                        typeField.setAccessible(true);
-                        type = typeField.get(df);
-                    } catch (NoSuchFieldException e1) {
-                        try {
-                            // 尝试方法 "type()"
-                            Method typeMethod = df.getClass().getMethod("type");
-                            type = typeMethod.invoke(df);
-                        } catch (NoSuchMethodException e2) {
-                            // 尝试字段 "specificType"
-                            Field specificTypeField = df.getClass().getDeclaredField("specificType");
-                            specificTypeField.setAccessible(true);
-                            type = specificTypeField.get(df);
-                        }
-                    }
-                    if (type == null) {
-                        // 回退到常量 0
-                        buf.put(TAG_CONSTANT);
-                        buf.putFloat(0.0f);
-                        return;
-                    }
-                    String typeName = type.toString().toUpperCase();
-                    byte tag;
-                    switch (typeName) {
-                        case "ADD": tag = TAG_ADD; break;
-                        case "SUB": tag = TAG_SUB; break;
-                        case "MUL": tag = TAG_MUL; break;
-                        case "DIV": tag = TAG_DIV; break;
-                        case "MIN": tag = TAG_MIN; break;
-                        case "MAX": tag = TAG_MAX; break;
-                        default: tag = TAG_ADD; break;
-                    }
-                    buf.put(tag);
 
-                    // 获取左右子节点
-                    DensityFunction left = null;
-                    DensityFunction right = null;
-                    try {
-                        Field leftField = df.getClass().getDeclaredField("left");
-                        leftField.setAccessible(true);
-                        left = (DensityFunction) leftField.get(df);
-                    } catch (NoSuchFieldException e) {
-                        // 尝试 "input" 和 "argument"
-                        Field inputField = df.getClass().getDeclaredField("input");
-                        inputField.setAccessible(true);
-                        left = (DensityFunction) inputField.get(df);
-                        Field argField = df.getClass().getDeclaredField("argument");
-                        argField.setAccessible(true);
-                        // 如果 argument 是 double，则包装为常量
-                        double arg = argField.getDouble(df);
-                        right = DensityFunctions.constant(arg);
-                    }
-                    if (right == null) {
-                        try {
-                            Field rightField = df.getClass().getDeclaredField("right");
-                            rightField.setAccessible(true);
-                            right = (DensityFunction) rightField.get(df);
-                        } catch (NoSuchFieldException e) {
-                            // 尝试 "argument2" 等
-                            Field arg2Field = df.getClass().getDeclaredField("argument2");
-                            arg2Field.setAccessible(true);
-                            double arg2 = arg2Field.getDouble(df);
-                            right = DensityFunctions.constant(arg2);
-                        }
-                    }
-                    if (left == null || right == null) {
-                        buf.put(TAG_CONSTANT);
-                        buf.putFloat(0.0f);
-                        return;
-                    }
-                    writeDF(buf, left);
-                    writeDF(buf, right);
-                } catch (Exception e) {
-                    // 如果失败，回退到常量 0
-                    buf.put(TAG_CONSTANT);
-                    buf.putFloat(0.0f);
-                }
-            } else if (className.contains("IntervalSelect")) {
-                buf.put(TAG_CONSTANT);
-                buf.putFloat(0.0f);
-            // Unsupported: 
-            } else if (className.contains("Spline")) {
-                buf.put(TAG_CONSTANT);
-                buf.putFloat(0.0f);
-            // Unsupported: 
-            } else if (className.contains("ShiftedNoise")) {
-                try {
-                    // 获取三个偏移函数和噪声对象
-                    DensityFunction shiftX = (DensityFunction) getField(df, "shiftX");
-                    DensityFunction shiftY = (DensityFunction) getField(df, "shiftY");
-                    DensityFunction shiftZ = (DensityFunction) getField(df, "shiftZ");
-                    Object noiseHolder = getField(df, "noise");
-                    double xzScale = getDoubleField(df, "xzScale");
-                    double yScale = getDoubleField(df, "yScale");
-                    buf.put(TAG_SHIFTED_NOISE);
-                    // 序列化三个偏移函数
-                    writeDF(buf, shiftX);
-                    writeDF(buf, shiftY);
-                    writeDF(buf, shiftZ);
-                    // 序列化噪声采样器（类似 Noise 节点）
-                    byte noiseType = 0;
-                    if (noiseHolder.getClass().getName().contains("Simplex")) noiseType = 1;
-                    long seed = getSeedFromNoise(noiseHolder);
-                    buf.put(noiseType);
-                    buf.putLong(seed);
-                    buf.putFloat((float) xzScale);
-                    buf.putFloat((float) yScale);
-                } catch (Exception e) {
-                    System.err.println("[c2me-wgpu] ❌ Failed to serialize ShiftedNoise: " + e.getMessage());
-                    buf.put(TAG_CONSTANT);
-                    buf.putFloat(0.0f);
-                }
-            } else if (className.contains("BeardifierMarker")) {
-                // 暂时用 Constant(0) 替代
-                buf.put(TAG_CONSTANT);
-                buf.putFloat(0.0f);
-            }  
-            else {
-                // 【诊断模式】打印未识别节点的完整字段信息
-                System.err.println("[c2me-wgpu] ⚠️ UNSUPPORTED NODE: " + className);
-                System.err.println("[c2me-wgpu]   Available fields: ");
-                for (java.lang.reflect.Field f : df.getClass().getDeclaredFields()) {
-                    f.setAccessible(true);
-                    Object val = null;
-                    try { val = f.get(df); } catch (Exception ignored) {}
-                    String valStr = (val instanceof DensityFunction)
-                        ? "DensityFunction(" + val.getClass().getSimpleName() + ")"
-                        : String.valueOf(val);
-                    System.err.println("[c2me-wgpu]     - " + f.getName() + " : " + f.getType().getSimpleName() + " = " + valStr);
-                }
-                buf.put(TAG_CONSTANT);
-                buf.putFloat(0.0f);
+        // ── Registry holder unwrap ──────────────────────────────
+        if (df instanceof DensityFunctionTypes.RegistryEntryHolder h) {
+            writeDF(buf, h.function().value());
+            return;
+        }
+
+        // ── Blend pseudo-nodes ──────────────────────────────────
+        if (df instanceof DensityFunctionTypes.BlendAlpha) {
+            writeConstant(buf, 1.0f);
+            return;
+        }
+        if (df instanceof DensityFunctionTypes.BlendOffset) {
+            writeConstant(buf, 0.0f);
+            return;
+        }
+        if (df instanceof DensityFunctionTypes.BlendDensity bd) {
+            writeDF(buf, bd.input());
+            return;
+        }
+
+        // ── Beardifier ──────────────────────────────────────────
+        if (df instanceof DensityFunctionTypes.Beardifier) {
+            buf.put(TAG_BEARDIFIER);
+            buf.putInt(0);
+            return;
+        }
+
+        // ── Constant ────────────────────────────────────────────
+        if (df instanceof DensityFunctionTypes.Constant c) {
+            writeConstant(buf, (float) c.value());
+            return;
+        }
+
+        // ── BinaryOperationLike (BinaryOperation + LinearOperation) ──
+        if (df instanceof DensityFunctionTypes.BinaryOperationLike b) {
+            DensityFunction a1 = b.argument1();
+            DensityFunction a2 = b.argument2();
+            switch (b.type()) {
+                case ADD -> buf.put(TAG_ADD);
+                case MUL -> buf.put(TAG_MUL);
+                case MIN -> buf.put(TAG_MIN);
+                case MAX -> buf.put(TAG_MAX);
             }
-        } catch (Exception e) {
-            System.err.println("[c2me-wgpu] ❌ FAILED to serialize: " + className + " | " + e.getMessage());
-            e.printStackTrace();
-            buf.put(TAG_CONSTANT);
-            buf.putFloat(0.0f);
+            writeDF(buf, a1);
+            writeDF(buf, a2);
+            return;
+        }
+
+        // ── UnaryOperation ──────────────────────────────────────
+        if (df instanceof DensityFunctionTypes.UnaryOperation u) {
+            DensityFunction in = u.input();
+            switch (u.type()) {
+                case ABS -> { buf.put(TAG_ABS); writeDF(buf, in); }
+                case SQUARE -> { buf.put(TAG_SQUARE); writeDF(buf, in); }
+                case CUBE -> { buf.put(TAG_CUBE); writeDF(buf, in); }
+                case HALF_NEGATIVE -> {
+                    buf.put(TAG_MUL);
+                    writeConstant(buf, -0.5f);
+                    writeDF(buf, in);
+                }
+                case QUARTER_NEGATIVE -> {
+                    buf.put(TAG_MUL);
+                    writeConstant(buf, -0.25f);
+                    writeDF(buf, in);
+                }
+                case SQUEEZE -> writeConstant(buf, 0.0f);
+            }
+            return;
+        }
+
+        // ── RangeChoice ─────────────────────────────────────────
+        if (df instanceof DensityFunctionTypes.RangeChoice r) {
+            buf.put(TAG_RANGE_CHOICE);
+            writeDF(buf, r.input());
+            writeConstant(buf, (float) r.minInclusive());
+            writeConstant(buf, (float) r.maxExclusive());
+            writeDF(buf, r.whenInRange());
+            writeDF(buf, r.whenOutOfRange());
+            writeDF(buf, r.whenOutOfRange());
+            return;
+        }
+
+        // ── Clamp → min(max(x, min), max) ───────────────────────
+        if (df instanceof DensityFunctionTypes.Clamp c) {
+            buf.put(TAG_MIN);
+            writeConstant(buf, (float) c.maxValue());
+            buf.put(TAG_MAX);
+            writeConstant(buf, (float) c.minValue());
+            writeDF(buf, c.input());
+            return;
+        }
+
+        // ── Wrapping (caches) ───────────────────────────────────
+        if (df instanceof DensityFunctionTypes.Wrapping w) {
+            switch (w.type()) {
+                case FLAT_CACHE -> buf.put(TAG_CACHE_FLAT);
+                case CACHE2D -> buf.put(TAG_CACHE_2D);
+                case CACHE_ONCE, CACHE_ALL_IN_CELL -> buf.put(TAG_CACHE_INTERP);
+                case INTERPOLATED -> buf.put(TAG_INTERP_NOISE);
+            }
+            writeDF(buf, w.wrapped());
+            return;
+        }
+
+        // ── Collect noise samplers before the Phase-2 placeholder ──
+        if (df instanceof DensityFunctionTypes.Noise tn) {
+            registerNoiseSampler(tn.noise());
+        }
+
+        // ── Phase-2 placeholders (noise chain) ──────────────────
+        if (df instanceof DensityFunctionTypes.YClampedGradient
+                || df instanceof DensityFunctionTypes.Noise
+                || df instanceof DensityFunctionTypes.ShiftedNoise
+                || df instanceof DensityFunctionTypes.Shift
+                || df instanceof DensityFunctionTypes.ShiftA
+                || df instanceof DensityFunctionTypes.ShiftB
+                || df instanceof DensityFunctionTypes.WeirdScaledSampler
+                || df instanceof DensityFunctionTypes.Spline
+                || df instanceof DensityFunctionTypes.EndIslands) {
+            writeConstant(buf, 0.0f);
+            return;
+        }
+
+        // ── Unknown node — diagnostic dump ──────────────────────
+        System.err.println("[c2me-wgpu] UNSUPPORTED NODE: " + df.getClass().getName());
+        for (Field f : df.getClass().getDeclaredFields()) {
+            try {
+                f.setAccessible(true);
+                Object v = f.get(df);
+                String repr = (v instanceof DensityFunction d)
+                        ? ("DensityFunction(" + d.getClass().getSimpleName() + ")")
+                        : String.valueOf(v);
+                System.err.println("[c2me-wgpu]   field " + f.getName()
+                        + " : " + f.getType().getSimpleName() + " = " + repr);
+            } catch (Throwable ignored) {
+            }
+        }
+        writeConstant(buf, 0.0f);
+    }
+
+    /**
+     * Append the collected Perlin permutation tables.
+     * Layout (little-endian):
+     *   u32 magic = 0x4D525750 ("PWPM")
+     *   u32 count
+     *   for each entry:
+     *     u32 perm[256]     (permutation bytes widened to u32)
+     *     f64 origin_x, origin_y, origin_z
+     */
+    private static void writePermResource(ByteBuffer buf) {
+        buf.putInt(PERM_MAGIC);
+        buf.putInt(PERM_SAMPLERS.size());
+        for (Object sampler : PERM_SAMPLERS) {
+            try {
+                byte[] perm = findPermutation(sampler);
+                for (int i = 0; i < 256; i++) {
+                    buf.putInt(perm[i] & 0xFF);
+                }
+                PerlinNoiseSampler p = (PerlinNoiseSampler) sampler;
+                buf.putDouble(p.originX);
+                buf.putDouble(p.originY);
+                buf.putDouble(p.originZ);
+            } catch (Throwable t) {
+                System.err.println("[c2me-wgpu] perm resource: skip sampler: " + t);
+                for (int i = 0; i < 256; i++) buf.putInt(0);
+                buf.putDouble(0); buf.putDouble(0); buf.putDouble(0);
+            }
         }
     }
 
-    // 反射工具方法
-    private static Object getField(Object obj, String fieldName) throws Exception {
-        Field field = obj.getClass().getDeclaredField(fieldName);
-        field.setAccessible(true);
-        return field.get(obj);
-    }
-
-    private static double getDoubleField(Object obj, String fieldName) throws Exception {
-        return (double) getField(obj, fieldName);
-    }
-
-    private static int getIntField(Object obj, String fieldName) throws Exception {
-        return (int) getField(obj, fieldName);
-    }
-
-    private static long getSeedFromNoise(Object noise) {
-        try {
-            // 尝试调用 seed() 方法（如果有）
-            Method method = noise.getClass().getMethod("seed");
-            return (long) method.invoke(noise);
-        } catch (Exception e1) {
-            try {
-                // 尝试读取 seed 字段
-                Field field = noise.getClass().getDeclaredField("seed");
-                field.setAccessible(true);
-                return field.getLong(noise);
-            } catch (Exception e2) {
-                return 0;
+    /** PerlinNoiseSampler has exactly one private byte[256] field (permutation). */
+    private static byte[] findPermutation(Object sampler) throws Exception {
+        for (Field f : sampler.getClass().getDeclaredFields()) {
+            if (f.getType() == byte[].class) {
+                f.setAccessible(true);
+                return (byte[]) f.get(sampler);
             }
+        }
+        throw new NoSuchFieldException("permutation (byte[]) not found");
+    }
+
+    private static void registerOctaveSampler(Object octaveSampler) {
+        if (octaveSampler == null) return;
+        try {
+            for (Field f : octaveSampler.getClass().getDeclaredFields()) {
+                if (f.getType() == PerlinNoiseSampler[].class) {
+                    f.setAccessible(true);
+                    PerlinNoiseSampler[] arr = (PerlinNoiseSampler[]) f.get(octaveSampler);
+                    for (PerlinNoiseSampler p : arr) {
+                        if (p != null && SEEN_PERM.put(p, null) == null) {
+                            PERM_SAMPLERS.add(p);
+                        }
+                    }
+                    return;
+                }
+            }
+        } catch (Throwable t) {
+            System.err.println("[c2me-wgpu] registerOctaveSampler failed: " + t);
+        }
+    }
+
+    private static void registerNoiseSampler(DensityFunction.Noise n) {
+        // 1) Prefer the already-instantiated sampler (populated when the router
+        //    comes from NoiseConfig; null for the raw settings template).
+        Object dperlin = n.noise();
+        // 2) Fall back to instantiating from NoiseConfig by registry key.
+        if (!(dperlin instanceof DoublePerlinNoiseSampler) && CURRENT_NOISE_CONFIG != null) {
+            try {
+                var keyOpt = n.noiseData().getKey();
+                if (keyOpt.isPresent()) {
+                    dperlin = CURRENT_NOISE_CONFIG.getOrCreateSampler(keyOpt.get());
+                }
+            } catch (Throwable t) {
+                System.err.println("[c2me-wgpu] getOrCreateSampler failed: " + t);
+            }
+        }
+        if (!(dperlin instanceof DoublePerlinNoiseSampler)) {
+            return;
+        }
+        if (dperlin == lastDperlin) return;
+        lastDperlin = dperlin;
+        try {
+            for (Field f : dperlin.getClass().getDeclaredFields()) {
+                if (OctavePerlinNoiseSampler.class.isAssignableFrom(f.getType())) {
+                    f.setAccessible(true);
+                    registerOctaveSampler(f.get(dperlin));
+                }
+            }
+        } catch (Throwable t) {
+            System.err.println("[c2me-wgpu] registerNoiseSampler failed: " + t);
         }
     }
 

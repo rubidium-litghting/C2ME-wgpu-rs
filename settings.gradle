@@ -26,7 +26,7 @@ if (c2meHome == null) {
     }
 }
 
-if (false && c2meHome != null && new File(c2meHome).isDirectory()) {
+if (c2meHome != null && new File(c2meHome).isDirectory()) {
     println "[settings.gradle] Using local C2ME-fabric composite build: $c2meHome"
     includeBuild(c2meHome) {
         dependencySubstitution {

@@ -27,7 +27,7 @@
 
 use crate::Result;
 use crate::ast::AstNode;
-use crate::ast::deserialize::{ShapeConfig, deserialize_full};
+use crate::ast::deserialize::{PermEntry, ShapeConfig, deserialize_full_with_perm};
 use crate::ast::equality::hash_ast;
 use crate::ast::opto;
 use crate::codegen::validate::validate_wgsl;
@@ -59,6 +59,11 @@ pub struct WorldContext {
     /// AST, packed into one flat `Vec<i32>` ready to upload to
     /// `@group(0) @binding(1)`.
     pub(crate) perm_table_set: PermutationTableSet,
+    /// Real Perlin permutation tables shipped by the Java side in the
+    /// PERM_RESOURCE trailer. Stored for the upcoming noise emitters;
+    /// not yet consumed by WGSL generation.
+    #[allow(dead_code)]
+    pub(crate) perm_entries: Vec<PermEntry>,
     /// Compiled single-pass pipeline — `None` until `compile_pipeline` is
     /// called. Cached globally in `pipeline_cache::IN_MEMORY_CACHE` keyed
     /// by `(fingerprint, Pass::Single)`.
@@ -84,7 +89,8 @@ impl WorldContext {
     /// without a real adapter.
     pub fn new(config_blob: &[u8]) -> Result<Self> {
         // 1. Deserialize Java blob into AST + shape + biome tail
-        let (ast_root, shape, biome_source) = deserialize_full(config_blob)?;
+        let (ast_root, shape, biome_source, perm_entries) =
+            deserialize_full_with_perm(config_blob)?;
 
         // 2. Run 4-pass optimization pipeline (constant_fold → normalize → cse → dce)
         let ast_root = opto::run_pipeline(ast_root)?;
@@ -112,6 +118,7 @@ impl WorldContext {
             fingerprint,
             shader_src,
             perm_table_set,
+            perm_entries,
             pipeline: None,
             perm_buffer: None,
         })

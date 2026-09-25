@@ -275,18 +275,16 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
         Ok(executed) => {
             // Merge all per-chunk results into one combined blob
             let mut all_f32s: Vec<f32> = Vec::new();
+            const CELLS_PER_CHANNEL: u64 = 16 * 16 * 16;
             let mut combined_offsets = [0u64; 16];
+            for (ch, off) in combined_offsets.iter_mut().enumerate() {
+                *off = (ch as u64) * CELLS_PER_CHANNEL * 4;
+            }
             let mut chunk_idx = 0u16;
 
             for (_key, blob) in &executed.results {
                 let chunk_f32s = decode_blob_f32s(blob);
                 if chunk_f32s.is_empty() { continue; }
-                // Compute offset for each channel
-                for ch in 0..16 {
-                    if combined_offsets[ch] == 0 && chunk_f32s.len() >= (ch + 1) * 4096 {
-                        combined_offsets[ch] = (chunk_idx as u64) * 16 * 16 * 16 * 4;
-                    }
-                }
                 all_f32s.extend_from_slice(&chunk_f32s);
                 chunk_idx += 1;
             }
