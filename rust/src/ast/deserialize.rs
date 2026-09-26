@@ -337,6 +337,46 @@ fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
             }
         }
 
+        // ── Shift / ShiftA / ShiftB (0xB4) ──────────────────────────────
+        0xB4 => {
+            // [kind:u8] [offset: NoiseSampler node]
+            ensure(bytes.len() >= cursor + 1, "Shift kind")?;
+            let kind = bytes[cursor];
+            cursor += 1;
+            let (offset, lo) = parse_node(bytes, cursor)?;
+            cursor += lo;
+            Shift {
+                kind,
+                offset: Box::new(offset),
+            }
+        }
+
+        // ── ShiftedNoise (0xB5) ────────────────────────────────────────
+        0xB5 => {
+            // [xzScale:f32] [yScale:f32] [shiftX][shiftY][shiftZ][noise]
+            ensure(bytes.len() >= cursor + 8, "ShiftedNoise scales")?;
+            let xz_scale = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            let y_scale = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            let (sx, l1) = parse_node(bytes, cursor)?;
+            cursor += l1;
+            let (sy, l2) = parse_node(bytes, cursor)?;
+            cursor += l2;
+            let (sz, l3) = parse_node(bytes, cursor)?;
+            cursor += l3;
+            let (nz, l4) = parse_node(bytes, cursor)?;
+            cursor += l4;
+            ShiftedNoise {
+                xz_scale,
+                y_scale,
+                shift_x: Box::new(sx),
+                shift_y: Box::new(sy),
+                shift_z: Box::new(sz),
+                noise: Box::new(nz),
+            }
+        }
+
         // ── Structure terrain / Shape selection (0xA0..0xB3) ───────────────
         0xA0 => {
             // EndIslands(child) — child 通常是坐标函数
@@ -353,22 +393,43 @@ fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
             Beardifier { struct_index }
         }
 
-        // ── 新增：Spline (0xB0) ─────────────────────────────────────────
+        // ── Spline (0xB0) ──────────────────────────────────────────────
         0xB0 => {
-            ensure(bytes.len() >= cursor + 4, "Spline point_count")?;
-            let point_count =
-                i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            // [min:f32][max:f32][count:i32][locations: f32×count]
+            // [derivatives: f32×count][location: node][values: node × count]
+            ensure(bytes.len() >= cursor + 12, "Spline header")?;
+            let _min = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
             cursor += 4;
-            let mut points = Vec::with_capacity(point_count);
-            for _ in 0..point_count {
-                ensure(bytes.len() >= cursor + 8, "Spline point")?;
-                let x = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            let _max = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            let count = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            let mut locations = Vec::with_capacity(count);
+            for _ in 0..count {
+                ensure(bytes.len() >= cursor + 4, "Spline location")?;
+                locations.push(f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()));
                 cursor += 4;
-                let y = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-                cursor += 4;
-                points.push((x, y));
             }
-            Spline { points }
+            let mut derivatives = Vec::with_capacity(count);
+            for _ in 0..count {
+                ensure(bytes.len() >= cursor + 4, "Spline derivative")?;
+                derivatives.push(f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()));
+                cursor += 4;
+            }
+            let (location, ll) = parse_node(bytes, cursor)?;
+            cursor += ll;
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (v, lv) = parse_node(bytes, cursor)?;
+                cursor += lv;
+                values.push(v);
+            }
+            Spline {
+                locations,
+                derivatives,
+                location: Box::new(location),
+                values,
+            }
         }
 
         0xB1 => {

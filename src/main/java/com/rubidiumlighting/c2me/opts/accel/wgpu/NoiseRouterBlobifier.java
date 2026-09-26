@@ -26,6 +26,7 @@ package com.rubidiumlighting.c2me.opts.accel.wgpu;
 
 import net.minecraft.util.math.noise.DoublePerlinNoiseSampler;
 import net.minecraft.util.math.noise.OctavePerlinNoiseSampler;
+import net.minecraft.util.math.Spline;
 import net.minecraft.util.math.noise.PerlinNoiseSampler;
 import net.minecraft.world.gen.densityfunction.DensityFunction;
 import net.minecraft.world.gen.densityfunction.DensityFunctionTypes;
@@ -94,6 +95,9 @@ public class NoiseRouterBlobifier {
     private static final byte TAG_RANGE_CHOICE = (byte) 0xB1;
     private static final byte TAG_INTERVAL_SEL = (byte) 0xB2;
     private static final byte TAG_Y_CLAMPED_GRAD = (byte) 0xB3;
+    private static final byte TAG_SPLINE = (byte) 0xB0;
+    private static final byte TAG_SHIFT = (byte) 0xB4;
+    private static final byte TAG_SHIFTED_NOISE = (byte) 0xB5;
     private static final byte TAG_CACHE_FLAT = (byte) 0xC0;
     private static final byte TAG_CACHE_2D = (byte) 0xC1;
     private static final byte TAG_CACHE_INTERP = (byte) 0xC2;
@@ -268,24 +272,42 @@ public class NoiseRouterBlobifier {
             return;
         }
 
+        // ── Shift / ShiftA / ShiftB (Offset interface) ──────────
+        if (df instanceof DensityFunctionTypes.Offset off) {
+            int kind = (df instanceof DensityFunctionTypes.ShiftA) ? 1
+                     : (df instanceof DensityFunctionTypes.ShiftB) ? 2 : 0;
+            buf.put(TAG_SHIFT);
+            buf.put((byte) kind);
+            buf.put(TAG_NOISE_SAMPLER);
+            writeNoiseSamplerPayload(buf, off.offsetNoise(), 1.0f, 1.0f);
+            return;
+        }
+
+        // ── ShiftedNoise ────────────────────────────────────────
+        if (df instanceof DensityFunctionTypes.ShiftedNoise sn) {
+            buf.put(TAG_SHIFTED_NOISE);
+            buf.putFloat((float) sn.xzScale());
+            buf.putFloat((float) sn.yScale());
+            writeDF(buf, sn.shiftX());
+            writeDF(buf, sn.shiftY());
+            writeDF(buf, sn.shiftZ());
+            buf.put(TAG_NOISE_SAMPLER);
+            // sn.noise() is a raw DensityFunction.Noise: its sample(d,e,f) does
+            // NOT re-apply xzScale (that already went into the coord shift).
+            writeNoiseSamplerPayload(buf, sn.noise(), 1.0f, 1.0f);
+            return;
+        }
+
         // ── Noise: emit TAG_NOISE_SAMPLER with structured stacks ─
         if (df instanceof DensityFunctionTypes.Noise tn) {
-            DpsInfo info = registerNoiseSampler(tn.noise());
             buf.put(TAG_NOISE_SAMPLER);
-            buf.put((byte) 0);                        // type: Perlin
-            boolean hasSecond = (info != null && info.second != null);
-            buf.put((byte) (hasSecond ? 1 : 0));      // flags
-            buf.putFloat(info != null ? info.amplitude : 1.0f);
-            buf.putFloat((float) tn.xzScale());
-            buf.putFloat((float) tn.yScale());
-            if (info != null && info.first != null) {
-                writeStack(buf, info.first);
-            } else {
-                writeFallbackStack(buf);
-            }
-            if (hasSecond) {
-                writeStack(buf, info.second);
-            }
+            writeNoiseSamplerPayload(buf, tn.noise(), (float) tn.xzScale(), (float) tn.yScale());
+            return;
+        }
+
+        // ── Spline: recursive Hermite tree ──────────────────────
+        if (df instanceof DensityFunctionTypes.Spline sp) {
+            writeSpline(buf, sp.spline());
             return;
         }
 
@@ -318,6 +340,78 @@ public class NoiseRouterBlobifier {
             }
         }
         writeConstant(buf, 0.0f);
+    }
+
+    /** Recursively serialize a MC Spline tree. FixedFloatFunction -> Constant. */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void writeSpline(ByteBuffer buf, Object node) {
+        if (node instanceof Spline.FixedFloatFunction<?, ?> f) {
+            writeConstant(buf, f.value());
+            return;
+        }
+        if (node instanceof Spline.Implementation<?, ?> impl) {
+            buf.put(TAG_SPLINE);
+            buf.putFloat(impl.min());
+            buf.putFloat(impl.max());
+            float[] locs = impl.locations();
+            float[] ders = impl.derivatives();
+            java.util.List<?> vals = impl.values();
+            buf.putInt(locs.length);
+            for (float l : locs) buf.putFloat(l);
+            for (float d : ders) buf.putFloat(d);
+            // location function: DensityFunctionWrapper -> inner DensityFunction
+            Object locFn = impl.locationFunction();
+            DensityFunction inner = unwrapLocFn(locFn);
+            if (inner != null) {
+                writeDF(buf, inner);
+            } else {
+                writeConstant(buf, 0.0f);
+            }
+            // values: recursive splines
+            for (Object v : vals) {
+                writeSpline(buf, v);
+            }
+            return;
+        }
+        // Unknown spline node -> constant 0
+        System.err.println("[c2me-wgpu] unknown spline node: " + node.getClass().getName());
+        writeConstant(buf, 0.0f);
+    }
+
+    /** Extract the wrapped DensityFunction from a Spline$DensityFunctionWrapper. */
+    private static DensityFunction unwrapLocFn(Object locFn) {
+        try {
+            java.lang.reflect.Field f = locFn.getClass().getDeclaredField("function");
+            f.setAccessible(true);
+            Object entry = f.get(locFn);
+            if (entry instanceof net.minecraft.registry.entry.RegistryEntry<?> re) {
+                Object v = re.value();
+                if (v instanceof DensityFunction d) return d;
+            }
+        } catch (Throwable t) {
+            System.err.println("[c2me-wgpu] unwrapLocFn failed: " + t);
+        }
+        return null;
+    }
+
+    /** Write [type:u8][flags:u8][amplitude:f32][xz:f32][yz:f32][stacks] for a DensityFunction.Noise. */
+    private static void writeNoiseSamplerPayload(ByteBuffer buf, DensityFunction.Noise n,
+                                                 float xzScale, float yScale) {
+        DpsInfo info = registerNoiseSampler(n);
+        buf.put((byte) 0);                        // type: Perlin
+        boolean hasSecond = (info != null && info.second != null);
+        buf.put((byte) (hasSecond ? 1 : 0));      // flags
+        buf.putFloat(info != null ? info.amplitude : 1.0f);
+        buf.putFloat(xzScale);
+        buf.putFloat(yScale);
+        if (info != null && info.first != null) {
+            writeStack(buf, info.first);
+        } else {
+            writeFallbackStack(buf);
+        }
+        if (hasSecond) {
+            writeStack(buf, info.second);
+        }
     }
 
     private static void writeStack(ByteBuffer buf, StackInfo st) {

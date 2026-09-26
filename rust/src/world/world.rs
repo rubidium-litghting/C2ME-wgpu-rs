@@ -1095,6 +1095,239 @@ mod tests {
     }
 
     #[test]
+    fn numerical_validation_shifted_noise() {
+        use crate::instance::WgpuInstance;
+        use crate::scheduler::batcher::{Batch, Priority};
+        use crate::scheduler::executor::ExecutorThread;
+        use crate::world::WorldContext;
+        use crate::world::constants::permutation_table_for_seed;
+        use std::sync::Arc;
+
+        let perms: Vec<[u32; 256]> = [11i64, 22, 33].iter()
+            .map(|&sd| permutation_table_for_seed(sd)).collect();
+        let perm_i32: Vec<i32> = perms.iter().flatten().map(|&v| v as i32).collect();
+
+        // Build a blob: ROOT(1ch) = ShiftedNoise(xz=0.25, ys=0.0,
+        //   shiftX = ShiftA(offset noise table0),
+        //   shiftY = Constant(0.0),
+        //   shiftZ = ShiftB(offset noise table1),
+        //   noise  = Perlin table2)
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&[0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        blob.push(0xFE);
+        blob.extend_from_slice(&[0x01, 0x00]);
+        blob.push(0xB5);
+        blob.extend_from_slice(&0.25f32.to_le_bytes());
+        blob.extend_from_slice(&0.0f32.to_le_bytes());
+        // shiftX = Shift kind=1 (ShiftA)
+        blob.push(0xB4); blob.push(1);
+        push_simple_noise(&mut blob, 0);
+        // shiftY = Constant(0.0)
+        blob.push(0x01);
+        blob.extend_from_slice(&0.0f32.to_le_bytes());
+        // shiftZ = Shift kind=2 (ShiftB)
+        blob.push(0xB4); blob.push(2);
+        push_simple_noise(&mut blob, 256);
+        // main noise
+        push_simple_noise(&mut blob, 512);
+        // shape
+        blob.extend_from_slice(&(-64i32).to_le_bytes());
+        blob.extend_from_slice(&384i32.to_le_bytes());
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        // biome
+        blob.push(0xF0);
+        blob.extend_from_slice(&123456789i64.to_le_bytes());
+        // PERM_RESOURCE
+        blob.extend_from_slice(&0x4D525750u32.to_le_bytes());
+        blob.extend_from_slice(&(perms.len() as u32).to_le_bytes());
+        for tb in &perms {
+            for &v in tb { blob.extend_from_slice(&v.to_le_bytes()); }
+            for _ in 0..3 { blob.extend_from_slice(&0.0f64.to_le_bytes()); }
+        }
+
+        let mut ctx = WorldContext::new(&blob).unwrap();
+        let instance = WgpuInstance::instance().unwrap();
+        ctx.compile_pipeline(&instance.device).unwrap();
+        let world_arc = Arc::new(ctx);
+        let executor = ExecutorThread::spawn(
+            Arc::new(instance.device.clone()),
+            Arc::new(instance.queue.clone()),
+            Default::default(),
+        ).unwrap();
+        // Use chunk coord 1 so world_x = 1 + cx*4 = 1,5,9... (non-grid)
+        let batch = Batch { positions: vec![(1, 0)], max_priority: Priority::Normal };
+        let result = executor.request_chunks(world_arc, batch).unwrap();
+        let br = result.results.values().next().unwrap();
+        let bytes = br.as_bytes();
+        let payload = &bytes[0x88..];
+        let gpu: Vec<f32> = (0..1536)
+            .map(|i| f32::from_le_bytes(payload[i*4..i*4+4].try_into().unwrap()))
+            .collect();
+
+        // CPU reference (MC algorithm).
+        let fx = (0i32, 1.0f32, 1.0f32, &[1.0f32][..]);
+        let fz = (256i32, 1.0f32, 1.0f32, &[1.0f32][..]);
+        let fnz = (512i32, 1.0f32, 1.0f32, &[1.0f32][..]);
+        let shift_a = |x: f32, z: f32| -> f32 {
+            cpu_noise_sampler(&perm_i32, fx, None, 1.0, 1.0, 1.0, x*0.25, 0.0, z*0.25) * 4.0
+        };
+        let shift_b = |x: f32, z: f32| -> f32 {
+            cpu_noise_sampler(&perm_i32, fz, None, 1.0, 1.0, 1.0, z*0.25, x*0.25, 0.0) * 4.0
+        };
+        let cpu = |x: f32, y: f32, z: f32| -> f32 {
+            let d = x*0.25 + shift_a(x, z);
+            let e = y*0.0 + 0.0;
+            let f = z*0.25 + shift_b(x, z);
+            cpu_noise_sampler(&perm_i32, fnz, None, 1.0, 1.0, 1.0, d, e, f)
+        };
+
+        let mut max_d = 0.0f32;
+        for cy in 0..96usize { for cz in 0..4usize { for cx in 0..4usize {
+            let wx = (1 + cx as i32 * 4) as f32;
+            let wy = (-64 + cy as i32 * 4) as f32;
+            let wz = (cz * 4) as f32;
+            let c = cpu(wx, wy, wz);
+            let g = gpu[cx + cz*4 + cy*16];
+            max_d = max_d.max((c - g).abs());
+        }}}
+        println!("shifted-noise: max_diff={:.6e}", max_d);
+        assert!(max_d < 1e-4, "shifted-noise diverged {:.6e}", max_d);
+    }
+
+    #[test]
+    fn numerical_validation_spline() {
+        use crate::instance::WgpuInstance;
+        use crate::scheduler::batcher::{Batch, Priority};
+        use crate::scheduler::executor::ExecutorThread;
+        use crate::world::WorldContext;
+        use crate::world::constants::permutation_table_for_seed;
+        use std::sync::Arc;
+
+        let perms: Vec<[u32; 256]> = [7i64].iter()
+            .map(|&sd| permutation_table_for_seed(sd)).collect();
+
+        // Build: ROOT(1ch) = Spline over Y with 4 nodes:
+        //   locations  = [-64, -20, 40, 320]
+        //   derivatives= [ 0.05, 0.1, -0.02, 0.0]
+        //   location   = InputY
+        //   values     = [Constant(0.0), Constant(0.5),
+        //                 PerlinNoise(table0), Constant(-0.3)]
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&[0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        blob.push(0xFE);
+        blob.extend_from_slice(&[0x01, 0x00]);
+
+        blob.push(0xB0);           // Spline
+        blob.extend_from_slice(&(-64.0f32).to_le_bytes()); // min
+        blob.extend_from_slice(&(320.0f32).to_le_bytes()); // max
+        blob.extend_from_slice(&4i32.to_le_bytes());       // count
+        for l in [-64.0f32, -20.0, 40.0, 320.0] {
+            blob.extend_from_slice(&l.to_le_bytes());
+        }
+        for d in [0.05f32, 0.1, -0.02, 0.0] {
+            blob.extend_from_slice(&d.to_le_bytes());
+        }
+        // location = InputY
+        blob.push(0x03);
+        // values[0] = Constant(0.0)
+        blob.push(0x01);
+        blob.extend_from_slice(&0.0f32.to_le_bytes());
+        // values[1] = Constant(0.5)
+        blob.push(0x01);
+        blob.extend_from_slice(&0.5f32.to_le_bytes());
+        // values[2] = Perlin noise table0
+        push_simple_noise(&mut blob, 0);
+        // values[3] = Constant(-0.3)
+        blob.push(0x01);
+        blob.extend_from_slice(&(-0.3f32).to_le_bytes());
+
+        // shape + biome
+        blob.extend_from_slice(&(-64i32).to_le_bytes());
+        blob.extend_from_slice(&384i32.to_le_bytes());
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.push(0xF0);
+        blob.extend_from_slice(&123456789i64.to_le_bytes());
+        // PERM_RESOURCE
+        blob.extend_from_slice(&0x4D525750u32.to_le_bytes());
+        blob.extend_from_slice(&(perms.len() as u32).to_le_bytes());
+        for tb in &perms {
+            for &v in tb { blob.extend_from_slice(&v.to_le_bytes()); }
+            for _ in 0..3 { blob.extend_from_slice(&0.0f64.to_le_bytes()); }
+        }
+
+        let mut ctx = WorldContext::new(&blob).unwrap();
+        let instance = WgpuInstance::instance().unwrap();
+        ctx.compile_pipeline(&instance.device).unwrap();
+        let world_arc = Arc::new(ctx);
+        let executor = ExecutorThread::spawn(
+            Arc::new(instance.device.clone()),
+            Arc::new(instance.queue.clone()),
+            Default::default(),
+        ).unwrap();
+        let batch = Batch { positions: vec![(1, 0)], max_priority: Priority::Normal };
+        let result = executor.request_chunks(world_arc, batch).unwrap();
+        let br = result.results.values().next().unwrap();
+        let bytes = br.as_bytes();
+        let payload = &bytes[0x88..];
+        let gpu: Vec<f32> = (0..1536)
+            .map(|i| f32::from_le_bytes(payload[i*4..i*4+4].try_into().unwrap()))
+            .collect();
+
+        let perm_i32: Vec<i32> = perms.iter().flatten().map(|&v| v as i32).collect();
+        let locs = [-64.0f32, -20.0, 40.0, 320.0];
+        let ders = [0.05f32, 0.1, -0.02, 0.0];
+        let cpu = |y: f32, wx: f32, wz: f32| -> f32 {
+            let v: [f32; 4] = [
+                0.0,
+                0.5,
+                cpu_noise_sampler(&perm_i32, (0, 1.0, 1.0, &[1.0f32][..]), None, 1.0, 1.0, 1.0, wx, y, wz),
+                -0.3,
+            ];
+            let outside = |v: f32, d: f32, l: f32, t: f32| if d == 0.0 { v } else { v + d*(t-l) };
+            if y < locs[0] { return outside(v[0], ders[0], locs[0], y); }
+            if y >= locs[3] { return outside(v[3], ders[3], locs[3], y); }
+            for k in 0..3 {
+                if y < locs[k+1] {
+                    let p = (y - locs[k]) / (locs[k+1] - locs[k]);
+                    let a = ders[k]*(locs[k+1]-locs[k]) - (v[k+1]-v[k]);
+                    let b = -ders[k+1]*(locs[k+1]-locs[k]) + (v[k+1]-v[k]);
+                    let lerp = |t: f32, a: f32, b: f32| a + t*(b-a);
+                    return lerp(p, v[k], v[k+1]) + p*(1.0-p)*lerp(p, a, b);
+                }
+            }
+            v[3]
+        };
+
+        let mut max_d = 0.0f32;
+        for cy in 0..96usize { for cz in 0..4usize { for cx in 0..4usize {
+            let wx = (1 + cx as i32 * 4) as f32;
+            let wy = (-64 + cy as i32 * 4) as f32;
+            let wz = (cz * 4) as f32;
+            let c = cpu(wy, wx, wz);
+            let g = gpu[cx + cz*4 + cy*16];
+            max_d = max_d.max((c - g).abs());
+        }}}
+        println!("spline: max_diff={:.6e}", max_d);
+        assert!(max_d < 1e-4, "spline diverged {:.6e}", max_d);
+    }
+
+        fn push_simple_noise(blob: &mut Vec<u8>, perm_offset: i32) {
+        blob.push(0x84);          // TAG_NOISE_SAMPLER
+        blob.push(0);             // type = Perlin
+        blob.push(0);             // flags = no second stack
+        blob.extend_from_slice(&1.0f32.to_le_bytes()); // amplitude
+        blob.extend_from_slice(&1.0f32.to_le_bytes()); // xz_scale
+        blob.extend_from_slice(&1.0f32.to_le_bytes()); // y_scale
+        blob.extend_from_slice(&perm_offset.to_le_bytes());
+        blob.extend_from_slice(&1.0f32.to_le_bytes()); // initial_freq
+        blob.extend_from_slice(&1.0f32.to_le_bytes()); // persistence
+        blob.extend_from_slice(&1i32.to_le_bytes());   // octaves
+        blob.extend_from_slice(&1.0f32.to_le_bytes()); // amp[0]
+    }
+
+    #[test]
     fn numerical_validation_nonzero_origin() {
         use crate::world::constants::permutation_table_for_seed;
         // 3 octaves, each with a distinct non-zero origin.

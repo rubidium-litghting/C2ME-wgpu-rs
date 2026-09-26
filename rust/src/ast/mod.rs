@@ -164,6 +164,25 @@ pub enum AstNode {
         child: Box<AstNode>,
     },
 
+    // ── Coordinate shifts / shifted noise ───────────────────────────────
+    /// MC `Shift`/`ShiftA`/`ShiftB` (Offset interface). `kind`:
+    /// 0 = Shift (X,Y,Z), 1 = ShiftA (X,0,Z), 2 = ShiftB (Z,X,0).
+    /// `offset` is a `NoiseSampler` child; sample = noise(coord*0.25) * 4.
+    Shift {
+        kind: u8,
+        offset: Box<AstNode>,
+    },
+    /// MC `ShiftedNoise`: shifts the sample coords by three 2D/3D noise
+    /// fields, then samples `noise` at the displaced coordinate.
+    ShiftedNoise {
+        xz_scale: f32,
+        y_scale: f32,
+        shift_x: Box<AstNode>,
+        shift_y: Box<AstNode>,
+        shift_z: Box<AstNode>,
+        noise: Box<AstNode>,
+    },
+
     // ── Structure terrain ───────────────────────────────────────────────
     EndIslands(Box<AstNode>),
     Beardifier {
@@ -172,7 +191,14 @@ pub enum AstNode {
 
     // ── Shape / Selection ───────────────────────────────────────────────
     Spline {
-        points: Vec<(f32, f32)>,
+        /// Spline node locations (sorted ascending).
+        locations: Vec<f32>,
+        /// Per-node Hermite derivative.
+        derivatives: Vec<f32>,
+        /// The `ToFloatFunction` input (usually Y or a noise field).
+        location: Box<AstNode>,
+        /// Per-node values; each is a nested `Spline` or a `Constant` leaf.
+        values: Vec<AstNode>,
     },
     RangeChoice {
         input: Box<AstNode>,
@@ -339,6 +365,22 @@ impl Hash for AstNode {
                 0x90u8.hash(state);
                 child.hash(state);
             }
+            AstNode::Shift { kind, offset } => {
+                0xB4u8.hash(state);
+                kind.hash(state);
+                offset.hash(state);
+            }
+            AstNode::ShiftedNoise {
+                xz_scale, y_scale, shift_x, shift_y, shift_z, noise,
+            } => {
+                0xB5u8.hash(state);
+                f32_to_hash_bits(*xz_scale).hash(state);
+                f32_to_hash_bits(*y_scale).hash(state);
+                shift_x.hash(state);
+                shift_y.hash(state);
+                shift_z.hash(state);
+                noise.hash(state);
+            }
 
             // ── Structure terrain ───────────────────────────────────────────
             AstNode::EndIslands(a) => {
@@ -351,13 +393,14 @@ impl Hash for AstNode {
             }
 
             // ── Shape / Selection ───────────────────────────────────────────
-            AstNode::Spline { points } => {
+            AstNode::Spline { locations, derivatives, location, values } => {
                 0xB0u8.hash(state);
-                points.len().hash(state);
-                for (x, y) in points {
-                    f32_to_hash_bits(*x).hash(state);
-                    f32_to_hash_bits(*y).hash(state);
-                }
+                locations.len().hash(state);
+                for v in locations { f32_to_hash_bits(*v).hash(state); }
+                for v in derivatives { f32_to_hash_bits(*v).hash(state); }
+                location.hash(state);
+                values.len().hash(state);
+                for v in values { v.hash(state); }
             }
             AstNode::RangeChoice {
                 input,

@@ -13,6 +13,7 @@ pub mod noise_simplex;
 pub mod range_choice;
 
 pub mod root;
+pub mod shift;
 pub mod spline;
 pub mod unary;
 pub mod y_clamped_gradient;
@@ -125,6 +126,7 @@ pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
             noise_simplex::emit(node, ctx)
         }
         AstNode::InterpolatedNoiseSampler { .. } => noise_interpolated::emit(node, ctx),
+        AstNode::Shift { .. } | AstNode::ShiftedNoise { .. } => shift::emit(node, ctx),
         AstNode::Beardifier { .. } => beardifier::emit(node, ctx),
         AstNode::Spline { .. } => spline::emit(node, ctx),
         AstNode::RangeChoice { .. } => range_choice::emit(node, ctx),

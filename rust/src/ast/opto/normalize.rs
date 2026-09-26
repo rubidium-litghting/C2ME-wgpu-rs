@@ -73,11 +73,22 @@ fn rec(node: AstNode) -> AstNode {
         | n @ SimplexNoise3D { .. }
         | n @ InterpolatedNoiseSampler { .. }
         | n @ Beardifier { .. }
-        | n @ Spline { .. }
         | n @ IntervalSelect { .. }
         | n @ YClampedGradient { .. }
         | n @ Aquifer { .. }
         | n @ BiomeTree { .. } => n,
+
+        Shift { kind, offset } => Shift { kind, offset: Box::new(rec(*offset)) },
+        Spline { locations, derivatives, location, values } => Spline {
+            locations: locations.clone(), derivatives: derivatives.clone(),
+            location: Box::new(rec(*location)),
+            values: values.iter().map(|v| rec(v.clone())).collect(),
+        },
+        ShiftedNoise { xz_scale, y_scale, shift_x, shift_y, shift_z, noise } => ShiftedNoise {
+            xz_scale, y_scale,
+            shift_x: Box::new(rec(*shift_x)), shift_y: Box::new(rec(*shift_y)), shift_z: Box::new(rec(*shift_z)),
+            noise: Box::new(rec(*noise)),
+        },
 
         // Structured nodes with children: post-order only ----------------
         EndIslands(a) => EndIslands(Box::new(rec(*a))),

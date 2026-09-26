@@ -89,6 +89,17 @@ where
 
     match node {
         AstNode::NoiseSampler { .. } => node, // 或使用通配符
+        Shift { kind, offset } => Shift { kind, offset: map_box(offset, &mut f) },
+        Spline { locations, derivatives, location, values } => Spline {
+            locations, derivatives,
+            location: map_box(location, &mut f),
+            values: values.into_iter().map(|v| f(v)).collect(),
+        },
+        ShiftedNoise { xz_scale, y_scale, shift_x, shift_y, shift_z, noise } => ShiftedNoise {
+            xz_scale, y_scale,
+            shift_x: map_box(shift_x, &mut f), shift_y: map_box(shift_y, &mut f), shift_z: map_box(shift_z, &mut f),
+            noise: map_box(noise, &mut f),
+        },
         // Leaves with no variable AstNode children -----------------------
         Constant(_)
         | InputX
@@ -98,7 +109,6 @@ where
         | SimplexNoise3D { .. }
         | InterpolatedNoiseSampler { .. }
         | Beardifier { .. }
-        | Spline { .. }
         | IntervalSelect { .. }
         | YClampedGradient { .. }
         | Aquifer { .. }
