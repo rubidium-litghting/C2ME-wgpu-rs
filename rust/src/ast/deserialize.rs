@@ -269,6 +269,13 @@ fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
             Sqrt(Box::new(a))
         }
 
+        0x25 => {
+            // Squeeze(a)
+            let (a, la) = parse_node(bytes, cursor)?;
+            cursor += la;
+            Squeeze(Box::new(a))
+        }
+
         // ── Noise samplers (0x80..0x90) ───────────────────────────────────
         0x82 => {
             // SimplexNoise2D { seed: i64 }
@@ -482,21 +489,16 @@ fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
 
         // ── 新增：YClampedGradient (0xB3) ──────────────────────────────
         0xB3 => {
-            ensure(bytes.len() >= cursor + 8, "YClampedGradient y_min/y_max")?;
-            let y_min = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            ensure(bytes.len() >= cursor + 16, "YClampedGradient")?;
+            let from_y = f32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap());
             cursor += 4;
-            let y_max = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            let to_y = f32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap());
             cursor += 4;
-            let (input, l1) = parse_node(bytes, cursor)?;
-            cursor += l1;
-            let (gradient, l2) = parse_node(bytes, cursor)?;
-            cursor += l2;
-            YClampedGradient {
-                y_min,
-                y_max,
-                input: Box::new(input),
-                gradient: Box::new(gradient),
-            }
+            let from_value = f32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap());
+            cursor += 4;
+            let to_value = f32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap());
+            cursor += 4;
+            YClampedGradient { from_y, to_y, from_value, to_value }
         }
 
         // ── Caches / Surface / Aquifer (0xC0..0xE0) ─────────────────────────

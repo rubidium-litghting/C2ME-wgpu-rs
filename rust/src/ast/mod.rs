@@ -51,6 +51,7 @@ pub const TAG_SQUARE: u8 = 0x21;
 pub const TAG_CUBE: u8 = 0x22;
 pub const TAG_SQRT: u8 = 0x23;
 pub const TAG_FLOOR_DIV: u8 = 0x24;
+pub const TAG_SQUEEZE: u8 = 0x25;
 pub const TAG_SIMPLEX_2D: u8 = 0x82;
 pub const TAG_SIMPLEX_3D: u8 = 0x83;
 pub const TAG_NOISE_SAMPLER: u8 = 0x84;
@@ -138,6 +139,7 @@ pub enum AstNode {
     Cube(Box<AstNode>),
     Sqrt(Box<AstNode>),
     FloorDiv(Box<AstNode>, Box<AstNode>),
+    Squeeze(Box<AstNode>),
 
     // ── Noise samplers ──────────────────────────────────────────────────
     NoiseSampler {
@@ -217,10 +219,10 @@ pub enum AstNode {
         out_of_bounds_hi: Box<AstNode>,
     },
     YClampedGradient {
-        y_min: i32,
-        y_max: i32,
-        input: Box<AstNode>,
-        gradient: Box<AstNode>,
+        from_y: f32,
+        to_y: f32,
+        from_value: f32,
+        to_value: f32,
     },
 
     // ── Caches ──────────────────────────────────────────────────────────
@@ -334,6 +336,10 @@ impl Hash for AstNode {
                 a.hash(state);
                 b.hash(state);
             }
+            AstNode::Squeeze(a) => {
+                TAG_SQUEEZE.hash(state);
+                a.hash(state);
+            }
 
             // ── Noise samplers ──────────────────────────────────────────────
             AstNode::NoiseSampler {
@@ -434,17 +440,12 @@ impl Hash for AstNode {
                 out_of_bounds_lo.hash(state);
                 out_of_bounds_hi.hash(state);
             }
-            AstNode::YClampedGradient {
-                y_min,
-                y_max,
-                input,
-                gradient,
-            } => {
+            AstNode::YClampedGradient { from_y, to_y, from_value, to_value } => {
                 0xB3u8.hash(state);
-                y_min.hash(state);
-                y_max.hash(state);
-                input.hash(state);
-                gradient.hash(state);
+                f32_to_hash_bits(*from_y).hash(state);
+                f32_to_hash_bits(*to_y).hash(state);
+                f32_to_hash_bits(*from_value).hash(state);
+                f32_to_hash_bits(*to_value).hash(state);
             }
 
             // ── Caches ──────────────────────────────────────────────────────

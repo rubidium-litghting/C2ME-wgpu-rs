@@ -93,6 +93,15 @@ const GRAD3: array<vec3<f32>, 16> = array<vec3<f32>, 16>(
     vec3(-1.0,  1.0,  0.0), vec3( 0.0, -1.0, -1.0)
 );
 
+fn squeeze(x: f32) -> f32 {
+    return x * 0.5 - x * x * x / 24.0;
+}
+
+fn clamped_map(v: f32, from_min: f32, from_max: f32, to_min: f32, to_max: f32) -> f32 {
+    let t = clamp((v - from_min) / (from_max - from_min), 0.0, 1.0);
+    return to_min + t * (to_max - to_min);
+}
+
 fn fade(t: f32) -> f32 {
     return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
 }

@@ -110,9 +110,9 @@ where
         | InterpolatedNoiseSampler { .. }
         | Beardifier { .. }
         | IntervalSelect { .. }
-        | YClampedGradient { .. }
-        | Aquifer { .. }
-        | BiomeTree { .. } => node,
+                | Aquifer { .. }
+        | BiomeTree { .. }
+        | YClampedGradient { .. } => node,
 
         // Binary arithmetic ----------------------------------------------
         Add(a, b) => Add(map_box(a, &mut f), map_box(b, &mut f)),
@@ -128,6 +128,7 @@ where
         Square(a) => Square(map_box(a, &mut f)),
         Cube(a) => Cube(map_box(a, &mut f)),
         Sqrt(a) => Sqrt(map_box(a, &mut f)),
+        Squeeze(a) => Squeeze(map_box(a, &mut f)),
 
         // Structured nodes with children ---------------------------------
         EndIslands(a) => EndIslands(map_box(a, &mut f)),

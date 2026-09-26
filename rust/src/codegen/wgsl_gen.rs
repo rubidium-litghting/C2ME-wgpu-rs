@@ -100,6 +100,15 @@ pub struct GenCtx {
     /// whether to compute the inner subtree (A), do trilinear lerp (B),
     /// or just emit inner (Single).
     pub pass: Pass,
+    /// Scope stack of memoized (fingerprint -> var name) bindings.
+    /// Index 0 is the function top level; each `{` pushes, each `}` pops.
+    /// A value memoized at scope k is visible from scope k and every
+    /// nested scope, so reusing it is always WGSL-scope-safe.
+    pub memo_stack: Vec<rustc_hash::FxHashMap<u64, String>>,
+    /// Set while `cell_x/y/z` are shadowed (Shift/ShiftedNoise/Cache).
+    /// Memoization is bypassed entirely then, because the same AST
+    /// evaluates to a different value at shadowed coordinates.
+    pub in_shadow: bool,
 }
 
 impl GenCtx {
@@ -112,6 +121,8 @@ impl GenCtx {
             next_cacheflat_slot: 0,
             next_cache_interp_slot: 0,
             pass,
+            memo_stack: vec![rustc_hash::FxHashMap::default()],
+            in_shadow: false,
         }
     }
     pub fn fresh_var(&mut self, prefix: &str) -> String {
@@ -120,7 +131,37 @@ impl GenCtx {
         format!("{prefix}_{n}")
     }
     pub fn emit(&mut self, s: impl Into<String>) {
-        self.lines.push(s.into());
+        let s = s.into();
+        // Maintain the memo scope stack in lockstep with brace nesting.
+        for ch in s.chars() {
+            match ch {
+                '{' => self.memo_stack.push(rustc_hash::FxHashMap::default()),
+                '}' => {
+                    if self.memo_stack.len() > 1 {
+                        self.memo_stack.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.lines.push(s);
+    }
+
+    /// Look up a memoized value in the current scope or any enclosing one.
+    pub fn memo_get(&self, key: u64) -> Option<&String> {
+        for m in self.memo_stack.iter().rev() {
+            if let Some(v) = m.get(&key) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// Record a memoized value in the innermost scope.
+    pub fn memo_put(&mut self, key: u64, value: String) {
+        if let Some(top) = self.memo_stack.last_mut() {
+            top.insert(key, value);
+        }
     }
     /// Push a `var<workgroup>` declaration to module scope.
     /// Use this from emitters that need shared memory (Cache2D, CacheFlat,

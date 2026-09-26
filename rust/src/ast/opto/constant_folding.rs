@@ -143,6 +143,10 @@ fn rec(node: AstNode) -> AstNode {
                 Cube(Box::new(fa))
             }
         }
+        Squeeze(a) => {
+            let fa = rec(*a);
+            Squeeze(Box::new(fa))
+        }
         Sqrt(a) => {
             let fa = rec(*a);
             if let Constant(x) = fa {
@@ -163,9 +167,9 @@ fn rec(node: AstNode) -> AstNode {
         | n @ InterpolatedNoiseSampler { .. }
         | n @ Beardifier { .. }
         | n @ IntervalSelect { .. }
-        | n @ YClampedGradient { .. }
-        | n @ Aquifer { .. }
-        | n @ BiomeTree { .. } => n,
+                | n @ Aquifer { .. }
+        | n @ BiomeTree { .. }
+        | n @ YClampedGradient { .. } => n,
 
         // Nodes with variable AstNode children — recurse but never fold
         // the node itself (semantic meaning depends on coordinate input

@@ -71,6 +71,8 @@ public class NoiseRouterBlobifier {
         }
     }
     private static NoiseConfig CURRENT_NOISE_CONFIG = null;
+    private static final java.util.Map<String, Boolean> PLACEHOLDER_SEEN =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     // ── Tags ────────────────────────────────────────────────────────
     private static final byte TAG_CONSTANT = 0x01;
@@ -135,6 +137,14 @@ public class NoiseRouterBlobifier {
         writeDF(buf, router.depth());
         writeDF(buf, router.ridges());
         writeDF(buf, router.initialDensityWithoutJaggedness());
+        System.err.println("[c2me-wgpu][chtype] continents=" + router.continents().getClass().getName());
+        System.err.println("[c2me-wgpu][chtype] depth=" + router.depth().getClass().getName());
+        System.err.println("[c2me-wgpu][chtype] initialDensity=" + router.initialDensityWithoutJaggedness().getClass().getName());
+        System.err.println("[c2me-wgpu][chtype] finalDensity=" + router.finalDensity().getClass().getName());
+        String fds = router.finalDensity().toString();
+        System.err.println("[c2me-wgpu][fd] len=" + fds.length());
+        System.err.println("[c2me-wgpu][fd] " + fds.substring(0, Math.min(3000, fds.length())));
+        System.err.println("[c2me-wgpu][fd_tail] " + fds.substring(Math.max(0, fds.length() - 3000)));
         writeDF(buf, router.finalDensity());
         writeDF(buf, router.veinToggle());
         writeDF(buf, router.veinRidged());
@@ -163,6 +173,13 @@ public class NoiseRouterBlobifier {
     }
 
     private static void writeDF(ByteBuffer buf, DensityFunction df) {
+        // Unwrap MC's RegistryEntryHolder layer (e.g. class_6916$class_7051):
+        // router channels come wrapped, the real tree is inside .function().
+        if (df instanceof DensityFunctionTypes.RegistryEntryHolder h) {
+            writeDF(buf, h.function().value());
+            return;
+        }
+
         if (df == null) {
             writeConstant(buf, 0.0f);
             return;
@@ -192,6 +209,13 @@ public class NoiseRouterBlobifier {
         if (df instanceof DensityFunctionTypes.Beardifier) {
             buf.put(TAG_BEARDIFIER);
             buf.putInt(0);
+            return;
+        }
+
+        // ── InterpolatedNoiseSampler (standalone class) ─────────
+        if (df instanceof net.minecraft.util.math.noise.InterpolatedNoiseSampler) {
+            // TODO: real impl. Placeholder to stop log spam.
+            writeConstant(buf, 0.0f);
             return;
         }
 
@@ -233,7 +257,7 @@ public class NoiseRouterBlobifier {
                     writeConstant(buf, -0.25f);
                     writeDF(buf, in);
                 }
-                case SQUEEZE -> writeConstant(buf, 0.0f);
+                case SQUEEZE -> { buf.put((byte) 0x25); writeDF(buf, in); }
             }
             return;
         }
@@ -311,6 +335,26 @@ public class NoiseRouterBlobifier {
             return;
         }
 
+        // ── YClampedGradient ────────────────────────────────────
+        if (df instanceof DensityFunctionTypes.YClampedGradient g) {
+            buf.put(TAG_Y_CLAMPED_GRAD);
+            buf.putFloat((float) g.fromY());
+            buf.putFloat((float) g.toY());
+            buf.putFloat((float) g.fromValue());
+            buf.putFloat((float) g.toValue());
+            return;
+        }
+
+        // ── YClampedGradient ────────────────────────────────────
+        if (df instanceof DensityFunctionTypes.YClampedGradient g) {
+            buf.put(TAG_Y_CLAMPED_GRAD);
+            buf.putFloat((float) g.fromY());
+            buf.putFloat((float) g.toY());
+            buf.putFloat((float) g.fromValue());
+            buf.putFloat((float) g.toValue());
+            return;
+        }
+
         // ── Phase-2 placeholders (noise chain) ──────────────────
         if (df instanceof DensityFunctionTypes.YClampedGradient
                 || df instanceof DensityFunctionTypes.Noise
@@ -321,6 +365,10 @@ public class NoiseRouterBlobifier {
                 || df instanceof DensityFunctionTypes.WeirdScaledSampler
                 || df instanceof DensityFunctionTypes.Spline
                 || df instanceof DensityFunctionTypes.EndIslands) {
+            PLACEHOLDER_SEEN.computeIfAbsent(df.getClass().getName(), k -> {
+                System.err.println("[c2me-wgpu][placeholder] " + k);
+                return Boolean.TRUE;
+            });
             writeConstant(buf, 0.0f);
             return;
         }
@@ -378,19 +426,15 @@ public class NoiseRouterBlobifier {
         writeConstant(buf, 0.0f);
     }
 
-    /** Extract the wrapped DensityFunction from a Spline$DensityFunctionWrapper. */
+    /** Extract the wrapped DensityFunction from a Spline$DensityFunctionWrapper.
+     *  Uses the record accessor (Loom remaps the method reference, unlike
+     *  string-keyed reflection which fails on intermediary names). */
     private static DensityFunction unwrapLocFn(Object locFn) {
-        try {
-            java.lang.reflect.Field f = locFn.getClass().getDeclaredField("function");
-            f.setAccessible(true);
-            Object entry = f.get(locFn);
-            if (entry instanceof net.minecraft.registry.entry.RegistryEntry<?> re) {
-                Object v = re.value();
-                if (v instanceof DensityFunction d) return d;
-            }
-        } catch (Throwable t) {
-            System.err.println("[c2me-wgpu] unwrapLocFn failed: " + t);
+        if (locFn instanceof DensityFunctionTypes.Spline.DensityFunctionWrapper w) {
+            return w.function().value();
         }
+        System.err.println("[c2me-wgpu] unwrapLocFn: unexpected class "
+                + locFn.getClass().getName());
         return null;
     }
 

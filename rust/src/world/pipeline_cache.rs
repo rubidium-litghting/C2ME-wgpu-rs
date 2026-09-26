@@ -108,11 +108,18 @@ pub fn get_or_compile(
 
     // 2. Slow path: compile. Outside the lock — compilation may take
     //    hundreds of ms and we don't want to block other lookups.
+    let t_src0 = std::time::Instant::now();
+    eprintln!("[c2me-wgpu][compile] shader source: {} lines, {} bytes",
+              shader_src.lines().count(), shader_src.len());
+
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(&format!("c2me_wgpu_shader_{fingerprint:08x}_p{}", pass_id(pass))),
         source: wgpu::ShaderSource::Wgsl(shader_src.into()),
     });
+    eprintln!("[c2me-wgpu][compile] create_shader_module done in {:?}",
+              t_src0.elapsed());
 
+    let t_pipe0 = std::time::Instant::now();
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(&format!("c2me_wgpu_pipeline_{fingerprint:08x}_p{}", pass_id(pass))),
         layout: Some(pipeline_layout),
@@ -121,6 +128,9 @@ pub fn get_or_compile(
         compilation_options: wgpu::PipelineCompilationOptions::default(),
         cache: None,
     });
+
+    eprintln!("[c2me-wgpu][compile] create_compute_pipeline done in {:?}",
+              t_pipe0.elapsed());
 
     // 3. Insert. If another thread raced us, drop the loser.
     {

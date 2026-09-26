@@ -83,7 +83,10 @@ fn emit_shift(ctx: &mut GenCtx, kind: u8, offset: &AstNode) -> Result<String> {
         }
         _ => return Err(anyhow!("invalid Shift kind {kind}")),
     }
+    let saved = ctx.in_shadow;
+    ctx.in_shadow = true;
     let inner2 = crate::codegen::emitters::emit_node(offset, ctx)?;
+    ctx.in_shadow = saved;
     ctx.emit(format!("  {var} = {inner2} * 4.0;"));
     ctx.emit("}".to_string());
     Ok(var)
@@ -117,7 +120,10 @@ fn emit_shifted_noise(
     ctx.emit(format!("  let cell_x: f32 = {dx};"));
     ctx.emit(format!("  let cell_y: f32 = {dy};"));
     ctx.emit(format!("  let cell_z: f32 = {dz};"));
+    let saved = ctx.in_shadow;
+    ctx.in_shadow = true;
     let nz = crate::codegen::emitters::emit_node(noise, ctx)?;
+    ctx.in_shadow = saved;
     ctx.emit(format!("  {var} = {nz};"));
     ctx.emit("}".to_string());
     Ok(var)

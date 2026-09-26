@@ -67,6 +67,7 @@ fn rec(node: AstNode) -> AstNode {
         Square(a) => Square(Box::new(rec(*a))),
         Cube(a) => Cube(Box::new(rec(*a))),
         Sqrt(a) => Sqrt(Box::new(rec(*a))),
+        Squeeze(a) => Squeeze(Box::new(rec(*a))),
 
         // Noise / placeholders (no variable AstNode children) ------------
         | n @ SimplexNoise2D { .. }
@@ -74,9 +75,9 @@ fn rec(node: AstNode) -> AstNode {
         | n @ InterpolatedNoiseSampler { .. }
         | n @ Beardifier { .. }
         | n @ IntervalSelect { .. }
-        | n @ YClampedGradient { .. }
-        | n @ Aquifer { .. }
-        | n @ BiomeTree { .. } => n,
+                | n @ Aquifer { .. }
+        | n @ BiomeTree { .. }
+        | n @ YClampedGradient { .. } => n,
 
         Shift { kind, offset } => Shift { kind, offset: Box::new(rec(*offset)) },
         Spline { locations, derivatives, location, values } => Spline {

@@ -106,7 +106,28 @@ fn emit_octave_stack(
 
 /// 统一节点分发函数。每个 emitter 模块都必须实现 `pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String>`。
 pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
-    match node {
+    // ── Memoization ────────────────────────────────────────────────
+    // MC's density tree is a DAG: the same subexpression (e.g. the
+    // `depth` / `offset` references) appears dozens of times. Without
+    // sharing, the emitter expands it every time -> 100k+ lines of WGSL.
+    // We key by AST fingerprint; disabled while coordinates are shadowed
+    // (Shift/ShiftedNoise/Cache) because then the same AST yields a
+    // different value.
+    let memo_key: Option<u64> = if ctx.in_shadow {
+        None
+    } else {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        node.hash(&mut h);
+        Some(h.finish())
+    };
+    if let Some(k) = memo_key {
+        if let Some(v) = ctx.memo_get(k) {
+            return Ok(v.clone());
+        }
+    }
+
+    let result = match node {
         AstNode::NoiseSampler { first, second, amplitude, xz_scale, y_scale, .. } => {
             emit_noise_sampler(ctx, first, second.as_ref(), *amplitude, *xz_scale, *y_scale)
         }
@@ -121,6 +142,12 @@ pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
         | AstNode::FloorDiv(_, _) => binary::emit(node, ctx),
         AstNode::Abs(_) | AstNode::Square(_) | AstNode::Cube(_) | AstNode::Sqrt(_) => {
             unary::emit(node, ctx)
+        }
+        AstNode::Squeeze(x) => {
+            let v = emit_node(x, ctx)?;
+            let var = ctx.fresh_var("sq");
+            ctx.emit(format!("let {var}: f32 = squeeze({v});"));
+            Ok(var)
         }
         AstNode::SimplexNoise2D { .. } | AstNode::SimplexNoise3D { .. } => {
             noise_simplex::emit(node, ctx)
@@ -140,5 +167,10 @@ pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
         AstNode::Aquifer { .. } => aquifer::emit(node, ctx),
         AstNode::BiomeTree { .. } => biome_tree::emit(node, ctx),
         AstNode::Root(_) => unreachable!("Root should be handled by root::emit"),
+    };
+
+    if let (Some(k), Ok(v)) = (memo_key, &result) {
+        ctx.memo_put(k, v.clone());
     }
+    result
 }

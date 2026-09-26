@@ -105,6 +105,8 @@ impl WorldContext {
         //    to synchronise corner computation and trilinear lerp within one
         //    dispatch (var<workgroup> memory does NOT persist across dispatches).
         let shader_src = wgsl_gen::emit_shader(&ast_root)?;
+        eprintln!("[c2me-wgpu][codegen] WGSL emitted: {} lines, {} bytes",
+                  shader_src.lines().count(), shader_src.len());
         validate_wgsl(&shader_src)
             .map_err(|e| anyhow::anyhow!("emitted WGSL failed naga validation:\n{e}"))?;
 
