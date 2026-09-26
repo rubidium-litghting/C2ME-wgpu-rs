@@ -117,19 +117,19 @@ fn perlin3d_with_perm(perm_offset: i32, x: f32, y: f32, z: f32) -> f32 {
     // Read this sampler's 256-entry table starting at perm_offset.
     let p = perm_offset;
     let a  = i32(perm[p + xi]);
-    let b  = i32(perm[p + (xi + 1) & 255]);
-    let aa = i32(perm[p + (a + yi) & 255]);
-    let ab = i32(perm[p + (a + yi + 1) & 255]);
-    let ba = i32(perm[p + (b + yi) & 255]);
-    let bb = i32(perm[p + (b + yi + 1) & 255]);
-    let aaa = i32(perm[p + (aa + zi) & 255]);
-    let aab = i32(perm[p + (aa + zi + 1) & 255]);
-    let aba = i32(perm[p + (ab + zi) & 255]);
-    let abb = i32(perm[p + (ab + zi + 1) & 255]);
-    let baa = i32(perm[p + (ba + zi) & 255]);
-    let bab = i32(perm[p + (ba + zi + 1) & 255]);
-    let bba = i32(perm[p + (bb + zi) & 255]);
-    let bbb = i32(perm[p + (bb + zi + 1) & 255]);
+    let b  = i32(perm[p + (((xi + 1)) & 255)]);
+    let aa = i32(perm[p + (((a + yi)) & 255)]);
+    let ab = i32(perm[p + (((a + yi + 1)) & 255)]);
+    let ba = i32(perm[p + (((b + yi)) & 255)]);
+    let bb = i32(perm[p + (((b + yi + 1)) & 255)]);
+    let aaa = i32(perm[p + (((aa + zi)) & 255)]);
+    let aab = i32(perm[p + (((aa + zi + 1)) & 255)]);
+    let aba = i32(perm[p + (((ab + zi)) & 255)]);
+    let abb = i32(perm[p + (((ab + zi + 1)) & 255)]);
+    let baa = i32(perm[p + (((ba + zi)) & 255)]);
+    let bab = i32(perm[p + (((ba + zi + 1)) & 255)]);
+    let bba = i32(perm[p + (((bb + zi)) & 255)]);
+    let bbb = i32(perm[p + (((bb + zi + 1)) & 255)]);
 
     let g000 = GRAD3[aaa & 15];
     let g100 = GRAD3[baa & 15];
@@ -172,6 +172,17 @@ fn noise_perlin3d(perm_offset: i32, x: f32, y: f32, z: f32) -> f32 {
     let px = maintain_precision(x);
     let py = maintain_precision(y);
     let pz = maintain_precision(z);
+    return perlin3d_with_perm(perm_offset, px, py, pz);
+}
+
+// MC-exact: maintainPrecision(coord*freq) THEN + origin, per octave.
+// `perm_offset` selects the table; its entry index (= perm_offset/256)
+// selects the (x,y,z) origin triple in binding 3.
+fn noise_perlin3d_origin(perm_offset: i32, x: f32, y: f32, z: f32) -> f32 {
+    let e = perm_offset / 256;
+    let px = maintain_precision(x)   + perm_origin[e * 3];
+    let py = maintain_precision(y)   + perm_origin[e * 3 + 1];
+    let pz = maintain_precision(z)   + perm_origin[e * 3 + 2];
     return perlin3d_with_perm(perm_offset, px, py, pz);
 }
 
@@ -427,19 +438,19 @@ fn perlin3d_with_perm_batched(
     let p = perm_offset;
 
     let a  = i32(perm[p + xi]);
-    let b  = i32(perm[p + (xi + 1) & 255]);
-    let aa = i32(perm[p + (a + yi) & 255]);
-    let ab = i32(perm[p + (a + yi + 1) & 255]);
-    let ba = i32(perm[p + (b + yi) & 255]);
-    let bb = i32(perm[p + (b + yi + 1) & 255]);
-    let aaa = i32(perm[p + (aa + zi) & 255]);
-    let aab = i32(perm[p + (aa + zi + 1) & 255]);
-    let aba = i32(perm[p + (ab + zi) & 255]);
-    let abb = i32(perm[p + (ab + zi + 1) & 255]);
-    let baa = i32(perm[p + (ba + zi) & 255]);
-    let bab = i32(perm[p + (ba + zi + 1) & 255]);
-    let bba = i32(perm[p + (bb + zi) & 255]);
-    let bbb = i32(perm[p + (bb + zi + 1) & 255]);
+    let b  = i32(perm[p + (((xi + 1)) & 255)]);
+    let aa = i32(perm[p + (((a + yi)) & 255)]);
+    let ab = i32(perm[p + (((a + yi + 1)) & 255)]);
+    let ba = i32(perm[p + (((b + yi)) & 255)]);
+    let bb = i32(perm[p + (((b + yi + 1)) & 255)]);
+    let aaa = i32(perm[p + (((aa + zi)) & 255)]);
+    let aab = i32(perm[p + (((aa + zi + 1)) & 255)]);
+    let aba = i32(perm[p + (((ab + zi)) & 255)]);
+    let abb = i32(perm[p + (((ab + zi + 1)) & 255)]);
+    let baa = i32(perm[p + (((ba + zi)) & 255)]);
+    let bab = i32(perm[p + (((ba + zi + 1)) & 255)]);
+    let bba = i32(perm[p + (((bb + zi)) & 255)]);
+    let bbb = i32(perm[p + (((bb + zi + 1)) & 255)]);
 
     // 2. 梯度向量
     let g000 = GRAD3[aaa & 15];

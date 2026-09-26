@@ -51,8 +51,6 @@ pub const TAG_SQUARE: u8 = 0x21;
 pub const TAG_CUBE: u8 = 0x22;
 pub const TAG_SQRT: u8 = 0x23;
 pub const TAG_FLOOR_DIV: u8 = 0x24;
-pub const TAG_PERLIN: u8 = 0x80;
-pub const TAG_DOUBLE_PERLIN: u8 = 0x81;
 pub const TAG_SIMPLEX_2D: u8 = 0x82;
 pub const TAG_SIMPLEX_3D: u8 = 0x83;
 pub const TAG_NOISE_SAMPLER: u8 = 0x84;
@@ -76,6 +74,44 @@ pub const TAG_ROOT: u8 = 0xFE;
 pub enum NoiseType {
     Perlin = 0,
     Simplex = 1,
+}
+
+/// One MC `OctavePerlinNoiseSampler`: a stack of `octaves` Perlin samplers.
+///
+/// MC's sample loop (confirmed from bytecode):
+/// ```text
+/// freq = initial_freq        // = 2^firstOctave
+/// amp  = persistence         // = 2^(n-1) / (2^n - 1)
+/// acc  = 0
+/// for i in 0..n:
+///     if octaveSamplers[i] != null:          // <=> amplitudes[i] != 0.0
+///         acc += amplitudes[i] * perlin(coord * freq) * amp
+///     freq *= 2.0
+///     amp  /= 2.0
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct OctaveSampler {
+    /// Base i32 index into the flat perm buffer; octave `i` reads the
+    /// 256-entry table starting at `perm_offset + i * 256`.
+    pub perm_offset: i32,
+    /// First octave's frequency multiplier (`2^firstOctave`).
+    pub initial_freq: f32,
+    /// First octave's amplitude multiplier (`2^(n-1)/(2^n-1)`).
+    pub persistence: f32,
+    /// Per-octave amplitude; a 0.0 entry means "no sampler at this octave".
+    pub amplitudes: Vec<f32>,
+}
+
+impl Hash for OctaveSampler {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.perm_offset.hash(state);
+        f32_to_hash_bits(self.initial_freq).hash(state);
+        f32_to_hash_bits(self.persistence).hash(state);
+        self.amplitudes.len().hash(state);
+        for &v in &self.amplitudes {
+            f32_to_hash_bits(v).hash(state);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,24 +140,19 @@ pub enum AstNode {
     FloorDiv(Box<AstNode>, Box<AstNode>),
 
     // ── Noise samplers ──────────────────────────────────────────────────
-    PerlinSampler {
-        seed: i64,
-        octaves: i32,
-        amplitudes: Vec<f32>,
-        lacunaritys: Vec<f32>,
-    },
     NoiseSampler {
         noise_type: NoiseType,
-        /// Index into the flat permutation buffer (binding 1); each entry is
-        /// a 256-u32 table. Replaces `seed` because MC 1.21.1 discards the
-        /// seed after table construction.
-        perm_offset: i32,
+        /// First `OctavePerlinNoiseSampler` (always present).
+        first: OctaveSampler,
+        /// Second octave sampler — `Some` for MC's `DoublePerlinNoiseSampler`
+        /// (the two are blended with a hard-coded 0.5 ratio); `None` for a
+        /// plain single `OctavePerlinNoiseSampler`.
+        second: Option<OctaveSampler>,
+        /// Outer blend factor applied to `(first + second)`; MC uses 0.5 for
+        /// `DoublePerlinNoiseSampler` and 1.0 for a plain octave stack.
+        amplitude: f32,
         xz_scale: f32,
         y_scale: f32,
-    },
-    DoublePerlin {
-        a: Box<AstNode>, // PerlinSampler A
-        b: Box<AstNode>, // PerlinSampler B
     },
     SimplexNoise2D {
         seed: i64,
@@ -279,41 +310,22 @@ impl Hash for AstNode {
             }
 
             // ── Noise samplers ──────────────────────────────────────────────
-            AstNode::PerlinSampler {
-                seed,
-                octaves,
-                amplitudes,
-                lacunaritys,
-            } => {
-                TAG_PERLIN.hash(state);
-                seed.hash(state);
-                octaves.hash(state);
-                amplitudes.len().hash(state);
-                for &v in amplitudes {
-                    f32_to_hash_bits(v).hash(state);
-                }
-                lacunaritys.len().hash(state);
-                for &v in lacunaritys {
-                    f32_to_hash_bits(v).hash(state);
-                }
-            }
             AstNode::NoiseSampler {
                 noise_type,
-                perm_offset,
+                first,
+                second,
+                amplitude,
                 xz_scale,
                 y_scale,
             } => {
                 TAG_NOISE_SAMPLER.hash(state);
                 0x84u8.hash(state);
                 noise_type.hash(state);
-                perm_offset.hash(state);
+                first.hash(state);
+                second.hash(state);
+                f32_to_hash_bits(*amplitude).hash(state);
                 xz_scale.to_bits().hash(state);
                 y_scale.to_bits().hash(state);
-            }
-            AstNode::DoublePerlin { a, b } => {
-                TAG_DOUBLE_PERLIN.hash(state);
-                a.hash(state);
-                b.hash(state);
             }
             AstNode::SimplexNoise2D { seed } => {
                 TAG_SIMPLEX_2D.hash(state);
@@ -492,20 +504,4 @@ mod tests {
         assert_ne!(hash_one(&a), hash_one(&b));
     }
 
-    #[test]
-    fn perlin_vec_length_sensitive() {
-        let p1 = AstNode::PerlinSampler {
-            seed: 0,
-            octaves: 1,
-            amplitudes: vec![1.0],
-            lacunaritys: vec![2.0],
-        };
-        let p2 = AstNode::PerlinSampler {
-            seed: 0,
-            octaves: 2,
-            amplitudes: vec![1.0, 0.5],
-            lacunaritys: vec![2.0, 2.0],
-        };
-        assert_ne!(hash_one(&p1), hash_one(&p2));
-    }
 }

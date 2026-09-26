@@ -109,41 +109,6 @@ mod tests {
             .expect("arithmetic emit must be valid WGSL");
     }
 
-    /// PerlinSampler emit must produce valid WGSL — this is the test that
-    /// catches signature mismatches between emitter and math_lib.wgsl
-    /// (e.g. if we forget to declare `noise_perlin3d` or the Kahan helpers).
-    #[test]
-    fn validate_accepts_perlin_emit() {
-        let perlin = AstNode::PerlinSampler {
-            seed: 42,
-            octaves: 2,
-            amplitudes: vec![1.0, 0.5],
-            lacunaritys: vec![2.0, 2.0],
-        };
-        let root = AstNode::Root(vec![perlin]);
-        let src = emit_shader(&root).expect("emit");
-        validate_wgsl(&src).expect("Perlin emit must be valid WGSL");
-    }
-
-    /// DoublePerlin(Perlin, Perlin) — both children resolve via Perlin
-    /// emitter so the whole shader must validate.
-    #[test]
-    fn validate_accepts_double_perlin_emit() {
-        let mk_perlin = || AstNode::PerlinSampler {
-            seed: 7,
-            octaves: 1,
-            amplitudes: vec![1.0],
-            lacunaritys: vec![2.0],
-        };
-        let dp = AstNode::DoublePerlin {
-            a: Box::new(mk_perlin()),
-            b: Box::new(mk_perlin()),
-        };
-        let root = AstNode::Root(vec![dp]);
-        let src = emit_shader(&root).expect("emit");
-        validate_wgsl(&src).expect("DoublePerlin emit must be valid WGSL");
-    }
-
     /// SimplexNoise2D — direct call to math_lib.wgsl::noise_simplex2d.
     #[test]
     fn validate_accepts_simplex2d_emit() {
@@ -167,10 +132,7 @@ mod tests {
         let root = AstNode::Root(vec![
             AstNode::Constant(0.5),
             AstNode::Add(
-                Box::new(AstNode::PerlinSampler {
-                    seed: 1, octaves: 1,
-                    amplitudes: vec![1.0], lacunaritys: vec![2.0],
-                }),
+                Box::new(AstNode::SimplexNoise3D { seed: 1 }),
                 Box::new(AstNode::SimplexNoise3D { seed: 2 }),
             ),
             AstNode::Mul(
@@ -204,11 +166,7 @@ mod tests {
             // Verifies slot allocation + nested barrier + shared-memory
             // read compose correctly.
             AstNode::Cache2D(Box::new(AstNode::CacheFlat(Box::new(
-                AstNode::PerlinSampler {
-                    seed: 42, octaves: 2,
-                    amplitudes: vec![1.0, 0.5],
-                    lacunaritys: vec![2.0, 2.0],
-                },
+                AstNode::SimplexNoise3D { seed: 42 },
             )))),
         ]);
         // CacheInterpolated now runs in single-pass mode (workgroup memory

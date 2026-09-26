@@ -44,7 +44,7 @@
 //! synchronization primitive — pass A's shared memory does not survive
 //! into pass B. Pass B re-runs inner if it must (the corner data is
 //! recomputed), but for typical NoiseRouter shapes inner is dominated
-//! by PerlinSampler whose cost is amortised by Cache2D/CacheFlat layers
+//! by noise samplers whose cost is amortised by Cache2D/CacheFlat layers
 //! *inside* the CacheInterpolated wrapper.
 //!
 //! Pipeline cache key: `(fingerprint, pass_id)` — see `pipeline_cache.rs`.
@@ -237,6 +237,7 @@ struct WorldgenParams {
 @group(0) @binding(0) var<storage, read>        params:       WorldgenParams;
 @group(0) @binding(1) var<storage, read>        perm: array<u32>;
 @group(0) @binding(2) var<storage, read_write>  out_buf:      array<f32>;
+@group(0) @binding(3) var<storage, read>        perm_origin:  array<f32>;
 "#;
 
 /// `main_entry` opening (single-pass mode) — sets up `cell_x / cell_y /
@@ -535,118 +536,6 @@ mod tests {
                 "at minimum must emit main_entry skeleton");
     }
 
-    // ── noise_perlin.rs tests ────────────────────────────────────────────
-
-    /// Single-channel Root with a 2-octave PerlinSampler.
-    ///
-    /// Asserts:
-    ///   1. `let amps_*: array<f32, 2> = array<f32, 2>(1.0, 0.5);`
-    ///   2. `let lacs_*: array<f32, 2> = array<f32, 2>(2.0, 2.0);`
-    ///   3. `var kacc_*: KahanSum = kahan_zero();` + 3 frequency vars
-    ///   4. `for (var i: u32 = 0u; i < 2u; i++) {`  loop header
-    ///   5. Inside loop: `let amp = amps_*[i];`, `let lac = lacs_*[i];`,
-    ///                   `noise_perlin3d(42 + i32(i), …) * amp;`,
-    ///                   `kahan_add(&kacc_*, pv_*);`
-    ///                   `fx_* *= lac;` / `fy_* *= lac;` / `fz_* *= lac;`
-    ///   6. Close for + `let p_*: f32 = kahan_result(kacc_*);`
-    ///   7. Final out_buf[0u …] = p_*
-    #[test]
-    fn emit_shader_perlin_2octaves() {
-        let perlin = AstNode::PerlinSampler {
-            seed: 42,
-            octaves: 2,
-            amplitudes: vec![1.0, 0.5],
-            lacunaritys: vec![2.0, 2.0],
-        };
-        let src = emit_shader(&tiny_root(vec![perlin])).expect("emit must succeed");
-
-        // 1 & 2 — array declarations
-        let amps_line = find_line(&src, |l| {
-            l.trim().starts_with("let amps_")
-                && l.trim().contains(": array<f32, 2> =")
-                && l.trim().contains("1.000000000e0")
-                && l.trim().contains("5.000000000e-1")
-        }).expect("missing amplitudes array<f32, 2> declaration");
-        let _ = amps_line;
-
-        let lacs_line = find_line(&src, |l| {
-            l.trim().starts_with("let lacs_")
-                && l.trim().contains(": array<f32, 2> =")
-        }).expect("missing lacunaritys array declaration");
-        let _ = lacs_line;
-
-        // 3 — Kahan accumulator
-        let kacc_line = find_line(&src, |l| {
-            l.trim().starts_with("var kacc_")
-                && l.trim().contains(": KahanSum = kahan_zero();")
-        }).expect("missing KahanSum var declaration");
-        // name extraction works for both `let` and `var` prefixes
-        let kacc_name = extract_var_name_prefix(kacc_line.1);
-
-        // frequency vars
-        assert!(find_line(&src, |l| l.trim().starts_with("var fx_")
-            && l.trim().contains("= cell_x;")).is_some(),
-                "missing fx = cell_x declaration");
-
-        // 4 — for loop header with static bound == 2
-        let for_line = find_line(&src, |l| {
-            l.trim().starts_with("for (var i: u32 = 0u; i < 2u; i++)")
-        }).expect("missing 2-iteration for loop header");
-        let _ = for_line;
-
-        // 5 — loop body: amp[i], lac[i], noise_perlin3d(42 + ...), kahan_add, *=
-        assert!(src.contains("let amp = amps_") && src.contains("[i];"),
-                "missing amp = amps[i] in loop body");
-        assert!(src.contains("let lac = lacs_") && src.contains("[i];"),
-                "missing lac = lacs[i] in loop body");
-        assert!(src.contains("noise_perlin3d(42 + i32(i),"),
-                "missing noise_perlin3d(seed+offset, fx, fy, fz) call");
-        assert!(src.contains(&format!("kahan_add(&{kacc_name},")),
-                "missing kahan_add(&kacc, pv) call in loop");
-        assert!(src.contains("*= lac;"),
-                "missing frequency multiplier lines *= lac");
-
-        // 6 — result = kahan_result(kacc)
-        let result_line = find_line(&src, |l| {
-            l.trim().starts_with("let p_")
-                && l.trim().contains(&format!("kahan_result({kacc_name})"))
-        }).expect("missing final kahan_result let binding");
-        let p_var = var_name_of_let_binding(result_line.1);
-
-        // 7 — out_buf write uses p_* var
-        let ch0_write = format!("out_buf[0u * cells_per_chunk + cell_idx] = {p_var};");
-        assert!(find_line(&src, |l| l.trim() == &ch0_write[..]).is_some(),
-                "ch0 out_buf write absent, expected `{ch0_write}`");
-    }
-
-    /// DoublePerlin(Perlin(oct=1), Simplex2D) — verifies dp blend 0.5 * va + 0.5 * vb.
-    ///
-    /// Simplex2D emitter is still stub ("simplex2d_stub"), but that's fine —
-    /// we just want to verify DoublePerlin's arithmetic wrapper is correct.
-    #[test]
-    fn emit_shader_double_perlin_blend_ratio() {
-        use crate::ast::AstNode::*;
-
-        let perlin_a = PerlinSampler {
-            seed: 10, octaves: 1,
-            amplitudes: vec![1.0], lacunaritys: vec![2.0],
-        };
-        let simplex_b = SimplexNoise2D { seed: 99 };
-        let dp = DoublePerlin { a: Box::new(perlin_a), b: Box::new(simplex_b) };
-        let src = emit_shader(&tiny_root(vec![dp])).expect("emit must succeed");
-
-        // DP blending line: `let dp_*: f32 = <a_var> * 5.000000000e-1 + <b_var> * 5.000000000e-1;`
-        let dp_line = find_line(&src, |l| {
-            let t = l.trim();
-            t.starts_with("let dp_")
-                && t.contains("* 5.000000000e-1 +")
-                && t.ends_with("* 5.000000000e-1;")
-        }).expect("missing DoublePerlin 0.5 blend line");
-        let dp_var = var_name_of_let_binding(dp_line.1);
-        let ch0_write = format!("out_buf[0u * cells_per_chunk + cell_idx] = {dp_var};");
-        assert!(find_line(&src, |l| l.trim() == &ch0_write[..]).is_some(),
-                "ch0 out_buf write absent, expected `{ch0_write}`");
-    }
 }
 
 /// Extract a variable name from either `let <name>: f32 = …;` or

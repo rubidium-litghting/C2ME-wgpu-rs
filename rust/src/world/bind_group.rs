@@ -90,6 +90,17 @@ pub fn create_layout(device: &wgpu::Device) -> Result<wgpu::BindGroupLayout> {
                 },
                 count: None,
             },
+            // binding 3: per-entry Perlin origin (x,y,z as f32), read-only
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
     Ok(layout)

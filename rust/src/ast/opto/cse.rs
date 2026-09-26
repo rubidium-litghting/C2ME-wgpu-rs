@@ -94,7 +94,6 @@ where
         | InputX
         | InputY
         | InputZ
-        | PerlinSampler { .. }
         | SimplexNoise2D { .. }
         | SimplexNoise3D { .. }
         | InterpolatedNoiseSampler { .. }
@@ -121,10 +120,6 @@ where
         Sqrt(a) => Sqrt(map_box(a, &mut f)),
 
         // Structured nodes with children ---------------------------------
-        DoublePerlin { a, b } => DoublePerlin {
-            a: map_box(a, &mut f),
-            b: map_box(b, &mut f),
-        },
         EndIslands(a) => EndIslands(map_box(a, &mut f)),
         RangeChoice {
             input,

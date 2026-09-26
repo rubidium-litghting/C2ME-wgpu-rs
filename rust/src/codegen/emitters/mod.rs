@@ -9,7 +9,6 @@ pub mod end_islands;
 pub mod find_top_surface;
 pub mod interval_select;
 pub mod noise_interpolated;
-pub mod noise_perlin;
 pub mod noise_simplex;
 pub mod range_choice;
 
@@ -22,21 +21,93 @@ use crate::ast::AstNode;
 use crate::codegen::wgsl_gen::GenCtx;
 use anyhow::{Result, anyhow};
 
+/// Emit a full MC `DoublePerlinNoiseSampler` (or single `OctavePerlinNoiseSampler`):
+/// sample each octave stack with Kahan summation, sum the two stacks, scale by
+/// `amplitude`. Coordinates are pre-scaled by `xz_scale` / `y_scale` (which Java
+/// already multiplied by MC's DOMAIN_SCALE=1.0181268882175227).
+fn emit_noise_sampler(
+    ctx: &mut GenCtx,
+    first: &crate::ast::OctaveSampler,
+    second: Option<&crate::ast::OctaveSampler>,
+    amplitude: f32,
+    xz_scale: f32,
+    y_scale: f32,
+) -> Result<String> {
+    // MC's DoublePerlinNoiseSampler applies DOMAIN_SCALE only to the SECOND
+    // stack: first.sample(x,y,z) + second.sample(x*D, y*D, z*D).
+    const DOMAIN_SCALE: f32 = 1.0181268882175227;
+    let v_first = emit_octave_stack(ctx, first, "first", xz_scale, y_scale, 1.0);
+    let total = if let Some(sec) = second {
+        let v_second = emit_octave_stack(ctx, sec, "second", xz_scale, y_scale, DOMAIN_SCALE);
+        let var = ctx.fresh_var("nsum");
+        ctx.emit(format!("let {var}: f32 = {v_first} + {v_second};"));
+        var
+    } else {
+        v_first
+    };
+    let var = ctx.fresh_var("ns");
+    ctx.emit(format!("let {var}: f32 = {total} * {:.9e};", amplitude));
+    Ok(var)
+}
+
+fn emit_octave_stack(
+    ctx: &mut GenCtx,
+    oct: &crate::ast::OctaveSampler,
+    tag: &str,
+    xz_scale: f32,
+    y_scale: f32,
+    domain_scale: f32,
+) -> String {
+    let n = oct.amplitudes.len();
+    let n_u32 = n as u32;
+    let amps_name = ctx.fresh_var(&format!("amps_{tag}"));
+    let acc_name = ctx.fresh_var(&format!("kacc_{tag}"));
+    let fx_name = ctx.fresh_var(&format!("fx_{tag}"));
+    let fy_name = ctx.fresh_var(&format!("fy_{tag}"));
+    let fz_name = ctx.fresh_var(&format!("fz_{tag}"));
+    let freq_name = ctx.fresh_var(&format!("freq_{tag}"));
+    let amp_name = ctx.fresh_var(&format!("ac_{tag}"));
+    let v_name = ctx.fresh_var(&format!("pv_{tag}"));
+    let out_name = ctx.fresh_var(&format!("os_{tag}"));
+
+    let amp_vals = oct
+        .amplitudes
+        .iter()
+        .map(|v| format!("{v:.9e}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    ctx.emit(format!(
+        "let {amps_name}: array<f32, {n_u32}> = array<f32, {n_u32}>({amp_vals});"
+    ));
+    let eff_xz = xz_scale * domain_scale;
+    let eff_y = y_scale * domain_scale;
+    ctx.emit(format!("var {fx_name}: f32 = cell_x * {eff_xz:.9e};"));
+    ctx.emit(format!("var {fy_name}: f32 = cell_y * {eff_y:.9e};"));
+    ctx.emit(format!("var {fz_name}: f32 = cell_z * {eff_xz:.9e};"));
+    ctx.emit(format!("var {freq_name}: f32 = {:.9e};", oct.initial_freq));
+    ctx.emit(format!("var {amp_name}: f32 = {:.9e};", oct.persistence));
+    ctx.emit(format!("var {acc_name}: KahanSum = kahan_zero();"));
+    ctx.emit(format!("for (var i: u32 = 0u; i < {n_u32}u; i++) {{"));
+    ctx.emit(format!("  let a_i = {amps_name}[i];"));
+    ctx.emit("  if (a_i != 0.0) {".to_string());
+    ctx.emit(format!(
+        "    let {v_name}: f32 = noise_perlin3d_origin({base}i + i32(i) * 256i, {fx_name} * {freq_name}, {fy_name} * {freq_name}, {fz_name} * {freq_name}) * a_i * {amp_name};",
+        base = oct.perm_offset
+    ));
+    ctx.emit(format!("    kahan_add(&{acc_name}, {v_name});"));
+    ctx.emit("  }".to_string());
+    ctx.emit(format!("  {freq_name} *= 2.0;"));
+    ctx.emit(format!("  {amp_name} *= 0.5;"));
+    ctx.emit("}".to_string());
+    ctx.emit(format!("let {out_name}: f32 = kahan_result({acc_name});"));
+    out_name
+}
+
 /// 统一节点分发函数。每个 emitter 模块都必须实现 `pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String>`。
 pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
     match node {
-        AstNode::NoiseSampler { perm_offset, xz_scale, y_scale, .. } => {
-            // Phase 2a: sample the FIRST octave's permutation table only
-            // (single Perlin, no DoublePerlin two-octave blend). Enough to
-            // prove the perm buffer reaches the GPU and yields non-zero values.
-            let var = ctx.fresh_var("ns");
-            ctx.emit(format!(
-                "let {var}: f32 = noise_perlin3d({perm_offset}i, cell_x * {xz:.9e}, cell_y * {ys:.9e}, cell_z * {xz:.9e});",
-                perm_offset = perm_offset,
-                xz = xz_scale,
-                ys = y_scale,
-            ));
-            Ok(var)
+        AstNode::NoiseSampler { first, second, amplitude, xz_scale, y_scale, .. } => {
+            emit_noise_sampler(ctx, first, second.as_ref(), *amplitude, *xz_scale, *y_scale)
         }
         AstNode::Constant(_) => constant::emit(node, ctx),
         AstNode::InputX | AstNode::InputY | AstNode::InputZ => coordinate::emit(node, ctx),
@@ -50,8 +121,6 @@ pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
         AstNode::Abs(_) | AstNode::Square(_) | AstNode::Cube(_) | AstNode::Sqrt(_) => {
             unary::emit(node, ctx)
         }
-        AstNode::PerlinSampler { .. } => noise_perlin::emit(node, ctx),
-        AstNode::DoublePerlin { .. } => noise_perlin::emit(node, ctx), // 复用 Perlin emitter
         AstNode::SimplexNoise2D { .. } | AstNode::SimplexNoise3D { .. } => {
             noise_simplex::emit(node, ctx)
         }

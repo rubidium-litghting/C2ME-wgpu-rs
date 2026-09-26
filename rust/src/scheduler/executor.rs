@@ -162,6 +162,8 @@ impl SingleBatchExecutor {
         // Get or create perm buffer (binding 1)
         let perm_buf = world.perm_buffer()
             .ok_or_else(|| "perm buffer not uploaded".to_string())?;
+        let origin_buf = world.origin_buffer()
+            .ok_or_else(|| "origin buffer not uploaded".to_string())?;
 
         // Create output buffer (binding 2)
         let output_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -193,6 +195,10 @@ impl SingleBatchExecutor {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: output_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: origin_buf.as_entire_binding(),
                 },
             ],
         });

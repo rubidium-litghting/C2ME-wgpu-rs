@@ -69,7 +69,6 @@ fn rec(node: AstNode) -> AstNode {
         Sqrt(a) => Sqrt(Box::new(rec(*a))),
 
         // Noise / placeholders (no variable AstNode children) ------------
-        n @ PerlinSampler { .. }
         | n @ SimplexNoise2D { .. }
         | n @ SimplexNoise3D { .. }
         | n @ InterpolatedNoiseSampler { .. }
@@ -81,10 +80,6 @@ fn rec(node: AstNode) -> AstNode {
         | n @ BiomeTree { .. } => n,
 
         // Structured nodes with children: post-order only ----------------
-        DoublePerlin { a, b } => DoublePerlin {
-            a: Box::new(rec(*a)),
-            b: Box::new(rec(*b)),
-        },
         EndIslands(a) => EndIslands(Box::new(rec(*a))),
         RangeChoice {
             input,

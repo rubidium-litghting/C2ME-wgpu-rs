@@ -119,9 +119,11 @@ pub fn permutation_table_for_seed(seed: i64) -> [u32; PERM_TABLE_SIZE] {
 ///
 /// Layout in the final `Vec<i32>`:
 ///   ```text
-///   [seed_0_table_0..256] [seed_1_table_0..256] ...
+///   [table_0_0..256] [table_1_0..256] ...
 ///   ```
-/// Each `PerlinSampler` looks up its offset via `offset_for(seed)`.
+/// Each `NoiseSampler` carries its own `perm_offset` (== `i * 256` for
+/// entry `i`); see `from_entries`. The legacy `from_seeds` constructor is
+/// retained for tests that don't have real tables to hand.
 #[derive(Debug, Clone, Default)]
 pub struct PermutationTableSet {
     /// Flat packed buffer: concatenation of all permutation tables.
@@ -130,6 +132,10 @@ pub struct PermutationTableSet {
     /// `seed → byte offset / 4` (= i32 index) within `buffer`.
     /// Used by `wgsl_gen` to emit `perm_offset_i32` in place of `seed_i32`.
     pub offsets: FxHashMap<i64, i32>,
+    /// Per-entry PerlinNoiseSampler origin (x,y,z), flat layout: entry i
+    /// occupies indices [i*3, i*3+3). Uploaded to binding 3. MC adds origin
+    /// to the noise coordinate AFTER maintainPrecision, BEFORE floor().
+    pub origins: Vec<f32>,
 }
 
 impl PermutationTableSet {
@@ -150,6 +156,7 @@ impl PermutationTableSet {
             let offset = set.buffer.len() as i32;
             set.buffer.extend(table.iter().map(|&x| x as i32));
             set.offsets.insert(seed, offset);
+            set.origins.extend([0.0f32, 0.0, 0.0]);
         }
         set
     }
@@ -163,6 +170,9 @@ impl PermutationTableSet {
             let offset = (i * 256) as i32;
             set.buffer.extend(e.perm.iter().map(|&x| x as i32));
             set.offsets.insert(i as i64, offset);
+            set.origins.push(e.origin[0] as f32);
+            set.origins.push(e.origin[1] as f32);
+            set.origins.push(e.origin[2] as f32);
         }
         set
     }

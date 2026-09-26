@@ -38,6 +38,7 @@ use anyhow::anyhow;
 use crate::Result;
 use crate::ast::AstNode;
 use crate::ast::NoiseType;
+use crate::ast::OctaveSampler;
 
 /// Parse a full blob including header. Returns (Root node, Shape config, BiomeTree).
 ///
@@ -138,7 +139,34 @@ fn parse_perm_resource(blob: &[u8], offset: usize) -> Result<Vec<PermEntry>> {
 
 /// Recursively parse one `[tag:u8][payload]` node starting at bytes[offset..].
 /// Returns (node, bytes_consumed).
-pub fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
+pub fn parse_octave_block(bytes: &[u8], cursor: &mut usize) -> Result<OctaveSampler> {
+    let cur = *cursor;
+    let rem = bytes.len().saturating_sub(cur);
+    ensure(rem >= 4 + 4 + 4 + 4, "OctaveSampler header")?;
+    let perm_offset = i32::from_le_bytes(bytes[cur..cur + 4].try_into().unwrap());
+    *cursor += 4;
+    let initial_freq = f32::from_le_bytes(bytes[cur + 4..cur + 8].try_into().unwrap());
+    *cursor += 4;
+    let persistence = f32::from_le_bytes(bytes[cur + 8..cur + 12].try_into().unwrap());
+    *cursor += 4;
+    let octaves = i32::from_le_bytes(bytes[cur + 12..cur + 16].try_into().unwrap());
+    *cursor += 4;
+    if octaves < 0 || octaves > 64 {
+        return Err(anyhow!("OctaveSampler: bogus octaves={octaves}"));
+    }
+    let n = octaves as usize;
+    let rem = bytes.len().saturating_sub(*cursor);
+    ensure(rem >= n * 4, "OctaveSampler amplitudes")?;
+    let mut amplitudes = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = *cursor + i * 4;
+        amplitudes.push(f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()));
+    }
+    *cursor += n * 4;
+    Ok(OctaveSampler { perm_offset, initial_freq, persistence, amplitudes })
+}
+
+fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
     if offset >= bytes.len() {
         return Err(anyhow!("binary blob deserialize error: unexpected EOF"));
     }
@@ -242,87 +270,6 @@ pub fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
         }
 
         // ── Noise samplers (0x80..0x90) ───────────────────────────────────
-        0x80 => {
-            // PerlinSampler
-            // Payload:
-            //   seed(i64 LE 8B) | octaves(i32 LE 4B)
-            //   amplitudes_len(i32 LE 4B) | [f32 LE; amplitudes_len]
-            //   lacunaritys_len(i32 LE 4B) | [f32 LE; lacunaritys_len]
-            let rem = |cur: usize| bytes.len().saturating_sub(cur);
-            ensure(
-                rem(cursor) >= 8 + 4 + 4,
-                "PerlinSampler header (seed/octaves/amp_len)",
-            )?;
-            let seed = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-            cursor += 8;
-            let octaves = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
-            let amp_len =
-                i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-            cursor += 4;
-
-            ensure(
-                rem(cursor) >= amp_len * 4,
-                "PerlinSampler amplitudes payload",
-            )?;
-            let mut amplitudes = Vec::with_capacity(amp_len);
-            for i in 0..amp_len {
-                let bits = u32::from_le_bytes(
-                    bytes[cursor + i * 4..cursor + i * 4 + 4]
-                        .try_into()
-                        .unwrap(),
-                );
-                amplitudes.push(f32::from_bits(bits));
-            }
-            cursor += amp_len * 4;
-
-            ensure(rem(cursor) >= 4, "PerlinSampler lacunaritys_len")?;
-            let lac_len =
-                i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-            cursor += 4;
-            ensure(
-                rem(cursor) >= lac_len * 4,
-                "PerlinSampler lacunaritys payload",
-            )?;
-            let mut lacunaritys = Vec::with_capacity(lac_len);
-            for i in 0..lac_len {
-                let bits = u32::from_le_bytes(
-                    bytes[cursor + i * 4..cursor + i * 4 + 4]
-                        .try_into()
-                        .unwrap(),
-                );
-                lacunaritys.push(f32::from_bits(bits));
-            }
-            cursor += lac_len * 4;
-
-            let want = octaves as usize;
-            if amplitudes.len() != want || lacunaritys.len() != want {
-                return Err(anyhow!(
-                    "PerlinSampler length mismatch: octaves={}, amplitudes.len()={}, lacunaritys.len()={}",
-                    octaves,
-                    amplitudes.len(),
-                    lacunaritys.len()
-                ));
-            }
-
-            PerlinSampler {
-                seed,
-                octaves,
-                amplitudes,
-                lacunaritys,
-            }
-        }
-        0x81 => {
-            // DoublePerlin(a, b)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?;
-            cursor += lb;
-            DoublePerlin {
-                a: Box::new(a),
-                b: Box::new(b),
-            }
-        }
         0x82 => {
             // SimplexNoise2D { seed: i64 }
             ensure(bytes.len() >= cursor + 8, "SimplexNoise2D seed")?;
@@ -338,23 +285,43 @@ pub fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
             SimplexNoise3D { seed }
         }
         0x84 => {
-            // Payload: [type:u8] [perm_offset:i32 LE] [xz_scale:f32 LE] [y_scale:f32 LE]
-            ensure(bytes.len() >= cursor + 1 + 4 + 4 + 4, "NoiseSampler")?;
+            // Payload:
+            //   [type:u8] [flags:u8] [amplitude:f32] [xz_scale:f32] [y_scale:f32]
+            //   [first: OctaveBlock]
+            //   if flags & 1: [second: OctaveBlock]
+            //
+            // OctaveBlock:
+            //   [perm_offset:i32] [lacunarity:f32] [octaves:i32]
+            //   [amplitudes: f32 × octaves]
+            ensure(bytes.len() >= cursor + 1 + 1 + 4 + 4 + 4, "NoiseSampler header")?;
             let noise_type = match bytes[cursor] {
                 0 => NoiseType::Perlin,
                 1 => NoiseType::Simplex,
                 _ => return Err(anyhow!("unknown noise type in NoiseSampler")),
             };
             cursor += 1;
-            let perm_offset = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            let flags = bytes[cursor];
+            cursor += 1;
+            let amplitude =
+                f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
             cursor += 4;
-            let xz_scale = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            let xz_scale =
+                f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
             cursor += 4;
-            let y_scale = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            let y_scale =
+                f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
             cursor += 4;
+            let first = parse_octave_block(bytes, &mut cursor)?;
+            let second = if flags & 1 != 0 {
+                Some(parse_octave_block(bytes, &mut cursor)?)
+            } else {
+                None
+            };
             NoiseSampler {
                 noise_type,
-                perm_offset,
+                first,
+                second,
+                amplitude,
                 xz_scale,
                 y_scale,
             }
@@ -789,125 +756,6 @@ mod tests {
     }
 
     // ── 子阶段 2.3-2 噪声采样器测试 ──────────────────────────────────────
-
-    /// 测试 PerlinSampler（带振幅/频率向量）解析：
-    ///   seed=42, octaves=2
-    ///   amplitudes = [1.0, 0.5]
-    ///   lacunaritys = [2.0, 2.0]
-    #[test]
-    fn test_perlin_sampler_with_vectors() {
-        let v1p0 = 1.0f32.to_le_bytes();
-        let v0p5 = 0.5f32.to_le_bytes();
-        let v2p0 = 2.0f32.to_le_bytes();
-
-        let blob: &[u8] = &[
-            // HEADER
-            0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ROOT(1 ch)
-            0xFE, 0x01, 0x00, // TAG_PERLIN = 0x80
-            0x80, // seed=42 (i64 LE)
-            0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // octaves=2 (i32 LE)
-            0x02, 0x00, 0x00, 0x00, // amplitudes_len=2
-            0x02, 0x00, 0x00, 0x00, // amplitudes[0]=1.0  [1]=0.5
-            v1p0[0], v1p0[1], v1p0[2], v1p0[3], v0p5[0], v0p5[1], v0p5[2], v0p5[3],
-            // lacunaritys_len=2
-            0x02, 0x00, 0x00, 0x00, // lacunaritys[0]=2.0  [1]=2.0
-            v2p0[0], v2p0[1], v2p0[2], v2p0[3], v2p0[0], v2p0[1], v2p0[2], v2p0[3],
-            // SHAPE_CONFIG 16B
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // BIOME
-            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
-        ];
-
-        let (root, _, _) = deserialize_full(blob).unwrap();
-
-        let expected = AstNode::Root(vec![AstNode::PerlinSampler {
-            seed: 42,
-            octaves: 2,
-            amplitudes: vec![1.0, 0.5],
-            lacunaritys: vec![2.0, 2.0],
-        }]);
-        assert_eq!(root, expected);
-    }
-
-    /// 测试 Simplex2D/3D + DoublePerlin 组合：
-    ///   ROOT(3 ch)
-    ///     ch0 = Simplex2D { seed: -1 }
-    ///     ch1 = Simplex3D { seed: 7 }
-    ///     ch2 = DoublePerlin {
-    ///         a = Perlin(octaves=1, amp[1.0], lac[2.0], seed=10)
-    ///         b = Simplex2D { seed: 99 }
-    ///     }
-    #[test]
-    fn test_simplex_and_double_perlin() {
-        let v1p0 = 1.0f32.to_le_bytes();
-        let v2p0 = 2.0f32.to_le_bytes();
-
-        let blob: &[u8] = &[
-            // HEADER
-            0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ROOT(3 ch)
-            0xFE, 0x03, 0x00, // === ch0: Simplex2D seed=-1 ===
-            0x82, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // -1i64 LE
-            // === ch1: Simplex3D seed=7 ===
-            0x83, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 7i64 LE
-            // === ch2: DoublePerlin ===
-            0x81, // a = Perlin(octaves=1, amp[1.0], lac[2.0], seed=10)
-            0x80, // seed=10
-            0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // octaves=1
-            0x01, 0x00, 0x00, 0x00, // amp_len=1, [1.0]
-            0x01, 0x00, 0x00, 0x00, v1p0[0], v1p0[1], v1p0[2], v1p0[3],
-            // lac_len=1, [2.0]
-            0x01, 0x00, 0x00, 0x00, v2p0[0], v2p0[1], v2p0[2], v2p0[3],
-            // b = Simplex2D { seed: 99 }
-            0x82, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 99i64 LE
-            // SHAPE_CONFIG 16B
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // BIOME
-            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
-        ];
-
-        let (root, _, _) = deserialize_full(blob).unwrap();
-
-        let ch0 = AstNode::SimplexNoise2D { seed: -1 };
-        let ch1 = AstNode::SimplexNoise3D { seed: 7 };
-        let ch2 = AstNode::DoublePerlin {
-            a: Box::new(AstNode::PerlinSampler {
-                seed: 10,
-                octaves: 1,
-                amplitudes: vec![1.0],
-                lacunaritys: vec![2.0],
-            }),
-            b: Box::new(AstNode::SimplexNoise2D { seed: 99 }),
-        };
-        assert_eq!(root, AstNode::Root(vec![ch0, ch1, ch2]));
-    }
-
-    /// 测试 PerlinSampler 契约：amplitudes.len() != octaves 应该报错
-    #[test]
-    fn test_perlin_sampler_length_mismatch_errors() {
-        let v1p0 = 1.0f32.to_le_bytes();
-        let v2p0 = 2.0f32.to_le_bytes();
-
-        // 构造：octaves=3，但 amplitudes 只有 2 个元素 → 长度不匹配
-        let blob: &[u8] = &[
-            // HEADER
-            0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ROOT(1 ch)
-            0xFE, 0x01, 0x00, 0x80, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // seed=42
-            0x03, 0x00, 0x00, 0x00, // octaves=3
-            0x02, 0x00, 0x00, 0x00, // amp_len=2  (!! < 3)
-            v1p0[0], v1p0[1], v1p0[2], v1p0[3], v2p0[0], v2p0[1], v2p0[2], v2p0[3], 0x03, 0x00,
-            0x00, 0x00, // lac_len=3
-            v2p0[0], v2p0[1], v2p0[2], v2p0[3], v2p0[0], v2p0[1], v2p0[2], v2p0[3], v2p0[0],
-            v2p0[1], v2p0[2], v2p0[3], // SHAPE_CONFIG 16B
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // BIOME
-            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
-        ];
-
-        let result = deserialize_full(blob);
-        assert!(result.is_err(), "expected mismatch error");
-        let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("length mismatch"),
-            "expected length mismatch in err, got: {msg}"
-        );
-    }
 
     // ── 子阶段 2.3-3 地形结构 / 形状选择测试 ───────────────────────────────
 

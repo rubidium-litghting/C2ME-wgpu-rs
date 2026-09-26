@@ -46,8 +46,29 @@ public class NoiseRouterBlobifier {
     private static final IdentityHashMap<Object, Void> SEEN_PERM = new IdentityHashMap<>();
     private static final List<Object> PERM_SAMPLERS = new ArrayList<>();
     private static Object lastDperlin = null;
-    /** IdentityHashMap: DoublePerlinNoiseSampler -> first Perlin index in PERM_SAMPLERS. */
-    private static final IdentityHashMap<Object, Integer> DPS_FIRST_INDEX = new IdentityHashMap<>();
+    /** IdentityHashMap: DoublePerlinNoiseSampler -> structured stack info. */
+    private static final IdentityHashMap<Object, DpsInfo> DPS_INFO = new IdentityHashMap<>();
+
+    private static final class StackInfo {
+        final int permOffset;
+        final float initialFreq;
+        final float persistence;
+        final float[] amplitudes;
+        StackInfo(int permOffset, float initialFreq, float persistence, float[] amplitudes) {
+            this.permOffset = permOffset;
+            this.initialFreq = initialFreq;
+            this.persistence = persistence;
+            this.amplitudes = amplitudes;
+        }
+    }
+    private static final class DpsInfo {
+        final StackInfo first;
+        final StackInfo second;
+        final float amplitude;
+        DpsInfo(StackInfo f, StackInfo sec, float amp) {
+            first = f; second = sec; amplitude = amp;
+        }
+    }
     private static NoiseConfig CURRENT_NOISE_CONFIG = null;
 
     // ── Tags ────────────────────────────────────────────────────────
@@ -86,7 +107,7 @@ public class NoiseRouterBlobifier {
         ByteBuffer buf = ByteBuffer.allocate(4 * 1024 * 1024).order(ByteOrder.LITTLE_ENDIAN);
         SEEN_PERM.clear();
         PERM_SAMPLERS.clear();
-        DPS_FIRST_INDEX.clear();
+        DPS_INFO.clear();
         // ── HEADER (10B) ─────────────────────────────────────────
         buf.put((byte) 0x4D);
         buf.put((byte) 0x43);
@@ -247,17 +268,24 @@ public class NoiseRouterBlobifier {
             return;
         }
 
-        // ── Noise: emit TAG_NOISE_SAMPLER with perm_offset ─────
+        // ── Noise: emit TAG_NOISE_SAMPLER with structured stacks ─
         if (df instanceof DensityFunctionTypes.Noise tn) {
-            int idx = registerNoiseSampler(tn.noise());
+            DpsInfo info = registerNoiseSampler(tn.noise());
             buf.put(TAG_NOISE_SAMPLER);
             buf.put((byte) 0);                        // type: Perlin
-            buf.putInt(idx >= 0 ? idx * 256 : 0);     // perm_offset (i32 LE)
-            // MC applies DOMAIN_SCALE=1.0181268882175227 inside
-            // DoublePerlinNoiseSampler to de-align integer grid coords.
-            final double DOMAIN_SCALE = 1.0181268882175227;
-            buf.putFloat((float) (tn.xzScale() * DOMAIN_SCALE));
-            buf.putFloat((float) (tn.yScale() * DOMAIN_SCALE));
+            boolean hasSecond = (info != null && info.second != null);
+            buf.put((byte) (hasSecond ? 1 : 0));      // flags
+            buf.putFloat(info != null ? info.amplitude : 1.0f);
+            buf.putFloat((float) tn.xzScale());
+            buf.putFloat((float) tn.yScale());
+            if (info != null && info.first != null) {
+                writeStack(buf, info.first);
+            } else {
+                writeFallbackStack(buf);
+            }
+            if (hasSecond) {
+                writeStack(buf, info.second);
+            }
             return;
         }
 
@@ -292,6 +320,20 @@ public class NoiseRouterBlobifier {
         writeConstant(buf, 0.0f);
     }
 
+    private static void writeStack(ByteBuffer buf, StackInfo st) {
+        buf.putInt(st.permOffset);
+        buf.putFloat(st.initialFreq);
+        buf.putFloat(st.persistence);
+        buf.putInt(st.amplitudes.length);
+        for (float a : st.amplitudes) buf.putFloat(a);
+    }
+    private static void writeFallbackStack(ByteBuffer buf) {
+        buf.putInt(0);
+        buf.putFloat(2.0f);
+        buf.putInt(1);
+        buf.putFloat(1.0f);
+    }
+
     /**
      * Append the collected Perlin permutation tables.
      * Layout (little-endian):
@@ -305,6 +347,11 @@ public class NoiseRouterBlobifier {
         buf.putInt(PERM_MAGIC);
         buf.putInt(PERM_SAMPLERS.size());
         for (Object sampler : PERM_SAMPLERS) {
+            if (sampler == null) {
+                for (int i = 0; i < 256; i++) buf.putInt(0);
+                buf.putDouble(0); buf.putDouble(0); buf.putDouble(0);
+                continue;
+            }
             try {
                 byte[] perm = findPermutation(sampler);
                 for (int i = 0; i < 256; i++) {
@@ -333,31 +380,114 @@ public class NoiseRouterBlobifier {
         throw new NoSuchFieldException("permutation (byte[]) not found");
     }
 
-    private static void registerOctaveSampler(Object octaveSampler) {
-        if (octaveSampler == null) return;
+    private static float[] extractAmplitudes(Object octaveSampler, int expectedLen) {
+        for (Field f : octaveSampler.getClass().getDeclaredFields()) {
+            if (f.getType() == double[].class) {
+                try {
+                    f.setAccessible(true);
+                    double[] arr = (double[]) f.get(octaveSampler);
+                    float[] out = new float[arr.length];
+                    for (int i = 0; i < arr.length; i++) out[i] = (float) arr[i];
+                    return out;
+                } catch (Throwable ignored) {}
+            }
+        }
+        for (Field f : octaveSampler.getClass().getDeclaredFields()) {
+            if (List.class.isAssignableFrom(f.getType())) {
+                try {
+                    f.setAccessible(true);
+                    List<?> list = (List<?>) f.get(octaveSampler);
+                    if (!list.isEmpty() && list.get(0) instanceof Double) {
+                        float[] out = new float[list.size()];
+                        for (int i = 0; i < list.size(); i++) {
+                            out[i] = ((Double) list.get(i)).floatValue();
+                        }
+                        return out;
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+        float[] out = new float[Math.max(1, expectedLen)];
+        java.util.Arrays.fill(out, 1.0f);
+        return out;
+    }
+
+    private static int extractFirstOctave(Object octaveSampler) {
         try {
+            Field f = octaveSampler.getClass().getDeclaredField("firstOctave");
+            f.setAccessible(true);
+            return f.getInt(octaveSampler);
+        } catch (Throwable ignored) {}
+        int best = 0; boolean found = false;
+        for (Field f : octaveSampler.getClass().getDeclaredFields()) {
+            if (f.getType() == int.class) {
+                try {
+                    f.setAccessible(true);
+                    int v = f.getInt(octaveSampler);
+                    if (v >= -20 && v <= 10 && (!found || v < best)) {
+                        best = v; found = true;
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+        return best;
+    }
+
+    private static StackInfo registerOneStack(Object octaveSampler) {
+        if (octaveSampler == null) return null;
+        try {
+            PerlinNoiseSampler[] arr = null;
             for (Field f : octaveSampler.getClass().getDeclaredFields()) {
                 if (f.getType() == PerlinNoiseSampler[].class) {
                     f.setAccessible(true);
-                    PerlinNoiseSampler[] arr = (PerlinNoiseSampler[]) f.get(octaveSampler);
-                    for (PerlinNoiseSampler p : arr) {
-                        if (p != null && SEEN_PERM.put(p, null) == null) {
-                            PERM_SAMPLERS.add(p);
-                        }
-                    }
-                    return;
+                    arr = (PerlinNoiseSampler[]) f.get(octaveSampler);
+                    break;
                 }
             }
+            if (arr == null) {
+                System.err.println("[c2me-wgpu] registerOneStack: no PerlinNoiseSampler[] field");
+                return null;
+            }
+            int baseIdx = PERM_SAMPLERS.size();
+            for (PerlinNoiseSampler p : arr) {
+                if (p == null) {
+                    PERM_SAMPLERS.add(null);
+                } else {
+                    SEEN_PERM.put(p, null);
+                    PERM_SAMPLERS.add(p);
+                }
+            }
+            float[] amps = extractAmplitudes(octaveSampler, arr.length);
+            int n = amps.length;
+            int firstOctave = extractFirstOctave(octaveSampler);
+            float initialFreq = (float) Math.pow(2.0, firstOctave);
+            float persistence = n <= 1
+                    ? 1.0f
+                    : (float) (Math.pow(2.0, n - 1) / (Math.pow(2.0, n) - 1.0));
+            return new StackInfo(baseIdx * 256, initialFreq, persistence, amps);
         } catch (Throwable t) {
-            System.err.println("[c2me-wgpu] registerOctaveSampler failed: " + t);
+            System.err.println("[c2me-wgpu] registerOneStack failed: " + t);
+            return null;
         }
     }
 
-    private static int registerNoiseSampler(DensityFunction.Noise n) {
-        // 1) Prefer the already-instantiated sampler (populated when the router
-        //    comes from NoiseConfig; null for the raw settings template).
+    private static float computeAmplitude(StackInfo st) {
+        if (st == null || st.amplitudes.length == 0) return 1.0f;
+        int minIdx = Integer.MAX_VALUE, maxIdx = Integer.MIN_VALUE;
+        for (int i = 0; i < st.amplitudes.length; i++) {
+            if (st.amplitudes[i] != 0.0f) {
+                if (i < minIdx) minIdx = i;
+                if (i > maxIdx) maxIdx = i;
+            }
+        }
+        if (maxIdx < minIdx) return 1.0f;
+        double n = maxIdx - minIdx;
+        double createAmplitude = 0.1 * (1.0 + 1.0 / (n + 1.0));
+        return (float) ((1.0 / 6.0) / createAmplitude);
+    }
+
+    private static DpsInfo registerNoiseSampler(DensityFunction.Noise n) {
         Object dperlin = n.noise();
-        // 2) Fall back to instantiating from NoiseConfig by registry key.
         if (!(dperlin instanceof DoublePerlinNoiseSampler) && CURRENT_NOISE_CONFIG != null) {
             try {
                 var keyOpt = n.noiseData().getKey();
@@ -369,27 +499,33 @@ public class NoiseRouterBlobifier {
             }
         }
         if (!(dperlin instanceof DoublePerlinNoiseSampler)) {
-            return -1;
+            return null;
         }
-        Integer cached = DPS_FIRST_INDEX.get(dperlin);
+        DpsInfo cached = DPS_INFO.get(dperlin);
         if (cached != null) return cached;
-        int firstIdx = -1;
         try {
+            Object first = null, second = null;
             for (Field f : dperlin.getClass().getDeclaredFields()) {
                 if (OctavePerlinNoiseSampler.class.isAssignableFrom(f.getType())) {
                     f.setAccessible(true);
-                    int before = PERM_SAMPLERS.size();
-                    registerOctaveSampler(f.get(dperlin));
-                    if (firstIdx < 0 && PERM_SAMPLERS.size() > before) {
-                        firstIdx = before;
-                    }
+                    Object v = f.get(dperlin);
+                    String nm = f.getName();
+                    if (nm.contains("first")) first = v;
+                    else if (nm.contains("second")) second = v;
+                    else if (first == null) first = v;
+                    else if (second == null) second = v;
                 }
             }
+            StackInfo fi = registerOneStack(first);
+            StackInfo si = registerOneStack(second);
+            float amp = computeAmplitude(fi);
+            DpsInfo info = new DpsInfo(fi, si, amp);
+            DPS_INFO.put(dperlin, info);
+            return info;
         } catch (Throwable t) {
             System.err.println("[c2me-wgpu] registerNoiseSampler failed: " + t);
+            return null;
         }
-        DPS_FIRST_INDEX.put(dperlin, firstIdx);
-        return firstIdx;
     }
 
     public static class ShapeConfig {

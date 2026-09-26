@@ -157,11 +157,8 @@ fn rec(node: AstNode) -> AstNode {
         }
 
         // Noise / Structure leaves ---------------------------------------
-        // No variable AstNode children — return as-is. PerlinSampler's Vec<f32>
-        // parameters are literals, not child nodes, so there's nothing to
-        // recurse into.
-        n @ PerlinSampler { .. }
-        | n @ SimplexNoise2D { .. }
+        // No variable AstNode children — return as-is.
+        n @ SimplexNoise2D { .. }
         | n @ SimplexNoise3D { .. }
         | n @ InterpolatedNoiseSampler { .. }
         | n @ Beardifier { .. }
@@ -175,10 +172,6 @@ fn rec(node: AstNode) -> AstNode {
         // the node itself (semantic meaning depends on coordinate input
         // or wrapper identity).
         AstNode::NoiseSampler { .. } => node, // 或使用通配符
-        DoublePerlin { a, b } => DoublePerlin {
-            a: Box::new(rec(*a)),
-            b: Box::new(rec(*b)),
-        },
         EndIslands(a) => EndIslands(Box::new(rec(*a))),
         RangeChoice {
             input,

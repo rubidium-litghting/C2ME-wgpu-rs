@@ -24,7 +24,7 @@
 
 //! SimplexNoise2D / SimplexNoise3D emitter.
 //!
-//! Unlike PerlinSampler, MC's SimplexNoiseSampler is a *single-octave* noise:
+//! MC's SimplexNoiseSampler is a *single-octave* noise:
 //!   * no `amplitudes[]` / `lacunaritys[]`
 //!   * no Kahan summation (铁律② does not apply)
 //!   * direct call to `math_lib.wgsl::noise_simpleXd(seed, x, y[, z])`
