@@ -1186,7 +1186,7 @@ mod tests {
 
         let mut max_d = 0.0f32;
         for cy in 0..96usize { for cz in 0..4usize { for cx in 0..4usize {
-            let wx = (1 + cx as i32 * 4) as f32;
+            let wx = (16 + cx as i32 * 4) as f32;
             let wy = (-64 + cy as i32 * 4) as f32;
             let wz = (cz * 4) as f32;
             let c = cpu(wx, wy, wz);

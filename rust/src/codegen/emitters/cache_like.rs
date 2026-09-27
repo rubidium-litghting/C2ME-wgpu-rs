@@ -229,10 +229,17 @@ pub(crate) fn emit_cache_interp(inner: &AstNode, ctx: &mut GenCtx) -> Result<Str
     ctx.emit("      let cz: u32 = lz + dz;");
     // Corner world coords. Corner 0 is one cell to the left of the
     // invocation's cell, hence the `- cell_width` offset.
-    ctx.emit("      let corner_x_i32: i32 = world_x_i32 - i32(params.cell_width) + i32(cx) * i32(params.cell_width);");
-    ctx.emit("      let corner_y_i32: i32 = world_y_i32 - i32(params.cell_height) + i32(cy) * i32(params.cell_height);");
-    ctx.emit("      let corner_z_i32: i32 = world_z_i32 - i32(params.cell_width) + i32(cz) * i32(params.cell_width);");
+    // `world_*` is the corner coordinate of THIS invocation's cell
+    // (global cell index = gid). Corner `cx = lx + dx` is `dx` cells to
+    // the +axis, so its world coord is world + dx * cell_size.
+    ctx.emit("      let corner_x_i32: i32 = world_x_i32 + i32(dx) * i32(params.cell_width);");
+    ctx.emit("      let corner_y_i32: i32 = world_y_i32 + i32(dy) * i32(params.cell_height);");
+    ctx.emit("      let corner_z_i32: i32 = world_z_i32 + i32(dz) * i32(params.cell_width);");
     // Shadow cell_x/y/z in a nested block so inner reads corner coords.
+    // Enter shadow scope BEFORE emitting `{`, so the pushed frame is
+    // flagged as a boundary and memo_get stops searching outward past it.
+    let saved_shadow = ctx.in_shadow;
+    ctx.in_shadow = true;
     ctx.emit("      {");
     ctx.emit("        let cell_x: f32 = f32(corner_x_i32);");
     ctx.emit("        let cell_y: f32 = f32(corner_y_i32);");
@@ -240,6 +247,7 @@ pub(crate) fn emit_cache_interp(inner: &AstNode, ctx: &mut GenCtx) -> Result<Str
     let inner_var = emit_node(inner, ctx)?;
     ctx.emit(format!("        {smem}[cx * 25u + cy * 5u + cz] = {inner_var};"));
     ctx.emit("      }");
+    ctx.in_shadow = saved_shadow;
     ctx.emit("    }");
     ctx.emit("  }");
     ctx.emit("}");

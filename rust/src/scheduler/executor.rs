@@ -137,8 +137,13 @@ impl SingleBatchExecutor {
         let shape = world.shape();
 
         // Build WorldgenParams
-        let origin_x = batch.positions.iter().map(|p| p.0).min().unwrap_or(0);
-        let origin_z = batch.positions.iter().map(|p| p.1).min().unwrap_or(0);
+        // `batch.positions` holds CHUNK coords; the shader wants BLOCK coords.
+        // A chunk is 16 blocks wide along X and Z.
+        let origin_x = batch.positions.iter().map(|p| p.0).min().unwrap_or(0) * 16;
+        let origin_z = batch.positions.iter().map(|p| p.1).min().unwrap_or(0) * 16;
+
+        eprintln!("[c2me-wgpu][batch] positions={:?} origin=({},{})",
+                  batch.positions, origin_x, origin_z);
 
         let params = WorldgenParams {
             batch_origin_x: origin_x,

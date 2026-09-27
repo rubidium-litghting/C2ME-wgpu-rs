@@ -113,9 +113,11 @@ pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
     // We key by AST fingerprint; disabled while coordinates are shadowed
     // (Shift/ShiftedNoise/Cache) because then the same AST yields a
     // different value.
-    let memo_key: Option<u64> = if ctx.in_shadow {
-        None
-    } else {
+    // Always memoize. Cross-shadow reuse is prevented by the scope-stack
+    // boundary flag (see GenCtx::memo_get), NOT by disabling memo here —
+    // disabling it re-expands the whole subtree and blows WGSL up to
+    // ~100k lines.
+    let memo_key: Option<u64> = {
         use std::hash::{Hash, Hasher};
         let mut h = rustc_hash::FxHasher::default();
         node.hash(&mut h);

@@ -104,7 +104,11 @@ pub struct GenCtx {
     /// Index 0 is the function top level; each `{` pushes, each `}` pops.
     /// A value memoized at scope k is visible from scope k and every
     /// nested scope, so reusing it is always WGSL-scope-safe.
-    pub memo_stack: Vec<rustc_hash::FxHashMap<u64, String>>,
+    /// Each frame: (is_shadow_boundary, fingerprint -> var). A boundary
+    /// frame means coordinates were shadowed when it was pushed, so
+    /// memo_get must NOT search past it (outer values used different
+    /// coordinates). Within the frame, memoization still works.
+    pub memo_stack: Vec<(bool, rustc_hash::FxHashMap<u64, String>)>,
     /// Set while `cell_x/y/z` are shadowed (Shift/ShiftedNoise/Cache).
     /// Memoization is bypassed entirely then, because the same AST
     /// evaluates to a different value at shadowed coordinates.
@@ -121,7 +125,7 @@ impl GenCtx {
             next_cacheflat_slot: 0,
             next_cache_interp_slot: 0,
             pass,
-            memo_stack: vec![rustc_hash::FxHashMap::default()],
+            memo_stack: vec![(false, rustc_hash::FxHashMap::default())],
             in_shadow: false,
         }
     }
@@ -135,7 +139,7 @@ impl GenCtx {
         // Maintain the memo scope stack in lockstep with brace nesting.
         for ch in s.chars() {
             match ch {
-                '{' => self.memo_stack.push(rustc_hash::FxHashMap::default()),
+                '{' => self.memo_stack.push((self.in_shadow, rustc_hash::FxHashMap::default())),
                 '}' => {
                     if self.memo_stack.len() > 1 {
                         self.memo_stack.pop();
@@ -147,11 +151,16 @@ impl GenCtx {
         self.lines.push(s);
     }
 
-    /// Look up a memoized value in the current scope or any enclosing one.
+    /// Look up a memoized value in the current scope or enclosing ones,
+    /// stopping at the first shadow boundary (values outside it were
+    /// computed at different coordinates and must not be reused).
     pub fn memo_get(&self, key: u64) -> Option<&String> {
-        for m in self.memo_stack.iter().rev() {
+        for (is_boundary, m) in self.memo_stack.iter().rev() {
             if let Some(v) = m.get(&key) {
                 return Some(v);
+            }
+            if *is_boundary {
+                break;
             }
         }
         None
@@ -159,7 +168,7 @@ impl GenCtx {
 
     /// Record a memoized value in the innermost scope.
     pub fn memo_put(&mut self, key: u64, value: String) {
-        if let Some(top) = self.memo_stack.last_mut() {
+        if let Some((_, top)) = self.memo_stack.last_mut() {
             top.insert(key, value);
         }
     }

@@ -55,6 +55,8 @@ public abstract class MixinChunkGenerator {
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu");
     private static final AtomicBoolean WORLD_INIT_ATTEMPTED = new AtomicBoolean(false);
     private static final AtomicLong WORLD_HANDLE = new AtomicLong(0L);
+    private static volatile NoiseRouter REF_ROUTER = null;
+    private static final AtomicBoolean TRUTH_DUMPED = new AtomicBoolean(false);
 
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
     private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,
@@ -77,6 +79,7 @@ public abstract class MixinChunkGenerator {
                     return;
                 }
                 NoiseRouterBlobifier.ShapeConfig shape = new NoiseRouterBlobifier.ShapeConfig(-64, 384, 4, 4);
+                REF_ROUTER = noiseConfig.getNoiseRouter();
                 ByteBuffer blob = NoiseRouterBlobifier.blobify(router, shape, noiseConfig);
                 LOGGER.info("[c2me-wgpu] first chunk [{} {}], blob size={} bytes",
                         chunk.getPos().x, chunk.getPos().z, blob.remaining());
@@ -147,11 +150,18 @@ public abstract class MixinChunkGenerator {
         BlockState stone = Blocks.STONE.getDefaultState();
         BlockState air = Blocks.AIR.getDefaultState();
 
+
+        float dmin = Float.POSITIVE_INFINITY, dmax = Float.NEGATIVE_INFINITY;
+        int stoneCells = 0, airCells = 0;
+
         for (int cy = 0; cy < CELLS_Y; cy++) {
             for (int cz = 0; cz < CELLS_Z; cz++) {
                 for (int cx = 0; cx < CELLS_X; cx++) {
                     int idx = cx + cz * CELLS_X + cy * CELLS_X * CELLS_Z;
                     float d = bb.getFloat(base + idx * 4);
+                    if (d < dmin) dmin = d;
+                    if (d > dmax) dmax = d;
+                    if (d > 0.0f) stoneCells++; else airCells++;
                     BlockState bs = (d > 0.0f) ? stone : air;
                     for (int dy = 0; dy < CELL_H; dy++) {
                         int by = MIN_Y + cy * CELL_H + dy;
@@ -167,6 +177,45 @@ public abstract class MixinChunkGenerator {
                         }
                     }
                 }
+            }
+        }
+
+
+        // One-shot: dump the depth channel's exact structure.
+        if (TRUTH_DUMPED.compareAndSet(false, true) && REF_ROUTER != null) {
+            LOGGER.info("[c2me-wgpu][depth] {}", REF_ROUTER.depth().toString());
+        }
+
+        // Compare MC truth vs GPU for chunk (0,0) across a vertical profile.
+        if (chunk.getPos().x == 0 && chunk.getPos().z == 0 && REF_ROUTER != null) {
+            int cx0 = chunk.getPos().x * 16;
+            int cz0 = chunk.getPos().z * 16;
+            NoiseRouter r = REF_ROUTER;
+            int[] cys = { 8, 12, 16, 20, 24, 28, 32 };
+            for (int cy : cys) {
+                int wy = MIN_Y + cy * CELL_H;
+                int idx = cy * CELLS_X * CELLS_Z; // cx=0, cz=0
+                var pos = new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(
+                        cx0, wy, cz0);
+                double t11 = r.finalDensity().sample(pos);
+                double t10 = r.initialDensityWithoutJaggedness().sample(pos);
+                double t8 = r.depth().sample(pos);
+                double t6 = r.continents().sample(pos);
+                double t7 = r.erosion().sample(pos);
+                double t9 = r.ridges().sample(pos);
+                float g11 = bb.getFloat(base + idx * 4);
+                int ch10base = PAYLOAD_BASE + 10 * CELLS_PER_CHANNEL * 4;
+                float g10 = bb.getFloat(ch10base + idx * 4);
+                int ch8base = PAYLOAD_BASE + 8 * CELLS_PER_CHANNEL * 4;
+                float g8 = bb.getFloat(ch8base + idx * 4);
+                int ch6base = PAYLOAD_BASE + 6 * CELLS_PER_CHANNEL * 4;
+                float g6 = bb.getFloat(ch6base + idx * 4);
+                int ch7base = PAYLOAD_BASE + 7 * CELLS_PER_CHANNEL * 4;
+                float g7 = bb.getFloat(ch7base + idx * 4);
+                int ch9base = PAYLOAD_BASE + 9 * CELLS_PER_CHANNEL * 4;
+                float g9 = bb.getFloat(ch9base + idx * 4);
+                LOGGER.info("[c2me-wgpu][cmp] y={} mc11={} gpu11={} mc10={} gpu10={} mc8={} gpu8={} mc6={} gpu6={} mc7={} gpu7={} mc9={} gpu9={}",
+                        wy, t11, g11, t10, g10, t8, g8, t6, g6, t7, g7, t9, g9);
             }
         }
     }

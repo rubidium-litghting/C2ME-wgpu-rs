@@ -137,14 +137,6 @@ public class NoiseRouterBlobifier {
         writeDF(buf, router.depth());
         writeDF(buf, router.ridges());
         writeDF(buf, router.initialDensityWithoutJaggedness());
-        System.err.println("[c2me-wgpu][chtype] continents=" + router.continents().getClass().getName());
-        System.err.println("[c2me-wgpu][chtype] depth=" + router.depth().getClass().getName());
-        System.err.println("[c2me-wgpu][chtype] initialDensity=" + router.initialDensityWithoutJaggedness().getClass().getName());
-        System.err.println("[c2me-wgpu][chtype] finalDensity=" + router.finalDensity().getClass().getName());
-        String fds = router.finalDensity().toString();
-        System.err.println("[c2me-wgpu][fd] len=" + fds.length());
-        System.err.println("[c2me-wgpu][fd] " + fds.substring(0, Math.min(3000, fds.length())));
-        System.err.println("[c2me-wgpu][fd_tail] " + fds.substring(Math.max(0, fds.length() - 3000)));
         writeDF(buf, router.finalDensity());
         writeDF(buf, router.veinToggle());
         writeDF(buf, router.veinRidged());
@@ -248,13 +240,19 @@ public class NoiseRouterBlobifier {
                 case SQUARE -> { buf.put(TAG_SQUARE); writeDF(buf, in); }
                 case CUBE -> { buf.put(TAG_CUBE); writeDF(buf, in); }
                 case HALF_NEGATIVE -> {
+                    // MC: x > 0 ? x : x*0.5   ==   max(x, 0.5*x)
+                    buf.put(TAG_MAX);
+                    writeDF(buf, in);
                     buf.put(TAG_MUL);
-                    writeConstant(buf, -0.5f);
+                    writeConstant(buf, 0.5f);
                     writeDF(buf, in);
                 }
                 case QUARTER_NEGATIVE -> {
+                    // MC: x > 0 ? x : x*0.25   ==   max(x, 0.25*x)
+                    buf.put(TAG_MAX);
+                    writeDF(buf, in);
                     buf.put(TAG_MUL);
-                    writeConstant(buf, -0.25f);
+                    writeConstant(buf, 0.25f);
                     writeDF(buf, in);
                 }
                 case SQUEEZE -> { buf.put((byte) 0x25); writeDF(buf, in); }
