@@ -384,6 +384,22 @@ fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
             }
         }
 
+        0x86 => {
+            // [mapper:u8] [input: node] [noise: NoiseSampler]
+            ensure(bytes.len() >= cursor + 1, "WeirdScaled mapper")?;
+            let mapper = bytes[cursor];
+            cursor += 1;
+            let (input, l1) = parse_node(bytes, cursor)?;
+            cursor += l1;
+            let (noise, l2) = parse_node(bytes, cursor)?;
+            cursor += l2;
+            WeirdScaledSampler {
+                mapper,
+                input: Box::new(input),
+                noise: Box::new(noise),
+            }
+        }
+
         // ── Structure terrain / Shape selection (0xA0..0xB3) ───────────────
         0xA0 => {
             // EndIslands(child) — child 通常是坐标函数

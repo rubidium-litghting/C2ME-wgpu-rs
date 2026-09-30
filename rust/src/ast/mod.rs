@@ -174,6 +174,14 @@ pub enum AstNode {
         kind: u8,
         offset: Box<AstNode>,
     },
+    /// MC `WeirdScaledSampler`: scale = mapper(input); result = scale *
+    /// abs(noise.sample(x/scale, y/scale, z/scale)). `mapper`: 1 = TYPE1
+    /// (scaleTunnels), 2 = TYPE2 (scaleCaves).
+    WeirdScaledSampler {
+        mapper: u8,
+        input: Box<AstNode>,
+        noise: Box<AstNode>,
+    },
     /// MC `ShiftedNoise`: shifts the sample coords by three 2D/3D noise
     /// fields, then samples `noise` at the displaced coordinate.
     ShiftedNoise {
@@ -375,6 +383,12 @@ impl Hash for AstNode {
                 0xB4u8.hash(state);
                 kind.hash(state);
                 offset.hash(state);
+            }
+            AstNode::WeirdScaledSampler { mapper, input, noise } => {
+                0x86u8.hash(state);
+                mapper.hash(state);
+                input.hash(state);
+                noise.hash(state);
             }
             AstNode::ShiftedNoise {
                 xz_scale, y_scale, shift_x, shift_y, shift_z, noise,

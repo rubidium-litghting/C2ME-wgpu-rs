@@ -176,6 +176,11 @@ fn rec(node: AstNode) -> AstNode {
         // or wrapper identity).
         AstNode::NoiseSampler { .. } => node, // 或使用通配符
         Shift { kind, offset } => Shift { kind, offset: Box::new(rec(*offset)) },
+        WeirdScaledSampler { mapper, input, noise } => WeirdScaledSampler {
+            mapper,
+            input: Box::new(rec(*input)),
+            noise: Box::new(rec(*noise)),
+        },
         Spline { locations, derivatives, location, values } => Spline {
             locations: locations.clone(), derivatives: derivatives.clone(),
             location: Box::new(rec(*location)),

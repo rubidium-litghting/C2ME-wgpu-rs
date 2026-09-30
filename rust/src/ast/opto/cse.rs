@@ -90,6 +90,11 @@ where
     match node {
         AstNode::NoiseSampler { .. } => node, // 或使用通配符
         Shift { kind, offset } => Shift { kind, offset: map_box(offset, &mut f) },
+        WeirdScaledSampler { mapper, input, noise } => WeirdScaledSampler {
+            mapper,
+            input: map_box(input, &mut f),
+            noise: map_box(noise, &mut f),
+        },
         Spline { locations, derivatives, location, values } => Spline {
             locations, derivatives,
             location: map_box(location, &mut f),

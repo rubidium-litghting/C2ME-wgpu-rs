@@ -104,6 +104,35 @@ fn emit_octave_stack(
     out_name
 }
 
+/// MC `WeirdScaledSampler`: scale = mapper(input); result = scale *
+/// abs(noise.sample(x/scale, y/scale, z/scale)).
+fn emit_weird_scaled(
+    ctx: &mut GenCtx,
+    mapper: u8,
+    input: &AstNode,
+    noise: &AstNode,
+) -> Result<String> {
+    let input_var = emit_node(input, ctx)?;
+    let scale_var = ctx.fresh_var("ws_scale");
+    let fn_name = if mapper == 1 { "scale_tunnels" } else { "scale_caves" };
+    ctx.emit(format!("let {scale_var}: f32 = {fn_name}({input_var});"));
+
+    // Noise is sampled at (x/scale, y/scale, z/scale); shadow coords.
+    let result = ctx.fresh_var("ws");
+    ctx.emit(format!("var {result}: f32 = 0.0;"));
+    let saved = ctx.in_shadow;
+    ctx.in_shadow = true;
+    ctx.emit("{".to_string());
+    ctx.emit(format!("  let cell_x: f32 = cell_x / {scale_var};"));
+    ctx.emit(format!("  let cell_y: f32 = cell_y / {scale_var};"));
+    ctx.emit(format!("  let cell_z: f32 = cell_z / {scale_var};"));
+    let n = emit_node(noise, ctx)?;
+    ctx.emit(format!("  {result} = abs({n}) * {scale_var};"));
+    ctx.emit("}".to_string());
+    ctx.in_shadow = saved;
+    Ok(result)
+}
+
 /// 统一节点分发函数。每个 emitter 模块都必须实现 `pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String>`。
 pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
     // ── Memoization ────────────────────────────────────────────────
@@ -156,6 +185,9 @@ pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
         }
         AstNode::InterpolatedNoiseSampler { .. } => noise_interpolated::emit(node, ctx),
         AstNode::Shift { .. } | AstNode::ShiftedNoise { .. } => shift::emit(node, ctx),
+        AstNode::WeirdScaledSampler { mapper, input, noise } => {
+            emit_weird_scaled(ctx, *mapper, input, noise)
+        }
         AstNode::Beardifier { .. } => beardifier::emit(node, ctx),
         AstNode::Spline { .. } => spline::emit(node, ctx),
         AstNode::RangeChoice { .. } => range_choice::emit(node, ctx),

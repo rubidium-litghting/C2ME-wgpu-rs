@@ -100,6 +100,7 @@ public class NoiseRouterBlobifier {
     private static final byte TAG_SPLINE = (byte) 0xB0;
     private static final byte TAG_SHIFT = (byte) 0xB4;
     private static final byte TAG_SHIFTED_NOISE = (byte) 0xB5;
+    private static final byte TAG_WEIRD_SCALED = (byte) 0x86;
     private static final byte TAG_CACHE_FLAT = (byte) 0xC0;
     private static final byte TAG_CACHE_2D = (byte) 0xC1;
     private static final byte TAG_CACHE_INTERP = (byte) 0xC2;
@@ -287,7 +288,15 @@ public class NoiseRouterBlobifier {
             switch (w.type()) {
                 case FLAT_CACHE -> buf.put(TAG_CACHE_FLAT);
                 case CACHE2D -> buf.put(TAG_CACHE_2D);
-                case CACHE_ONCE, CACHE_ALL_IN_CELL -> buf.put(TAG_CACHE_INTERP);
+                // CACHE_ONCE / CACHE_ALL_IN_CELL are pure memoisation in MC:
+                // they return the same value as their inner at the same
+                // position. Treating them as INTERPOLATED (corner-blend)
+                // silently changes the value -> wrong density. Emit as
+                // passthrough (recurse into the wrapped node).
+                case CACHE_ONCE, CACHE_ALL_IN_CELL -> {
+                    writeDF(buf, w.wrapped());
+                    return;
+                }
                 case INTERPOLATED -> buf.put(TAG_INTERP_NOISE);
             }
             writeDF(buf, w.wrapped());
@@ -350,6 +359,18 @@ public class NoiseRouterBlobifier {
             buf.putFloat((float) g.toY());
             buf.putFloat((float) g.fromValue());
             buf.putFloat((float) g.toValue());
+            return;
+        }
+
+        // ── WeirdScaledSampler ──────────────────────────────────
+        if (df instanceof DensityFunctionTypes.WeirdScaledSampler ws) {
+            buf.put(TAG_WEIRD_SCALED);
+            buf.put(ws.rarityValueMapper() ==
+                    DensityFunctionTypes.WeirdScaledSampler.RarityValueMapper.TYPE1
+                    ? (byte) 1 : (byte) 2);
+            writeDF(buf, ws.input());
+            buf.put(TAG_NOISE_SAMPLER);
+            writeNoiseSamplerPayload(buf, ws.noise(), 1.0f, 1.0f);
             return;
         }
 

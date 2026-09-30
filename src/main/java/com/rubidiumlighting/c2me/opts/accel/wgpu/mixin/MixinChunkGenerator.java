@@ -56,6 +56,10 @@ public abstract class MixinChunkGenerator {
     private static final AtomicBoolean WORLD_INIT_ATTEMPTED = new AtomicBoolean(false);
     private static final AtomicLong WORLD_HANDLE = new AtomicLong(0L);
     private static volatile NoiseRouter REF_ROUTER = null;
+<<<<<<< HEAD
+=======
+    private static volatile NoiseRouter RAW_ROUTER = null;
+>>>>>>> ce8386e (2b: fix CACHE_ONCE passthrough, SQUEEZE clamp, RangeChoice semantics; add WeirdScaledSampler — finalDensity now aligned (~1e-3))
     private static final AtomicBoolean TRUTH_DUMPED = new AtomicBoolean(false);
 
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
@@ -80,6 +84,10 @@ public abstract class MixinChunkGenerator {
                 }
                 NoiseRouterBlobifier.ShapeConfig shape = new NoiseRouterBlobifier.ShapeConfig(-64, 384, 4, 4);
                 REF_ROUTER = noiseConfig.getNoiseRouter();
+<<<<<<< HEAD
+=======
+                RAW_ROUTER = router;
+>>>>>>> ce8386e (2b: fix CACHE_ONCE passthrough, SQUEEZE clamp, RangeChoice semantics; add WeirdScaledSampler — finalDensity now aligned (~1e-3))
                 ByteBuffer blob = NoiseRouterBlobifier.blobify(router, shape, noiseConfig);
                 LOGGER.info("[c2me-wgpu] first chunk [{} {}], blob size={} bytes",
                         chunk.getPos().x, chunk.getPos().z, blob.remaining());
@@ -183,7 +191,15 @@ public abstract class MixinChunkGenerator {
 
         // One-shot: dump the depth channel's exact structure.
         if (TRUTH_DUMPED.compareAndSet(false, true) && REF_ROUTER != null) {
+<<<<<<< HEAD
             LOGGER.info("[c2me-wgpu][depth] {}", REF_ROUTER.depth().toString());
+=======
+            if (RAW_ROUTER != null) {
+                String ds = RAW_ROUTER.depth().toString();
+                LOGGER.info("[c2me-wgpu][depth] len={} head={}", ds.length(),
+                        ds.substring(0, Math.min(2000, ds.length())));
+            }
+>>>>>>> ce8386e (2b: fix CACHE_ONCE passthrough, SQUEEZE clamp, RangeChoice semantics; add WeirdScaledSampler — finalDensity now aligned (~1e-3))
         }
 
         // Compare MC truth vs GPU for chunk (0,0) across a vertical profile.

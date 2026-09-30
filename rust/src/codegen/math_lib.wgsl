@@ -93,8 +93,25 @@ const GRAD3: array<vec3<f32>, 16> = array<vec3<f32>, 16>(
     vec3(-1.0,  1.0,  0.0), vec3( 0.0, -1.0, -1.0)
 );
 
+fn scale_tunnels(x: f32) -> f32 {
+    if (x < -0.5) { return 0.75; }
+    if (x < 0.0)  { return 1.0; }
+    if (x < 0.5)  { return 1.5; }
+    return 2.0;
+}
+
+fn scale_caves(x: f32) -> f32 {
+    if (x < -0.75) { return 0.5; }
+    if (x < -0.5)  { return 0.75; }
+    if (x < 0.5)   { return 1.0; }
+    if (x < 0.75)  { return 2.0; }
+    return 3.0;
+}
+
 fn squeeze(x: f32) -> f32 {
-    return x * 0.5 - x * x * x / 24.0;
+    // MC: x = clamp(x, -1, 1); return x/2 - x^3/24
+    let c = clamp(x, -1.0, 1.0);
+    return c * 0.5 - c * c * c / 24.0;
 }
 
 fn clamped_map(v: f32, from_min: f32, from_max: f32, to_min: f32, to_max: f32) -> f32 {
