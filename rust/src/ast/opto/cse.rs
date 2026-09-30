@@ -117,6 +117,7 @@ where
         | IntervalSelect { .. }
                 | Aquifer { .. }
         | BiomeTree { .. }
+        | InterpNoiseSampler { .. }
         | YClampedGradient { .. } => node,
 
         // Binary arithmetic ----------------------------------------------

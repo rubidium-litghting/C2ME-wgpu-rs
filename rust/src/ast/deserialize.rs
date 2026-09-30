@@ -400,6 +400,28 @@ fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
             }
         }
 
+        0x87 => {
+            ensure(bytes.len() >= cursor + 40, "InterpNoiseSampler")?;
+            let rd_f = |b: &[u8], o: usize| f32::from_le_bytes(b[o..o+4].try_into().unwrap());
+            let rd_i = |b: &[u8], o: usize| i32::from_le_bytes(b[o..o+4].try_into().unwrap());
+            let xz_scale = rd_f(bytes, cursor); cursor += 4;
+            let y_scale = rd_f(bytes, cursor); cursor += 4;
+            let xz_factor = rd_f(bytes, cursor); cursor += 4;
+            let y_factor = rd_f(bytes, cursor); cursor += 4;
+            let smear = rd_f(bytes, cursor); cursor += 4;
+            let lower_base = rd_i(bytes, cursor); cursor += 4;
+            let lower_count = rd_i(bytes, cursor); cursor += 4;
+            let upper_base = rd_i(bytes, cursor); cursor += 4;
+            let upper_count = rd_i(bytes, cursor); cursor += 4;
+            let interp_base = rd_i(bytes, cursor); cursor += 4;
+            let interp_count = rd_i(bytes, cursor); cursor += 4;
+            InterpNoiseSampler {
+                xz_scale, y_scale, xz_factor, y_factor, smear,
+                lower_base, lower_count, upper_base, upper_count,
+                interp_base, interp_count,
+            }
+        }
+
         // ── Structure terrain / Shape selection (0xA0..0xB3) ───────────────
         0xA0 => {
             // EndIslands(child) — child 通常是坐标函数

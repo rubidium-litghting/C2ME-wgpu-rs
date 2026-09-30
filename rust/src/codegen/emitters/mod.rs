@@ -188,6 +188,22 @@ pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
         AstNode::WeirdScaledSampler { mapper, input, noise } => {
             emit_weird_scaled(ctx, *mapper, input, noise)
         }
+        AstNode::InterpNoiseSampler {
+            xz_scale, y_scale, xz_factor, y_factor, smear,
+            lower_base, lower_count, upper_base, upper_count,
+            interp_base, interp_count,
+        } => {
+            let var = ctx.fresh_var("ins");
+            ctx.emit(format!(
+                "let {var}: f32 = interp_noise_sampler({lb}i, {lc}i, {ub}i, {uc}i, {ib}i, {ic}i, cell_x, cell_y, cell_z, {xzs:.9e}, {yss:.9e}, {xzf:.9e}, {yf:.9e}, {sm:.9e});",
+                lb = lower_base, lc = lower_count,
+                ub = upper_base, uc = upper_count,
+                ib = interp_base, ic = interp_count,
+                xzs = xz_scale, yss = y_scale, xzf = xz_factor,
+                yf = y_factor, sm = smear,
+            ));
+            Ok(var)
+        }
         AstNode::Beardifier { .. } => beardifier::emit(node, ctx),
         AstNode::Spline { .. } => spline::emit(node, ctx),
         AstNode::RangeChoice { .. } => range_choice::emit(node, ctx),

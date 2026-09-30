@@ -169,6 +169,7 @@ fn rec(node: AstNode) -> AstNode {
         | n @ IntervalSelect { .. }
                 | n @ Aquifer { .. }
         | n @ BiomeTree { .. }
+        | n @ InterpNoiseSampler { .. }
         | n @ YClampedGradient { .. } => n,
 
         // Nodes with variable AstNode children — recurse but never fold

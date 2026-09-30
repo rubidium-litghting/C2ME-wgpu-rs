@@ -4,7 +4,8 @@
   "package": "com.rubidiumlighting.c2me.opts.accel.wgpu.mixin",
   "compatibilityLevel": "JAVA_21",
   "mixins": [
-    "MixinChunkGenerator"
+    "MixinChunkGenerator",
+    "InterpolatedNoiseSamplerAccessor"
   ],
   "client": [],
   "server": [],

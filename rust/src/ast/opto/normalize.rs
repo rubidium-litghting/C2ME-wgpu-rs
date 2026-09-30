@@ -77,6 +77,7 @@ fn rec(node: AstNode) -> AstNode {
         | n @ IntervalSelect { .. }
                 | n @ Aquifer { .. }
         | n @ BiomeTree { .. }
+        | n @ InterpNoiseSampler { .. }
         | n @ YClampedGradient { .. } => n,
 
         Shift { kind, offset } => Shift { kind, offset: Box::new(rec(*offset)) },

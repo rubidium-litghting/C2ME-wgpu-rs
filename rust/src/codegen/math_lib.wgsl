@@ -108,6 +108,113 @@ fn scale_caves(x: f32) -> f32 {
     return 3.0;
 }
 
+fn perlin_ysmear(perm_offset: i32, x: f32, y: f32, z: f32, yfreq: f32, ysmear: f32) -> f32 {
+    let e = perm_offset / 256;
+    let px = x + perm_origin[e * 3];
+    let py = y + perm_origin[e * 3 + 1];
+    let pz = z + perm_origin[e * 3 + 2];
+    let ix = i32(floor(px));
+    let iy = i32(floor(py));
+    let iz = i32(floor(pz));
+    let fx = px - f32(ix);
+    let fy = py - f32(iy);
+    let fz = pz - f32(iz);
+    var o: f32 = 0.0;
+    if (yfreq != 0.0) {
+        let m = select(fy, ysmear, (ysmear >= 0.0) && (ysmear < fy));
+        o = floor(m / yfreq + 1.0e-7) * yfreq;
+    }
+    let dy = fy - o;
+    let p = perm_offset;
+    let xi = ix & 255;
+    let yi = iy & 255;
+    let zi = iz & 255;
+    let a  = i32(perm[p + xi]);
+    let b  = i32(perm[p + (((xi + 1)) & 255)]);
+    let aa = i32(perm[p + (((a + yi)) & 255)]);
+    let ab = i32(perm[p + (((a + yi + 1)) & 255)]);
+    let ba = i32(perm[p + (((b + yi)) & 255)]);
+    let bb = i32(perm[p + (((b + yi + 1)) & 255)]);
+    let aaa = i32(perm[p + (((aa + zi)) & 255)]);
+    let aab = i32(perm[p + (((aa + zi + 1)) & 255)]);
+    let aba = i32(perm[p + (((ab + zi)) & 255)]);
+    let abb = i32(perm[p + (((ab + zi + 1)) & 255)]);
+    let baa = i32(perm[p + (((ba + zi)) & 255)]);
+    let bab = i32(perm[p + (((ba + zi + 1)) & 255)]);
+    let bba = i32(perm[p + (((bb + zi)) & 255)]);
+    let bbb = i32(perm[p + (((bb + zi + 1)) & 255)]);
+    let g000 = GRAD3[aaa & 15];
+    let g100 = GRAD3[baa & 15];
+    let g010 = GRAD3[aba & 15];
+    let g110 = GRAD3[bba & 15];
+    let g001 = GRAD3[aab & 15];
+    let g101 = GRAD3[bab & 15];
+    let g011 = GRAD3[abb & 15];
+    let g111 = GRAD3[bbb & 15];
+    let n000 = dot(g000, vec3(fx,       dy,       fz));
+    let n100 = dot(g100, vec3(fx - 1.0, dy,       fz));
+    let n010 = dot(g010, vec3(fx,       dy - 1.0, fz));
+    let n110 = dot(g110, vec3(fx - 1.0, dy - 1.0, fz));
+    let n001 = dot(g001, vec3(fx,       dy,       fz - 1.0));
+    let n101 = dot(g101, vec3(fx - 1.0, dy,       fz - 1.0));
+    let n011 = dot(g011, vec3(fx,       dy - 1.0, fz - 1.0));
+    let n111 = dot(g111, vec3(fx - 1.0, dy - 1.0, fz - 1.0));
+    let u = fade(fx);
+    let v = fade(fy);
+    let w = fade(fz);
+    return trilinear_lerp(n000, n100, n010, n110, n001, n101, n011, n111, u, v, w);
+}
+
+fn interp_noise_sampler(
+    lb: i32, lc: i32, ub: i32, uc: i32, ib: i32, ic: i32,
+    bx: f32, by: f32, bz: f32,
+    xz_scale: f32, y_scale: f32, xz_factor: f32, y_factor: f32, smear: f32
+) -> f32 {
+    let sxz = 684.412 * xz_scale;
+    let sy = 684.412 * y_scale;
+    let d = bx * sxz;
+    let e = by * sy;
+    let f = bz * sxz;
+    let g = d / xz_factor;
+    let h = e / y_factor;
+    let l = f / xz_factor;
+    let mm = sy * smear / y_factor;
+    let smear_y_raw = sy * smear;
+
+    var q = 0.0;
+    var r = 1.0;
+    for (var i = 0; i < ic; i++) {
+        q += perlin_ysmear(ib + i * 256,
+                           maintain_precision(g * r), maintain_precision(h * r),
+                           maintain_precision(l * r), mm * r, h * r) / r;
+        r *= 0.5;
+    }
+    let interp = (q / 10.0 + 1.0) / 2.0;
+    let noLower = interp >= 1.0;
+    let noUpper = interp <= 0.0;
+
+    var lo = 0.0;
+    var up = 0.0;
+    r = 1.0;
+    // lower/upper use the RAW (un-divided) coords and a different
+    // arg4/arg5 scaling than the interp stack (per MC bytecode).
+    for (var i = 0; i < lc; i++) {
+        if (!noLower) {
+            lo += perlin_ysmear(lb + i * 256,
+                                maintain_precision(d * r), maintain_precision(e * r),
+                                maintain_precision(f * r), smear_y_raw * r, e * r) / r;
+        }
+        if (!noUpper) {
+            up += perlin_ysmear(ub + i * 256,
+                                maintain_precision(d * r), maintain_precision(e * r),
+                                maintain_precision(f * r), smear_y_raw * r, e * r) / r;
+        }
+        r *= 0.5;
+    }
+    let t = clamp(interp, 0.0, 1.0);
+    return (lo / 512.0 + t * (up / 512.0 - lo / 512.0)) / 128.0;
+}
+
 fn squeeze(x: f32) -> f32 {
     // MC: x = clamp(x, -1, 1); return x/2 - x^3/24
     let c = clamp(x, -1.0, 1.0);

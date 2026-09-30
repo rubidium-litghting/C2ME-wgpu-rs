@@ -101,6 +101,7 @@ public class NoiseRouterBlobifier {
     private static final byte TAG_SHIFT = (byte) 0xB4;
     private static final byte TAG_SHIFTED_NOISE = (byte) 0xB5;
     private static final byte TAG_WEIRD_SCALED = (byte) 0x86;
+    private static final byte TAG_INTERP_NOISE_SAMPLER = (byte) 0x87;
     private static final byte TAG_CACHE_FLAT = (byte) 0xC0;
     private static final byte TAG_CACHE_2D = (byte) 0xC1;
     private static final byte TAG_CACHE_INTERP = (byte) 0xC2;
@@ -206,9 +207,8 @@ public class NoiseRouterBlobifier {
         }
 
         // ── InterpolatedNoiseSampler (standalone class) ─────────
-        if (df instanceof net.minecraft.util.math.noise.InterpolatedNoiseSampler) {
-            // TODO: real impl. Placeholder to stop log spam.
-            writeConstant(buf, 0.0f);
+        if (df instanceof net.minecraft.util.math.noise.InterpolatedNoiseSampler ins) {
+            writeInterpolatedNoiseSampler(buf, ins);
             return;
         }
 
@@ -476,6 +476,46 @@ public class NoiseRouterBlobifier {
             writeStack(buf, info.second);
         }
     }
+
+    /** Serialize a standalone MC InterpolatedNoiseSampler (class_5822). */
+    private static void writeInterpolatedNoiseSampler(
+            ByteBuffer buf, net.minecraft.util.math.noise.InterpolatedNoiseSampler ins) {
+        com.rubidiumlighting.c2me.opts.accel.wgpu.mixin.InterpolatedNoiseSamplerAccessor acc =
+                (com.rubidiumlighting.c2me.opts.accel.wgpu.mixin.InterpolatedNoiseSamplerAccessor) ins;
+        buf.put(TAG_INTERP_NOISE_SAMPLER);
+        buf.putFloat((float) acc.getXzScale());
+        buf.putFloat((float) acc.getYScale());
+        buf.putFloat((float) acc.getXzFactor());
+        buf.putFloat((float) acc.getYFactor());
+        buf.putFloat((float) acc.getSmearScaleMultiplier());
+        writeRawOctaveStack(buf, acc.getLowerInterpolatedNoise());
+        writeRawOctaveStack(buf, acc.getUpperInterpolatedNoise());
+        writeRawOctaveStack(buf, acc.getInterpolationNoise());
+    }
+
+    /** Register an OctavePerlinNoiseSampler's octaves and write [base:i32][count:i32]. */
+    private static void writeRawOctaveStack(ByteBuffer buf, Object octave) {
+        try {
+            java.lang.reflect.Field af = null;
+            for (java.lang.reflect.Field f : octave.getClass().getDeclaredFields()) {
+                if (f.getType() == PerlinNoiseSampler[].class) { af = f; break; }
+            }
+            if (af == null) { buf.putInt(0); buf.putInt(0); return; }
+            af.setAccessible(true);
+            PerlinNoiseSampler[] arr = (PerlinNoiseSampler[]) af.get(octave);
+            int baseIdx = PERM_SAMPLERS.size();
+            for (PerlinNoiseSampler p : arr) {
+                if (p == null) PERM_SAMPLERS.add(null);
+                else { SEEN_PERM.put(p, null); PERM_SAMPLERS.add(p); }
+            }
+            buf.putInt(baseIdx * 256);
+            buf.putInt(arr.length);
+        } catch (Throwable t) {
+            System.err.println("[c2me-wgpu] writeRawOctaveStack failed: " + t);
+            buf.putInt(0); buf.putInt(0);
+        }
+    }
+
 
     private static void writeStack(ByteBuffer buf, StackInfo st) {
         buf.putInt(st.permOffset);

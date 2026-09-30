@@ -182,6 +182,14 @@ pub enum AstNode {
         input: Box<AstNode>,
         noise: Box<AstNode>,
     },
+    /// MC standalone `InterpolatedNoiseSampler` (class_5822): 3 octave
+    /// stacks (lower/upper/interp) blended by a clamped lerp.
+    InterpNoiseSampler {
+        xz_scale: f32, y_scale: f32, xz_factor: f32, y_factor: f32, smear: f32,
+        lower_base: i32, lower_count: i32,
+        upper_base: i32, upper_count: i32,
+        interp_base: i32, interp_count: i32,
+    },
     /// MC `ShiftedNoise`: shifts the sample coords by three 2D/3D noise
     /// fields, then samples `noise` at the displaced coordinate.
     ShiftedNoise {
@@ -389,6 +397,19 @@ impl Hash for AstNode {
                 mapper.hash(state);
                 input.hash(state);
                 noise.hash(state);
+            }
+            AstNode::InterpNoiseSampler {
+                xz_scale, y_scale, xz_factor, y_factor, smear,
+                lower_base, lower_count, upper_base, upper_count,
+                interp_base, interp_count,
+            } => {
+                0x87u8.hash(state);
+                for v in [xz_scale, y_scale, xz_factor, y_factor, smear] {
+                    f32_to_hash_bits(*v).hash(state);
+                }
+                lower_base.hash(state); lower_count.hash(state);
+                upper_base.hash(state); upper_count.hash(state);
+                interp_base.hash(state); interp_count.hash(state);
             }
             AstNode::ShiftedNoise {
                 xz_scale, y_scale, shift_x, shift_y, shift_z, noise,
