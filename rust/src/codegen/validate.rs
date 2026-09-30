@@ -198,12 +198,11 @@ mod tests {
         assert!(src.contains("ci_0[cx * 25u + cy * 5u + cz]"),
             "must write corners by (cx, cy, cz) index:\n{src}");
 
-        // Phase 2 (trilinear lerp) — runs AFTER workgroupBarrier() in the
-        // same dispatch, reading from the shared memory populated in phase 1.
-        assert!(src.contains("trilinear_lerp("),
-            "must call trilinear_lerp for phase 2:\n{src}");
-        assert!(src.contains("0.5, 0.5, 0.5);"),
-            "must use trilinear weights 0.5, 0.5, 0.5:\n{src}");
+        // Phase 2 — trilinear lerp to the cell center after the barrier.
+        assert!(src.contains("workgroupBarrier();"),
+            "must have a workgroupBarrier between phases:\n{src}");
+        assert!(src.contains("ci_0[lx * 25u + ly * 5u + lz]"),
+            "must output the min corner in phase 2:\n{src}");
 
         // out_buf write still happens (single-pass mode writes results).
         assert!(src.contains("out_buf["),

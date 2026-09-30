@@ -104,7 +104,17 @@ public abstract class MixinChunkGenerator {
                 return;
             }
             java.lang.foreign.MemorySegment seg = WgpuThinBinding.takeResultBlob(req);
-            writeDensityToChunk(chunk, seg);
+
+            // Reuse MC's own AquiferSampler: it decides water/lava/air vs
+            // solid from the density value we computed on the GPU. This
+            // replaces the crude global sea-level fill.
+            NoiseChunkGenerator gen = (NoiseChunkGenerator) (Object) this;
+            net.minecraft.world.gen.chunk.ChunkNoiseSampler sampler =
+                    ((NoiseChunkGeneratorInvoker) (Object) gen).callCreateChunkNoiseSampler(
+                            chunk, structureAccessor, blender, noiseConfig);
+            net.minecraft.world.gen.chunk.AquiferSampler aquifer = sampler.getAquiferSampler();
+
+            writeDensityToChunk(chunk, seg, aquifer);
 
             // Cancel vanilla generation and hand back the (now filled) chunk.
             cir.setReturnValue(CompletableFuture.completedFuture(chunk));
@@ -129,7 +139,8 @@ public abstract class MixinChunkGenerator {
      * STONE / AIR. Cell grid = (16/cellW) × (height/cellH) × (16/cellW)
      * = 4 × 96 × 4 = 1536 cells; each cell covers cellW×cellH×cellW blocks.
      */
-    private static void writeDensityToChunk(Chunk chunk, java.lang.foreign.MemorySegment seg) {
+    private static void writeDensityToChunk(Chunk chunk, java.lang.foreign.MemorySegment seg,
+                                            net.minecraft.world.gen.chunk.AquiferSampler aquifer) {
         final int CHANNEL = 11;                 // finalDensity
         final int CELLS_PER_CHANNEL = 4 * 96 * 4;
         final int PAYLOAD_BASE = 0x88;
@@ -156,33 +167,90 @@ public abstract class MixinChunkGenerator {
         float dmin = Float.POSITIVE_INFINITY, dmax = Float.NEGATIVE_INFINITY;
         int stoneCells = 0, airCells = 0;
 
-        for (int cy = 0; cy < CELLS_Y; cy++) {
-            for (int cz = 0; cz < CELLS_Z; cz++) {
-                for (int cx = 0; cx < CELLS_X; cx++) {
-                    int idx = cx + cz * CELLS_X + cy * CELLS_X * CELLS_Z;
-                    float d = bb.getFloat(base + idx * 4);
-                    if (d < dmin) dmin = d;
-                    if (d > dmax) dmax = d;
-                    if (d > 0.0f) stoneCells++; else airCells++;
-                    BlockState bs = (d > 0.0f) ? stone : air;
-                    for (int dy = 0; dy < CELL_H; dy++) {
-                        int by = MIN_Y + cy * CELL_H + dy;
-                        int secIdx = chunk.getSectionIndex(by);
-                        if (secIdx < 0 || secIdx >= chunk.getSectionArray().length) continue;
-                        ChunkSection sec = chunk.getSection(secIdx);
-                        for (int dz = 0; dz < CELL_W; dz++) {
-                            int bz = cz * CELL_W + dz;
-                            for (int dx = 0; dx < CELL_W; dx++) {
-                                int bx = cx * CELL_W + dx;
-                                sec.setBlockState(bx & 15, by & 15, bz & 15, bs);
-                            }
-                        }
-                    }
+        // Precompute all cell values so we can trilinearly interpolate.
+        float[] cells = new float[CELLS_PER_CHANNEL];
+        for (int i = 0; i < CELLS_PER_CHANNEL; i++) {
+            float d = bb.getFloat(base + i * 4);
+            cells[i] = d;
+            if (d < dmin) dmin = d;
+            if (d > dmax) dmax = d;
+            if (d > 0.0f) stoneCells++; else airCells++;
+        }
+
+        // Block-level trilinear interpolation.
+        //
+        // MC's ChunkNoiseSampler evaluates the density at every BLOCK via
+        // trilinear interpolation of cell-corner samples. We only have one
+        // value per cell (4x4x4 blocks), so we approximate: treat each
+        // cell's value as its center sample and interpolate per block
+        // between the two neighbouring cells in each axis. Without this,
+        // an entire 4x4x4 cell flips between stone/air at once, which
+        // fills the top few blocks of every ocean cell with stone.
+        for (int by = 0; by < 384; by++) {
+            int globalY = MIN_Y + by;
+            int secIdx = chunk.getSectionIndex(globalY);
+            if (secIdx < 0 || secIdx >= chunk.getSectionArray().length) continue;
+            ChunkSection sec = chunk.getSection(secIdx);
+
+            // Cell values are CENTER samples: cell (i,j,k) covers blocks
+            // [4i, 4i+4) etc, centre at block 4i+2. A block bx in cell units
+            // (centre at integer) sits at `bx/4 - 0.5`; floor gives the
+            // lower cell, fraction the weight toward the upper one.
+            // Cell values are CORNER samples: cell i covers blocks
+            // [4i, 4i+4); its value is the density at block 4i. Interpolate
+            // between corner[i] and corner[i+1] with weight (b%4)/4.
+            int iy = by / CELL_H;
+            int cy0 = iy, cy1 = Math.min(iy + 1, CELLS_Y - 1);
+            float ty = (by % CELL_H) / (float) CELL_H;
+
+            for (int bz = 0; bz < 16; bz++) {
+                int iz = bz / CELL_W;
+                int cz0 = iz, cz1 = Math.min(iz + 1, CELLS_Z - 1);
+                float tz = (bz % CELL_W) / (float) CELL_W;
+
+                for (int bx = 0; bx < 16; bx++) {
+                    int ix = bx / CELL_W;
+                    int cx0 = ix, cx1 = Math.min(ix + 1, CELLS_X - 1);
+                    float tx = (bx % CELL_W) / (float) CELL_W;
+
+                    float c000 = cells[cx0 + cz0 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
+                    float c100 = cells[cx1 + cz0 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
+                    float c010 = cells[cx0 + cz0 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
+                    float c110 = cells[cx1 + cz0 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
+                    float c001 = cells[cx0 + cz1 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
+                    float c101 = cells[cx1 + cz1 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
+                    float c011 = cells[cx0 + cz1 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
+                    float c111 = cells[cx1 + cz1 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
+
+                    float x00 = c000 + tx * (c100 - c000);
+                    float x10 = c010 + tx * (c110 - c010);
+                    float x01 = c001 + tx * (c101 - c001);
+                    float x11 = c011 + tx * (c111 - c011);
+                    float y0 = x00 + ty * (x10 - x00);
+                    float y1 = x01 + ty * (x11 - x01);
+                    float d = y0 + tz * (y1 - y0);
+
+                    // Let MC's aquifer decide: null = solid (stone),
+                    // otherwise water / lava / air per local fluid level.
+                    net.minecraft.world.gen.densityfunction.DensityFunction.NoisePos npos =
+                            new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(
+                                    chunk.getPos().getStartX() + bx, globalY,
+                                    chunk.getPos().getStartZ() + bz);
+                    BlockState bs = aquifer.apply(npos, (double) d);
+                    if (bs == null) bs = stone;
+                    sec.setBlockState(bx & 15, globalY & 15, bz & 15, bs);
                 }
             }
         }
 
 
+
+        // One-shot: dump ch10's raw structure.
+        if (TRUTH_DUMPED.compareAndSet(false, true) && RAW_ROUTER != null) {
+            String ds = RAW_ROUTER.initialDensityWithoutJaggedness().toString();
+            LOGGER.info("[c2me-wgpu][ch10] len={} head={}", ds.length(),
+                    ds.substring(0, Math.min(2500, ds.length())));
+        }
 
         // Mismatch scan: compare ch6/8/10/11 MC vs GPU at y=8/-32.
         if (REF_ROUTER != null) {
@@ -196,11 +264,14 @@ public abstract class MixinChunkGenerator {
             int any = 0;
             for (int wy : wys) {
                 int cyCell = (wy - MIN_Y) / CELL_H;
+                // GPU now outputs the cell's MIN-CORNER value (block 4i),
+                // so compare MC at the same corner block.
+                int px = cx0, py = wy, pz = cz0;
                 double[] mc = {
-                    REF_ROUTER.continents().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(cx0, wy, cz0)),
-                    REF_ROUTER.depth().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(cx0, wy, cz0)),
-                    REF_ROUTER.initialDensityWithoutJaggedness().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(cx0, wy, cz0)),
-                    REF_ROUTER.finalDensity().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(cx0, wy, cz0)),
+                    REF_ROUTER.continents().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(px, py, pz)),
+                    REF_ROUTER.depth().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(px, py, pz)),
+                    REF_ROUTER.initialDensityWithoutJaggedness().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(px, py, pz)),
+                    REF_ROUTER.finalDensity().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(px, py, pz)),
                 };
                 int idx = cyCell * CELLS_X * CELLS_Z;
                 for (int i = 0; i < 4; i++) {

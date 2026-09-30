@@ -125,22 +125,13 @@ pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
 ///
 /// Slot layout: `array<f32, 16>` indexed by `lx * 4 + lz` (4×4 XZ grid).
 fn emit_cache2d(inner: &AstNode, ctx: &mut GenCtx) -> Result<String> {
-    let slot = ctx.alloc_cache2d_slot();
-    let smem = format!("c2d_{slot}");
-
-    // Module-scope declaration (WGSL forbids var<workgroup> in fn body).
-    ctx.declare_shared(format!("var<workgroup> {smem}: array<f32, 16>;"));
-
-    // Body: only lid.y == 0 invocations compute inner; all read after barrier.
-    ctx.emit("if (ly == 0u) {");
-    let inner_var = emit_node(inner, ctx)?;
-    ctx.emit(format!("  {smem}[lx * 4u + lz] = {inner_var};"));
-    ctx.emit("}");
-    ctx.emit("workgroupBarrier();");
-
-    let result = ctx.fresh_var("c2d_r");
-    ctx.emit(format!("let {result}: f32 = {smem}[lx * 4u + lz];"));
-    Ok(result)
+    // Cache2D is pure memoisation (the wrapped value depends only on x,z).
+    // A per-cell kernel evaluates exactly one cell per invocation, so we
+    // simply evaluate the inner subtree in place. Shared memory is NOT
+    // used: when Cache2D is nested inside CacheInterpolated's corner loop
+    // its barrier would sit in a variable-trip-count loop (WGSL UB), which
+    // silently biased the density in whole regions.
+    emit_node(inner, ctx)
 }
 
 /// CacheFlat — per-column shared memory cache.
@@ -150,23 +141,10 @@ fn emit_cache2d(inner: &AstNode, ctx: &mut GenCtx) -> Result<String> {
 /// `lx * 4 + lz` — NOT a single scalar. (Using a scalar silently drops
 /// all x/z variation, which biases the density in whole regions.)
 fn emit_cache_flat(inner: &AstNode, ctx: &mut GenCtx) -> Result<String> {
-    let slot = ctx.alloc_cacheflat_slot();
-    let smem = format!("cf_{slot}");
-
-    ctx.declare_shared(format!("var<workgroup> {smem}: array<f32, 16>;"));
-
-    // Only the bottom Y layer computes; every (lx, lz) column gets its own
-    // slot. The inner subtree is emitted with cell_y shadowed to a fixed
-    // value so it is evaluated once per column, not once per y.
-    ctx.emit("if (ly == 0u) {");
-    let inner_var = emit_node(inner, ctx)?;
-    ctx.emit(format!("  {smem}[lx * 4u + lz] = {inner_var};"));
-    ctx.emit("}");
-    ctx.emit("workgroupBarrier();");
-
-    let result = ctx.fresh_var("cf_r");
-    ctx.emit(format!("let {result}: f32 = {smem}[lx * 4u + lz];"));
-    Ok(result)
+    // FlatCache is pure memoisation (the wrapped value is Y-independent).
+    // Same reasoning as Cache2D: evaluate in place, no shared memory and
+    // no barrier (avoids the nested-in-loop UB).
+    emit_node(inner, ctx)
 }
 
 /// CacheInterpolated — cell-corner trilinear lerp within a single dispatch.
@@ -273,22 +251,13 @@ pub(crate) fn emit_cache_interp(inner: &AstNode, ctx: &mut GenCtx) -> Result<Str
     //   corner (lx,   ly+1, lz  ) → c010   corner (lx,   ly+1, lz+1) → c011
     //   corner (lx+1, ly+1, lz  ) → c110   corner (lx+1, ly+1, lz+1) → c111
     //
-    // Weights tx/ty/tz = 0.5 (cell centers for cell_width=4, the MC
-    // default). For non-default cell sizes this would be
-    // (cell_size-1)/cell_size, but MC vanilla always uses 4×4×4 cells.
+    // Output THIS cell's MIN corner value (density at block 4*lx).
+    // MC samples finalDensity at cell corners and trilinearly interpolates
+    // every block from them; the Java write-back does the same, so the GPU
+    // must hand over corner values (not a center average).
     ctx.emit("workgroupBarrier();");
-    ctx.emit("// CacheInterpolated phase 2: trilinear lerp from shared memory.");
+    ctx.emit("// CacheInterpolated phase 2: output this cell's min-corner value.");
     let r = ctx.fresh_var("ci_r");
-    ctx.emit(format!("let {r}: f32 = trilinear_lerp("));
-    ctx.emit(format!("  {smem}[(lx + 0u) * 25u + (ly + 0u) * 5u + (lz + 0u)],"));
-    ctx.emit(format!("  {smem}[(lx + 1u) * 25u + (ly + 0u) * 5u + (lz + 0u)],"));
-    ctx.emit(format!("  {smem}[(lx + 0u) * 25u + (ly + 1u) * 5u + (lz + 0u)],"));
-    ctx.emit(format!("  {smem}[(lx + 1u) * 25u + (ly + 1u) * 5u + (lz + 0u)],"));
-    ctx.emit(format!("  {smem}[(lx + 0u) * 25u + (ly + 0u) * 5u + (lz + 1u)],"));
-    ctx.emit(format!("  {smem}[(lx + 1u) * 25u + (ly + 0u) * 5u + (lz + 1u)],"));
-    ctx.emit(format!("  {smem}[(lx + 0u) * 25u + (ly + 1u) * 5u + (lz + 1u)],"));
-    ctx.emit(format!("  {smem}[(lx + 1u) * 25u + (ly + 1u) * 5u + (lz + 1u)],"));
-    ctx.emit("  0.5, 0.5, 0.5);");
-
+    ctx.emit(format!("let {r}: f32 = {smem}[lx * 25u + ly * 5u + lz];"));
     Ok(r)
 }
