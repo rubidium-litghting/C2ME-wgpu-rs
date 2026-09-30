@@ -71,6 +71,8 @@ public class NoiseRouterBlobifier {
         }
     }
     private static NoiseConfig CURRENT_NOISE_CONFIG = null;
+    /** Every InterpolatedNoiseSampler encountered while serializing. */
+    public static final java.util.List<Object> SEEN_INS = new java.util.ArrayList<>();
     private static final java.util.Map<String, Boolean> PLACEHOLDER_SEEN =
             new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -116,6 +118,7 @@ public class NoiseRouterBlobifier {
         SEEN_PERM.clear();
         PERM_SAMPLERS.clear();
         DPS_INFO.clear();
+        SEEN_INS.clear();
         // ── HEADER (10B) ─────────────────────────────────────────
         buf.put((byte) 0x4D);
         buf.put((byte) 0x43);
@@ -208,6 +211,7 @@ public class NoiseRouterBlobifier {
 
         // ── InterpolatedNoiseSampler (standalone class) ─────────
         if (df instanceof net.minecraft.util.math.noise.InterpolatedNoiseSampler ins) {
+            SEEN_INS.add(ins);
             writeInterpolatedNoiseSampler(buf, ins);
             return;
         }

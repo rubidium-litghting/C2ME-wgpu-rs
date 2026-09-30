@@ -184,39 +184,41 @@ public abstract class MixinChunkGenerator {
 
 
 
-        // Compare MC truth vs GPU for chunk (0,0) across a vertical profile.
-        if (chunk.getPos().x == 0 && chunk.getPos().z == 0 && REF_ROUTER != null) {
+        // Mismatch scan: compare ch6/8/10/11 MC vs GPU at y=8/-32.
+        if (REF_ROUTER != null) {
             int cx0 = chunk.getPos().x * 16;
             int cz0 = chunk.getPos().z * 16;
-            NoiseRouter r = REF_ROUTER;
-            int[] cys = { 8, 12, 16, 20, 24, 28, 32 };
-            for (int cy : cys) {
-                int wy = MIN_Y + cy * CELL_H;
-                int idx = cy * CELLS_X * CELLS_Z; // cx=0, cz=0
-                var pos = new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(
-                        cx0, wy, cz0);
-                double t11 = r.finalDensity().sample(pos);
-                double t10 = r.initialDensityWithoutJaggedness().sample(pos);
-                double t8 = r.depth().sample(pos);
-                double t6 = r.continents().sample(pos);
-                double t7 = r.erosion().sample(pos);
-                double t9 = r.ridges().sample(pos);
-                float g11 = bb.getFloat(base + idx * 4);
-                int ch10base = PAYLOAD_BASE + 10 * CELLS_PER_CHANNEL * 4;
-                float g10 = bb.getFloat(ch10base + idx * 4);
-                int ch8base = PAYLOAD_BASE + 8 * CELLS_PER_CHANNEL * 4;
-                float g8 = bb.getFloat(ch8base + idx * 4);
-                int ch6base = PAYLOAD_BASE + 6 * CELLS_PER_CHANNEL * 4;
-                float g6 = bb.getFloat(ch6base + idx * 4);
-                int ch7base = PAYLOAD_BASE + 7 * CELLS_PER_CHANNEL * 4;
-                float g7 = bb.getFloat(ch7base + idx * 4);
-                int ch9base = PAYLOAD_BASE + 9 * CELLS_PER_CHANNEL * 4;
-                float g9 = bb.getFloat(ch9base + idx * 4);
-                LOGGER.info("[c2me-wgpu][cmp] y={} mc11={} gpu11={} mc10={} gpu10={} mc8={} gpu8={} mc6={} gpu6={} mc7={} gpu7={} mc9={} gpu9={}",
-                        wy, t11, g11, t10, g10, t8, g8, t6, g6, t7, g7, t9, g9);
+            int[] wys = { -32, 8 };
+            int[] chs = { 6, 8, 10, 11 };
+            int[] bases = new int[4];
+            for (int i = 0; i < 4; i++) bases[i] = PAYLOAD_BASE + chs[i] * CELLS_PER_CHANNEL * 4;
+            StringBuilder sb = new StringBuilder();
+            int any = 0;
+            for (int wy : wys) {
+                int cyCell = (wy - MIN_Y) / CELL_H;
+                double[] mc = {
+                    REF_ROUTER.continents().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(cx0, wy, cz0)),
+                    REF_ROUTER.depth().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(cx0, wy, cz0)),
+                    REF_ROUTER.initialDensityWithoutJaggedness().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(cx0, wy, cz0)),
+                    REF_ROUTER.finalDensity().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(cx0, wy, cz0)),
+                };
+                int idx = cyCell * CELLS_X * CELLS_Z;
+                for (int i = 0; i < 4; i++) {
+                    float gpu = bb.getFloat(bases[i] + idx * 4);
+                    double d = mc[i] - gpu;
+                    if (Math.abs(d) > 0.02) {
+                        any++;
+                        sb.append(String.format(" y=%d ch%d mc=%.4f gpu=%.4f", wy, chs[i], mc[i], gpu));
+                    }
+                }
+            }
+            if (any > 0) {
+                LOGGER.info("[c2me-wgpu][chdiv] ({},{}){}", chunk.getPos().x, chunk.getPos().z, sb);
             }
         }
     }
+
+
 
     private NoiseRouter getNoiseRouter(NoiseChunkGenerator generator) {
         try {

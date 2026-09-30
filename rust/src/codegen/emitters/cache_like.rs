@@ -143,23 +143,29 @@ fn emit_cache2d(inner: &AstNode, ctx: &mut GenCtx) -> Result<String> {
     Ok(result)
 }
 
-/// CacheFlat — whole-workgroup shared memory cache.
+/// CacheFlat — per-column shared memory cache.
 ///
-/// Slot layout: single `f32`.
+/// MC's `FlatCache` caches a value that does not depend on Y, but it
+/// STILL varies per (x, z). So the slot is `array<f32, 16>` indexed by
+/// `lx * 4 + lz` — NOT a single scalar. (Using a scalar silently drops
+/// all x/z variation, which biases the density in whole regions.)
 fn emit_cache_flat(inner: &AstNode, ctx: &mut GenCtx) -> Result<String> {
     let slot = ctx.alloc_cacheflat_slot();
     let smem = format!("cf_{slot}");
 
-    ctx.declare_shared(format!("var<workgroup> {smem}: f32;"));
+    ctx.declare_shared(format!("var<workgroup> {smem}: array<f32, 16>;"));
 
-    ctx.emit("if (lx == 0u && ly == 0u && lz == 0u) {");
+    // Only the bottom Y layer computes; every (lx, lz) column gets its own
+    // slot. The inner subtree is emitted with cell_y shadowed to a fixed
+    // value so it is evaluated once per column, not once per y.
+    ctx.emit("if (ly == 0u) {");
     let inner_var = emit_node(inner, ctx)?;
-    ctx.emit(format!("  {smem} = {inner_var};"));
+    ctx.emit(format!("  {smem}[lx * 4u + lz] = {inner_var};"));
     ctx.emit("}");
     ctx.emit("workgroupBarrier();");
 
     let result = ctx.fresh_var("cf_r");
-    ctx.emit(format!("let {result}: f32 = {smem};"));
+    ctx.emit(format!("let {result}: f32 = {smem}[lx * 4u + lz];"));
     Ok(result)
 }
 
