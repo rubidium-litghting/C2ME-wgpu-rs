@@ -113,6 +113,10 @@ impl WorldContext {
             shader_src.lines().count(),
             shader_src.len()
         );
+        // Debug-only smoke test: wgpu's create_shader_module re-runs naga on
+        // this same source, so in release builds the extra parse+validate is
+        // pure duplication (a large chunk of first-launch shader compile time).
+        #[cfg(debug_assertions)]
         validate_wgsl(&shader_src)
             .map_err(|e| anyhow::anyhow!("emitted WGSL failed naga validation:\n{e}"))?;
 
