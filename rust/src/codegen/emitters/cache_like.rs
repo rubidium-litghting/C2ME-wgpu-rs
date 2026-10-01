@@ -108,7 +108,7 @@
 
 use crate::ast::AstNode;
 use crate::codegen::emitters::emit_node;
-use crate::codegen::wgsl_gen::{GenCtx, Pass};
+use crate::codegen::wgsl_gen::GenCtx;
 use crate::Result;
 use anyhow::anyhow;
 
@@ -151,113 +151,11 @@ fn emit_cache_flat(inner: &AstNode, ctx: &mut GenCtx) -> Result<String> {
 ///
 /// See module-level doc for the full algorithm description.
 pub(crate) fn emit_cache_interp(inner: &AstNode, ctx: &mut GenCtx) -> Result<String> {
-    // Single-pass mode is the ONLY supported mode for CacheInterpolated:
-    //   * Pass A (corner computation) + workgroupBarrier() + Pass B
-    //     (trilinear lerp) must run in the SAME dispatch — `var<workgroup>`
-    //     shared memory does NOT persist across separate dispatches, so a
-    //     two-dispatch approach would leave pass B reading uninitialised
-    //     memory. The `workgroupBarrier()` inside one dispatch is the
-    //     correct WGSL synchronisation primitive for this pattern.
-    //
-    // The legacy Pass::A / Pass::B entry points are rejected here —
-    // `requires_two_pass` now returns false for CacheInterpolated, so the
-    // two-pipeline path in WorldContext is never taken.
-    if ctx.pass != Pass::Single {
-        return Err(anyhow!(
-            "CacheInterpolated requires single-pass mode (workgroup memory \
-             does not persist across dispatches); got pass {:?}. \
-             Call emit_shader(root) instead of emit_shader_for_pass.",
-            ctx.pass
-        ));
-    }
-
-    let slot = ctx.alloc_cache_interp_slot();
-    let smem = format!("ci_{slot}");
-
-    // Shared memory: 5×5×5 = 125 f32 cell-corner values.
-    ctx.declare_shared(format!("var<workgroup> {smem}: array<f32, 125>;"));
-
-    // ── Phase 1: compute all assigned cell-corners into shared memory ──
-    //
-    // Corner-assignment rule: corner (cx, cy, cz) with cx, cy, cz ∈
-    // {0, 1, 2, 3, 4} is computed by the invocation whose lid is
-    //   (min(cx, 3), min(cy, 3), min(cz, 3)).
-    // Interior invocations (lid < 3 on all axes) compute 1 corner;
-    // boundary invocations (lid == 3) also compute the +1 apron corner
-    // on that axis; the (3, 3, 3) invocation computes all 8 corners of
-    // the (3..5, 3..5, 3..5) sub-cube.
-    //
-    // For invocation (lx, ly, lz), we loop dx ∈ [0, lx==3 ? 1 : 0],
-    // dy ∈ [0, ly==3 ? 1 : 0], dz ∈ [0, lz==3 ? 1 : 0] and compute
-    // corner (lx+dx, ly+dy, lz+dz).
-    //
-    // The inner subtree is emitted ONCE inside the loop body; each
-    // iteration shadows `cell_x / cell_y / cell_z` with the corner's
-    // world coords, so coordinate-dependent emitters (InputX/Y/Z,
-    // PerlinSampler, …) sample at the corner instead of the cell center.
-    // Inner MUST NOT itself contain a Cache2D / CacheFlat (those are
-    // sibling cache layers in MC's NoiseRouter, never nested inside
-    // CacheInterpolated) — if it did, their `lx/ly/lz` indexing would be
-    // wrong inside this loop.
-    ctx.emit("// CacheInterpolated phase 1: compute assigned cell-corners.");
-    ctx.emit("{");
-    ctx.emit("let dx_max: u32 = select(0u, 1u, lx == 3u);");
-    ctx.emit("let dy_max: u32 = select(0u, 1u, ly == 3u);");
-    ctx.emit("let dz_max: u32 = select(0u, 1u, lz == 3u);");
-    ctx.emit("for (var dx: u32 = 0u; dx <= dx_max; dx++) {");
-    ctx.emit("  for (var dy: u32 = 0u; dy <= dy_max; dy++) {");
-    ctx.emit("    for (var dz: u32 = 0u; dz <= dz_max; dz++) {");
-    // Corner local coords — in [0, 4].
-    ctx.emit("      let cx: u32 = lx + dx;");
-    ctx.emit("      let cy: u32 = ly + dy;");
-    ctx.emit("      let cz: u32 = lz + dz;");
-    // Corner world coords. Corner 0 is one cell to the left of the
-    // invocation's cell, hence the `- cell_width` offset.
-    // `world_*` is the corner coordinate of THIS invocation's cell
-    // (global cell index = gid). Corner `cx = lx + dx` is `dx` cells to
-    // the +axis, so its world coord is world + dx * cell_size.
-    ctx.emit("      let corner_x_i32: i32 = world_x_i32 + i32(dx) * i32(params.cell_width);");
-    ctx.emit("      let corner_y_i32: i32 = world_y_i32 + i32(dy) * i32(params.cell_height);");
-    ctx.emit("      let corner_z_i32: i32 = world_z_i32 + i32(dz) * i32(params.cell_width);");
-    // Shadow cell_x/y/z in a nested block so inner reads corner coords.
-    // Enter shadow scope BEFORE emitting `{`, so the pushed frame is
-    // flagged as a boundary and memo_get stops searching outward past it.
-    let saved_shadow = ctx.in_shadow;
-    ctx.in_shadow = true;
-    ctx.emit("      {");
-    ctx.emit("        let cell_x: f32 = f32(corner_x_i32);");
-    ctx.emit("        let cell_y: f32 = f32(corner_y_i32);");
-    ctx.emit("        let cell_z: f32 = f32(corner_z_i32);");
-    let inner_var = emit_node(inner, ctx)?;
-    ctx.emit(format!("        {smem}[cx * 25u + cy * 5u + cz] = {inner_var};"));
-    ctx.emit("      }");
-    ctx.in_shadow = saved_shadow;
-    ctx.emit("    }");
-    ctx.emit("  }");
-    ctx.emit("}");
-    ctx.emit("}");
-
-    // ── Phase 2: trilinear interpolation from shared memory ────────────
-    //
-    // workgroupBarrier() guarantees every invocation has written its
-    // assigned corners before any invocation reads them. After the
-    // barrier, each invocation reads its 8 surrounding corners and runs
-    // trilinear_lerp to produce the cell's final density value.
-    //
-    // Corner index mapping (cell at lid (lx, ly, lz) interpolates between
-    // corners (lx..lx+1, ly..ly+1, lz..lz+1)):
-    //   corner (lx,   ly,   lz  ) → c000   corner (lx,   ly,   lz+1) → c001
-    //   corner (lx+1, ly,   lz  ) → c100   corner (lx+1, ly,   lz+1) → c101
-    //   corner (lx,   ly+1, lz  ) → c010   corner (lx,   ly+1, lz+1) → c011
-    //   corner (lx+1, ly+1, lz  ) → c110   corner (lx+1, ly+1, lz+1) → c111
-    //
-    // Output THIS cell's MIN corner value (density at block 4*lx).
-    // MC samples finalDensity at cell corners and trilinearly interpolates
-    // every block from them; the Java write-back does the same, so the GPU
-    // must hand over corner values (not a center average).
-    ctx.emit("workgroupBarrier();");
-    ctx.emit("// CacheInterpolated phase 2: output this cell's min-corner value.");
-    let r = ctx.fresh_var("ci_r");
-    ctx.emit(format!("let {r}: f32 = {smem}[lx * 25u + ly * 5u + lz];"));
-    Ok(r)
+    // Pass-through. The dispatch now covers the corner grid
+    // (cell_count + 1 per axis), so each invocation IS a distinct
+    // corner sample. MC's ChunkNoiseSampler does the same: it samples
+    // density at cell corners, then trilinearly interpolates per block.
+    // We hand raw corner values to the Java write-back, which runs the
+    // identical interpolation. No shared memory / barrier needed.
+    emit_node(inner, ctx)
 }

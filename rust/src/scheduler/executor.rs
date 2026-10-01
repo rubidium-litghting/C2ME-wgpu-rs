@@ -96,7 +96,7 @@ impl SingleBatchExecutor {
     ) -> Result<Self, String> {
         // One chunk = 16 channels × 16×16×16 cells × 4 bytes = 256 KiB.
         // Staging must hold a full batch (config.max_batch_size chunks).
-        let bytes_per_chunk: usize = 16 * 1536 * 4;
+        let bytes_per_chunk: usize = 16 * 2425 * 4;
         let max_buffer_size = bytes_per_chunk * config.max_batch_size.max(1);
         let staging = StagingChain::new(&device, config.staging_capacity, max_buffer_size);
 
@@ -130,7 +130,7 @@ impl SingleBatchExecutor {
 
         let t0 = std::time::Instant::now();
         let num_chunks = batch.positions.len() as u32;
-        let f32_per_chunk = 16 * 1536; // 16 channels × (4×96×4 cells)
+        let f32_per_chunk = 16 * 2425; // 16 channels × (5×97×5 corner grid)
         let total_f32s = (num_chunks as usize) * f32_per_chunk;
         let total_bytes = total_f32s * 4;
 
@@ -142,8 +142,6 @@ impl SingleBatchExecutor {
         let origin_x = batch.positions.iter().map(|p| p.0).min().unwrap_or(0) * 16;
         let origin_z = batch.positions.iter().map(|p| p.1).min().unwrap_or(0) * 16;
 
-        eprintln!("[c2me-wgpu][batch] positions={:?} origin=({},{})",
-                  batch.positions, origin_x, origin_z);
 
         let params = WorldgenParams {
             batch_origin_x: origin_x,
@@ -226,9 +224,10 @@ impl SingleBatchExecutor {
             // Workgroup size is (4,4,4), so dispatch that many workgroups.
             let cw = (shape.cell_width.max(1) as u32);
             let chh = (shape.cell_height.max(1) as u32);
-            let ccx = 16 / cw;
-            let ccz = 16 / cw;
-            let ccy = (shape.height as u32) / chh;
+            // Corner grid: one more corner than cells per axis.
+            let ccx = 16 / cw + 1;
+            let ccz = 16 / cw + 1;
+            let ccy = (shape.height as u32) / chh + 1;
             let wg_x = (ccx + 3) / 4;
             let wg_y = (ccy + 3) / 4;
             let wg_z = (ccz + 3) / 4;
@@ -280,7 +279,7 @@ impl SingleBatchExecutor {
         // ── one-shot channel diagnostic ─────────────────────────────
         static DIAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            const CPC: usize = 4 * 96 * 4;
+            const CPC: usize = 5 * 97 * 5;
             for ch in 0..16usize {
                 let base = ch * CPC;
                 let end = (base + CPC).min(f32s.len());
@@ -297,7 +296,7 @@ impl SingleBatchExecutor {
         }
 
         let mut result_map = FxHashMap::default();
-        const CELLS_PER_CHANNEL: usize = 4 * 96 * 4;
+        const CELLS_PER_CHANNEL: usize = 5 * 97 * 5;
         let mut channel_offsets = [0u64; 16];
         for (ch, off) in channel_offsets.iter_mut().enumerate() {
             *off = (ch * CELLS_PER_CHANNEL * 4) as u64;

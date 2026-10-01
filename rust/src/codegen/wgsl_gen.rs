@@ -317,10 +317,13 @@ fn main_entry(
   let cz_i32: i32 = i32(gid.z);
 
   // ── chunk dimensions in cells (16×16 blocks per chunk) ──────────────
-  let cell_count_x: i32 = 16 / i32(params.cell_width);
-  let cell_count_z: i32 = 16 / i32(params.cell_width);
-  let cell_count_y: i32 = i32(params.height_f) / i32(params.cell_height);
+  let cell_count_x: i32 = 16 / i32(params.cell_width) + 1;
+  let cell_count_z: i32 = 16 / i32(params.cell_width) + 1;
+  let cell_count_y: i32 = i32(params.height_f) / i32(params.cell_height) + 1;
   let cells_per_chunk: u32 = u32(cell_count_x * cell_count_y * cell_count_z);
+  if (cx_i32 >= cell_count_x || cy_i32 >= cell_count_y || cz_i32 >= cell_count_z) {
+    return;
+  }
 
   // ── cell linear index (MC-native stride, see mc_stride.rs) ─────────
   let cell_idx: u32 = u32(cx_i32
@@ -354,10 +357,13 @@ fn main_pass_a(
   let cx_i32: i32 = i32(gid.x);
   let cy_i32: i32 = i32(gid.y);
   let cz_i32: i32 = i32(gid.z);
-  let cell_count_x: i32 = 16 / i32(params.cell_width);
-  let cell_count_z: i32 = 16 / i32(params.cell_width);
-  let cell_count_y: i32 = i32(params.height_f) / i32(params.cell_height);
+  let cell_count_x: i32 = 16 / i32(params.cell_width) + 1;
+  let cell_count_z: i32 = 16 / i32(params.cell_width) + 1;
+  let cell_count_y: i32 = i32(params.height_f) / i32(params.cell_height) + 1;
   let cells_per_chunk: u32 = u32(cell_count_x * cell_count_y * cell_count_z);
+  if (cx_i32 >= cell_count_x || cy_i32 >= cell_count_y || cz_i32 >= cell_count_z) {
+    return;
+  }
   let cell_idx: u32 = u32(cx_i32
                          + cz_i32 * cell_count_x
                          + cy_i32 * cell_count_x * cell_count_z);
@@ -383,10 +389,13 @@ fn main_pass_b(
   let cx_i32: i32 = i32(gid.x);
   let cy_i32: i32 = i32(gid.y);
   let cz_i32: i32 = i32(gid.z);
-  let cell_count_x: i32 = 16 / i32(params.cell_width);
-  let cell_count_z: i32 = 16 / i32(params.cell_width);
-  let cell_count_y: i32 = i32(params.height_f) / i32(params.cell_height);
+  let cell_count_x: i32 = 16 / i32(params.cell_width) + 1;
+  let cell_count_z: i32 = 16 / i32(params.cell_width) + 1;
+  let cell_count_y: i32 = i32(params.height_f) / i32(params.cell_height) + 1;
   let cells_per_chunk: u32 = u32(cell_count_x * cell_count_y * cell_count_z);
+  if (cx_i32 >= cell_count_x || cy_i32 >= cell_count_y || cz_i32 >= cell_count_z) {
+    return;
+  }
   let cell_idx: u32 = u32(cx_i32
                          + cz_i32 * cell_count_x
                          + cy_i32 * cell_count_x * cell_count_z);

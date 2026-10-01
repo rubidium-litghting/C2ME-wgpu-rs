@@ -688,7 +688,7 @@ mod tests {
         let blob_result = result.results.values().next().unwrap();
         let bytes = blob_result.as_bytes();
         let payload = &bytes[0x88..];
-        (0..1536).map(|i| f32::from_le_bytes(payload[i*4..i*4+4].try_into().unwrap())).collect()
+        (0..2425).map(|i| f32::from_le_bytes(payload[i*4..i*4+4].try_into().unwrap())).collect()
     }
 
     #[test]
@@ -703,12 +703,12 @@ mod tests {
         let amps1 = [1.0f32];
         let gpu_b = build_run_blob(0, 1.0, 0.3, 0.3, (0, 1.0, 1.0, &amps1), None, &perms);
         let mut max_b = 0.0f32;
-        for cy in 0..96usize { for cz in 0..4usize { for cx in 0..4usize {
+        for cy in 0..97usize { for cz in 0..5usize { for cx in 0..5usize {
             let wx = (cx * 4) as f32;
             let wy = (-64 + cy as i32 * 4) as f32;
             let wz = (cz * 4) as f32;
             let cpu = cpu_octave_stack(&perm_i32, 0, 1.0, 1.0, &amps1, wx*0.3, wy*0.3, wz*0.3);
-            let gpu = gpu_b[cx + cz*4 + cy*16];
+            let gpu = gpu_b[cx + cz*5 + cy*25];
             max_b = max_b.max((cpu - gpu).abs());
         }}}
         println!("Case B (1 octave, offset 0):    max_diff={:.6e}", max_b);
@@ -716,12 +716,12 @@ mod tests {
         // Case C: single octave at offset 256
         let gpu_c = build_run_blob(0, 1.0, 0.3, 0.3, (256, 1.0, 1.0, &amps1), None, &perms);
         let mut max_c = 0.0f32;
-        for cy in 0..96usize { for cz in 0..4usize { for cx in 0..4usize {
+        for cy in 0..97usize { for cz in 0..5usize { for cx in 0..5usize {
             let wx = (cx * 4) as f32;
             let wy = (-64 + cy as i32 * 4) as f32;
             let wz = (cz * 4) as f32;
             let cpu = cpu_octave_stack(&perm_i32, 256, 1.0, 1.0, &amps1, wx*0.3, wy*0.3, wz*0.3);
-            let gpu = gpu_c[cx + cz*4 + cy*16];
+            let gpu = gpu_c[cx + cz*5 + cy*25];
             max_c = max_c.max((cpu - gpu).abs());
         }}}
         println!("Case C (1 octave, offset 256):  max_diff={:.6e}", max_c);
@@ -730,12 +730,12 @@ mod tests {
         let amps2 = [1.0f32, 0.5];
         let gpu_d = build_run_blob(0, 1.0, 0.3, 0.3, (0, 1.0, 1.0, &amps2), None, &perms);
         let mut max_d = 0.0f32;
-        for cy in 0..96usize { for cz in 0..4usize { for cx in 0..4usize {
+        for cy in 0..97usize { for cz in 0..5usize { for cx in 0..5usize {
             let wx = (cx * 4) as f32;
             let wy = (-64 + cy as i32 * 4) as f32;
             let wz = (cz * 4) as f32;
             let cpu = cpu_octave_stack(&perm_i32, 0, 1.0, 1.0, &amps2, wx*0.3, wy*0.3, wz*0.3);
-            let gpu = gpu_d[cx + cz*4 + cy*16];
+            let gpu = gpu_d[cx + cz*5 + cy*25];
             max_d = max_d.max((cpu - gpu).abs());
         }}}
         println!("Case D (2 octaves):             max_diff={:.6e}", max_d);
@@ -768,12 +768,12 @@ mod tests {
         let gpu_a = build_run_blob(0, 1.0, 0.3, 0.3,
             (0, 1.0, 1.0, &amps), None, &perms);
         let mut max_a = 0.0f32;
-        for cy in 0..96usize { for cz in 0..4usize { for cx in 0..4usize {
+        for cy in 0..97usize { for cz in 0..5usize { for cx in 0..5usize {
             let wx = (cx * 4) as f32;
             let wy = (-64 + cy as i32 * 4) as f32;
             let wz = (cz * 4) as f32;
             let cpu = cpu_octave_stack(&perm_i32, 0, 1.0, 1.0, &amps, wx*0.3, wy*0.3, wz*0.3);
-            let gpu = gpu_a[cx + cz*4 + cy*16];
+            let gpu = gpu_a[cx + cz*5 + cy*25];
             max_a = max_a.max((cpu - gpu).abs());
         }}}
         println!("Case A (single stack, 3 octaves): max_diff={:.6e}", max_a);
@@ -851,7 +851,7 @@ mod tests {
 
         let bytes = blob_result.as_bytes();
         let payload = &bytes[0x88..];
-        let ch0: Vec<f32> = (0..1536)
+        let ch0: Vec<f32> = (0..2425)
             .map(|i| f32::from_le_bytes(payload[i*4..i*4+4].try_into().unwrap()))
             .collect();
 
@@ -860,14 +860,14 @@ mod tests {
         let mut max_diff = 0.0f32;
         let mut sum_sq = 0.0f64;
         let mut n = 0usize;
-        for cy in 0..96usize {
-            for cz in 0..4usize {
-                for cx in 0..4usize {
+        for cy in 0..97usize {
+            for cz in 0..5usize {
+                for cx in 0..5usize {
                     let wx = (cx * 4) as f32;
                     let wy = (-64 + cy as i32 * 4) as f32;
                     let wz = (cz * 4) as f32;
                     let cpu = cpu_noise_sampler(&perm_i32, first, second, 0.8, 0.3, 0.3, wx, wy, wz);
-                    let gpu = ch0[cx + cz * 4 + cy * 16];
+                    let gpu = ch0[cx + cz * 5 + cy * 25];
                     let d = (cpu - gpu).abs();
                     sum_sq += (d as f64) * (d as f64);
                     n += 1;
@@ -882,7 +882,7 @@ mod tests {
             let wy = (-64 + cy as i32 * 4) as f32;
             let wz = (cz * 4) as f32;
             let cpu = cpu_noise_sampler(&perm_i32, first, second, 0.8, 0.3, 0.3, wx, wy, wz);
-            let gpu = ch0[cx + cz * 4 + cy * 16];
+            let gpu = ch0[cx + cz * 5 + cy * 25];
             println!("  cell ({},{},{}) cpu={:.6} gpu={:.6}", cx, cy, cz, cpu, gpu);
         }
         assert!(max_diff < 1e-4, "double-stack divergence {:.6e}", max_diff);
@@ -957,7 +957,7 @@ mod tests {
         let br = result.results.values().next().unwrap();
         let bytes = br.as_bytes();
         let payload = &bytes[0x88..];
-        (0..1536).map(|i| f32::from_le_bytes(payload[i*4..i*4+4].try_into().unwrap())).collect()
+        (0..2425).map(|i| f32::from_le_bytes(payload[i*4..i*4+4].try_into().unwrap())).collect()
     }
 
     #[test]
@@ -1071,7 +1071,7 @@ mod tests {
         let br = result.results.values().next().unwrap();
         let bytes = br.as_bytes();
         let payload = &bytes[0x88..];
-        let gpu: Vec<f32> = (0..1536)
+        let gpu: Vec<f32> = (0..2425)
             .map(|i| f32::from_le_bytes(payload[i*4..i*4+4].try_into().unwrap()))
             .collect();
 
@@ -1083,7 +1083,7 @@ mod tests {
             let cy = ((wy + 64.0) / 4.0) as usize;
             let cz = (wz / 4.0) as usize;
             if cx >= 4 || cz >= 4 || cy >= 96 { continue; }
-            let idx = cx + cz * 4 + cy * 16;
+            let idx = cx + cz * 5 + cy * 25;
             let d = (gpu[idx] - mc).abs();
             if d > max_diff {
                 max_diff = d;
@@ -1163,7 +1163,7 @@ mod tests {
         let br = result.results.values().next().unwrap();
         let bytes = br.as_bytes();
         let payload = &bytes[0x88..];
-        let gpu: Vec<f32> = (0..1536)
+        let gpu: Vec<f32> = (0..2425)
             .map(|i| f32::from_le_bytes(payload[i*4..i*4+4].try_into().unwrap()))
             .collect();
 
@@ -1185,12 +1185,12 @@ mod tests {
         };
 
         let mut max_d = 0.0f32;
-        for cy in 0..96usize { for cz in 0..4usize { for cx in 0..4usize {
+        for cy in 0..97usize { for cz in 0..5usize { for cx in 0..5usize {
             let wx = (16 + cx as i32 * 4) as f32;
             let wy = (-64 + cy as i32 * 4) as f32;
             let wz = (cz * 4) as f32;
             let c = cpu(wx, wy, wz);
-            let g = gpu[cx + cz*4 + cy*16];
+            let g = gpu[cx + cz*5 + cy*25];
             max_d = max_d.max((c - g).abs());
         }}}
         println!("shifted-noise: max_diff={:.6e}", max_d);
@@ -1273,7 +1273,7 @@ mod tests {
         let br = result.results.values().next().unwrap();
         let bytes = br.as_bytes();
         let payload = &bytes[0x88..];
-        let gpu: Vec<f32> = (0..1536)
+        let gpu: Vec<f32> = (0..2425)
             .map(|i| f32::from_le_bytes(payload[i*4..i*4+4].try_into().unwrap()))
             .collect();
 
@@ -1303,12 +1303,12 @@ mod tests {
         };
 
         let mut max_d = 0.0f32;
-        for cy in 0..96usize { for cz in 0..4usize { for cx in 0..4usize {
+        for cy in 0..97usize { for cz in 0..5usize { for cx in 0..5usize {
             let wx = (1 + cx as i32 * 4) as f32;
             let wy = (-64 + cy as i32 * 4) as f32;
             let wz = (cz * 4) as f32;
             let c = cpu(wy, wx, wz);
-            let g = gpu[cx + cz*4 + cy*16];
+            let g = gpu[cx + cz*5 + cy*25];
             max_d = max_d.max((c - g).abs());
         }}}
         println!("spline: max_diff={:.6e}", max_d);
@@ -1345,7 +1345,7 @@ mod tests {
         let gpu = build_run_blob_origin(0, 1.0, 0.3, 0.3,
             (0, 1.0, 1.0, &amps), None, &perms, &origins);
         let mut max_d = 0.0f32;
-        for cy in 0..96usize { for cz in 0..4usize { for cx in 0..4usize {
+        for cy in 0..97usize { for cz in 0..5usize { for cx in 0..5usize {
             let wx = (cx * 4) as f32;
             let wy = (-64 + cy as i32 * 4) as f32;
             let wz = (cz * 4) as f32;
@@ -1359,7 +1359,7 @@ mod tests {
                 cpu_kahan_add(&mut acc, amps[i] * s * amp);
                 freq *= 2.0; amp *= 0.5;
             }
-            let g = gpu[cx + cz*4 + cy*16];
+            let g = gpu[cx + cz*5 + cy*25];
             max_d = max_d.max((acc.0 - g).abs());
         }}}
         println!("nonzero-origin (3 octaves): max_diff={:.6e}", max_d);
@@ -1422,7 +1422,7 @@ mod tests {
 
         let bytes = blob_result.as_bytes();
         let payload = &bytes[0x88..];
-        let ch0: Vec<f32> = (0..1536).map(|i| {
+        let ch0: Vec<f32> = (0..2425).map(|i| {
             f32::from_le_bytes(payload[i*4..i*4+4].try_into().unwrap())
         }).collect();
 
@@ -1430,14 +1430,14 @@ mod tests {
         let mut max_cell = (0usize, 0usize, 0usize);
         let mut sum_sq = 0.0f64;
         let mut n = 0usize;
-        for cy in 0..96usize {
-            for cz in 0..4usize {
-                for cx in 0..4usize {
+        for cy in 0..97usize {
+            for cz in 0..5usize {
+                for cx in 0..5usize {
                     let wx = (cx * 4) as f32;
                     let wy = (-64 + cy as i32 * 4) as f32;
                     let wz = (cz * 4) as f32;
                     let cpu = cpu_noise_perlin3d(&perm_i32, 0, wx * 0.3, wy * 0.3, wz * 0.3);
-                    let gpu_idx = cx + cz * 4 + cy * 16;
+                    let gpu_idx = cx + cz * 5 + cy * 25;
                     let gpu = ch0[gpu_idx];
                     let d = (cpu - gpu).abs();
                     sum_sq += (d as f64) * (d as f64);
@@ -1453,7 +1453,7 @@ mod tests {
             let wy = (-64 + cy as i32 * 4) as f32;
             let wz = (cz * 4) as f32;
             let cpu = cpu_noise_perlin3d(&perm_i32, 0, wx * 0.3, wy * 0.3, wz * 0.3);
-            let gpu_idx = cx + cz * 4 + cy * 16;
+            let gpu_idx = cx + cz * 5 + cy * 25;
             println!("  cell ({},{},{}) world ({},{},{}) cpu={:.6} gpu={:.6}",
                      cx, cy, cz, wx, wy, wz, cpu, ch0[gpu_idx]);
         }

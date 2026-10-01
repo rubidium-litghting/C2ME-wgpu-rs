@@ -149,64 +149,41 @@ mod tests {
     /// WGSL with proper `var<workgroup>` declarations, `workgroupBarrier()`,
     /// and shared-memory reads — all within a single-pass `main_entry`.
     #[test]
+    /// Cache wrappers - all three degrade to pass-through memoisation.
+    /// Cache2D / CacheFlat skip shared memory (avoids barrier-in-loop UB);
+    /// CacheInterpolated likewise passes through because the dispatch grid
+    /// now IS the corner grid (cell_count + 1 per axis).
+    #[test]
     fn validate_accepts_cache_wrappers() {
         let root = AstNode::Root(vec![
-            // CacheFlat around a Constant — should emit a single-f32 slot.
             AstNode::CacheFlat(Box::new(AstNode::Constant(1.5))),
-            // Cache2D around a SimplexNoise2D — 16-slot array<f32, 16>.
             AstNode::Cache2D(Box::new(AstNode::SimplexNoise2D { seed: 7 })),
-            // CacheInterpolated around Add(InputX, InputY) — phase 4-3
-            // real implementation: corner computation + workgroupBarrier()
-            // + trilinear lerp, all in one dispatch.
             AstNode::CacheInterpolated(Box::new(AstNode::Add(
                 Box::new(AstNode::InputX),
                 Box::new(AstNode::InputY),
             ))),
-            // Nested cache — Cache2D wraps CacheFlat wraps PerlinSampler.
-            // Verifies slot allocation + nested barrier + shared-memory
-            // read compose correctly.
             AstNode::Cache2D(Box::new(AstNode::CacheFlat(Box::new(
                 AstNode::SimplexNoise3D { seed: 42 },
             )))),
         ]);
-        // CacheInterpolated now runs in single-pass mode (workgroup memory
-        // does not persist across dispatches, so two-pass was incorrect).
         assert!(!crate::codegen::wgsl_gen::requires_two_pass(&root),
-            "CacheInterpolated must NOT require two-pass (single-pass + barrier)");
+            "caches must NOT require two-pass dispatch");
 
-        // Single-pass emit — CacheInterpolated produces corner computation
-        // + workgroupBarrier() + trilinear_lerp in one main_entry.
         let src = emit_shader(&root).expect("emit single-pass shader");
         validate_wgsl(&src).expect("cache-wrappers WGSL must be valid");
 
-        // Structural checks for phase 4-3 CacheInterpolated.
         assert!(src.contains("fn main_entry("),
-            "must use single-pass entry point main_entry:\n{src}");
-        assert!(src.contains("var<workgroup> ci_0: array<f32, 125>;"),
-            "must declare 5×5×5 CacheInterpolated shared memory:\n{src}");
-
-        // Phase 1 (corner computation): loop-based assignment with
-        // select(0u, 1u, lid==3) bounds covering all 125 corners.
-        assert!(src.contains("select(0u, 1u, lx == 3u)"),
-            "must compute dx_max via select for +x apron:\n{src}");
-        assert!(src.contains("select(0u, 1u, ly == 3u)"),
-            "must compute dy_max via select for +y apron:\n{src}");
-        assert!(src.contains("select(0u, 1u, lz == 3u)"),
-            "must compute dz_max via select for +z apron:\n{src}");
-        assert!(src.contains("for (var dx: u32 = 0u; dx <= dx_max; dx++)"),
-            "must have dx corner loop:\n{src}");
-        assert!(src.contains("ci_0[cx * 25u + cy * 5u + cz]"),
-            "must write corners by (cx, cy, cz) index:\n{src}");
-
-        // Phase 2 — trilinear lerp to the cell center after the barrier.
-        assert!(src.contains("workgroupBarrier();"),
-            "must have a workgroupBarrier between phases:\n{src}");
-        assert!(src.contains("ci_0[lx * 25u + ly * 5u + lz]"),
-            "must output the min corner in phase 2:\n{src}");
-
-        // out_buf write still happens (single-pass mode writes results).
+            "must use single-pass entry point main_entry");
+        assert!(!src.contains("workgroupBarrier();"),
+            "cache wrappers must not emit barriers");
+        assert!(!src.contains("var<workgroup>"),
+            "cache wrappers must not declare shared memory");
+        assert!(src.contains("+ 1;"),
+            "must use corner grid (cell_count + 1)");
+        assert!(src.contains("return;"),
+            "must guard out-of-range invocations");
         assert!(src.contains("out_buf["),
-            "single-pass mode must write out_buf:\n{src}");
+            "single-pass mode must write out_buf");
     }
 
     // ── error paths: naga must reject obvious garbage ──────────────────

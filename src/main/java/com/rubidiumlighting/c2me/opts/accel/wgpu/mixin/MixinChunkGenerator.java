@@ -31,6 +31,7 @@ import net.minecraft.block.Blocks;
 import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.world.chunk.Chunk;
 import net.minecraft.world.chunk.ChunkSection;
+import net.minecraft.world.Heightmap;
 import net.minecraft.world.gen.StructureAccessor;
 import net.minecraft.world.gen.chunk.Blender;
 import net.minecraft.world.gen.chunk.ChunkGeneratorSettings;
@@ -58,6 +59,12 @@ public abstract class MixinChunkGenerator {
     private static volatile NoiseRouter REF_ROUTER = null;
     private static volatile NoiseRouter RAW_ROUTER = null;
     private static final AtomicBoolean TRUTH_DUMPED = new AtomicBoolean(false);
+
+    // Cell grid dims (corner samples per axis). MC uses 5x97x5 corners;
+    // we currently ship 4x96x4 + edge extrapolation (see cellAt).
+    private static final int CELLS_X = 5;
+    private static final int CELLS_Y = 97;
+    private static final int CELLS_Z = 5;
 
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
     private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,
@@ -99,19 +106,42 @@ public abstract class MixinChunkGenerator {
             if (req == 0L) {
                 return;
             }
-            int st = WgpuThinBinding.pollStatus(req);
+            // requestChunks is ASYNC: it returns a handle immediately while
+            // the GPU computes in the background. Returning here on PENDING
+            // (without cir.setReturnValue) let vanilla's CPU populateNoise
+            // run the whole chunk itself — that was the CPU-usage culprit.
+            // Block until the GPU result is ready instead.
+            int st;
+            long deadline = System.nanoTime() + 10_000_000_000L; // 10s
+            while ((st = WgpuThinBinding.pollStatus(req))
+                    == WgpuThinBinding.STATUS_PENDING) {
+                if (System.nanoTime() > deadline) {
+                    LOGGER.warn("[c2me-wgpu] GPU request timed out, falling back to CPU");
+                    break;
+                }
+                // Sleep briefly instead of busy-spinning: onSpinWait() burns
+                // a full core while waiting, which showed up as high CPU.
+                java.util.concurrent.locks.LockSupport.parkNanos(100_000L);
+            }
             if (st != WgpuThinBinding.STATUS_DONE) {
-                return;
+                return; // GPU failed/timed out -> vanilla CPU path runs
             }
             java.lang.foreign.MemorySegment seg = WgpuThinBinding.takeResultBlob(req);
 
             // Reuse MC's own AquiferSampler: it decides water/lava/air vs
             // solid from the density value we computed on the GPU. This
             // replaces the crude global sea-level fill.
+            // Reuse the chunk's cached sampler (vanilla buildSurface does the
+            // same). Creating a fresh ChunkNoiseSampler per call was a large
+            // CPU cost (it rebuilds the whole density-function graph).
             NoiseChunkGenerator gen = (NoiseChunkGenerator) (Object) this;
+            final Blender fBlender = blender;
+            final StructureAccessor fSa = structureAccessor;
+            final NoiseConfig fNc = noiseConfig;
             net.minecraft.world.gen.chunk.ChunkNoiseSampler sampler =
-                    ((NoiseChunkGeneratorInvoker) (Object) gen).callCreateChunkNoiseSampler(
-                            chunk, structureAccessor, blender, noiseConfig);
+                    chunk.getOrCreateChunkNoiseSampler(cs ->
+                            ((NoiseChunkGeneratorInvoker) (Object) gen)
+                                    .callCreateChunkNoiseSampler(cs, fSa, fBlender, fNc));
             net.minecraft.world.gen.chunk.AquiferSampler aquifer = sampler.getAquiferSampler();
 
             writeDensityToChunk(chunk, seg, aquifer);
@@ -142,13 +172,10 @@ public abstract class MixinChunkGenerator {
     private static void writeDensityToChunk(Chunk chunk, java.lang.foreign.MemorySegment seg,
                                             net.minecraft.world.gen.chunk.AquiferSampler aquifer) {
         final int CHANNEL = 11;                 // finalDensity
-        final int CELLS_PER_CHANNEL = 4 * 96 * 4;
+        final int CELLS_PER_CHANNEL = CELLS_X * CELLS_Y * CELLS_Z;
         final int PAYLOAD_BASE = 0x88;
         final int CELL_W = 4;
         final int CELL_H = 4;
-        final int CELLS_X = 4;
-        final int CELLS_Y = 96;
-        final int CELLS_Z = 4;
         final int MIN_Y = -64;
 
         long need = PAYLOAD_BASE + (long) (CHANNEL + 1) * CELLS_PER_CHANNEL * 4;
@@ -162,6 +189,8 @@ public abstract class MixinChunkGenerator {
 
         BlockState stone = Blocks.STONE.getDefaultState();
         BlockState air = Blocks.AIR.getDefaultState();
+        Heightmap oceanFloorWg = chunk.getHeightmap(Heightmap.Type.OCEAN_FLOOR_WG);
+        Heightmap worldSurfaceWg = chunk.getHeightmap(Heightmap.Type.WORLD_SURFACE_WG);
 
 
         float dmin = Float.POSITIVE_INFINITY, dmax = Float.NEGATIVE_INFINITY;
@@ -200,19 +229,22 @@ public abstract class MixinChunkGenerator {
             // [4i, 4i+4); its value is the density at block 4i. Interpolate
             // between corner[i] and corner[i+1] with weight (b%4)/4.
             int iy = by / CELL_H;
-            int cy0 = iy, cy1 = Math.min(iy + 1, CELLS_Y - 1);
+            int cy0 = iy, cy1 = iy + 1;
             float ty = (by % CELL_H) / (float) CELL_H;
 
             for (int bz = 0; bz < 16; bz++) {
                 int iz = bz / CELL_W;
-                int cz0 = iz, cz1 = Math.min(iz + 1, CELLS_Z - 1);
+                int cz0 = iz, cz1 = iz + 1;
                 float tz = (bz % CELL_W) / (float) CELL_W;
 
                 for (int bx = 0; bx < 16; bx++) {
                     int ix = bx / CELL_W;
-                    int cx0 = ix, cx1 = Math.min(ix + 1, CELLS_X - 1);
+                    int cx0 = ix, cx1 = ix + 1;
                     float tx = (bx % CELL_W) / (float) CELL_W;
 
+                    // cellAt() linearly extrapolates past the grid edge, so
+                    // the last cell of a chunk is NOT flat — that flat strip
+                    // was the visible chunk-boundary seam.
                     float c000 = cells[cx0 + cz0 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
                     float c100 = cells[cx1 + cz0 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
                     float c010 = cells[cx0 + cz0 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
@@ -238,7 +270,16 @@ public abstract class MixinChunkGenerator {
                                     chunk.getPos().getStartZ() + bz);
                     BlockState bs = aquifer.apply(npos, (double) d);
                     if (bs == null) bs = stone;
-                    sec.setBlockState(bx & 15, globalY & 15, bz & 15, bs);
+                    if (bs == air) continue;
+                    int lx = bx & 15;
+                    int ly = globalY & 15;
+                    int lz = bz & 15;
+                    sec.setBlockState(lx, ly, lz, bs);
+                    // Vanilla tracks both WG heightmaps right after writing.
+                    // Skipping this left structure placement (villages!) with
+                    // a stale surface height, so buildings floated.
+                    oceanFloorWg.trackUpdate(lx, globalY, lz, bs);
+                    worldSurfaceWg.trackUpdate(lx, globalY, lz, bs);
                 }
             }
         }
@@ -288,6 +329,7 @@ public abstract class MixinChunkGenerator {
             }
         }
     }
+
 
 
 
