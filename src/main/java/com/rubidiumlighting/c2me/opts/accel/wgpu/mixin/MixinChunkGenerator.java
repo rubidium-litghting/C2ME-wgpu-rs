@@ -70,9 +70,15 @@ public abstract class MixinChunkGenerator {
 
     // Cell grid dims (corner samples per axis). MC uses 5x49x5 corners;
     // we currently ship 4x96x4 + edge extrapolation (see cellAt).
-    private static final int CELLS_X = 5;
-    private static final int CELLS_Y = 49;
-    private static final int CELLS_Z = 5;
+    // Grid dims, set from the dimension's GenerationShapeConfig at world init
+    // (Overworld 5x49x5 cell 4x8; End 3x33x3 cell 8x4; etc.). Defaults=Overworld.
+    private static volatile int GRID_X = 5;
+    private static volatile int GRID_Y = 49;
+    private static volatile int GRID_Z = 5;
+    private static volatile int GRID_CW = 4;
+    private static volatile int GRID_CH = 8;
+    private static volatile int GRID_MINY = -64;
+    private static volatile int GRID_H = 384;
 
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
     private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,
@@ -101,7 +107,21 @@ public abstract class MixinChunkGenerator {
                     LOGGER.warn("[c2me-wgpu] NoiseRouter is null, falling back to CPU");
                     return;
                 }
-                NoiseRouterBlobifier.ShapeConfig shape = new NoiseRouterBlobifier.ShapeConfig(-64, 384, 4, 8);
+                net.minecraft.world.gen.chunk.GenerationShapeConfig gsc =
+                        self.getSettings().value().generationShapeConfig();
+                int hc = gsc.horizontalCellBlockCount();
+                int vc = gsc.verticalCellBlockCount();
+                GRID_MINY = gsc.minimumY();
+                GRID_H = gsc.height();
+                GRID_CW = hc;
+                GRID_CH = vc;
+                GRID_X = 16 / hc + 1;
+                GRID_Z = 16 / hc + 1;
+                GRID_Y = GRID_H / vc + 1;
+                LOGGER.info("[c2me-wgpu] shape: minY={} h={} cell={}x{} grid={}x{}x{}",
+                        GRID_MINY, GRID_H, GRID_CW, GRID_CH, GRID_X, GRID_Y, GRID_Z);
+                NoiseRouterBlobifier.ShapeConfig shape =
+                        new NoiseRouterBlobifier.ShapeConfig(GRID_MINY, GRID_H, hc, vc);
                 RAW_ROUTER = router;
                 ByteBuffer blob = NoiseRouterBlobifier.blobify(router, shape, noiseConfig);
                 LOGGER.info("[c2me-wgpu] first chunk [{} {}], blob size={} bytes",
@@ -141,8 +161,8 @@ public abstract class MixinChunkGenerator {
                         sb.append("# cx cz startX startZ\n");
                         sb.append("CHUNK ").append(chunk.getPos().x).append(' ')
                           .append(chunk.getPos().z).append('\n');
-                        sb.append("DIMS 5 49 5\n");
-                        sb.append("CELL_W 4\nMIN_Y -64\n");
+                        sb.append("DIMS ").append(GRID_X).append(" ").append(GRID_Y).append(" ").append(GRID_Z).append("\n");
+                        sb.append("CELL_W ").append(GRID_CW).append("\nMIN_Y ").append(GRID_MINY).append("\n");
                         // Dump several channels so we can tell a broken
                         // sampling framework (ch0 wrong) from a broken
                         // specific node (only ch11 wrong).
@@ -220,12 +240,12 @@ public abstract class MixinChunkGenerator {
                                     break;
                                 }
                             }
-                            for (int j = 0; j < 49; j++) {
-                                int wy = -64 + j * 8;
-                                for (int k = 0; k < 5; k++) {
-                                    int wz = sz + k * 4;
-                                    for (int i = 0; i < 5; i++) {
-                                        int wx = sx + i * 4;
+                            for (int j = 0; j < GRID_Y; j++) {
+                                int wy = GRID_MINY + j * GRID_CH;
+                                for (int k = 0; k < GRID_Z; k++) {
+                                    int wz = sz + k * GRID_CW;
+                                    for (int i = 0; i < GRID_X; i++) {
+                                        int wx = sx + i * GRID_CW;
                                         double v = fd.sample(
                                                 new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(
                                                         wx, wy, wz));
@@ -371,11 +391,14 @@ public abstract class MixinChunkGenerator {
                                             int batchIndex,
                                             StructureAccessor structureAccessor) {
         final int CHANNEL = 11;                 // finalDensity
+        final int CELLS_X = GRID_X;
+        final int CELLS_Y = GRID_Y;
+        final int CELLS_Z = GRID_Z;
         final int CELLS_PER_CHANNEL = CELLS_X * CELLS_Y * CELLS_Z;
         final int PAYLOAD_BASE = 0x88;
-        final int CELL_W = 4;
-        final int CELL_H = 8;
-        final int MIN_Y = -64;
+        final int CELL_W = GRID_CW;
+        final int CELL_H = GRID_CH;
+        final int MIN_Y = GRID_MINY;
 
         // Blob layout (multi-chunk): payload = chunk0[16 channels][CPC],
         // chunk1[16 channels][CPC], ... The header channel_offsets only
@@ -445,7 +468,7 @@ public abstract class MixinChunkGenerator {
         // between the two neighbouring cells in each axis. Without this,
         // an entire 4x4x4 cell flips between stone/air at once, which
         // fills the top few blocks of every ocean cell with stone.
-        for (int by = 0; by < 384; by++) {
+        for (int by = 0; by < GRID_H; by++) {
             int globalY = MIN_Y + by;
             int secIdx = chunk.getSectionIndex(globalY);
             if (secIdx < 0 || secIdx >= chunk.getSectionArray().length) continue;
