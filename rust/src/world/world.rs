@@ -460,8 +460,13 @@ mod tests {
         let batch_size = 64;
         let total_batches = (all_positions.len() + batch_size - 1) / batch_size;
 
+        // One GPU dispatch covers the corner grid 5x97x5 padded to the
+        // workgroup size 4 -> 8x100x8 = 6400 invocations.
+        const INVOCATIONS_PER_DISPATCH: u64 = 8 * 100 * 8;
+
         let start = Instant::now();
         let mut total_chunks = 0;
+        let mut total_gpu_time = std::time::Duration::ZERO;
 
         for batch_idx in 0..total_batches {
             let start_pos = batch_idx * batch_size;
@@ -473,7 +478,8 @@ mod tests {
                 max_priority: Priority::Normal,
             };
 
-            let _result = executor.request_chunks(world_arc.clone(), batch).unwrap();
+            let result = executor.request_chunks(world_arc.clone(), batch).unwrap();
+            total_gpu_time += result.dispatch_time;
             total_chunks += chunk_slice.len();
         }
 
@@ -481,9 +487,55 @@ mod tests {
         let total_seconds = elapsed.as_secs_f64();
         let chunks_per_second = total_chunks as f64 / total_seconds;
 
+        let gpu_seconds = total_gpu_time.as_secs_f64();
+        let per_batch_ms = total_gpu_time.as_secs_f64() * 1000.0 / total_batches as f64;
+        let per_chunk_ms = per_batch_ms / batch_size as f64;
+        let gpu_busy_pct = if total_seconds > 0.0 {
+            gpu_seconds / total_seconds * 100.0
+        } else {
+            0.0
+        };
+
         println!(
             "✅ 性能测试完成：生成 {} 个区块，耗时 {:.3}s，吞吐量 {:.1} 区块/秒",
             total_chunks, total_seconds, chunks_per_second
+        );
+        println!(
+            "   GPU 批次：{} 批 × {} 区块，平均 {:.3} ms/批（{:.3} ms/区块）",
+            total_batches, batch_size, per_batch_ms, per_chunk_ms
+        );
+        println!(
+            "   GPU 忙碌占比 {:.1}%，调度开销占比 {:.1}%",
+            gpu_busy_pct,
+            100.0 - gpu_busy_pct
+        );
+
+        // ── theoretical throughput ───────────────────────────────────
+        // NOTE: the shader currently computes ONE chunk's density grid per
+        // dispatch, regardless of how many positions the batch holds. So
+        // per_batch_ms already includes all fixed dispatch cost. Let
+        //   T = per_batch_ms = T_setup + T_compute_1chunk.
+        // If the shader processed all N chunks in the SAME dispatch, the
+        // batch time would become T_setup + N * T_compute. Since
+        // T_compute <= T (unknown split), the resulting throughput lies
+        // between these two bounds:
+        //   lower  = 1 / T             (compute-bound: time grows with N)
+        //   upper  = N / T             (overhead-bound: setup dominates)
+        let lower_cps = 1000.0 / per_batch_ms;
+        let upper_cps = (batch_size as f64) * 1000.0 / per_batch_ms;
+        println!(
+            "   ── 理论吞吐量（shader 支持 {} 区块/批后）──",
+            batch_size
+        );
+        println!("      下限（计算主导，时间随 N 线性增长）: {:.1} 区块/秒", lower_cps);
+        println!("      上限（调度开销主导，setup 摊薄）: {:.1} 区块/秒", upper_cps);
+        println!(
+            "      GPU 算力参考: {:.2e} invocation/秒（{} invocation/dispatch）",
+            total_batches as f64 * INVOCATIONS_PER_DISPATCH as f64 / total_seconds,
+            INVOCATIONS_PER_DISPATCH
+        );
+        println!(
+            "      （shader 现为多块 dispatch：一次生成整批 {} 区块）", batch_size
         );
 
         // 如果时间太短，给出提示

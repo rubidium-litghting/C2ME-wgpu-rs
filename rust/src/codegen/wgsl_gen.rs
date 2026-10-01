@@ -288,6 +288,7 @@ struct WorldgenParams {
 @group(0) @binding(1) var<storage, read>        perm: array<u32>;
 @group(0) @binding(2) var<storage, read_write>  out_buf:      array<f32>;
 @group(0) @binding(3) var<storage, read>        perm_origin:  array<f32>;
+@group(0) @binding(4) var<storage, read>        positions:    array<i32>;
 "#;
 
 /// `main_entry` opening (single-pass mode) — sets up `cell_x / cell_y /
@@ -321,18 +322,34 @@ fn main_entry(
   let cell_count_z: i32 = 16 / i32(params.cell_width) + 1;
   let cell_count_y: i32 = i32(params.height_f) / i32(params.cell_height) + 1;
   let cells_per_chunk: u32 = u32(cell_count_x * cell_count_y * cell_count_z);
-  if (cx_i32 >= cell_count_x || cy_i32 >= cell_count_y || cz_i32 >= cell_count_z) {
+
+  // ── multi-chunk dispatch: gid.z spans cell_count_z × num_chunks ─────
+  // Every chunk in the batch owns a contiguous band of `cell_count_z`
+  // z-slices, so ONE dispatch generates all of them. The chunk's world
+  // origin comes from the `positions` buffer (sorted [cx,cz,...]).
+  let num_chunks: i32 = i32(arrayLength(&positions)) / 2;
+  let chunk_index: i32 = cz_i32 / cell_count_z;
+  let cz_local: i32 = cz_i32 % cell_count_z;
+  if (cx_i32 >= cell_count_x || cy_i32 >= cell_count_y
+      || cz_local >= cell_count_z || chunk_index >= num_chunks) {
     return;
   }
 
+  let origin_x: i32 = positions[chunk_index * 2] * 16;
+  let origin_z: i32 = positions[chunk_index * 2 + 1] * 16;
+
   // ── cell linear index (MC-native stride, see mc_stride.rs) ─────────
+  // Local cell index within this chunk (MC-native stride).
   let cell_idx: u32 = u32(cx_i32
-                         + cz_i32 * cell_count_x
+                         + cz_local * cell_count_x
                          + cy_i32 * cell_count_x * cell_count_z);
+  // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
+  // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
+  let chunk_cell_base: u32 = u32(chunk_index) * 16u * cells_per_chunk;
 
   // ── 铁律①: i32 world coords via origin subtraction ──────────────────
-  let world_x_i32: i32 = params.batch_origin_x + cx_i32 * i32(params.cell_width);
-  let world_z_i32: i32 = params.batch_origin_z + cz_i32 * i32(params.cell_width);
+  let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
+  let world_z_i32: i32 = origin_z + cz_local * i32(params.cell_width);
   let world_y_i32: i32 = i32(params.min_y_f) + cy_i32 * i32(params.cell_height);
 
   // ── f32 noise inputs (the coordinate emitter returns these names) ───
@@ -361,14 +378,30 @@ fn main_pass_a(
   let cell_count_z: i32 = 16 / i32(params.cell_width) + 1;
   let cell_count_y: i32 = i32(params.height_f) / i32(params.cell_height) + 1;
   let cells_per_chunk: u32 = u32(cell_count_x * cell_count_y * cell_count_z);
-  if (cx_i32 >= cell_count_x || cy_i32 >= cell_count_y || cz_i32 >= cell_count_z) {
+
+  // ── multi-chunk dispatch: gid.z spans cell_count_z × num_chunks ─────
+  // Every chunk in the batch owns a contiguous band of `cell_count_z`
+  // z-slices, so ONE dispatch generates all of them. The chunk's world
+  // origin comes from the `positions` buffer (sorted [cx,cz,...]).
+  let num_chunks: i32 = i32(arrayLength(&positions)) / 2;
+  let chunk_index: i32 = cz_i32 / cell_count_z;
+  let cz_local: i32 = cz_i32 % cell_count_z;
+  if (cx_i32 >= cell_count_x || cy_i32 >= cell_count_y
+      || cz_local >= cell_count_z || chunk_index >= num_chunks) {
     return;
   }
+
+  let origin_x: i32 = positions[chunk_index * 2] * 16;
+  let origin_z: i32 = positions[chunk_index * 2 + 1] * 16;
+  // Local cell index within this chunk (MC-native stride).
   let cell_idx: u32 = u32(cx_i32
-                         + cz_i32 * cell_count_x
+                         + cz_local * cell_count_x
                          + cy_i32 * cell_count_x * cell_count_z);
-  let world_x_i32: i32 = params.batch_origin_x + cx_i32 * i32(params.cell_width);
-  let world_z_i32: i32 = params.batch_origin_z + cz_i32 * i32(params.cell_width);
+  // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
+  // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
+  let chunk_cell_base: u32 = u32(chunk_index) * 16u * cells_per_chunk;
+  let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
+  let world_z_i32: i32 = origin_z + cz_local * i32(params.cell_width);
   let world_y_i32: i32 = i32(params.min_y_f) + cy_i32 * i32(params.cell_height);
   let cell_x: f32 = f32(world_x_i32);
   let cell_y: f32 = f32(world_y_i32);
@@ -393,14 +426,30 @@ fn main_pass_b(
   let cell_count_z: i32 = 16 / i32(params.cell_width) + 1;
   let cell_count_y: i32 = i32(params.height_f) / i32(params.cell_height) + 1;
   let cells_per_chunk: u32 = u32(cell_count_x * cell_count_y * cell_count_z);
-  if (cx_i32 >= cell_count_x || cy_i32 >= cell_count_y || cz_i32 >= cell_count_z) {
+
+  // ── multi-chunk dispatch: gid.z spans cell_count_z × num_chunks ─────
+  // Every chunk in the batch owns a contiguous band of `cell_count_z`
+  // z-slices, so ONE dispatch generates all of them. The chunk's world
+  // origin comes from the `positions` buffer (sorted [cx,cz,...]).
+  let num_chunks: i32 = i32(arrayLength(&positions)) / 2;
+  let chunk_index: i32 = cz_i32 / cell_count_z;
+  let cz_local: i32 = cz_i32 % cell_count_z;
+  if (cx_i32 >= cell_count_x || cy_i32 >= cell_count_y
+      || cz_local >= cell_count_z || chunk_index >= num_chunks) {
     return;
   }
+
+  let origin_x: i32 = positions[chunk_index * 2] * 16;
+  let origin_z: i32 = positions[chunk_index * 2 + 1] * 16;
+  // Local cell index within this chunk (MC-native stride).
   let cell_idx: u32 = u32(cx_i32
-                         + cz_i32 * cell_count_x
+                         + cz_local * cell_count_x
                          + cy_i32 * cell_count_x * cell_count_z);
-  let world_x_i32: i32 = params.batch_origin_x + cx_i32 * i32(params.cell_width);
-  let world_z_i32: i32 = params.batch_origin_z + cz_i32 * i32(params.cell_width);
+  // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
+  // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
+  let chunk_cell_base: u32 = u32(chunk_index) * 16u * cells_per_chunk;
+  let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
+  let world_z_i32: i32 = origin_z + cz_local * i32(params.cell_width);
   let world_y_i32: i32 = i32(params.min_y_f) + cy_i32 * i32(params.cell_height);
   let cell_x: f32 = f32(world_x_i32);
   let cell_y: f32 = f32(world_y_i32);
@@ -462,7 +511,7 @@ mod tests {
 
         // constant literal + out_buf write
         assert!(src.contains("let c_0: f32 ="), "missing constant let binding");
-        assert!(src.contains("out_buf[0u * cells_per_chunk + cell_idx] = c_0;"),
+        assert!(src.contains("out_buf[chunk_cell_base + 0u * cells_per_chunk + cell_idx] = c_0;"),
                 "missing ch0 out_buf write");
     }
 
@@ -504,9 +553,9 @@ mod tests {
         // Extract the Add-result var name for the out_buf write assertion.
         let add_var = var_name_of_let_binding(add_line.unwrap().1);
         // two out_buf writes at correct channel slots
-        assert!(find_line(&src, |l| l.trim() == "out_buf[0u * cells_per_chunk + cell_idx] = c_0;").is_some(),
+        assert!(find_line(&src, |l| l.trim() == "out_buf[chunk_cell_base + 0u * cells_per_chunk + cell_idx] = c_0;").is_some(),
                 "ch0 out_buf write absent");
-        let ch1_write = format!("out_buf[1u * cells_per_chunk + cell_idx] = {add_var};");
+        let ch1_write = format!("out_buf[chunk_cell_base + 1u * cells_per_chunk + cell_idx] = {add_var};");
         assert!(find_line(&src, |l| l.trim() == &ch1_write[..]).is_some(),
                 "ch1 out_buf write absent, expected `{ch1_write}`");
     }
@@ -569,7 +618,7 @@ mod tests {
         let mul_var = var_name_of_let_binding(mul_line.1);
 
         // Final out_buf write uses Mul var
-        let expected_write = format!("out_buf[0u * cells_per_chunk + cell_idx] = {mul_var};");
+        let expected_write = format!("out_buf[chunk_cell_base + 0u * cells_per_chunk + cell_idx] = {mul_var};");
         assert!(find_line(&src, |l| l.trim() == &expected_write[..]).is_some(),
                 "ch0 out_buf write absent, expected `{expected_write}`");
     }

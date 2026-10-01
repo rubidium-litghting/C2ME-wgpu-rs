@@ -282,7 +282,16 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
             }
             let mut chunk_idx = 0u16;
 
-            for (_key, blob) in &executed.results {
+            // Emit chunks in the SAME order as batch.positions (sorted,
+            // deduped). The previous FxHashMap iteration order was
+            // non-deterministic, so multi-chunk blobs could not be mapped
+            // back to chunk coords by the caller. Batching depends on this.
+            for &(cx, cz) in &executed.batch.positions {
+                let key = ((cx as i64) << 32) | (cz as i64 & 0xFFFFFFFF);
+                let blob = match executed.results.get(&key) {
+                    Some(b) => b,
+                    None => continue,
+                };
                 let chunk_f32s = decode_blob_f32s(blob);
                 if chunk_f32s.is_empty() { continue; }
                 all_f32s.extend_from_slice(&chunk_f32s);

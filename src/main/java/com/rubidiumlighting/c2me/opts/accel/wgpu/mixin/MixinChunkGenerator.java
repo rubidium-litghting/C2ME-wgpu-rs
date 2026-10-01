@@ -25,6 +25,7 @@
 package com.rubidiumlighting.c2me.opts.accel.wgpu.mixin;
 
 import com.rubidiumlighting.c2me.opts.accel.wgpu.NoiseRouterBlobifier;
+import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuBatchCoordinator;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuThinBinding;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
@@ -33,6 +34,7 @@ import net.minecraft.world.chunk.Chunk;
 import net.minecraft.world.chunk.ChunkSection;
 import net.minecraft.world.Heightmap;
 import net.minecraft.world.gen.StructureAccessor;
+import net.minecraft.world.gen.StructureWeightSampler;
 import net.minecraft.world.gen.chunk.Blender;
 import net.minecraft.world.gen.chunk.ChunkGeneratorSettings;
 import net.minecraft.world.gen.chunk.NoiseChunkGenerator;
@@ -56,7 +58,7 @@ public abstract class MixinChunkGenerator {
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu");
     private static final AtomicBoolean WORLD_INIT_ATTEMPTED = new AtomicBoolean(false);
     private static final AtomicLong WORLD_HANDLE = new AtomicLong(0L);
-    private static volatile NoiseRouter REF_ROUTER = null;
+    private static volatile WgpuBatchCoordinator COORDINATOR = null;
     private static volatile NoiseRouter RAW_ROUTER = null;
     private static final AtomicBoolean TRUTH_DUMPED = new AtomicBoolean(false);
 
@@ -87,7 +89,6 @@ public abstract class MixinChunkGenerator {
                     return;
                 }
                 NoiseRouterBlobifier.ShapeConfig shape = new NoiseRouterBlobifier.ShapeConfig(-64, 384, 4, 4);
-                REF_ROUTER = noiseConfig.getNoiseRouter();
                 RAW_ROUTER = router;
                 ByteBuffer blob = NoiseRouterBlobifier.blobify(router, shape, noiseConfig);
                 LOGGER.info("[c2me-wgpu] first chunk [{} {}], blob size={} bytes",
@@ -99,34 +100,28 @@ public abstract class MixinChunkGenerator {
             if (world == 0L) {
                 return;
             }
-
-            // ── per-chunk GPU compute + write-back ───────────────
-            long req = WgpuThinBinding.requestChunks(world,
-                    new int[]{chunk.getPos().x, chunk.getPos().z});
-            if (req == 0L) {
-                return;
-            }
-            // requestChunks is ASYNC: it returns a handle immediately while
-            // the GPU computes in the background. Returning here on PENDING
-            // (without cir.setReturnValue) let vanilla's CPU populateNoise
-            // run the whole chunk itself — that was the CPU-usage culprit.
-            // Block until the GPU result is ready instead.
-            int st;
-            long deadline = System.nanoTime() + 10_000_000_000L; // 10s
-            while ((st = WgpuThinBinding.pollStatus(req))
-                    == WgpuThinBinding.STATUS_PENDING) {
-                if (System.nanoTime() > deadline) {
-                    LOGGER.warn("[c2me-wgpu] GPU request timed out, falling back to CPU");
-                    break;
+            WgpuBatchCoordinator coord = COORDINATOR;
+            if (coord == null) {
+                synchronized (MixinChunkGenerator.class) {
+                    if (COORDINATOR == null) {
+                        COORDINATOR = new WgpuBatchCoordinator(world);
+                    }
+                    coord = COORDINATOR;
                 }
-                // Sleep briefly instead of busy-spinning: onSpinWait() burns
-                // a full core while waiting, which showed up as high CPU.
-                java.util.concurrent.locks.LockSupport.parkNanos(100_000L);
             }
-            if (st != WgpuThinBinding.STATUS_DONE) {
-                return; // GPU failed/timed out -> vanilla CPU path runs
+
+            // ── GPU compute via the batch coordinator ────────────
+            // Requests from all worker threads are coalesced into one
+            // dispatch (see WgpuBatchCoordinator). The returned blob holds
+            // the whole batch; batchIndex selects this chunk's slice.
+            WgpuBatchCoordinator.GpuChunk gpu;
+            try {
+                gpu = coord.request(chunk.getPos().x, chunk.getPos().z);
+            } catch (Throwable t) {
+                LOGGER.warn("[c2me-wgpu] GPU batch request failed, falling back to CPU", t);
+                return; // vanilla CPU path runs
             }
-            java.lang.foreign.MemorySegment seg = WgpuThinBinding.takeResultBlob(req);
+            java.lang.foreign.MemorySegment seg = gpu.seg;
 
             // Reuse MC's own AquiferSampler: it decides water/lava/air vs
             // solid from the density value we computed on the GPU. This
@@ -144,7 +139,7 @@ public abstract class MixinChunkGenerator {
                                     .callCreateChunkNoiseSampler(cs, fSa, fBlender, fNc));
             net.minecraft.world.gen.chunk.AquiferSampler aquifer = sampler.getAquiferSampler();
 
-            writeDensityToChunk(chunk, seg, aquifer);
+            writeDensityToChunk(chunk, seg, aquifer, gpu.batchIndex, structureAccessor);
 
             // Cancel vanilla generation and hand back the (now filled) chunk.
             cir.setReturnValue(CompletableFuture.completedFuture(chunk));
@@ -170,7 +165,9 @@ public abstract class MixinChunkGenerator {
      * = 4 × 96 × 4 = 1536 cells; each cell covers cellW×cellH×cellW blocks.
      */
     private static void writeDensityToChunk(Chunk chunk, java.lang.foreign.MemorySegment seg,
-                                            net.minecraft.world.gen.chunk.AquiferSampler aquifer) {
+                                            net.minecraft.world.gen.chunk.AquiferSampler aquifer,
+                                            int batchIndex,
+                                            StructureAccessor structureAccessor) {
         final int CHANNEL = 11;                 // finalDensity
         final int CELLS_PER_CHANNEL = CELLS_X * CELLS_Y * CELLS_Z;
         final int PAYLOAD_BASE = 0x88;
@@ -178,19 +175,35 @@ public abstract class MixinChunkGenerator {
         final int CELL_H = 4;
         final int MIN_Y = -64;
 
-        long need = PAYLOAD_BASE + (long) (CHANNEL + 1) * CELLS_PER_CHANNEL * 4;
+        // Blob layout (multi-chunk): payload = chunk0[16 channels][CPC],
+        // chunk1[16 channels][CPC], ... The header channel_offsets only
+        // describe chunk 0, so chunk i's channel c lives at
+        //   PAYLOAD_BASE + i * 16 * CPC * 4 + c * CPC * 4
+        long chunkStride = 16L * CELLS_PER_CHANNEL * 4;
+        long need = PAYLOAD_BASE + (long) batchIndex * chunkStride
+                + (long) (CHANNEL + 1) * CELLS_PER_CHANNEL * 4;
         if (seg.byteSize() < need) {
             return;
         }
 
         java.nio.ByteBuffer bb = seg.asByteBuffer();
         bb.order(java.nio.ByteOrder.LITTLE_ENDIAN);
-        int base = PAYLOAD_BASE + CHANNEL * CELLS_PER_CHANNEL * 4;
+        int base = (int) (PAYLOAD_BASE + (long) batchIndex * chunkStride
+                + CHANNEL * CELLS_PER_CHANNEL * 4);
 
         BlockState stone = Blocks.STONE.getDefaultState();
         BlockState air = Blocks.AIR.getDefaultState();
         Heightmap oceanFloorWg = chunk.getHeightmap(Heightmap.Type.OCEAN_FLOOR_WG);
         Heightmap worldSurfaceWg = chunk.getHeightmap(Heightmap.Type.WORLD_SURFACE_WG);
+
+        // MC's real "Beardifier": shapes terrain around structures (flattens
+        // / buries under villages so houses sit in the ground). The GPU
+        // density lacks it, so structures floated/sank. Reuse MC's own
+        // sampler — for chunks with no structure the piece list is empty and
+        // sample() returns 0, so the cost is negligible.
+        StructureWeightSampler structureWeight =
+                StructureWeightSampler.createStructureWeightSampler(
+                        structureAccessor, chunk.getPos());
 
 
         float dmin = Float.POSITIVE_INFINITY, dmax = Float.NEGATIVE_INFINITY;
@@ -268,7 +281,13 @@ public abstract class MixinChunkGenerator {
                             new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(
                                     chunk.getPos().getStartX() + bx, globalY,
                                     chunk.getPos().getStartZ() + bz);
-                    BlockState bs = aquifer.apply(npos, (double) d);
+                    // Beard is applied PER BLOCK (not at cell corners):
+                    // MC's mapAll swaps Beardifier for StructureWeightSampler
+                    // as a direct density node, so it is NOT trilinearly
+                    // interpolated. Doing so flattened the structure
+                    // foundations and made buildings float again.
+                    double beard = structureWeight.sample(npos);
+                    BlockState bs = aquifer.apply(npos, (double) d + beard);
                     if (bs == null) bs = stone;
                     if (bs == air) continue;
                     int lx = bx & 15;
@@ -291,42 +310,6 @@ public abstract class MixinChunkGenerator {
             String ds = RAW_ROUTER.initialDensityWithoutJaggedness().toString();
             LOGGER.info("[c2me-wgpu][ch10] len={} head={}", ds.length(),
                     ds.substring(0, Math.min(2500, ds.length())));
-        }
-
-        // Mismatch scan: compare ch6/8/10/11 MC vs GPU at y=8/-32.
-        if (REF_ROUTER != null) {
-            int cx0 = chunk.getPos().x * 16;
-            int cz0 = chunk.getPos().z * 16;
-            int[] wys = { -32, 8 };
-            int[] chs = { 6, 8, 10, 11 };
-            int[] bases = new int[4];
-            for (int i = 0; i < 4; i++) bases[i] = PAYLOAD_BASE + chs[i] * CELLS_PER_CHANNEL * 4;
-            StringBuilder sb = new StringBuilder();
-            int any = 0;
-            for (int wy : wys) {
-                int cyCell = (wy - MIN_Y) / CELL_H;
-                // GPU now outputs the cell's MIN-CORNER value (block 4i),
-                // so compare MC at the same corner block.
-                int px = cx0, py = wy, pz = cz0;
-                double[] mc = {
-                    REF_ROUTER.continents().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(px, py, pz)),
-                    REF_ROUTER.depth().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(px, py, pz)),
-                    REF_ROUTER.initialDensityWithoutJaggedness().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(px, py, pz)),
-                    REF_ROUTER.finalDensity().sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(px, py, pz)),
-                };
-                int idx = cyCell * CELLS_X * CELLS_Z;
-                for (int i = 0; i < 4; i++) {
-                    float gpu = bb.getFloat(bases[i] + idx * 4);
-                    double d = mc[i] - gpu;
-                    if (Math.abs(d) > 0.02) {
-                        any++;
-                        sb.append(String.format(" y=%d ch%d mc=%.4f gpu=%.4f", wy, chs[i], mc[i], gpu));
-                    }
-                }
-            }
-            if (any > 0) {
-                LOGGER.info("[c2me-wgpu][chdiv] ({},{}){}", chunk.getPos().x, chunk.getPos().z, sb);
-            }
         }
     }
 

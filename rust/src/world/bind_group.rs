@@ -101,6 +101,17 @@ pub fn create_layout(device: &wgpu::Device) -> Result<wgpu::BindGroupLayout> {
                 },
                 count: None,
             },
+            // binding 4: batch chunk positions, packed [cx,cz,...], read-only
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
     Ok(layout)

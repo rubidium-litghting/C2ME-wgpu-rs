@@ -139,6 +139,9 @@ impl SingleBatchExecutor {
         // Build WorldgenParams
         // `batch.positions` holds CHUNK coords; the shader wants BLOCK coords.
         // A chunk is 16 blocks wide along X and Z.
+        // Per-chunk origins now live in the `positions` buffer; params
+        // keeps the batch-min origin for legacy scalar math (unused by the
+        // prologue but harmless).
         let origin_x = batch.positions.iter().map(|p| p.0).min().unwrap_or(0) * 16;
         let origin_z = batch.positions.iter().map(|p| p.1).min().unwrap_or(0) * 16;
 
@@ -160,6 +163,19 @@ impl SingleBatchExecutor {
             label: Some("c2me_wgpu_params"),
             contents: bytemuck::bytes_of(&params),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Packed chunk positions [cx,cz,...] for the shader (binding 4).
+        // Sorted + deduped by PendingQueue::flush, matching the output order.
+        let mut packed_positions: Vec<i32> = Vec::with_capacity(batch.positions.len() * 2);
+        for &(cx, cz) in &batch.positions {
+            packed_positions.push(cx);
+            packed_positions.push(cz);
+        }
+        let positions_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("c2me_wgpu_positions"),
+            contents: bytemuck::cast_slice(&packed_positions),
+            usage: wgpu::BufferUsages::STORAGE,
         });
 
         // Get or create perm buffer (binding 1)
@@ -203,6 +219,10 @@ impl SingleBatchExecutor {
                     binding: 3,
                     resource: origin_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: positions_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -228,9 +248,12 @@ impl SingleBatchExecutor {
             let ccx = 16 / cw + 1;
             let ccz = 16 / cw + 1;
             let ccy = (shape.height as u32) / chh + 1;
+            // Multi-chunk: the z axis carries (cells_z × num_chunks)
+            // invocations so one dispatch covers the whole batch.
+            let num_chunks = batch.positions.len() as u32;
             let wg_x = (ccx + 3) / 4;
             let wg_y = (ccy + 3) / 4;
-            let wg_z = (ccz + 3) / 4;
+            let wg_z = (ccz * num_chunks + 3) / 4;
             cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
         }
 
