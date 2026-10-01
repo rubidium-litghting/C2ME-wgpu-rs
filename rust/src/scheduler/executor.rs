@@ -302,7 +302,8 @@ impl SingleBatchExecutor {
         // ── one-shot channel diagnostic ─────────────────────────────
         static DIAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            const CPC: usize = 5 * 97 * 5;
+            let nc = batch.positions.len().max(1);
+            let CPC: usize = (f32s.len() / (nc * 16)).max(1);
             for ch in 0..16usize {
                 let base = ch * CPC;
                 let end = (base + CPC).min(f32s.len());
@@ -319,12 +320,16 @@ impl SingleBatchExecutor {
         }
 
         let mut result_map = FxHashMap::default();
-        const CELLS_PER_CHANNEL: usize = 5 * 97 * 5;
+        // Derive cells-per-channel from the staging size so this stays in
+        // sync with the shader's shape (5*97*5 before, 5*49*5 after the
+        // vertical-cell-height fix). total = num_chunks*16*CPC*4 bytes.
+        let nc = batch.positions.len().max(1);
+        let cells_per_channel = (f32s.len() / (nc * 16)).max(1);
         let mut channel_offsets = [0u64; 16];
         for (ch, off) in channel_offsets.iter_mut().enumerate() {
-            *off = (ch * CELLS_PER_CHANNEL * 4) as u64;
+            *off = (ch * cells_per_channel * 4) as u64;
         }
-        let chunk_size_f32 = 16 * CELLS_PER_CHANNEL;
+        let chunk_size_f32 = 16 * cells_per_channel;
 
         for (i, &pos) in batch.positions.iter().enumerate() {
             let start = i * chunk_size_f32;
