@@ -20,7 +20,7 @@ pub mod y_clamped_gradient;
 
 use crate::ast::AstNode;
 use crate::codegen::wgsl_gen::GenCtx;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
 /// Emit a full MC `DoublePerlinNoiseSampler` (or single `OctavePerlinNoiseSampler`):
 /// sample each octave stack with Kahan summation, sum the two stacks, scale by

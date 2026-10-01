@@ -414,6 +414,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "perf benchmark; run with --ignored"]
     fn gpu_performance_benchmark() {
         use crate::instance::WgpuInstance;
         use crate::scheduler::batcher::{Batch, Priority};
@@ -2048,6 +2049,110 @@ mod tests {
         }
     }
 
+    /// Three-way: CPU-f32 interpreter vs GPU vs ref(double). If CPU-f32 ~= GPU
+    /// but both differ from ref -> pure f32 precision, codegen is faithful.
+    /// If CPU-f32 != GPU -> structural codegen bug.
+    #[test]
+    #[ignore = "needs GPU; run with --ignored"]
+    fn cpu_f32_vs_gpu() {
+        use crate::instance::WgpuInstance;
+        use crate::scheduler::batcher::{Batch, Priority};
+        use crate::scheduler::executor::ExecutorThread;
+        use crate::world::WorldContext;
+        use std::sync::Arc;
+
+        let bin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+        let ref_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.ref.txt");
+        let blob = std::fs::read(bin_path).expect("read blob");
+        let txt = std::fs::read_to_string(ref_path).expect("read ref");
+
+        let dx = 5usize; let dy = 49usize; let dz = 5usize;
+        let cpc = dx * dy * dz;
+        // parse ref for ch10/ch11
+        let chan_map: &[(&str, usize)] = &[
+            ("initialDensityWithoutJaggedness", 10), ("finalDensity", 11)];
+        let mut ref_data: std::collections::HashMap<usize, Vec<f32>> = std::collections::HashMap::new();
+        let mut cur: Option<usize> = None;
+        let (mut cx, mut cz) = (0i32, 0i32);
+        for line in txt.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("CHUNK ") {
+                let mut it = rest.split_whitespace();
+                cx = it.next().unwrap().parse().unwrap();
+                cz = it.next().unwrap().parse().unwrap();
+                continue;
+            }
+            if let Some(name) = line.strip_prefix("CHANNEL ") {
+                cur = chan_map.iter().find(|(n, _)| *n == name).map(|(_, c)| *c);
+                if let Some(c) = cur { ref_data.entry(c).or_insert_with(|| vec![0f32; cpc]); }
+                continue;
+            }
+            if line.starts_with('#') || line.starts_with("DIMS") || line.starts_with("CELL_W") || line.starts_with("MIN_Y") { continue; }
+            let p: Vec<&str> = line.split_whitespace().collect();
+            if p.len() != 4 { continue; }
+            if let Some(c) = cur {
+                let i: usize = p[0].parse().unwrap();
+                let j: usize = p[1].parse().unwrap();
+                let k: usize = p[2].parse().unwrap();
+                let v: f32 = p[3].parse().unwrap();
+                if let Some(vec) = ref_data.get_mut(&c) { vec[i + k*dx + j*dx*dz] = v; }
+            }
+        }
+
+        // run GPU
+        let mut ctx = WorldContext::new(&blob).unwrap();
+        let perm: Vec<i32> = ctx.perm_table_set().buffer.clone();
+        let origins: Vec<f32> = ctx.perm_table_set().origins.clone();
+        // eval CPU before moving ctx
+        let ast_root = ctx.ast_root.clone();
+        let crate::ast::AstNode::Root(channels) = &ast_root else { panic!("not root") };
+        let sx = cx * 16; let sz = cz * 16;
+        let mut cpu_vals: std::collections::HashMap<usize, Vec<f32>> = std::collections::HashMap::new();
+        for &(_, ch) in chan_map {
+            let node = &channels[ch];
+            let mut v = vec![0f32; cpc];
+            for j in 0..dy {
+                let wy = (-64 + j as i32 * 8) as f32;
+                for k in 0..dz {
+                    let wz = (sz + k as i32 * 4) as f32;
+                    for i in 0..dx {
+                        let wx = (sx + i as i32 * 4) as f32;
+                        v[i + k*dx + j*dx*dz] = cpu_ast_eval(node, &perm, &origins, wx, wy, wz);
+                    }
+                }
+            }
+            cpu_vals.insert(ch, v);
+        }
+
+        let instance = WgpuInstance::instance().unwrap();
+        ctx.compile_pipeline(&instance.device).unwrap();
+        let world_arc = Arc::new(ctx);
+        let executor = ExecutorThread::spawn(
+            Arc::new(instance.device.clone()), Arc::new(instance.queue.clone()), Default::default()).unwrap();
+        let batch = Batch { positions: vec![(cx, cz)], max_priority: Priority::Normal };
+        let result = executor.request_chunks(world_arc, batch).unwrap();
+        let br = result.results.values().next().unwrap();
+        let payload = &br.as_bytes()[0x88..];
+
+        for &(name, ch) in chan_map {
+            let cv = &cpu_vals[&ch];
+            let rv = &ref_data[&ch];
+            let base = ch * cpc * 4;
+            let (mut rc, mut rg, mut cg, mut mx_cg, mut mx_rc) = (0.0f64, 0.0f64, 0.0f64, 0.0f32, 0.0f32);
+            for idx in 0..cpc {
+                let gpu = f32::from_le_bytes(payload[base+idx*4..base+idx*4+4].try_into().unwrap());
+                rc += ((cv[idx]-rv[idx]) as f64).powi(2);
+                rg += ((gpu-rv[idx]) as f64).powi(2);
+                cg += ((cv[idx]-gpu) as f64).powi(2);
+                mx_cg = mx_cg.max((cv[idx]-gpu).abs());
+                mx_rc = mx_rc.max((cv[idx]-rv[idx]).abs());
+            }
+            let n = cpc as f64;
+            println!("ch{} {}: |cpu-ref|rms={:.3e} max={:.3e} |gpu-ref|rms={:.3e} |cpu-gpu|rms={:.3e} max={:.3e}",
+                ch, name, (rc/n).sqrt(), mx_rc, (rg/n).sqrt(), (cg/n).sqrt(), mx_cg);
+        }
+    }
+
     // ── EndIslands: GPU 2D-simplex vs Rust CPU reference ──────────────
     fn cpu_sx_map(perm: &[i32], a: i32) -> i32 {
         perm[(a & 255) as usize]
@@ -2205,4 +2310,291 @@ mod tests {
         println!("EndIslands GPU vs CPU: max_diff={:.6e}, non-floor cells={}", max_diff, n_hit);
         assert!(max_diff < 1e-4, "EndIslands divergence {:.6e}", max_diff);
     }
+
+    #[test]
+    #[ignore = "diagnostic; run with --ignored"]
+    fn dump_channel_histograms() {
+        use crate::ast::deserialize::deserialize_full_with_perm;
+        use crate::ast::opto::run_pipeline;
+        use crate::ast::AstNode;
+        use std::collections::BTreeMap;
+
+        fn walk(node: &AstNode, out: &mut BTreeMap<String, usize>) {
+            let name = match node {
+                AstNode::Constant(_) => "Constant",
+                AstNode::InputX => "InputX",
+                AstNode::InputY => "InputY",
+                AstNode::InputZ => "InputZ",
+                AstNode::Add(..) => "Add",
+                AstNode::Sub(..) => "Sub",
+                AstNode::Mul(..) => "Mul",
+                AstNode::Div(..) => "Div",
+                AstNode::Min(..) => "Min",
+                AstNode::Max(..) => "Max",
+                AstNode::Abs(_) => "Abs",
+                AstNode::Square(_) => "Square",
+                AstNode::Cube(_) => "Cube",
+                AstNode::Sqrt(_) => "Sqrt",
+                AstNode::FloorDiv(..) => "FloorDiv",
+                AstNode::Squeeze(_) => "Squeeze",
+                AstNode::NoiseSampler { .. } => "NoiseSampler",
+                AstNode::SimplexNoise2D { .. } => "SimplexNoise2D",
+                AstNode::SimplexNoise3D { .. } => "SimplexNoise3D",
+                AstNode::InterpolatedNoiseSampler { .. } => "InterpolatedNoiseSampler",
+                AstNode::Shift { .. } => "Shift",
+                AstNode::WeirdScaledSampler { .. } => "WeirdScaledSampler",
+                AstNode::InterpNoiseSampler { .. } => "InterpNoiseSampler",
+                AstNode::ShiftedNoise { .. } => "ShiftedNoise",
+                AstNode::EndIslands { .. } => "EndIslands",
+                AstNode::Beardifier { .. } => "Beardifier",
+                AstNode::Spline { .. } => "Spline",
+                AstNode::RangeChoice { .. } => "RangeChoice",
+                AstNode::IntervalSelect { .. } => "IntervalSelect",
+                AstNode::YClampedGradient { .. } => "YClampedGradient",
+                AstNode::CacheFlat(_) => "CacheFlat",
+                AstNode::Cache2D(_) => "Cache2D",
+                AstNode::CacheInterpolated(_) => "CacheInterpolated",
+                AstNode::FindTopSurface { .. } => "FindTopSurface",
+                AstNode::Aquifer { .. } => "Aquifer",
+                AstNode::BiomeTree { .. } => "BiomeTree",
+                AstNode::Root(_) => "Root",
+            };
+            *out.entry(name.to_string()).or_insert(0) += 1;
+            // recurse
+            match node {
+                AstNode::Add(a,b)|AstNode::Sub(a,b)|AstNode::Mul(a,b)|AstNode::Div(a,b)
+                |AstNode::Min(a,b)|AstNode::Max(a,b)|AstNode::FloorDiv(a,b) => { walk(a,out); walk(b,out); }
+                AstNode::Abs(a)|AstNode::Square(a)|AstNode::Cube(a)|AstNode::Sqrt(a)
+                |AstNode::Squeeze(a) => walk(a,out),
+                AstNode::NoiseSampler { .. } => {}
+                AstNode::InterpolatedNoiseSampler { child } => walk(child,out),
+                AstNode::Shift { offset, .. } => walk(offset,out),
+                AstNode::WeirdScaledSampler { input, noise, .. } => { walk(input,out); walk(noise,out); }
+                AstNode::ShiftedNoise { shift_x, shift_y, shift_z, noise, .. } => { walk(shift_x,out); walk(shift_y,out); walk(shift_z,out); walk(noise,out); }
+                AstNode::Spline { location, values, .. } => { walk(location,out); for v in values { walk(v,out); } }
+                AstNode::RangeChoice { input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi } => { walk(input,out); walk(min,out); walk(max,out); walk(in_bounds,out); walk(out_of_bounds_lo,out); walk(out_of_bounds_hi,out); }
+                AstNode::IntervalSelect { input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi } => { walk(input,out); walk(min,out); walk(max,out); walk(in_bounds,out); walk(out_of_bounds_lo,out); walk(out_of_bounds_hi,out); }
+                AstNode::YClampedGradient { .. } => {}
+                AstNode::CacheFlat(a)|AstNode::Cache2D(a)|AstNode::CacheInterpolated(a) => walk(a,out),
+                AstNode::EndIslands { .. } => {}
+                AstNode::Beardifier { .. } => {}
+                AstNode::FindTopSurface { .. } => {}
+                AstNode::Aquifer { density, fluid_level } => { walk(density,out); walk(fluid_level,out); }
+                AstNode::BiomeTree { .. } => {}
+                AstNode::Root(chans) => { for c in chans { walk(c,out); } }
+                _ => {}
+            }
+        }
+
+        let bin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+        let blob = std::fs::read(bin_path).expect("read blob");
+        let (ast_root, _shape, _bs, _pe, _se) = deserialize_full_with_perm(&blob).unwrap();
+        let ast_root = run_pipeline(ast_root).unwrap();
+        let AstNode::Root(channels) = &ast_root else { panic!("not root") };
+        let names = ["barrierNoise","fluidLevelFloodedness","fluidLevelSpread","lavaNoise","temperature","vegetation","continents","erosion","depth","ridges","initDensity","finalDensity","veinToggle","veinRidged","veinGap"];
+        for (i, ch) in channels.iter().enumerate() {
+            let mut hist = BTreeMap::new();
+            walk(ch, &mut hist);
+            let nm = names.get(i).copied().unwrap_or("?");
+            let items: Vec<String> = hist.iter().map(|(k,v)| format!("{k}={v}")).collect();
+            println!("ch{:2} {nm:20} : {}", i, items.join(" "));
+        }
+    }
+
+
+    fn cpu_scale_tunnels(x: f32) -> f32 {
+        if x < -0.5 { 0.75 } else if x < 0.0 { 1.0 } else if x < 0.5 { 1.5 } else { 2.0 }
+    }
+    fn cpu_scale_caves(x: f32) -> f32 {
+        if x < -0.75 { 0.5 } else if x < -0.5 { 0.75 } else if x < 0.5 { 1.0 } else if x < 0.75 { 2.0 } else { 3.0 }
+    }
+    fn cpu_perlin_origin(perm: &[i32], origins: &[f32], po: i32, x: f32, y: f32, z: f32) -> f32 {
+        let e = po / 256;
+        let px = cpu_maintain_precision(x) + origins[(e * 3) as usize];
+        let py = cpu_maintain_precision(y) + origins[(e * 3 + 1) as usize];
+        let pz = cpu_maintain_precision(z) + origins[(e * 3 + 2) as usize];
+        cpu_perlin3d_impl(perm, po, px, py, pz)
+    }
+    fn cpu_oct(perm: &[i32], origins: &[f32], oct: &crate::ast::OctaveSampler, cx: f32, cy: f32, cz: f32) -> f32 {
+        let mut freq = oct.initial_freq;
+        let mut amp = oct.persistence;
+        let mut acc = (0.0f32, 0.0f32);
+        for i in 0..oct.amplitudes.len() {
+            if oct.amplitudes[i] != 0.0 {
+                let s = cpu_perlin_origin(perm, origins, oct.perm_offset + i as i32 * 256, cx * freq, cy * freq, cz * freq);
+                cpu_kahan_add(&mut acc, oct.amplitudes[i] * s * amp);
+            }
+            freq *= 2.0; amp *= 0.5;
+        }
+        acc.0
+    }
+    fn cpu_perlin_ysmear(perm: &[i32], origins: &[f32], po: i32, x: f32, y: f32, z: f32, yfreq: f32, ysmear: f32) -> f32 {
+        let e = po / 256;
+        let px = x + origins[(e*3) as usize];
+        let py = y + origins[(e*3+1) as usize];
+        let pz = z + origins[(e*3+2) as usize];
+        let ix = px.floor() as i32; let iy = py.floor() as i32; let iz = pz.floor() as i32;
+        let fx = px - ix as f32; let fy = py - iy as f32; let fz = pz - iz as f32;
+        let mut o = 0.0f32;
+        if yfreq != 0.0 {
+            let m = if ysmear >= 0.0 && ysmear < fy { ysmear } else { fy };
+            o = (m / yfreq + 1.0e-7).floor() * yfreq;
+        }
+        let dy = fy - o;
+        let p = po;
+        let xi = ix & 255; let yi = iy & 255; let zi = iz & 255;
+        let g = |i: i32| -> [f32;3] {
+            match i & 15 {
+                0=>[1.0,1.0,0.0],1=>[-1.0,1.0,0.0],2=>[1.0,-1.0,0.0],3=>[-1.0,-1.0,0.0],
+                4=>[1.0,0.0,1.0],5=>[-1.0,0.0,1.0],6=>[1.0,0.0,-1.0],7=>[-1.0,0.0,-1.0],
+                8=>[0.0,1.0,1.0],9=>[0.0,-1.0,1.0],10=>[0.0,1.0,-1.0],11=>[0.0,-1.0,-1.0],
+                12=>[1.0,1.0,0.0],13=>[0.0,-1.0,1.0],14=>[-1.0,1.0,0.0],_=>[0.0,-1.0,-1.0],
+            }
+        };
+        let idx=|i:i32|(p+i) as usize;
+        let a=perm[idx(xi)]; let b=perm[idx((xi+1)&255)];
+        let aa=perm[idx((a+yi)&255)]; let ab=perm[idx((a+yi+1)&255)];
+        let ba=perm[idx((b+yi)&255)]; let bb=perm[idx((b+yi+1)&255)];
+        let aaa=perm[idx((aa+zi)&255)]; let aab=perm[idx((aa+zi+1)&255)];
+        let aba=perm[idx((ab+zi)&255)]; let abb=perm[idx((ab+zi+1)&255)];
+        let baa=perm[idx((ba+zi)&255)]; let bab=perm[idx((ba+zi+1)&255)];
+        let bba=perm[idx((bb+zi)&255)]; let bbb=perm[idx((bb+zi+1)&255)];
+        let dot=|gr:[f32;3],dx:f32,dy:f32,dz:f32| gr[0]*dx+gr[1]*dy+gr[2]*dz;
+        let n000=dot(g(aaa),fx,dy,fz); let n100=dot(g(baa),fx-1.0,dy,fz);
+        let n010=dot(g(aba),fx,dy-1.0,fz); let n110=dot(g(bba),fx-1.0,dy-1.0,fz);
+        let n001=dot(g(aab),fx,dy,fz-1.0); let n101=dot(g(bab),fx-1.0,dy,fz-1.0);
+        let n011=dot(g(abb),fx,dy-1.0,fz-1.0); let n111=dot(g(bbb),fx-1.0,dy-1.0,fz-1.0);
+        cpu_trilinear(n000,n100,n010,n110,n001,n101,n011,n111,cpu_fade(fx),cpu_fade(fy),cpu_fade(fz))
+    }
+    fn cpu_interp_noise_sampler(perm: &[i32], origins: &[f32],
+        lb:i32,lc:i32,ub:i32,uc:i32,ib:i32,ic:i32,
+        bx:f32,by:f32,bz:f32,
+        xz_scale:f32,y_scale:f32,xz_factor:f32,y_factor:f32,smear:f32) -> f32 {
+        let _ = uc;
+        let sxz = 684.412 * xz_scale; let sy = 684.412 * y_scale;
+        let d = bx*sxz; let e = by*sy; let f = bz*sxz;
+        let gg = d/xz_factor; let h = e/y_factor; let l = f/xz_factor;
+        let mm = sy*smear/y_factor; let smear_y_raw = sy*smear;
+        let mut q = 0.0f32; let mut r = 1.0f32;
+        for i in 0..ic {
+            q += cpu_perlin_ysmear(perm, origins, ib+i*256,
+                cpu_maintain_precision(gg*r), cpu_maintain_precision(h*r), cpu_maintain_precision(l*r),
+                mm*r, h*r) / r;
+            r *= 0.5;
+        }
+        let interp = (q/10.0 + 1.0)/2.0;
+        let no_lower = interp >= 1.0; let no_upper = interp <= 0.0;
+        let mut lo = 0.0f32; let mut up = 0.0f32; r = 1.0;
+        for i in 0..lc {
+            if !no_lower {
+                lo += cpu_perlin_ysmear(perm, origins, lb+i*256,
+                    cpu_maintain_precision(d*r), cpu_maintain_precision(e*r), cpu_maintain_precision(f*r),
+                    smear_y_raw*r, e*r) / r;
+            }
+            if !no_upper {
+                up += cpu_perlin_ysmear(perm, origins, ub+i*256,
+                    cpu_maintain_precision(d*r), cpu_maintain_precision(e*r), cpu_maintain_precision(f*r),
+                    smear_y_raw*r, e*r) / r;
+            }
+            r *= 0.5;
+        }
+        let t = interp.clamp(0.0,1.0);
+        (lo/512.0 + t*(up/512.0 - lo/512.0))/128.0
+    }
+    fn cpu_ast_eval(node: &crate::ast::AstNode, perm: &[i32], origins: &[f32], x: f32, y: f32, z: f32) -> f32 {
+        use crate::ast::AstNode as A;
+        match node {
+            A::Constant(v) => *v,
+            A::InputX => x, A::InputY => y, A::InputZ => z,
+            A::Add(a, b) => cpu_ast_eval(a, perm, origins, x, y, z) + cpu_ast_eval(b, perm, origins, x, y, z),
+            A::Sub(a, b) => cpu_ast_eval(a, perm, origins, x, y, z) - cpu_ast_eval(b, perm, origins, x, y, z),
+            A::Mul(a, b) => cpu_ast_eval(a, perm, origins, x, y, z) * cpu_ast_eval(b, perm, origins, x, y, z),
+            A::Div(a, b) => cpu_ast_eval(a, perm, origins, x, y, z) / cpu_ast_eval(b, perm, origins, x, y, z),
+            A::Min(a, b) => cpu_ast_eval(a, perm, origins, x, y, z).min(cpu_ast_eval(b, perm, origins, x, y, z)),
+            A::Max(a, b) => cpu_ast_eval(a, perm, origins, x, y, z).max(cpu_ast_eval(b, perm, origins, x, y, z)),
+            A::FloorDiv(a, b) => (cpu_ast_eval(a, perm, origins, x, y, z) / cpu_ast_eval(b, perm, origins, x, y, z)).floor(),
+            A::Abs(a) => cpu_ast_eval(a, perm, origins, x, y, z).abs(),
+            A::Square(a) => { let v = cpu_ast_eval(a, perm, origins, x, y, z); v * v }
+            A::Cube(a) => { let v = cpu_ast_eval(a, perm, origins, x, y, z); v * v * v }
+            A::Sqrt(a) => cpu_ast_eval(a, perm, origins, x, y, z).sqrt(),
+            A::Squeeze(a) => { let v = cpu_ast_eval(a, perm, origins, x, y, z).clamp(-1.0, 1.0); v * 0.5 - v * v * v / 24.0 }
+            A::CacheFlat(a) | A::Cache2D(a) | A::CacheInterpolated(a) => cpu_ast_eval(a, perm, origins, x, y, z),
+            A::YClampedGradient { from_y, to_y, from_value, to_value } => {
+                let t = ((y - from_y) / (to_y - from_y)).clamp(0.0, 1.0);
+                from_value + t * (to_value - from_value)
+            }
+            A::Spline { locations, derivatives, location, values } => {
+                let t = cpu_ast_eval(location, perm, origins, x, y, z);
+                let n = locations.len();
+                let vs: Vec<f32> = values.iter().map(|v| cpu_ast_eval(v, perm, origins, x, y, z)).collect();
+                if n == 0 { return 0.0; }
+                if n == 1 { return vs[0]; }
+                if t < locations[0] {
+                    let d0 = derivatives[0];
+                    return if d0 == 0.0 { vs[0] } else { vs[0] + d0 * (t - locations[0]) };
+                }
+                if t >= locations[n - 1] {
+                    let dn = derivatives[n - 1];
+                    return if dn == 0.0 { vs[n - 1] } else { vs[n - 1] + dn * (t - locations[n - 1]) };
+                }
+                for k in 0..n - 1 {
+                    if t < locations[k + 1] {
+                        let lk = locations[k]; let lk1 = locations[k + 1];
+                        let dk = derivatives[k]; let dk1 = derivatives[k + 1];
+                        let vk = vs[k]; let vk1 = vs[k + 1];
+                        let width = lk1 - lk;
+                        let p = (t - lk) / width;
+                        let a = dk * width - (vk1 - vk);
+                        let b = dk1 * -1.0 * width + (vk1 - vk);
+                        return vk + p * (vk1 - vk) + p * (1.0 - p) * (a + p * (b - a));
+                    }
+                }
+                vs[n - 1]
+            }
+            A::NoiseSampler { first, second, amplitude, xz_scale, y_scale, .. } => {
+                const D: f32 = 1.0181268882175227;
+                let vf = cpu_oct(perm, origins, first, x * xz_scale, y * y_scale, z * xz_scale);
+                let total = if let Some(sec) = second {
+                    vf + cpu_oct(perm, origins, sec, x * xz_scale * D, y * y_scale * D, z * xz_scale * D)
+                } else { vf };
+                total * amplitude
+            }
+            A::Shift { kind, offset } => {
+                let (cx, cy, cz) = match kind {
+                    0 => (x * 0.25, y * 0.25, z * 0.25),
+                    1 => (x * 0.25, 0.0, z * 0.25),
+                    2 => (z * 0.25, x * 0.25, 0.0),
+                    _ => (x, y, z),
+                };
+                cpu_ast_eval(offset, perm, origins, cx, cy, cz) * 4.0
+            }
+            A::ShiftedNoise { xz_scale, y_scale, shift_x, shift_y, shift_z, noise } => {
+                let d = x * xz_scale + cpu_ast_eval(shift_x, perm, origins, x, y, z);
+                let e = y * y_scale + cpu_ast_eval(shift_y, perm, origins, x, y, z);
+                let f = z * xz_scale + cpu_ast_eval(shift_z, perm, origins, x, y, z);
+                cpu_ast_eval(noise, perm, origins, d, e, f)
+            }
+            A::WeirdScaledSampler { mapper, input, noise } => {
+                let iv = cpu_ast_eval(input, perm, origins, x, y, z);
+                let scale = if *mapper == 1 { cpu_scale_tunnels(iv) } else { cpu_scale_caves(iv) };
+                cpu_ast_eval(noise, perm, origins, x / scale, y / scale, z / scale).abs() * scale
+            }
+            A::InterpNoiseSampler { xz_scale, y_scale, xz_factor, y_factor, smear,
+                lower_base, lower_count, upper_base, upper_count, interp_base, interp_count } => {
+                cpu_interp_noise_sampler(perm, origins, *lower_base, *lower_count, *upper_base, *upper_count,
+                    *interp_base, *interp_count, x, y, z, *xz_scale, *y_scale, *xz_factor, *y_factor, *smear)
+            }
+            A::InterpolatedNoiseSampler { child } => cpu_ast_eval(child, perm, origins, x, y, z),
+            A::RangeChoice { input, min, max, in_bounds, out_of_bounds_lo, out_of_bounds_hi } => {
+                let iv = cpu_ast_eval(input, perm, origins, x, y, z);
+                let mn = cpu_ast_eval(min, perm, origins, x, y, z);
+                let mx = cpu_ast_eval(max, perm, origins, x, y, z);
+                if iv >= mn && iv < mx { cpu_ast_eval(in_bounds, perm, origins, x, y, z) }
+                else if iv < mn { cpu_ast_eval(out_of_bounds_lo, perm, origins, x, y, z) }
+                else { cpu_ast_eval(out_of_bounds_hi, perm, origins, x, y, z) }
+            }
+            _ => f32::NAN,
+        }
+    }
+
 }

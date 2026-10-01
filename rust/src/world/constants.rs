@@ -27,7 +27,9 @@
 //!
 //! — ALL values f32 or i32, @align(4). No f64 anywhere (D05).
 //! — Must match `bytemuck::Pod` so we can cast raw bytes safely.
-//! — The `batch_origin_*` fields enable 铁律① local-offset coordinates.
+//! — The `batch_origin_*` / `batch_count_*` fields are LEGACY/RESERVED
+//!   (per-chunk origin now comes from the `positions` buffer); they exist
+//!   only to keep the GPU struct layout stable. See field docs.
 
 use bytemuck::{Pod, Zeroable};
 use rustc_hash::FxHashMap;
@@ -37,8 +39,11 @@ use rustc_hash::FxHashMap;
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct WorldgenParams {
-    /// Batch world-coordinate origin X (i32). Iron rule ①: subtract this
-    /// from per-cell i32 BEFORE converting to f32, to keep magnitudes small.
+    /// LEGACY/RESERVED: the shader now derives per-chunk origin from the
+    /// `positions` buffer (binding 4), NOT from these fields. They are kept
+    /// only to preserve the GPU struct layout (byte offsets of later fields).
+    /// Do NOT remove without updating `BINDINGS_HEADER` in wgsl_gen.rs and
+    /// the offset_of! asserts below in lockstep.
     pub batch_origin_x: i32,
     pub batch_origin_z: i32,
 
@@ -50,7 +55,8 @@ pub struct WorldgenParams {
     pub min_y_f: f32,
     pub height_f: f32,
 
-    /// Number of chunks in this dispatch batch (width along x/z).
+    /// LEGACY/RESERVED: shader uses `arrayLength(&positions)/2` instead.
+    /// Kept only for GPU struct layout parity (see batch_origin_* note).
     pub batch_count_x: i32,
     pub batch_count_z: i32,
 

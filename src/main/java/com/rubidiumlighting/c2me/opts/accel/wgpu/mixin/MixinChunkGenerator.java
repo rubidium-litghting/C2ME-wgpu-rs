@@ -109,11 +109,16 @@ public abstract class MixinChunkGenerator {
         try {
             // ── one-time world init ──────────────────────────────
             if (WORLD_INIT_ATTEMPTED.compareAndSet(false, true)) {
-                // Use settings.noiseRouter(): the RAW, un-compiled node tree.
-                // (noiseConfig.getNoiseRouter() returns c2me-opts-dfc's compiled
-                // JVM bytecode, which cannot be serialized.)
+                // Blob source = the RAW tree behind the COMPILED router that
+                // MC actually generates with. settings.noiseRouter() is a
+                // DIFFERENT tree (verified: |settings-compiled|=16.8 on
+                // initialDensity, fallback==compiled to 0.0), so serializing
+                // it made the GPU reproduce the wrong terrain. decompileRouter
+                // strips c2me-opts-dfc's CompiledDensityFunction back to its
+                // blendingFallback (the original tree, numerically identical
+                // to the JIT result).
                 NoiseChunkGenerator self = (NoiseChunkGenerator) (Object) this;
-                NoiseRouter router = getNoiseRouter(self);
+                NoiseRouter router = decompileRouter(noiseConfig.getNoiseRouter());
                 if (router == null) {
                     LOGGER.warn("[c2me-wgpu] NoiseRouter is null, falling back to CPU");
                     return;
@@ -589,14 +594,62 @@ public abstract class MixinChunkGenerator {
 
 
 
-    private NoiseRouter getNoiseRouter(NoiseChunkGenerator generator) {
-        try {
-            RegistryEntry<ChunkGeneratorSettings> entry = generator.getSettings();
-            ChunkGeneratorSettings settings = entry.value();
-            return settings.noiseRouter();
-        } catch (Exception e) {
-            LOGGER.error("Failed to get NoiseRouter", e);
-            return null;
+    /** Strip RegistryEntryHolder + Wrapper(cache) layers so a router
+     *  node can be single-shot sampled for diagnostics. */
+    /** Get the raw (un-compiled) tree behind a c2me-opts-dfc compiled node.
+     *  CompiledDensityFunction keeps the original DensityFunction in its
+     *  blendingFallback; JIT evaluation is numerically identical to it. */
+    private static net.minecraft.world.gen.densityfunction.DensityFunction decompileOne(
+            net.minecraft.world.gen.densityfunction.DensityFunction df) {
+        if (df == null) return null;
+        net.minecraft.world.gen.densityfunction.DensityFunction cur = df;
+        for (int guard = 0; guard < 8; guard++) {
+            if (cur instanceof
+                    net.minecraft.world.gen.densityfunction.DensityFunctionTypes.RegistryEntryHolder h) {
+                cur = h.function().value();
+                continue;
+            }
+            try {
+                java.lang.reflect.Method m = null;
+                for (Class<?> c = cur.getClass(); c != null && m == null; c = c.getSuperclass()) {
+                    try { m = c.getDeclaredMethod("getFallback"); }
+                    catch (NoSuchMethodException ignored) {}
+                }
+                if (m == null) break;
+                m.setAccessible(true);
+                Object o = m.invoke(cur);
+                if (o instanceof net.minecraft.world.gen.densityfunction.DensityFunction d && d != cur) {
+                    cur = d;
+                    continue;
+                }
+                break;
+            } catch (Throwable t) {
+                break;
+            }
         }
+        return cur;
     }
+
+    /** Rebuild a NoiseRouter whose channels are the raw trees behind the
+     *  compiled router. Used as the blob source so GPU reproduces the SAME
+     *  tree MC actually generates terrain with. */
+    private static NoiseRouter decompileRouter(NoiseRouter c) {
+        return new NoiseRouter(
+                decompileOne(c.barrierNoise()),
+                decompileOne(c.fluidLevelFloodednessNoise()),
+                decompileOne(c.fluidLevelSpreadNoise()),
+                decompileOne(c.lavaNoise()),
+                decompileOne(c.temperature()),
+                decompileOne(c.vegetation()),
+                decompileOne(c.continents()),
+                decompileOne(c.erosion()),
+                decompileOne(c.depth()),
+                decompileOne(c.ridges()),
+                decompileOne(c.initialDensityWithoutJaggedness()),
+                decompileOne(c.finalDensity()),
+                decompileOne(c.veinToggle()),
+                decompileOne(c.veinRidged()),
+                decompileOne(c.veinGap()));
+    }
+
 }

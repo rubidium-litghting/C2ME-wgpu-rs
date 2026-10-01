@@ -305,26 +305,6 @@ impl SingleBatchExecutor {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
 
-        // ── one-shot channel diagnostic ─────────────────────────────
-        static DIAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let nc = batch.positions.len().max(1);
-            let CPC: usize = (f32s.len() / (nc * 16)).max(1);
-            for ch in 0..16usize {
-                let base = ch * CPC;
-                let end = (base + CPC).min(f32s.len());
-                if base >= end { continue; }
-                let slice = &f32s[base..end];
-                let mut mn = f32::INFINITY;
-                let mut mx = f32::NEG_INFINITY;
-                let mut sum = 0.0f64;
-                for &v in slice { mn = mn.min(v); mx = mx.max(v); sum += v as f64; }
-                let mean = sum / slice.len() as f64;
-                eprintln!("[c2me-wgpu][chan] ch{:2} min={:.5} max={:.5} mean={:.5}",
-                          ch, mn, mx, mean);
-            }
-        }
-
         let mut result_map = FxHashMap::default();
         // Derive cells-per-channel from the staging size so this stays in
         // sync with the shader's shape (5*97*5 before, 5*49*5 after the
