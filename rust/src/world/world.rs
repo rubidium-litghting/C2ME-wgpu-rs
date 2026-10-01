@@ -389,50 +389,63 @@ mod tests {
         use std::sync::Arc;
         use std::time::Instant;
 
-        // 构造一个包含多种节点的 blob（与之前相同）
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&[0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
-        blob.push(0xFE);
-        blob.extend_from_slice(&[0x06, 0x00]);
-        blob.extend_from_slice(&[0x01]);
-        blob.extend_from_slice(&1.0f32.to_le_bytes());
-        blob.push(0x02);
+        // Prefer a REAL router blob dumped from the game. To produce it:
+        //   1) run the game with  -Dc2me.dumpBlob=/tmp/real_router.bin
+        //   2) cp /tmp/real_router.bin src/test/resources/real_router.bin
+        // Falls back to the hand-made minimal blob when the file is absent.
+        let real_path = concat!(env!("CARGO_MANIFEST_DIR"),
+                                "/../src/test/resources/real_router.bin");
+        let mut blob: Vec<u8> = if std::path::Path::new(real_path).exists() {
+            let b = std::fs::read(real_path).expect("read real_router.bin");
+            println!("[bench] using REAL router blob: {} bytes", b.len());
+            b
+        } else {
+            println!("[bench] real_router.bin absent — using hand-made minimal blob");
+            let mut blob = Vec::new();
+            blob.extend_from_slice(&[0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            blob.push(0xFE);
+            blob.extend_from_slice(&[0x06, 0x00]);
+            blob.extend_from_slice(&[0x01]);
+            blob.extend_from_slice(&1.0f32.to_le_bytes());
+            blob.push(0x02);
         // TAG_NOISE_SAMPLER(0x84)
         //   type=Perlin(0) flags=0 (single stack)
         //   amplitude=1.0 xz_scale=1.0 y_scale=1.0
         //   first stack: perm_offset=0 initial_freq=1.0 persistence=1.0
         //                octaves=1 amps=[1.0]
-        blob.extend_from_slice(&[0x84, 0x00, 0x00]);
-        blob.extend_from_slice(&1.0f32.to_le_bytes());   // amplitude
-        blob.extend_from_slice(&1.0f32.to_le_bytes());   // xz_scale
-        blob.extend_from_slice(&1.0f32.to_le_bytes());   // y_scale
-        blob.extend_from_slice(&0i32.to_le_bytes());     // perm_offset
-        blob.extend_from_slice(&1.0f32.to_le_bytes());   // initial_freq
-        blob.extend_from_slice(&1.0f32.to_le_bytes());   // persistence
-        blob.extend_from_slice(&1i32.to_le_bytes());     // octaves
-        blob.extend_from_slice(&1.0f32.to_le_bytes());   // amp[0]
-        blob.extend_from_slice(&[0x82]);
-        blob.extend_from_slice(&7i64.to_le_bytes());
-        blob.extend_from_slice(&[0xB1]);
-        blob.extend_from_slice(&[0x01]);
-        blob.extend_from_slice(&0.0f32.to_le_bytes());
-        blob.extend_from_slice(&[0x01]);
-        blob.extend_from_slice(&1.0f32.to_le_bytes());
-        blob.extend_from_slice(&[0x01]);
-        blob.extend_from_slice(&2.0f32.to_le_bytes());
-        blob.extend_from_slice(&[0x01]);
-        blob.extend_from_slice(&3.0f32.to_le_bytes());
-        blob.extend_from_slice(&[0x01]);
-        blob.extend_from_slice(&(-1.0f32).to_le_bytes());
-        blob.extend_from_slice(&[0x01]);
-        blob.extend_from_slice(&1.0f32.to_le_bytes());
-        blob.extend_from_slice(&[0xC0, 0x03]);
-        blob.extend_from_slice(&(-64i32).to_le_bytes());
-        blob.extend_from_slice(&384i32.to_le_bytes());
-        blob.extend_from_slice(&4i32.to_le_bytes());
-        blob.extend_from_slice(&4i32.to_le_bytes());
-        blob.extend_from_slice(&[0xF0]);
-        blob.extend_from_slice(&123456789i64.to_le_bytes());
+            blob.extend_from_slice(&[0x84, 0x00, 0x00]);
+            blob.extend_from_slice(&1.0f32.to_le_bytes());   // amplitude
+            blob.extend_from_slice(&1.0f32.to_le_bytes());   // xz_scale
+            blob.extend_from_slice(&1.0f32.to_le_bytes());   // y_scale
+            blob.extend_from_slice(&0i32.to_le_bytes());     // perm_offset
+            blob.extend_from_slice(&1.0f32.to_le_bytes());   // initial_freq
+            blob.extend_from_slice(&1.0f32.to_le_bytes());   // persistence
+            blob.extend_from_slice(&1i32.to_le_bytes());     // octaves
+            blob.extend_from_slice(&1.0f32.to_le_bytes());   // amp[0]
+            blob.extend_from_slice(&[0x82]);
+            blob.extend_from_slice(&7i64.to_le_bytes());
+            blob.extend_from_slice(&[0xB1]);
+            blob.extend_from_slice(&[0x01]);
+            blob.extend_from_slice(&0.0f32.to_le_bytes());
+            blob.extend_from_slice(&[0x01]);
+            blob.extend_from_slice(&1.0f32.to_le_bytes());
+            blob.extend_from_slice(&[0x01]);
+            blob.extend_from_slice(&2.0f32.to_le_bytes());
+            blob.extend_from_slice(&[0x01]);
+            blob.extend_from_slice(&3.0f32.to_le_bytes());
+            blob.extend_from_slice(&[0x01]);
+            blob.extend_from_slice(&(-1.0f32).to_le_bytes());
+            blob.extend_from_slice(&[0x01]);
+            blob.extend_from_slice(&1.0f32.to_le_bytes());
+            blob.extend_from_slice(&[0xC0, 0x03]);
+            blob.extend_from_slice(&(-64i32).to_le_bytes());
+            blob.extend_from_slice(&384i32.to_le_bytes());
+            blob.extend_from_slice(&4i32.to_le_bytes());
+            blob.extend_from_slice(&4i32.to_le_bytes());
+            blob.extend_from_slice(&[0xF0]);
+            blob.extend_from_slice(&123456789i64.to_le_bytes());
+            blob
+        };
 
         // 创建 WorldContext 并编译 pipeline
         let mut ctx = WorldContext::new(&blob).unwrap();

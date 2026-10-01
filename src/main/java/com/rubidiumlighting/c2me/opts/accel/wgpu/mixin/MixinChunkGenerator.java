@@ -93,6 +93,31 @@ public abstract class MixinChunkGenerator {
                 ByteBuffer blob = NoiseRouterBlobifier.blobify(router, shape, noiseConfig);
                 LOGGER.info("[c2me-wgpu] first chunk [{} {}], blob size={} bytes",
                         chunk.getPos().x, chunk.getPos().z, blob.remaining());
+                // ── optional: dump real router blob for offline benchmark ──
+                // Run game with -Dc2me.dumpBlob=/path/to/real_router.bin
+                // Trigger sources, in order: JVM prop, env var, marker file.
+                // The marker file is easiest: `touch /tmp/c2me_dump_blob`
+                // before launching — no launcher JVM-arg config needed.
+                String dumpPath = System.getProperty("c2me.dumpBlob");
+                if (dumpPath == null || dumpPath.isEmpty()) {
+                    dumpPath = System.getenv("C2ME_DUMP_BLOB");
+                }
+                if ((dumpPath == null || dumpPath.isEmpty())
+                        && java.nio.file.Files.exists(
+                                java.nio.file.Path.of("/tmp/c2me_dump_blob"))) {
+                    dumpPath = "/tmp/real_router.bin";
+                }
+                if (dumpPath != null && !dumpPath.isEmpty()) {
+                    try {
+                        java.nio.ByteBuffer dup = blob.duplicate();
+                        byte[] bytes = new byte[dup.remaining()];
+                        dup.get(bytes);
+                        java.nio.file.Files.write(java.nio.file.Path.of(dumpPath), bytes);
+                        LOGGER.info("[c2me-wgpu] dumped router blob ({} bytes) to {}", bytes.length, dumpPath);
+                    } catch (Throwable t) {
+                        LOGGER.warn("[c2me-wgpu] blob dump failed", t);
+                    }
+                }
                 trySendToRust(blob);
             }
 
