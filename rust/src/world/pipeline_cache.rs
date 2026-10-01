@@ -119,6 +119,20 @@ pub fn get_or_compile(
     eprintln!("[c2me-wgpu][compile] create_shader_module done in {:?}",
               t_src0.elapsed());
 
+    // On-disk pipeline cache: load any previous blob for this fingerprint,
+    // hand it to wgpu, then persist the (possibly extended) result.
+    let cached_data = load(fingerprint).ok().flatten();
+    // SAFETY: `cached_data` is either None or bytes previously returned by
+    // PipelineCache::get_data (our own cache file); `fallback: true` makes
+    // wgpu ignore corrupt data rather than UB.
+    let pc = unsafe {
+        device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+            label: Some(&format!("c2me_wgpu_pcache_{fingerprint:08x}")),
+            data: cached_data.as_deref(),
+            fallback: true,
+        })
+    };
+
     let t_pipe0 = std::time::Instant::now();
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(&format!("c2me_wgpu_pipeline_{fingerprint:08x}_p{}", pass_id(pass))),
@@ -126,11 +140,17 @@ pub fn get_or_compile(
         module: &shader,
         entry_point: Some(entry_point),
         compilation_options: wgpu::PipelineCompilationOptions::default(),
-        cache: None,
+        cache: Some(&pc),
     });
 
     eprintln!("[c2me-wgpu][compile] create_compute_pipeline done in {:?}",
               t_pipe0.elapsed());
+
+    if let Some(data) = pc.get_data() {
+        if let Err(e) = save(fingerprint, &data) {
+            eprintln!("[c2me-wgpu][cache] save failed: {e}");
+        }
+    }
 
     // 3. Insert. If another thread raced us, drop the loser.
     {
@@ -148,19 +168,58 @@ pub fn get_or_compile(
 // On-disk LZ4_flex-compressed pipeline cache (TODO — phase 4+)
 // ============================================================================
 
-/// Try to load a cached pipeline blob for the given fingerprint.
-pub fn load(_fingerprint: u64) -> Result<Option<Vec<u8>>> {
-    Ok(None) // skeleton: no persistent cache yet
+/// Directory holding on-disk pipeline caches.
+fn cache_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    Some(base.join("c2me").join("wgpu_pipelines"))
 }
 
-/// Save a raw pipeline blob (post-LZ4 compression) for `fingerprint`.
-pub fn save(_fingerprint: u64, _compressed_blob: &[u8]) -> Result<()> {
+fn cache_path(fingerprint: u32) -> Option<std::path::PathBuf> {
+    Some(cache_dir()?.join(format!("{fingerprint:08x}.cache")))
+}
+
+/// Try to load a cached pipeline blob for the given fingerprint.
+/// Returns the DECOMPRESSED data (ready to hand to PipelineCacheDescriptor).
+pub fn load(fingerprint: u32) -> Result<Option<Vec<u8>>> {
+    let Some(path) = cache_path(fingerprint) else { return Ok(None); };
+    let compressed = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {path:?}")),
+    };
+    match decompress(&compressed) {
+        Ok(raw) => {
+            eprintln!("[c2me-wgpu][cache] loaded pipeline cache {fingerprint:08x} ({} bytes)", raw.len());
+            Ok(Some(raw))
+        }
+        Err(e) => {
+            eprintln!("[c2me-wgpu][cache] corrupt cache {fingerprint:08x}: {e}; ignoring");
+            Ok(None)
+        }
+    }
+}
+
+/// Save a RAW pipeline blob (compressed here) for `fingerprint`.
+pub fn save(fingerprint: u32, raw_blob: &[u8]) -> Result<()> {
+    let Some(path) = cache_path(fingerprint) else { return Ok(()); };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {dir:?}"))?;
+    }
+    let compressed = compress(raw_blob);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &compressed).with_context(|| format!("write {tmp:?}"))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("rename to {path:?}"))?;
+    eprintln!("[c2me-wgpu][cache] saved pipeline cache {fingerprint:08x} ({} raw -> {} compressed)",
+              raw_blob.len(), compressed.len());
     Ok(())
 }
 
 /// Compress a raw wgpu::PipelineCache data blob using LZ4_flex.
 pub fn compress(raw: &[u8]) -> Vec<u8> {
-    lz4_flex::compress(raw)
+    // Must match decompress(), which uses decompress_size_prepended.
+    lz4_flex::compress_prepend_size(raw)
 }
 
 /// Decompress.
