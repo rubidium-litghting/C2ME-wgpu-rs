@@ -95,7 +95,6 @@ public class NoiseRouterBlobifier {
     private static final byte TAG_NOISE_SAMPLER = (byte) 0x84;
     private static final byte TAG_INTERP_NOISE = (byte) 0x90;
     private static final byte TAG_END_ISLANDS = (byte) 0xA0;
-    private static final byte TAG_BEARDIFIER = (byte) 0xA1;
     private static final byte TAG_RANGE_CHOICE = (byte) 0xB1;
     private static final byte TAG_INTERVAL_SEL = (byte) 0xB2;
     private static final byte TAG_Y_CLAMPED_GRAD = (byte) 0xB3;
@@ -204,8 +203,10 @@ public class NoiseRouterBlobifier {
 
         // ── Beardifier ──────────────────────────────────────────
         if (df instanceof DensityFunctionTypes.Beardifier) {
-            buf.put(TAG_BEARDIFIER);
-            buf.putInt(0);
+            // GPU density omits Beardifier; MC's real beard is applied
+            // per-block in MixinChunkGenerator via StructureWeightSampler.
+            // Emit constant 0 so the node contributes nothing on the GPU path.
+            writeConstant(buf, 0.0f);
             return;
         }
 

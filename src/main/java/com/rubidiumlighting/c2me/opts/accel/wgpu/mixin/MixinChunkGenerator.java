@@ -199,11 +199,21 @@ public abstract class MixinChunkGenerator {
         // MC's real "Beardifier": shapes terrain around structures (flattens
         // / buries under villages so houses sit in the ground). The GPU
         // density lacks it, so structures floated/sank. Reuse MC's own
-        // sampler — for chunks with no structure the piece list is empty and
-        // sample() returns 0, so the cost is negligible.
-        StructureWeightSampler structureWeight =
-                StructureWeightSampler.createStructureWeightSampler(
-                        structureAccessor, chunk.getPos());
+        // Only build the (expensive) structure-weight sampler when this chunk
+        // actually contains a structure whose terrain adaptation is not NONE.
+        // Vanilla's own predicate is `s.getTerrainAdaptation() != NONE` (see
+        // StructureWeightSampler.method_42696); matching it exactly is what lets
+        // us skip ~98k sample() calls on structure-free chunks. Using `s -> true`
+        // here pulled in NONE-adaptation structures and effectively never skipped.
+        boolean chunkHasStructure = !structureAccessor
+                .getStructureStarts(chunk.getPos(),
+                        s -> s.getTerrainAdaptation()
+                                != net.minecraft.world.gen.StructureTerrainAdaptation.NONE)
+                .isEmpty();
+        StructureWeightSampler structureWeight = chunkHasStructure
+                ? StructureWeightSampler.createStructureWeightSampler(
+                        structureAccessor, chunk.getPos())
+                : null;
 
 
         float dmin = Float.POSITIVE_INFINITY, dmax = Float.NEGATIVE_INFINITY;
@@ -218,7 +228,6 @@ public abstract class MixinChunkGenerator {
             if (d > dmax) dmax = d;
             if (d > 0.0f) stoneCells++; else airCells++;
         }
-
         // Block-level trilinear interpolation.
         //
         // MC's ChunkNoiseSampler evaluates the density at every BLOCK via
@@ -286,7 +295,8 @@ public abstract class MixinChunkGenerator {
                     // as a direct density node, so it is NOT trilinearly
                     // interpolated. Doing so flattened the structure
                     // foundations and made buildings float again.
-                    double beard = structureWeight.sample(npos);
+                    double beard = (structureWeight != null)
+                            ? structureWeight.sample(npos) : 0.0;
                     BlockState bs = aquifer.apply(npos, (double) d + beard);
                     if (bs == null) bs = stone;
                     if (bs == air) continue;

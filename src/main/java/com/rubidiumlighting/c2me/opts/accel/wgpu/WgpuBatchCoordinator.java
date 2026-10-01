@@ -34,6 +34,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Coalesces per-chunk GPU requests into a single dispatch.
@@ -78,6 +79,13 @@ public final class WgpuBatchCoordinator {
     private final BlockingQueue<Job> queue = new LinkedBlockingQueue<>();
     private final long worldHandle;
     private volatile boolean running = true;
+
+    // ── throughput stats (logged every STATS_INTERVAL_NS) ──────────
+    private static final long STATS_INTERVAL_NS = 2_000_000_000L;
+    private final AtomicLong statBatches = new AtomicLong();
+    private final AtomicLong statChunks = new AtomicLong();
+    private final AtomicLong statGpuNanos = new AtomicLong();
+    private volatile long statsWindowStart = System.nanoTime();
 
     public WgpuBatchCoordinator(long worldHandle) {
         this.worldHandle = worldHandle;
@@ -143,6 +151,7 @@ public final class WgpuBatchCoordinator {
     }
 
     private void dispatch(List<Job> batch, int[] positions) {
+        long __t0 = System.nanoTime();
         long req;
         try {
             req = WgpuThinBinding.requestChunks(worldHandle, positions);
@@ -188,6 +197,28 @@ public final class WgpuBatchCoordinator {
         for (int i = 0; i < n; i++) {
             batch.get(i).future.complete(new GpuChunk(seg, i));
         }
+        recordStats(n, System.nanoTime() - __t0);
+    }
+
+    private void recordStats(int chunks, long gpuNanos) {
+        statBatches.incrementAndGet();
+        statChunks.addAndGet(chunks);
+        statGpuNanos.addAndGet(gpuNanos);
+        long now = System.nanoTime();
+        long win = now - statsWindowStart;
+        if (win < STATS_INTERVAL_NS) return;
+        long b = statBatches.getAndSet(0);
+        long c = statChunks.getAndSet(0);
+        long g = statGpuNanos.getAndSet(0);
+        statsWindowStart = now;
+        if (b == 0) return;
+        double sec = win / 1e9;
+        double cps = c / sec;
+        double avgBatchMs = (g / 1e6) / b;
+        double avgChunkMs = (g / 1e6) / Math.max(1, c);
+        LOGGER.info(String.format(
+                "[c2me-wgpu] CPS=%.1f  batches=%d  chunks=%d  avgBatch=%.2fms  avgChunk=%.3fms  (window=%.2fs)",
+                cps, b, c, avgBatchMs, avgChunkMs, sec));
     }
 
     private static void failAll(List<Job> batch, Throwable t) {
