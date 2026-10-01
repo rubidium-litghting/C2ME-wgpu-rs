@@ -64,6 +64,7 @@ pub struct WorldContext {
     /// not yet consumed by WGSL generation.
     #[allow(dead_code)]
     pub(crate) perm_entries: Vec<PermEntry>,
+    pub(crate) simplex_entries: Vec<crate::ast::deserialize::SimplexEntry>,
     /// Compiled single-pass pipeline — `None` until `compile_pipeline` is
     /// called. Cached globally in `pipeline_cache::IN_MEMORY_CACHE` keyed
     /// by `(fingerprint, Pass::Single)`.
@@ -72,6 +73,8 @@ pub struct WorldContext {
     /// `compile_pipeline`, kept alive for the lifetime of this
     /// `WorldContext` so the scheduler can bind it without re-uploading.
     pub(crate) perm_buffer: Option<wgpu::Buffer>,
+    /// SimplexNoiseSampler tables for EndIslands (binding 5).
+    pub(crate) simplex_buffer: Option<wgpu::Buffer>,
     /// GPU-side per-entry origin buffer (binding 3), f32 x3 per entry.
     pub(crate) origin_buffer: Option<wgpu::Buffer>,
 }
@@ -91,7 +94,7 @@ impl WorldContext {
     /// without a real adapter.
     pub fn new(config_blob: &[u8]) -> Result<Self> {
         // 1. Deserialize Java blob into AST + shape + biome tail
-        let (ast_root, shape, biome_source, perm_entries) =
+        let (ast_root, shape, biome_source, perm_entries, simplex_entries) =
             deserialize_full_with_perm(config_blob)?;
 
         // 2. Run 4-pass optimization pipeline (constant_fold → normalize → cse → dce)
@@ -128,8 +131,10 @@ impl WorldContext {
             shader_src,
             perm_table_set,
             perm_entries,
+            simplex_entries,
             pipeline: None,
             perm_buffer: None,
+            simplex_buffer: None,
             origin_buffer: None,
         })
     }
@@ -196,6 +201,22 @@ impl WorldContext {
             self.origin_buffer = Some(ob);
         }
 
+        // Upload simplex tables (binding 5). Each entry = 512 i32 (only the
+        // first 256 meaningful, MC shuffles perm[0..256)). Empty -> dummy.
+        if self.simplex_buffer.is_none() {
+            let mut data: Vec<i32> = Vec::new();
+            for e in &self.simplex_entries {
+                data.extend_from_slice(&e.perm);
+            }
+            if data.is_empty() { data.push(0); }
+            let sb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("c2me_wgpu_simplex"),
+                contents: bytemuck::cast_slice(&data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+            self.simplex_buffer = Some(sb);
+        }
+
         Ok(())
     }
 
@@ -215,6 +236,11 @@ impl WorldContext {
     /// `compile_pipeline` has been called.
     pub fn origin_buffer(&self) -> Option<&wgpu::Buffer> {
         self.origin_buffer.as_ref()
+    }
+
+    /// Borrow the simplex table buffer (binding 5), if uploaded.
+    pub fn simplex_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.simplex_buffer.as_ref()
     }
 
     /// Borrow the CPU-side permutation table set (useful for unit tests

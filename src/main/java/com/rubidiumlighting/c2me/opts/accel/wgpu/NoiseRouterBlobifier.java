@@ -44,6 +44,8 @@ public class NoiseRouterBlobifier {
 
     // ── Permutation resource collection ─────────────────────────────
     private static final int PERM_MAGIC = 0x4D525750; // "PWPM"
+    private static final int SIMPLEX_MAGIC = 0x4D525358; // "SXRM"
+    private static final java.util.List<Object> SIMPLEX_SAMPLERS = new java.util.ArrayList<>();
     private static final IdentityHashMap<Object, Void> SEEN_PERM = new IdentityHashMap<>();
     private static final List<Object> PERM_SAMPLERS = new ArrayList<>();
     private static Object lastDperlin = null;
@@ -118,6 +120,7 @@ public class NoiseRouterBlobifier {
         PERM_SAMPLERS.clear();
         DPS_INFO.clear();
         SEEN_INS.clear();
+        SIMPLEX_SAMPLERS.clear();
         // ── HEADER (10B) ─────────────────────────────────────────
         buf.put((byte) 0x4D);
         buf.put((byte) 0x43);
@@ -158,6 +161,7 @@ public class NoiseRouterBlobifier {
 
         // ── PERM_RESOURCE (appended; Rust stores for later use) ─
         writePermResource(buf);
+        writeSimplexResource(buf);
 
         buf.flip();
         return buf;
@@ -379,6 +383,26 @@ public class NoiseRouterBlobifier {
             return;
         }
 
+        // ── EndIslands ──────────────────────────────────────────
+        if (df instanceof DensityFunctionTypes.EndIslands) {
+            try {
+                java.lang.reflect.Field sf = null;
+                for (java.lang.reflect.Field f : df.getClass().getDeclaredFields()) {
+                    if (f.getType() == net.minecraft.util.math.noise.SimplexNoiseSampler.class) { sf = f; break; }
+                }
+                if (sf == null) throw new NoSuchFieldException("EndIslands.sampler");
+                sf.setAccessible(true);
+                int idx = SIMPLEX_SAMPLERS.size();
+                SIMPLEX_SAMPLERS.add(sf.get(df));
+                buf.put(TAG_END_ISLANDS);
+                buf.putInt(idx);
+            } catch (Throwable t) {
+                System.err.println("[c2me-wgpu] EndIslands serialize failed: " + t);
+                writeConstant(buf, 0.0f);
+            }
+            return;
+        }
+
         // ── Phase-2 placeholders (noise chain) ──────────────────
         if (df instanceof DensityFunctionTypes.YClampedGradient
                 || df instanceof DensityFunctionTypes.Noise
@@ -387,8 +411,7 @@ public class NoiseRouterBlobifier {
                 || df instanceof DensityFunctionTypes.ShiftA
                 || df instanceof DensityFunctionTypes.ShiftB
                 || df instanceof DensityFunctionTypes.WeirdScaledSampler
-                || df instanceof DensityFunctionTypes.Spline
-                || df instanceof DensityFunctionTypes.EndIslands) {
+                || df instanceof DensityFunctionTypes.Spline) {
             PLACEHOLDER_SEEN.computeIfAbsent(df.getClass().getName(), k -> {
                 System.err.println("[c2me-wgpu][placeholder] " + k);
                 return Boolean.TRUE;
@@ -566,6 +589,32 @@ public class NoiseRouterBlobifier {
             } catch (Throwable t) {
                 System.err.println("[c2me-wgpu] perm resource: skip sampler: " + t);
                 for (int i = 0; i < 256; i++) buf.putInt(0);
+                buf.putDouble(0); buf.putDouble(0); buf.putDouble(0);
+            }
+        }
+    }
+
+    /** Append captured SimplexNoiseSampler tables (int[512] + origin). */
+    private static void writeSimplexResource(ByteBuffer buf) {
+        buf.putInt(SIMPLEX_MAGIC);
+        buf.putInt(SIMPLEX_SAMPLERS.size());
+        for (Object sampler : SIMPLEX_SAMPLERS) {
+            try {
+                java.lang.reflect.Field pf = null;
+                for (java.lang.reflect.Field f : sampler.getClass().getDeclaredFields()) {
+                    if (f.getType() == int[].class) { pf = f; break; }
+                }
+                if (pf == null) throw new NoSuchFieldException("simplex permutation");
+                pf.setAccessible(true);
+                int[] perm = (int[]) pf.get(sampler);
+                for (int i = 0; i < 512; i++) buf.putInt(perm[i]);
+                Class<?> c = sampler.getClass();
+                buf.putDouble((double) c.getField("originX").get(sampler));
+                buf.putDouble((double) c.getField("originY").get(sampler));
+                buf.putDouble((double) c.getField("originZ").get(sampler));
+            } catch (Throwable t) {
+                System.err.println("[c2me-wgpu] simplex resource: skip: " + t);
+                for (int i = 0; i < 512; i++) buf.putInt(0);
                 buf.putDouble(0); buf.putDouble(0); buf.putDouble(0);
             }
         }

@@ -192,7 +192,7 @@ fn rec(node: AstNode) -> AstNode {
             shift_x: Box::new(rec(*shift_x)), shift_y: Box::new(rec(*shift_y)), shift_z: Box::new(rec(*shift_z)),
             noise: Box::new(rec(*noise)),
         },
-        EndIslands(a) => EndIslands(Box::new(rec(*a))),
+        n @ EndIslands { .. } => n.clone(),
         RangeChoice {
             input,
             min,

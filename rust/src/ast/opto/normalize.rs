@@ -98,7 +98,7 @@ fn rec(node: AstNode) -> AstNode {
         },
 
         // Structured nodes with children: post-order only ----------------
-        EndIslands(a) => EndIslands(Box::new(rec(*a))),
+        n @ EndIslands { .. } => n.clone(),
         RangeChoice {
             input,
             min,

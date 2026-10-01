@@ -55,8 +55,19 @@ pub struct PermEntry {
 /// Magic of the PERM_RESOURCE trailer: "PWPM" little-endian.
 pub const PERM_MAGIC: u32 = 0x4D52_5750;
 
+/// A captured SimplexNoiseSampler table (EndIslands): int[512] permutation
+/// plus its origin offset, shipped in the optional SIMPLEX_RESOURCE trailer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimplexEntry {
+    pub perm: [i32; 512],
+    pub origin: [f64; 3],
+}
+
+/// Magic of the SIMPLEX_RESOURCE trailer: "SXRM" little-endian.
+pub const SIMPLEX_MAGIC: u32 = 0x4D52_5358;
+
 pub fn deserialize_full(blob: &[u8]) -> Result<(AstNode, ShapeConfig, AstNode)> {
-    let (root, shape, biome, _perm) = deserialize_full_with_perm(blob)?;
+    let (root, shape, biome, _perm, _simplex) = deserialize_full_with_perm(blob)?;
     Ok((root, shape, biome))
 }
 
@@ -64,7 +75,7 @@ pub fn deserialize_full(blob: &[u8]) -> Result<(AstNode, ShapeConfig, AstNode)> 
 /// trailer. Returns an empty Vec when the trailer is absent.
 pub fn deserialize_full_with_perm(
     blob: &[u8],
-) -> Result<(AstNode, ShapeConfig, AstNode, Vec<PermEntry>)> {
+) -> Result<(AstNode, ShapeConfig, AstNode, Vec<PermEntry>, Vec<SimplexEntry>)> {
     // 1. check blob.len() >= 10, else Deserialize("truncated header")
     ensure(blob.len() >= 10, "header")?;
     // 2. read u32 magic at offset 0, assert == 0x4D433257
@@ -97,21 +108,22 @@ pub fn deserialize_full_with_perm(
     // (allow trailing bytes for future extension; protocol doesn't forbid them)
     let _ = cursor;
 
-    // 7. optional PERM_RESOURCE trailer
-    let perm_entries = parse_perm_resource(blob, cursor).unwrap_or_default();
+    // 7. optional PERM_RESOURCE trailer, then SIMPLEX_RESOURCE
+    let (perm_entries, after_perm) = parse_perm_resource(blob, cursor).unwrap_or_default();
+    let simplex_entries = parse_simplex_resource(blob, after_perm).unwrap_or_default();
 
-    Ok((root, shape_cfg, biome_tree, perm_entries))
+    Ok((root, shape_cfg, biome_tree, perm_entries, simplex_entries))
 }
 
 /// Parse the optional PERM_RESOURCE trailer starting at `offset`.
 /// Returns empty Vec when no trailer is present.
-fn parse_perm_resource(blob: &[u8], offset: usize) -> Result<Vec<PermEntry>> {
+fn parse_perm_resource(blob: &[u8], offset: usize) -> Result<(Vec<PermEntry>, usize)> {
     if offset + 8 > blob.len() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), offset));
     }
     let magic = u32::from_le_bytes(blob[offset..offset + 4].try_into().unwrap());
     if magic != PERM_MAGIC {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), offset));
     }
     let count = u32::from_le_bytes(blob[offset + 4..offset + 8].try_into().unwrap()) as usize;
     let mut cursor = offset + 8;
@@ -133,6 +145,37 @@ fn parse_perm_resource(blob: &[u8], offset: usize) -> Result<Vec<PermEntry>> {
             cursor += 8;
         }
         out.push(PermEntry { perm, origin });
+    }
+    Ok((out, cursor))
+}
+
+/// Parse the optional SIMPLEX_RESOURCE trailer starting at `offset`.
+/// Each entry is int[512] (2048 B) + 3×f64 origin (24 B) = 2072 B.
+fn parse_simplex_resource(blob: &[u8], offset: usize) -> Result<Vec<SimplexEntry>> {
+    if offset + 8 > blob.len() {
+        return Ok(Vec::new());
+    }
+    let magic = u32::from_le_bytes(blob[offset..offset + 4].try_into().unwrap());
+    if magic != SIMPLEX_MAGIC {
+        return Ok(Vec::new());
+    }
+    let count = u32::from_le_bytes(blob[offset + 4..offset + 8].try_into().unwrap()) as usize;
+    let mut cursor = offset + 8;
+    let entry_size = 512 * 4 + 3 * 8;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if cursor + entry_size > blob.len() { break; }
+        let mut perm = [0i32; 512];
+        for slot in perm.iter_mut() {
+            *slot = i32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+        }
+        let mut origin = [0f64; 3];
+        for slot in origin.iter_mut() {
+            *slot = f64::from_le_bytes(blob[cursor..cursor + 8].try_into().unwrap());
+            cursor += 8;
+        }
+        out.push(SimplexEntry { perm, origin });
     }
     Ok(out)
 }
@@ -424,10 +467,12 @@ fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
 
         // ── Structure terrain / Shape selection (0xA0..0xB3) ───────────────
         0xA0 => {
-            // EndIslands(child) — child 通常是坐标函数
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            EndIslands(Box::new(a))
+            // EndIslands { perm_index: i32 }
+            ensure(bytes.len() >= cursor + 4, "EndIslands perm_index")?;
+            let perm_index = i32::from_le_bytes(
+                bytes[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            EndIslands { perm_index }
         }
 
         // ── 新增：Beardifier (0xA1) ────────────────────────────────────
@@ -874,7 +919,7 @@ mod tests {
             // HEADER
             0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ROOT(2 ch)
             0xFE, 0x02, 0x00, // ch0: EndIslands(InputX)  → 0xA0
-            0xA0, 0x02, // ch1: RangeChoice → 0xB1
+            0xA0, 0x05, 0x00, 0x00, 0x00, // ch0: EndIslands{perm_index:5}
             0xB1, // input = Sub(Y, 64.0) → 0x11
             0x11, 0x03, 0x01, f64p0[0], f64p0[1], f64p0[2], f64p0[3], // min = 0.0
             0x01, f0p0[0], f0p0[1], f0p0[2], f0p0[3], // max = 384.0
@@ -888,7 +933,7 @@ mod tests {
 
         let (root, _, _) = deserialize_full(blob).unwrap();
         let expected = AstNode::Root(vec![
-            AstNode::EndIslands(Box::new(AstNode::InputX)),
+            AstNode::EndIslands { perm_index: 5 },
             AstNode::RangeChoice {
                 input: Box::new(AstNode::Sub(
                     Box::new(AstNode::InputY),

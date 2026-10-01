@@ -202,7 +202,9 @@ pub enum AstNode {
     },
 
     // ── Structure terrain ───────────────────────────────────────────────
-    EndIslands(Box<AstNode>),
+    EndIslands {
+        perm_index: i32,
+    },
     Beardifier {
         struct_index: i32,
     },
@@ -424,9 +426,9 @@ impl Hash for AstNode {
             }
 
             // ── Structure terrain ───────────────────────────────────────────
-            AstNode::EndIslands(a) => {
+            AstNode::EndIslands { perm_index } => {
                 TAG_END_ISLANDS.hash(state);
-                a.hash(state);
+                perm_index.hash(state);
             }
             AstNode::Beardifier { struct_index } => {
                 0xA1u8.hash(state);

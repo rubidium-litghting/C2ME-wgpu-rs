@@ -764,3 +764,88 @@ fn sample_world_noise(
         default: { return 0.0; }
     }
 }
+
+// ============================================================================
+// § EndIslands (End dimension) — MC SimplexNoiseSampler 2D port
+// ============================================================================
+// simplex_perm (binding 5) holds, per entry, 512 ints; entry i starts at
+// i*512. Only the first 256 are non-zero (MC shuffles perm[0..256)).
+// map(a) = perm[a & 255]; grad uses GRADIENTS[h%12] dot (x, y, 0).
+
+const SX_SKEW_2D:   f32 = 0.3660254037844386;  // 0.5*(sqrt(3)-1)
+const SX_UNSKEW_2D: f32 = 0.21132486540518713; // (3-sqrt(3))/6
+
+fn sx_map(perm_base: i32, a: i32) -> i32 {
+    return i32(simplex_perm[perm_base + (a & 255)]);
+}
+
+fn sx_grad(h: i32, x: f32, y: f32) -> f32 {
+    let t = 0.5 - x * x - y * y;
+    if (t < 0.0) { return 0.0; }
+    let t4 = t * t * t * t;
+    var dp: f32 = 0.0;
+    // GRADIENTS[h] dot (x, y, 0) for h in 0..11
+    if (h == 0) { dp = x + y; }
+    else if (h == 1) { dp = -x + y; }
+    else if (h == 2) { dp = x - y; }
+    else if (h == 3) { dp = -x - y; }
+    else if (h == 4 || h == 6) { dp = x; }
+    else if (h == 5 || h == 7) { dp = -x; }
+    else if (h == 8 || h == 10) { dp = y; }
+    else { dp = -y; }
+    return t4 * dp;
+}
+
+fn simplex2d(perm_base: i32, x: f32, y: f32) -> f32 {
+    let s = (x + y) * SX_SKEW_2D;
+    let i = floor(x + s);
+    let j = floor(y + s);
+    let t = (i + j) * SX_UNSKEW_2D;
+    let x0 = x - (i - t);
+    let y0 = y - (j - t);
+    var i1: f32 = 0.0;
+    var j1: f32 = 0.0;
+    if (x0 > y0) { i1 = 1.0; j1 = 0.0; } else { i1 = 0.0; j1 = 1.0; }
+    let x1 = x0 - i1 + SX_UNSKEW_2D;
+    let y1 = y0 - j1 + SX_UNSKEW_2D;
+    let x2 = x0 - 1.0 + 2.0 * SX_UNSKEW_2D;
+    let y2 = y0 - 1.0 + 2.0 * SX_UNSKEW_2D;
+    let ii = i32(i) & 255;
+    let jj = i32(j) & 255;
+    let gi0 = sx_map(perm_base, ii + sx_map(perm_base, jj)) % 12;
+    let gi1 = sx_map(perm_base, ii + i32(i1) + sx_map(perm_base, jj + i32(j1))) % 12;
+    let gi2 = sx_map(perm_base, ii + 1 + sx_map(perm_base, jj + 1)) % 12;
+    return 70.0 * (sx_grad(gi0, x0, y0) + sx_grad(gi1, x1, y1) + sx_grad(gi2, x2, y2));
+}
+
+// MC DensityFunctionTypes$EndIslands.sample: blockX/8, blockZ/8 then the
+// static 25x25 island scan. Returns the raw sample() value; the caller
+// applies (v - 8) / 128.
+fn end_islands(perm_index: i32, block_x: i32, block_z: i32) -> f32 {
+    let base = perm_index * 512;
+    let x = block_x / 8;
+    let z = block_z / 8;
+    let x2 = x / 2;
+    let z2 = z / 2;
+    let xr = x % 2;
+    let zr = z % 2;
+    var d = clamp(100.0 - sqrt(f32(x * x + z * z)) * 8.0, -100.0, 80.0);
+    for (var dx: i32 = -12; dx <= 12; dx = dx + 1) {
+        for (var dz: i32 = -12; dz <= 12; dz = dz + 1) {
+            let lx = x2 + dx;
+            let lz = z2 + dz;
+            if (lx * lx + lz * lz > 4096) { continue; }
+            if (simplex2d(base, f32(lx), f32(lz)) < -0.9) {
+                let f = f32(abs(lx)) * 3439.0 + f32(abs(lz)) * 147.0;
+                let ff = (f % 13.0) + 9.0;
+                let gx = f32(xr - 2 * dx);
+                let gz = f32(zr - 2 * dz);
+                let g = clamp(100.0 - sqrt(gx * gx + gz * gz) * ff, -100.0, 80.0);
+                d = max(d, g);
+            }
+        }
+    }
+    return d;
+}
+
+

@@ -183,6 +183,8 @@ impl SingleBatchExecutor {
             .ok_or_else(|| "perm buffer not uploaded".to_string())?;
         let origin_buf = world.origin_buffer()
             .ok_or_else(|| "origin buffer not uploaded".to_string())?;
+        let simplex_buf = world.simplex_buffer()
+            .ok_or_else(|| "simplex buffer not uploaded".to_string())?;
 
         // Create output buffer (binding 2)
         let output_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -222,6 +224,10 @@ impl SingleBatchExecutor {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: positions_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: simplex_buf.as_entire_binding(),
                 },
             ],
         });

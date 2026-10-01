@@ -212,7 +212,7 @@ pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
         AstNode::CacheFlat(_) | AstNode::Cache2D(_) | AstNode::CacheInterpolated(_) => {
             cache_like::emit(node, ctx)
         }
-        AstNode::EndIslands(_) => end_islands::emit(node, ctx),
+        AstNode::EndIslands { .. } => end_islands::emit(node, ctx),
         AstNode::FindTopSurface { .. } => find_top_surface::emit(node, ctx),
         AstNode::Aquifer { .. } => aquifer::emit(node, ctx),
         AstNode::BiomeTree { .. } => biome_tree::emit(node, ctx),

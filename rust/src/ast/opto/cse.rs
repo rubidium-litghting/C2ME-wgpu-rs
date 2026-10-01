@@ -137,7 +137,7 @@ where
         Squeeze(a) => Squeeze(map_box(a, &mut f)),
 
         // Structured nodes with children ---------------------------------
-        EndIslands(a) => EndIslands(map_box(a, &mut f)),
+        n @ EndIslands { .. } => n.clone(),
         RangeChoice {
             input,
             min,
