@@ -2043,4 +2043,162 @@ mod tests {
             eprintln!("[WARN] GPU vs vanilla: ch10/ch11 residual - known WIP");
         }
     }
+
+    // ── EndIslands: GPU 2D-simplex vs Rust CPU reference ──────────────
+    fn cpu_sx_map(perm: &[i32], a: i32) -> i32 {
+        perm[(a & 255) as usize]
+    }
+    fn cpu_sx_grad(h: i32, x: f32, y: f32) -> f32 {
+        let t = 0.5 - x * x - y * y;
+        if t < 0.0 { return 0.0; }
+        let t4 = t * t * t * t;
+        let dp = match h {
+            0 => x + y, 1 => -x + y, 2 => x - y, 3 => -x - y,
+            4 | 6 => x, 5 | 7 => -x, 8 | 10 => y, _ => -y,
+        };
+        t4 * dp
+    }
+    fn cpu_simplex2d(perm: &[i32], x: f32, y: f32) -> f32 {
+        const SKEW: f32 = 0.3660254037844386;
+        const UNSKEW: f32 = 0.21132486540518713;
+        let s = (x + y) * SKEW;
+        let i = (x + s).floor();
+        let j = (y + s).floor();
+        let t = (i + j) * UNSKEW;
+        let x0 = x - (i - t);
+        let y0 = y - (j - t);
+        let (i1, j1) = if x0 > y0 { (1.0f32, 0.0f32) } else { (0.0, 1.0) };
+        let x1 = x0 - i1 + UNSKEW;
+        let y1 = y0 - j1 + UNSKEW;
+        let x2 = x0 - 1.0 + 2.0 * UNSKEW;
+        let y2 = y0 - 1.0 + 2.0 * UNSKEW;
+        let ii = (i as i32) & 255;
+        let jj = (j as i32) & 255;
+        let gi0 = cpu_sx_map(perm, ii + cpu_sx_map(perm, jj)) % 12;
+        let gi1 = cpu_sx_map(perm, ii + i1 as i32 + cpu_sx_map(perm, jj + j1 as i32)) % 12;
+        let gi2 = cpu_sx_map(perm, ii + 1 + cpu_sx_map(perm, jj + 1)) % 12;
+        70.0 * (cpu_sx_grad(gi0, x0, y0) + cpu_sx_grad(gi1, x1, y1) + cpu_sx_grad(gi2, x2, y2))
+    }
+    fn cpu_end_islands(perm: &[i32], bx: i32, bz: i32) -> f32 {
+        let x = bx / 8;
+        let z = bz / 8;
+        let x2 = x / 2;
+        let z2 = z / 2;
+        let xr = x % 2;
+        let zr = z % 2;
+        let mut d = (100.0 - (((x * x + z * z) as f32).sqrt()) * 8.0).clamp(-100.0, 80.0);
+        for dx in -12..=12i32 {
+            for dz in -12..=12i32 {
+                let lx = x2 + dx;
+                let lz = z2 + dz;
+                if lx * lx + lz * lz > 4096 { continue; }
+                if cpu_simplex2d(perm, lx as f32, lz as f32) < -0.9 {
+                    let f = (lx.abs() as f32) * 3439.0 + (lz.abs() as f32) * 147.0;
+                    let ff = (f % 13.0) + 9.0;
+                    let gx = (xr - 2 * dx) as f32;
+                    let gz = (zr - 2 * dz) as f32;
+                    let g = (100.0 - (gx * gx + gz * gz).sqrt() * ff).clamp(-100.0, 80.0);
+                    d = d.max(g);
+                }
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn end_islands_cpu_vs_gpu() {
+        use crate::instance::WgpuInstance;
+        use crate::scheduler::batcher::{Batch, Priority};
+        use crate::scheduler::executor::ExecutorThread;
+        use crate::world::WorldContext;
+        use std::sync::Arc;
+
+        // Deterministic 512-int permutation; only perm[0..256) is used.
+        let mut perm = [0i32; 512];
+        for i in 0..256usize {
+            perm[i] = ((i * 137 + 41) % 256) as i32;
+        }
+        // Ensure a permutation (0..255 each once): use a simple LCG shuffle.
+        let mut arr: Vec<i32> = (0..256).collect();
+        let mut seed: u32 = 12345;
+        for i in (1..256).rev() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let j = (seed >> 16) as usize % (i + 1);
+            arr.swap(i, j);
+        }
+        for i in 0..256usize { perm[i] = arr[i]; }
+
+        // Build blob: Root([EndIslands{perm_index:0}]) + SIMPLEX trailer.
+        let mut blob: Vec<u8> = Vec::new();
+        blob.extend_from_slice(&[0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        blob.push(0xFE);
+        blob.extend_from_slice(&[0x01, 0x00]);           // 1 channel
+        blob.push(0xA0);                                  // EndIslands
+        blob.extend_from_slice(&0i32.to_le_bytes());      // perm_index = 0
+        blob.extend_from_slice(&(-64i32).to_le_bytes());  // shape
+        blob.extend_from_slice(&384i32.to_le_bytes());
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.extend_from_slice(&4i32.to_le_bytes());
+        blob.push(0xF0);
+        blob.extend_from_slice(&123456789i64.to_le_bytes());
+        // PERM trailer (0 entries) then SIMPLEX trailer (1 entry)
+        blob.extend_from_slice(&0x4D525750u32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&0x4D525358u32.to_le_bytes());
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        for &v in &perm { blob.extend_from_slice(&v.to_le_bytes()); }
+        for _ in 0..3 { blob.extend_from_slice(&0.0f64.to_le_bytes()); }
+
+        let mut ctx = WorldContext::new(&blob).unwrap();
+        let instance = WgpuInstance::instance().unwrap();
+        ctx.compile_pipeline(&instance.device).unwrap();
+        let world_arc = Arc::new(ctx);
+        let executor = ExecutorThread::spawn(
+            Arc::new(instance.device.clone()),
+            Arc::new(instance.queue.clone()),
+            Default::default(),
+        ).unwrap();
+        // EndIslands is sparse: find one chunk where the CPU reference
+        // actually leaves the clamp floor, so the simplex2d "< -0.9"
+        // branch is exercised.
+        let mut hit: Option<(i32, i32)> = None;
+        'outer: for cx in -300..300i32 {
+            for cz in -300..300i32 {
+                if cpu_end_islands(&perm, cx * 16, cz * 16) > -99.0 {
+                    hit = Some((cx, cz));
+                    break 'outer;
+                }
+            }
+        }
+        let cpos = hit.expect("no EndIslands-hitting chunk found");
+        println!("EndIslands: hitting chunk = {:?} (cpu={:.4})",
+                 cpos, cpu_end_islands(&perm, cpos.0 * 16, cpos.1 * 16));
+
+        let batch = Batch { positions: vec![cpos], max_priority: Priority::Normal };
+        let result = executor.request_chunks(world_arc, batch).unwrap();
+        let br = result.results.get(&(((cpos.0 as i64) << 32) | (cpos.1 as i64 & 0xFFFFFFFF)))
+            .unwrap();
+        let bytes = br.as_bytes();
+        let payload = &bytes[0x88..];
+        const CPC: usize = 5 * 97 * 5;
+
+        let mut max_diff = 0.0f32;
+        let mut n_hit = 0;
+        for k in 0..5usize {
+            for j in 0..97usize {
+                for i in 0..5usize {
+                    let bx = cpos.0 * 16 + (i * 4) as i32;
+                    let bz = cpos.1 * 16 + (k * 4) as i32;
+                    let cpu = (cpu_end_islands(&perm, bx, bz) - 8.0) / 128.0;
+                    let idx = i + k * 5 + j * 25;
+                    let gpu = f32::from_le_bytes(payload[idx*4..idx*4+4].try_into().unwrap());
+                    if cpu > -0.7 { n_hit += 1; }
+                    let d = (cpu - gpu).abs();
+                    if d > max_diff { max_diff = d; }
+                }
+            }
+        }
+        println!("EndIslands GPU vs CPU: max_diff={:.6e}, non-floor cells={}", max_diff, n_hit);
+        assert!(max_diff < 1e-4, "EndIslands divergence {:.6e}", max_diff);
+    }
 }

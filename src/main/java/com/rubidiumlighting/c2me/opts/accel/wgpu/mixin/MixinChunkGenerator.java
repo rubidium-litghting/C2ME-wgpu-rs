@@ -88,6 +88,17 @@ public abstract class MixinChunkGenerator {
             return;
         }
 
+        // Only accelerate Overworld-family dimensions. Nether/End use a
+        // different GenerationShapeConfig and (for End) EndIslands, and the
+        // GPU world context is a single Overworld instance — so let vanilla
+        // generate those rather than producing wrong terrain.
+        NoiseChunkGenerator selfGen = (NoiseChunkGenerator) (Object) this;
+        if (!(selfGen.matchesSettings(ChunkGeneratorSettings.OVERWORLD)
+                || selfGen.matchesSettings(ChunkGeneratorSettings.LARGE_BIOMES)
+                || selfGen.matchesSettings(ChunkGeneratorSettings.AMPLIFIED))) {
+            return;
+        }
+
         // Vanilla-reference mode: skip the GPU and let MC generate normally.
         // The RETURN injection below dumps the resulting blocks so we can
         // compare GPU terrain against true vanilla terrain offline.
