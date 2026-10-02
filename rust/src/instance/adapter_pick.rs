@@ -32,22 +32,35 @@
 //! 自动回退到 C2ME 的 CPU 路径，而不是用 wgpu 的 CPU 后端（那个走的是
 //! software rasterizer，比原生 CPU 路径慢得多）。
 //!
-//! User can override via `C2ME_WGPU_ADAPTER_NAME` env var (substring match).
+//! User can override via the standard wgpu `WGPU_ADAPTER_NAME` env var
+//! (case-insensitive substring match). If set but no adapter matches, we log
+//! and fall back to the priority order below rather than aborting.
 
 use crate::Result;
 use std::env;
 
 /// Pick the "best" adapter from a wgpu::Instance.
 ///
-/// # Panics
-/// Skeleton-only, does no I/O yet.
+/// Order: explicit `WGPU_ADAPTER_NAME` (substring, case-insensitive) >
+/// IntegratedGpu > DiscreteGpu > VirtualGpu > any non-CPU adapter.
+///
+/// Returns `Err` if no adapter is usable, so the caller can fall back to
+/// C2ME's CPU path.
 pub fn pick_best(instance: &wgpu::Instance) -> Result<wgpu::Adapter> {
-    let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::PRIMARY));
-    if let Ok(name) = env::var("C2ME_WGPU_ADAPTER_NAME") {
-        if let Some(adapter) = adapters.iter().find(|&adp| adp.get_info().name.contains(&name)) {
+    // Enumerate with `all()` rather than `PRIMARY`: when the user sets
+    // `WGPU_BACKEND=gl`, the instance only enables GL, and `PRIMARY`
+    // (Vulkan/Metal/DX12/WebGPU) would filter those adapters out entirely.
+    // The instance itself only ever yields adapters for the backends it was
+    // created with, so `all()` cannot introduce unwanted ones.
+    let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+    if let Ok(name) = env::var("WGPU_ADAPTER_NAME") {
+        let needle = name.to_lowercase();
+        if let Some(adapter) = adapters.iter().find(|&adp| {
+            adp.get_info().name.to_lowercase().contains(&needle)
+        }) {
             return Ok(adapter.clone());
-        }else {
-            eprintln!("[c2me-wgpu-rs] No adapter found with name: {}", name);
+        } else {
+            eprintln!("[c2me-wgpu-rs] WGPU_ADAPTER_NAME=\"{}\" matched no adapter; using default priority order", name);
         }
     }
     let priority_order = [
@@ -63,5 +76,21 @@ pub fn pick_best(instance: &wgpu::Instance) -> Result<wgpu::Adapter> {
             return Ok(adapter.clone());
         }
     }
+
+    // Last resort: the GL backend often reports `DeviceType::Other` (it cannot
+    // reliably classify the GPU), so the priority list above filters it out.
+    // If the user explicitly asked for such a backend (e.g. WGPU_BACKEND=gl),
+    // honour that by taking the first non-CPU adapter. CPU/software adapters
+    // (llvmpipe, etc.) stay excluded — C2ME's own CPU path is faster.
+    if let Some(adapter) = adapters.iter().find(|adp| {
+        adp.get_info().device_type != wgpu::DeviceType::Cpu
+    }) {
+        crate::wgpu_debug!(
+            "[c2me-wgpu-rs] no typed adapter matched; using first non-CPU: {} ({:?})",
+            adapter.get_info().name, adapter.get_info().device_type
+        );
+        return Ok(adapter.clone());
+    }
+
     Err(anyhow::anyhow!("No suitable adapter found"))
 }

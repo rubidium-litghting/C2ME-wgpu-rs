@@ -1,0 +1,175 @@
+# C2ME wgpu Accelerator
+
+GPU-accelerated world generation for Minecraft, powered by
+[wgpu](https://wgpu.rs/) (Vulkan / Metal / DX12 / WebGPU).
+
+A standalone companion mod for [C2ME](https://modrinth.com/mod/c2me-fabric)
+that offloads the heavy noise / density-function pipeline of chunk generation
+onto the GPU.
+
+> **Compatibility-first.** This mod is deliberately built on **fp32** so it can
+> run on the *widest possible range of GPUs* — including integrated graphics
+> and mobile SoCs. The official C2ME accelerator targets `fp64` via OpenCL;
+> this mod complements it by covering devices that fp64 (and `shader-f64`)
+> cannot reach.
+
+---
+
+## Requirements
+
+| | |
+|---|---|
+| Minecraft | 1.21.1 (Fabric) |
+| Fabric Loader | >= 0.17.2 |
+| **C2ME** | **required** (this is a companion module, not standalone) |
+| Java | 22+ (built with the Java 25 toolchain) |
+| GPU | Any GPU with a working wgpu backend |
+
+Java 22 or newer is required because the mod talks to its Rust core through
+the Panama FFM API.
+
+---
+
+## Installation
+
+1. Install Fabric Loader for Minecraft 1.21.1.
+2. Put **C2ME** and **C2ME wgpu Accelerator** into your `mods/` folder.
+3. Launch the game.
+
+No configuration is needed. If a compatible GPU is found, terrain generation
+is offloaded automatically; otherwise the mod stays silent and Minecraft runs
+as usual.
+
+---
+
+## Platform support
+
+| Platform | Status |
+|---|---|
+| Linux x86_64 | ✅ tested |
+| Android aarch64 (custom JVM) | ✅ tested (Kirin 980) |
+| Windows (DX12) | ⚠️ wgpu backend available, not officially tested |
+| macOS (Metal) | ⚠️ wgpu backend available, not officially tested |
+
+On Android, `-XX:+UseZGC` is **not** supported by the custom JVM and the mod
+will not suggest it there.
+
+---
+
+## How it works
+
+1. **Serialize** — the vanilla `NoiseRouter` (the density-function tree that
+   drives terrain) is serialized into a compact binary blob on the Java side.
+2. **Hand off** — the blob is passed to a Rust `cdylib` through the Panama FFM
+   API (no callbacks, a simple poll model).
+3. **Compile** — Rust deserializes the tree, runs optimization passes, and
+   generates a WGSL compute shader, which is compiled to a GPU pipeline
+   (and cached on disk).
+4. **Dispatch** — the GPU evaluates the density field for a whole batch of
+   chunks in one dispatch.
+5. **Write back** — density values are read back and turned into blocks,
+   reusing Minecraft's own `AquiferSampler`, `StructureWeightSampler`
+   (Beardifier) and ore-vein samplers so the result matches vanilla.
+
+---
+
+## Accuracy
+
+The mod computes in **fp32**. Compared to Minecraft's `double` reference:
+
+- shallow expressions agree to about **1e-6**;
+- deep expressions (thousands of noise samples) can drift up to about **1e-2**.
+
+This is the **inherent limit of fp32**, not a bug. Terrain thresholds are not
+sensitive to differences of this magnitude, and the generated terrain is
+visually indistinguishable from vanilla. Higher precision is only ever obtained
+through fp32-internal compensation — `f64` is intentionally never used, because
+it would exclude most mobile GPUs.
+
+---
+
+## Known limitations
+
+- **Ore veins** are not block-exact with vanilla. They are pre-filtered on the
+  GPU and finished with Minecraft's own sampler; this only affects ore
+  placement, never the terrain itself.
+- At extremely far End coordinates (~370k blocks), a partial NaN fallback is
+  used to reproduce vanilla's void bands.
+
+---
+
+## Environment variables
+
+### GPU selection (standard wgpu variables)
+
+The mod honours wgpu's own environment variables, so they behave the same as
+in any other wgpu application:
+
+| Variable | Values | Effect |
+|---|---|---|
+| `WGPU_BACKEND` | `vulkan`, `dx12`, `metal`, `gl`, `webgpu` (comma-separated) | Restrict the graphics backends tried. Useful when one backend is broken (e.g. `WGPU_BACKEND=gl`). |
+| `WGPU_ADAPTER_NAME` | substring (case-insensitive) | Force a specific GPU by name, e.g. `WGPU_ADAPTER_NAME=radeon`. If nothing matches, the mod logs a warning and falls back to its default choice. |
+
+Without any of these, the mod uses Vulkan / Metal / DX12 (whichever the OS
+provides) and prefers the **integrated GPU**, so the discrete GPU stays free
+for rendering.
+
+### Diagnostics and debug exports
+
+Set these only when troubleshooting. All of them are read once at startup.
+
+| Variable | Value | Effect |
+|---|---|---|
+| `C2ME_WGPU_DEBUG` | any non-empty value | Enables verbose logging: shader-compile timings, pipeline-cache hits/misses, and periodic chunk-per-second (`CPS=`) throughput stats. Silent by default. |
+| `C2ME_VANILLA_REF` | `1` | Skip the GPU entirely, let vanilla generate the chunk, then dump its blocks for offline comparison against GPU output. |
+| `C2ME_DUMP_DENSITY` | `1` | Dump the GPU density values of the chunk at (0, 0). |
+| `C2ME_DUMP_BLOB` | file path | Dump the serialized NoiseRouter blob to the given path. |
+
+The blob dump can also be set with the JVM property `-Dc2me.dumpBlob=<path>`;
+the environment variable is only a fallback when the property is unset.
+
+### Cache location
+
+| Variable | Effect |
+|---|---|
+| `XDG_CACHE_HOME` | Base directory for the on-disk shader pipeline cache (`$XDG_CACHE_HOME/c2me/wgpu_pipelines/`). |
+| `HOME` | Fallback when `XDG_CACHE_HOME` is unset (`$HOME/.cache`). |
+
+> **Note:** the cache path follows the XDG convention, which is native to Linux
+> only. On Windows and macOS these variables are usually unset or non-standard,
+> so the on-disk pipeline cache is effectively disabled there. This costs a
+> one-off shader recompile per launch and does not affect correctness.
+
+### Build-time only
+
+| Variable | Effect |
+|---|---|
+| `C2ME_FABRIC_HOME` | Location of a C2ME-fabric checkout for the composite build. |
+| `ANDROID_NDK_HOME` | If set, the build also cross-compiles the native library for Android. |
+
+---
+
+## Building from source
+
+```bash
+./gradlew build
+```
+
+The built mod jar is written to `build/libs/`.
+
+Building requires:
+- JDK 25 (for the Java toolchain) and JDK 21 (for the Gradle JVM);
+- a Rust toolchain (the native library is compiled as part of the build);
+- **C2ME-fabric source**, cloned next to this repository (the build uses it
+  as a Gradle composite build; see `settings.gradle` for the search paths
+  `../C2ME-fabric` and `$C2ME_FABRIC_HOME`);
+- **`cargo-ndk`** *only if* you build for Android
+  (`cargo install cargo-ndk`, plus an Android NDK; the Android build is
+  skipped automatically when `ANDROID_NDK_HOME` is not set,
+  or forced off with `-PskipAndroid`).
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).

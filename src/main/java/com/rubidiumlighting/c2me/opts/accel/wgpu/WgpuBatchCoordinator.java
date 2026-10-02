@@ -53,6 +53,9 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class WgpuBatchCoordinator {
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu-batch");
 
+    /** Verbose per-window throughput logging, enabled with {@code C2ME_WGPU_DEBUG=1}. */
+    private static final boolean DEBUG = "1".equals(System.getenv("C2ME_WGPU_DEBUG"));
+
     /** Max chunks coalesced into one GPU dispatch. */
     private static final int MAX_BATCH = 64;
     /** Max time (ms) to wait for more requests before flushing a short batch. */
@@ -204,6 +207,7 @@ public final class WgpuBatchCoordinator {
         statBatches.incrementAndGet();
         statChunks.addAndGet(chunks);
         statGpuNanos.addAndGet(gpuNanos);
+        if (!DEBUG) return;
         long now = System.nanoTime();
         long win = now - statsWindowStart;
         if (win < STATS_INTERVAL_NS) return;

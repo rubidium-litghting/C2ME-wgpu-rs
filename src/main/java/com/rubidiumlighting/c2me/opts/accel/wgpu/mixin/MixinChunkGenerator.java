@@ -63,12 +63,17 @@ public abstract class MixinChunkGenerator {
     private static final java.util.concurrent.ConcurrentHashMap<ChunkGeneratorSettings, DimState>
             DIM_STATES = new java.util.concurrent.ConcurrentHashMap<>();
 
-    /** Marker file: when present, skip GPU entirely so MC generates vanilla
-     *  blocks; the RETURN injection then dumps them for comparison. */
-    private static final java.nio.file.Path VANILLA_REF_MARKER =
-            java.nio.file.Path.of("/tmp/c2me_vanilla_ref");
-    private static final java.nio.file.Path DENSITY_DUMP_MARKER =
-            java.nio.file.Path.of("/tmp/c2me_dump_density");
+    /** Debug export switches, read once at class-init from the environment.
+     *   - {@code C2ME_VANILLA_REF=1}  : skip GPU, let vanilla generate, then
+     *     dump the resulting blocks (see the RETURN injection below) so GPU
+     *     terrain can be compared against true vanilla terrain offline.
+     *   - {@code C2ME_DUMP_DENSITY=1} : dump the GPU density values for the
+     *     chunk at (0, 0).
+     *   - {@code C2ME_DUMP_BLOB=<path>} : dump the serialized NoiseRouter blob. */
+    private static final boolean VANILLA_REF =
+            "1".equals(System.getenv("C2ME_VANILLA_REF"));
+    private static final boolean DUMP_DENSITY =
+            "1".equals(System.getenv("C2ME_DUMP_DENSITY"));
 
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
     private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,
@@ -85,7 +90,7 @@ public abstract class MixinChunkGenerator {
         // Vanilla-reference mode: skip the GPU and let MC generate normally.
         // The RETURN injection below dumps the resulting blocks so we can
         // compare GPU terrain against true vanilla terrain offline.
-        if (java.nio.file.Files.exists(VANILLA_REF_MARKER)) {
+        if (VANILLA_REF) {
             return;
         }
 
@@ -158,7 +163,7 @@ public abstract class MixinChunkGenerator {
     private void afterPopulateNoise(Blender blender, NoiseConfig noiseConfig,
                                     StructureAccessor structureAccessor, Chunk chunk,
                                     CallbackInfoReturnable<CompletableFuture<Chunk>> cir) {
-        if (!java.nio.file.Files.exists(VANILLA_REF_MARKER)) {
+        if (!VANILLA_REF) {
             return;
         }
         CompletableFuture<Chunk> f = cir.getReturnValue();
@@ -248,8 +253,7 @@ public abstract class MixinChunkGenerator {
         Heightmap worldSurfaceWg = chunk.getHeightmap(Heightmap.Type.WORLD_SURFACE_WG);
 
         StringBuilder densityDump = null;
-        if (java.nio.file.Files.exists(DENSITY_DUMP_MARKER)
-                && chunk.getPos().x == 0 && chunk.getPos().z == 0) {
+        if (DUMP_DENSITY && chunk.getPos().x == 0 && chunk.getPos().z == 0) {
             densityDump = new StringBuilder();
         }
 
@@ -521,10 +525,6 @@ public abstract class MixinChunkGenerator {
         String dumpPath = System.getProperty("c2me.dumpBlob");
         if (dumpPath == null || dumpPath.isEmpty()) {
             dumpPath = System.getenv("C2ME_DUMP_BLOB");
-        }
-        if ((dumpPath == null || dumpPath.isEmpty())
-                && java.nio.file.Files.exists(java.nio.file.Path.of("/tmp/c2me_dump_blob"))) {
-            dumpPath = "/tmp/real_router.bin";
         }
         if (dumpPath == null || dumpPath.isEmpty()) {
             return;

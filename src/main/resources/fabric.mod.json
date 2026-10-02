@@ -4,7 +4,18 @@
   "version": "${version}",
   "name": "C2ME wgpu Accelerator",
   "description": "GPU-accelerated world generation using wgpu (Vulkan/Metal/DX12/WebGPU) — standalone companion mod for C2ME",
+  "authors": [
+    "RubidiumLighting"
+  ],
+  "contact": {
+    "homepage": "https://gitee.com/rubidium-lighting/C2ME-wgpu-rs",
+    "sources": "https://gitee.com/rubidium-lighting/C2ME-wgpu-rs",
+    "issues": "https://gitee.com/rubidium-lighting/C2ME-wgpu-rs/issues"
+  },
+  "license": "MIT",
+  "icon": "assets/c2me-opts-accel-wgpu/icon.png",
   "environment": "*",
+  "entrypoints": {},
   "mixins": [
     "c2me-opts-accel-wgpu.mixins.json"
   ],
@@ -14,10 +25,6 @@
     "java": ">=22",
     "c2me": "*"
   },
-  "authors": [
-    "RubidiumLighting"
-  ],
-  "license": "MIT",
   "custom": {
     "modmenu": {
       "parent": "c2me"

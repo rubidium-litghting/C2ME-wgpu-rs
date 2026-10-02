@@ -30,6 +30,7 @@ use crate::ast::AstNode;
 use crate::ast::deserialize::{PermEntry, ShapeConfig, deserialize_full_with_perm};
 use crate::ast::equality::hash_ast;
 use crate::ast::opto;
+#[cfg(debug_assertions)]
 use crate::codegen::validate::validate_wgsl;
 use crate::codegen::wgsl_gen::{self, Pass};
 use crate::world::bind_group;
@@ -108,7 +109,7 @@ impl WorldContext {
         //    to synchronise corner computation and trilinear lerp within one
         //    dispatch (var<workgroup> memory does NOT persist across dispatches).
         let shader_src = wgsl_gen::emit_shader(&ast_root)?;
-        eprintln!(
+        crate::wgpu_debug!(
             "[c2me-wgpu][codegen] WGSL emitted: {} lines, {} bytes",
             shader_src.lines().count(),
             shader_src.len()

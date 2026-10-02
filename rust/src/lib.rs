@@ -47,3 +47,28 @@ pub mod resources;
 pub mod result;
 
 pub use error::{C2meError, Result};
+
+/// Whether verbose GPU/codegen diagnostics are enabled.
+///
+/// Gated by the `C2ME_WGPU_DEBUG` environment variable (any non-empty value).
+/// Used by the `wgpu_debug!` macro for shader-compile / pipeline-cache logs
+/// that would otherwise spam the game log on every launch.
+pub(crate) fn debug_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var_os("C2ME_WGPU_DEBUG").is_some_and(|v| !v.is_empty())
+    })
+}
+
+/// `eprintln!` that only prints when `C2ME_WGPU_DEBUG` is set.
+///
+/// Set `C2ME_WGPU_DEBUG=1` to see shader-compile timings, pipeline-cache
+/// hits/misses and other codegen diagnostics. Silent by default.
+#[macro_export]
+macro_rules! wgpu_debug {
+    ($($arg:tt)*) => {
+        if $crate::debug_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}

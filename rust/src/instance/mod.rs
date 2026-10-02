@@ -67,7 +67,7 @@ impl WgpuInstance {
 
     fn init() -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
+            backends: wgpu::Backends::PRIMARY.with_env(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = adapter_pick::pick_best(&instance)?;
@@ -76,7 +76,7 @@ impl WgpuInstance {
         let adapter_info = adapter.get_info();
         let workarounds = Workarounds::detect(&adapter_info);
         if workarounds.any() {
-            eprintln!("[c2me-wgpu-rs] enabled workarounds for {} ({}): {:?}", adapter_info.name, adapter_info.driver, workarounds);
+            crate::wgpu_debug!("[c2me-wgpu-rs] enabled workarounds for {} ({}): {:?}", adapter_info.name, adapter_info.driver, workarounds);
         }
 
         let (device, queue) = pollster::block_on(
