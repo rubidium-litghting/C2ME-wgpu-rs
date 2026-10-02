@@ -1,4 +1,4 @@
-# C2ME wgpu Accelerator
+# C2ME-wgpu-rs
 
 GPU-accelerated world generation for Minecraft, powered by
 [wgpu](https://wgpu.rs/) (Vulkan / Metal / DX12 / WebGPU).
@@ -33,7 +33,7 @@ the Panama FFM API.
 ## Installation
 
 1. Install Fabric Loader for Minecraft 1.21.1.
-2. Put **C2ME** and **C2ME wgpu Accelerator** into your `mods/` folder.
+2. Put **C2ME** and **C2ME-wgpu-rs** into your `mods/` folder.
 3. Launch the game.
 
 No configuration is needed. If a compatible GPU is found, terrain generation
@@ -123,6 +123,7 @@ Set these only when troubleshooting. All of them are read once at startup.
 | `C2ME_WGPU_DEBUG` | any non-empty value | Enables verbose logging: shader-compile timings, pipeline-cache hits/misses, and periodic chunk-per-second (`CPS=`) throughput stats. Silent by default. |
 | `C2ME_VANILLA_REF` | `1` | Skip the GPU entirely, let vanilla generate the chunk, then dump its blocks for offline comparison against GPU output. |
 | `C2ME_DUMP_DENSITY` | `1` | Dump the GPU density values of the chunk at (0, 0). |
+| `C2ME_DUMP_BLOCKS` | `1` | Dump the block states of the chunk at (0, 0), for offline comparison against vanilla. |
 | `C2ME_DUMP_BLOB` | file path | Dump the serialized NoiseRouter blob to the given path. |
 
 The blob dump can also be set with the JVM property `-Dc2me.dumpBlob=<path>`;

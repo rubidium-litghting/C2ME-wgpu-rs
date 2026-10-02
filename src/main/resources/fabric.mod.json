@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "id": "c2me-opts-accel-wgpu",
   "version": "${version}",
-  "name": "C2ME wgpu Accelerator",
-  "description": "GPU-accelerated world generation using wgpu (Vulkan/Metal/DX12/WebGPU) — standalone companion mod for C2ME",
+  "name": "C2ME-wgpu-rs",
+  "description": "GPU-accelerated world generation using wgpu (Vulkan/Metal/DX12/WebGPU). Requires C2ME.",
   "authors": [
     "RubidiumLighting"
   ],
@@ -24,10 +24,5 @@
     "fabricloader": ">=0.17.2",
     "java": ">=22",
     "c2me": "*"
-  },
-  "custom": {
-    "modmenu": {
-      "parent": "c2me"
-    }
   }
 }

@@ -69,11 +69,15 @@ public abstract class MixinChunkGenerator {
      *     terrain can be compared against true vanilla terrain offline.
      *   - {@code C2ME_DUMP_DENSITY=1} : dump the GPU density values for the
      *     chunk at (0, 0).
+     *   - {@code C2ME_DUMP_BLOCKS=1}  : dump the block states of the chunk at
+     *     (0, 0) for offline comparison against vanilla.
      *   - {@code C2ME_DUMP_BLOB=<path>} : dump the serialized NoiseRouter blob. */
     private static final boolean VANILLA_REF =
             "1".equals(System.getenv("C2ME_VANILLA_REF"));
     private static final boolean DUMP_DENSITY =
             "1".equals(System.getenv("C2ME_DUMP_DENSITY"));
+    private static final boolean DUMP_BLOCKS =
+            "1".equals(System.getenv("C2ME_DUMP_BLOCKS"));
 
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
     private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,
@@ -150,7 +154,9 @@ public abstract class MixinChunkGenerator {
                     ((ChunkNoiseSamplerAccessor) (Object) sampler).getBlockStateSampler();
 
             writeDensityToChunk(chunk, seg, aquifer, oreVein, gpu.batchIndex, structureAccessor, ds);
-            maybeDumpBlocks(chunk, "gpu");
+            if (DUMP_BLOCKS) {
+                maybeDumpBlocks(chunk, "gpu");
+            }
 
             // Cancel vanilla generation and hand back the (now filled) chunk.
             cir.setReturnValue(CompletableFuture.completedFuture(chunk));
