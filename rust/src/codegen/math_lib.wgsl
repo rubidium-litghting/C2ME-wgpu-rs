@@ -834,7 +834,7 @@ fn end_islands(perm_index: i32, block_x: i32, block_z: i32) -> f32 {
         for (var dz: i32 = -12; dz <= 12; dz = dz + 1) {
             let lx = x2 + dx;
             let lz = z2 + dz;
-            if (lx * lx + lz * lz > 4096) { continue; }
+            if (lx * lx + lz * lz <= 4096) { continue; }
             if (simplex2d(base, f32(lx), f32(lz)) < -0.9) {
                 let f = f32(abs(lx)) * 3439.0 + f32(abs(lz)) * 147.0;
                 let ff = (f % 13.0) + 9.0;

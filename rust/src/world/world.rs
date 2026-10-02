@@ -2200,7 +2200,7 @@ mod tests {
             for dz in -12..=12i32 {
                 let lx = x2 + dx;
                 let lz = z2 + dz;
-                if lx * lx + lz * lz > 4096 { continue; }
+                if lx * lx + lz * lz <= 4096 { continue; }  // process only OUTER ring (>4096), matching MC
                 if cpu_simplex2d(perm, lx as f32, lz as f32) < -0.9 {
                     let f = (lx.abs() as f32) * 3439.0 + (lz.abs() as f32) * 147.0;
                     let ff = (f % 13.0) + 9.0;

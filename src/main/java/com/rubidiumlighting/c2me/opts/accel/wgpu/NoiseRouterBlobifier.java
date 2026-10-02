@@ -532,7 +532,15 @@ public class NoiseRouterBlobifier {
             af.setAccessible(true);
             PerlinNoiseSampler[] arr = (PerlinNoiseSampler[]) af.get(octave);
             int baseIdx = PERM_SAMPLERS.size();
-            for (PerlinNoiseSampler p : arr) {
+            // MC's OctavePerlinNoiseSampler.getOctave(i) returns
+            // octaveSamplers[length-1-i] — REVERSED. InterpolatedNoiseSampler
+            // (old_blended_noise) iterates i=0..n via getOctave, so we must
+            // store the tables in reversed array order; the Rust/WGSL side
+            // then iterates forward and reads the same perlin at the same
+            // frequency (this is why regular noise, which uses the forward
+            // sample() loop, was unaffected).
+            for (int ai = arr.length - 1; ai >= 0; ai--) {
+                PerlinNoiseSampler p = arr[ai];
                 if (p == null) PERM_SAMPLERS.add(null);
                 else { SEEN_PERM.put(p, null); PERM_SAMPLERS.add(p); }
             }
@@ -600,18 +608,20 @@ public class NoiseRouterBlobifier {
         buf.putInt(SIMPLEX_SAMPLERS.size());
         for (Object sampler : SIMPLEX_SAMPLERS) {
             try {
-                java.lang.reflect.Field pf = null;
-                for (java.lang.reflect.Field f : sampler.getClass().getDeclaredFields()) {
-                    if (f.getType() == int[].class) { pf = f; break; }
-                }
-                if (pf == null) throw new NoSuchFieldException("simplex permutation");
-                pf.setAccessible(true);
-                int[] perm = (int[]) pf.get(sampler);
+                // Use the Loom-remapped @Accessor for the private
+                // `permutation` table and direct field access for the public
+                // originX/Y/Z. String reflection (getField("originX")) breaks
+                // on intermediary names at runtime and used to silently write
+                // 512 zeros, corrupting the EndIslands simplex table.
+                net.minecraft.util.math.noise.SimplexNoiseSampler sns =
+                        (net.minecraft.util.math.noise.SimplexNoiseSampler) sampler;
+                int[] perm =
+                        ((com.rubidiumlighting.c2me.opts.accel.wgpu.mixin.SimplexNoiseSamplerAccessor) sns)
+                                .getPermutation();
                 for (int i = 0; i < 512; i++) buf.putInt(perm[i]);
-                Class<?> c = sampler.getClass();
-                buf.putDouble((double) c.getField("originX").get(sampler));
-                buf.putDouble((double) c.getField("originY").get(sampler));
-                buf.putDouble((double) c.getField("originZ").get(sampler));
+                buf.putDouble(sns.originX);
+                buf.putDouble(sns.originY);
+                buf.putDouble(sns.originZ);
             } catch (Throwable t) {
                 System.err.println("[c2me-wgpu] simplex resource: skip: " + t);
                 for (int i = 0; i < 512; i++) buf.putInt(0);

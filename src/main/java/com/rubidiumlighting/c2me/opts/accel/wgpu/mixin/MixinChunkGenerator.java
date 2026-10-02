@@ -49,18 +49,18 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.nio.ByteBuffer;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 
 @Mixin(NoiseChunkGenerator.class)
 public abstract class MixinChunkGenerator {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu");
-    private static final AtomicBoolean WORLD_INIT_ATTEMPTED = new AtomicBoolean(false);
-    private static final AtomicLong WORLD_HANDLE = new AtomicLong(0L);
-    private static volatile WgpuBatchCoordinator COORDINATOR = null;
-    private static volatile NoiseRouter RAW_ROUTER = null;
-    private static final AtomicBoolean TRUTH_DUMPED = new AtomicBoolean(false);
+    /** Per-dimension state, keyed by the dimension's noise-settings singleton.
+     *  Each distinct settings (Overworld / LargeBiomes / Amplified / Nether /
+     *  End / …) has its own NoiseRouter + shape → its own WorldContext. This
+     *  also fixes a latent bug: previously the first-loaded dimension's context
+     *  was reused for any later, differently-shaped dimension. */
+    private static final java.util.concurrent.ConcurrentHashMap<ChunkGeneratorSettings, DimState>
+            DIM_STATES = new java.util.concurrent.ConcurrentHashMap<>();
     /** Marker file: when present, skip GPU entirely so MC generates vanilla
      *  blocks; the RETURN injection then dumps them for comparison. */
     private static final java.nio.file.Path VANILLA_REF_MARKER =
@@ -68,34 +68,11 @@ public abstract class MixinChunkGenerator {
     private static final java.nio.file.Path DENSITY_DUMP_MARKER =
             java.nio.file.Path.of("/tmp/c2me_dump_density");
 
-    // Cell grid dims (corner samples per axis). MC uses 5x49x5 corners;
-    // we currently ship 4x96x4 + edge extrapolation (see cellAt).
-    // Grid dims, set from the dimension's GenerationShapeConfig at world init
-    // (Overworld 5x49x5 cell 4x8; End 3x33x3 cell 8x4; etc.). Defaults=Overworld.
-    private static volatile int GRID_X = 5;
-    private static volatile int GRID_Y = 49;
-    private static volatile int GRID_Z = 5;
-    private static volatile int GRID_CW = 4;
-    private static volatile int GRID_CH = 8;
-    private static volatile int GRID_MINY = -64;
-    private static volatile int GRID_H = 384;
-
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
     private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,
                                  StructureAccessor structureAccessor, Chunk chunk,
                                  CallbackInfoReturnable<CompletableFuture<Chunk>> cir) {
         if (!WgpuThinBinding.isAvailable()) {
-            return;
-        }
-
-        // Only accelerate Overworld-family dimensions. Nether/End use a
-        // different GenerationShapeConfig and (for End) EndIslands, and the
-        // GPU world context is a single Overworld instance — so let vanilla
-        // generate those rather than producing wrong terrain.
-        NoiseChunkGenerator selfGen = (NoiseChunkGenerator) (Object) this;
-        if (!(selfGen.matchesSettings(ChunkGeneratorSettings.OVERWORLD)
-                || selfGen.matchesSettings(ChunkGeneratorSettings.LARGE_BIOMES)
-                || selfGen.matchesSettings(ChunkGeneratorSettings.AMPLIFIED))) {
             return;
         }
 
@@ -107,192 +84,26 @@ public abstract class MixinChunkGenerator {
         }
 
         try {
-            // ── one-time world init ──────────────────────────────
-            if (WORLD_INIT_ATTEMPTED.compareAndSet(false, true)) {
-                // Blob source = the RAW tree behind the COMPILED router that
-                // MC actually generates with. settings.noiseRouter() is a
-                // DIFFERENT tree (verified: |settings-compiled|=16.8 on
-                // initialDensity, fallback==compiled to 0.0), so serializing
-                // it made the GPU reproduce the wrong terrain. decompileRouter
-                // strips c2me-opts-dfc's CompiledDensityFunction back to its
-                // blendingFallback (the original tree, numerically identical
-                // to the JIT result).
-                NoiseChunkGenerator self = (NoiseChunkGenerator) (Object) this;
-                NoiseRouter router = decompileRouter(noiseConfig.getNoiseRouter());
-                if (router == null) {
-                    LOGGER.warn("[c2me-wgpu] NoiseRouter is null, falling back to CPU");
-                    return;
-                }
-                net.minecraft.world.gen.chunk.GenerationShapeConfig gsc =
-                        self.getSettings().value().generationShapeConfig();
-                int hc = gsc.horizontalCellBlockCount();
-                int vc = gsc.verticalCellBlockCount();
-                GRID_MINY = gsc.minimumY();
-                GRID_H = gsc.height();
-                GRID_CW = hc;
-                GRID_CH = vc;
-                GRID_X = 16 / hc + 1;
-                GRID_Z = 16 / hc + 1;
-                GRID_Y = GRID_H / vc + 1;
-                LOGGER.info("[c2me-wgpu] shape: minY={} h={} cell={}x{} grid={}x{}x{}",
-                        GRID_MINY, GRID_H, GRID_CW, GRID_CH, GRID_X, GRID_Y, GRID_Z);
-                NoiseRouterBlobifier.ShapeConfig shape =
-                        new NoiseRouterBlobifier.ShapeConfig(GRID_MINY, GRID_H, hc, vc);
-                RAW_ROUTER = router;
-                ByteBuffer blob = NoiseRouterBlobifier.blobify(router, shape, noiseConfig);
-                LOGGER.info("[c2me-wgpu] first chunk [{} {}], blob size={} bytes",
-                        chunk.getPos().x, chunk.getPos().z, blob.remaining());
-                // ── optional: dump real router blob for offline benchmark ──
-                // Run game with -Dc2me.dumpBlob=/path/to/real_router.bin
-                // Trigger sources, in order: JVM prop, env var, marker file.
-                // The marker file is easiest: `touch /tmp/c2me_dump_blob`
-                // before launching — no launcher JVM-arg config needed.
-                String dumpPath = System.getProperty("c2me.dumpBlob");
-                if (dumpPath == null || dumpPath.isEmpty()) {
-                    dumpPath = System.getenv("C2ME_DUMP_BLOB");
-                }
-                if ((dumpPath == null || dumpPath.isEmpty())
-                        && java.nio.file.Files.exists(
-                                java.nio.file.Path.of("/tmp/c2me_dump_blob"))) {
-                    dumpPath = "/tmp/real_router.bin";
-                }
-                if (dumpPath != null && !dumpPath.isEmpty()) {
-                    try {
-                        java.nio.ByteBuffer dup = blob.duplicate();
-                        byte[] bytes = new byte[dup.remaining()];
-                        dup.get(bytes);
-                        java.nio.file.Files.write(java.nio.file.Path.of(dumpPath), bytes);
-                        LOGGER.info("[c2me-wgpu] dumped router blob ({} bytes) to {}", bytes.length, dumpPath);
-                    } catch (Throwable t) {
-                        LOGGER.warn("[c2me-wgpu] blob dump failed", t);
-                    }
-                }
-                // ── corner reference dump for GPU <-> vanilla comparison ──
-                // Writes the raw-router finalDensity at the same 5x97x5 corner
-                // grid the GPU emits. RAW_ROUTER has no Beardifier (that is
-                // applied per-block), matching the GPU channel exactly.
-                if (dumpPath != null && !dumpPath.isEmpty() && RAW_ROUTER != null) {
-                    try {
-                        StringBuilder sb = new StringBuilder();
-                        sb.append("# cx cz startX startZ\n");
-                        sb.append("CHUNK ").append(chunk.getPos().x).append(' ')
-                          .append(chunk.getPos().z).append('\n');
-                        sb.append("DIMS ").append(GRID_X).append(" ").append(GRID_Y).append(" ").append(GRID_Z).append("\n");
-                        sb.append("CELL_W ").append(GRID_CW).append("\nMIN_Y ").append(GRID_MINY).append("\n");
-                        // Dump several channels so we can tell a broken
-                        // sampling framework (ch0 wrong) from a broken
-                        // specific node (only ch11 wrong).
-                        // Use the COMPILED router (noiseConfig.getNoiseRouter()):
-                        // the raw settings router has nodes whose standalone
-                        // sample() returns 0 (caches not driven). The compiled
-                        // router samples correctly, so it is our ground truth.
-                        NoiseRouter CR = noiseConfig.getNoiseRouter();
-                        java.util.LinkedHashMap<String, net.minecraft.world.gen.densityfunction.DensityFunction> chans =
-                                new java.util.LinkedHashMap<>();
-                        chans.put("barrierNoise", CR.barrierNoise());
-                        chans.put("fluidLevelFloodednessNoise", CR.fluidLevelFloodednessNoise());
-                        chans.put("fluidLevelSpreadNoise", CR.fluidLevelSpreadNoise());
-                        chans.put("lavaNoise", CR.lavaNoise());
-                        chans.put("temperature", CR.temperature());
-                        chans.put("vegetation", CR.vegetation());
-                        chans.put("continents", CR.continents());
-                        chans.put("erosion", CR.erosion());
-                        chans.put("depth", CR.depth());
-                        chans.put("ridges", CR.ridges());
-                        chans.put("initialDensityWithoutJaggedness", CR.initialDensityWithoutJaggedness());
-                        chans.put("finalDensity", CR.finalDensity());
-                        // Also dump every registry-referenced density function
-                        // (e.g. overworld/factor, overworld/sloped_cheese) so we
-                        // can isolate which sub-node diverges.
-                        java.util.LinkedHashMap<String, net.minecraft.world.gen.densityfunction.DensityFunction> extra =
-                                new java.util.LinkedHashMap<>();
-                        try {
-                            net.minecraft.world.gen.densityfunction.DensityFunction rootFd = CR.finalDensity();
-                            net.minecraft.world.gen.densityfunction.DensityFunction walked =
-                                    rootFd.apply(new net.minecraft.world.gen.densityfunction.DensityFunction.DensityFunctionVisitor() {
-                                        public net.minecraft.world.gen.densityfunction.DensityFunction apply(
-                                                net.minecraft.world.gen.densityfunction.DensityFunction df) {
-                                            if (df instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.RegistryEntryHolder h) {
-                                                try {
-                                                    String k = h.function().getKey().map(kk -> kk.getValue().getPath()).orElse(null);
-                                                    if (k != null) extra.put(k, h.function().value());
-                                                } catch (Throwable ignored) {}
-                                            }
-                                            return df;
-                                        }
-                                    });
-                        } catch (Throwable t) {
-                            LOGGER.warn("[c2me-wgpu] walk finalDensity failed", t);
+            // ── per-dimension state (context + coordinator + grid) ──
+            NoiseChunkGenerator selfGen = (NoiseChunkGenerator) (Object) this;
+            ChunkGeneratorSettings settings = selfGen.getSettings().value();
+            DimState ds = DIM_STATES.get(settings);
+            if (ds == null) {
+                // Double-checked locking: world init is expensive (~7s shader
+                // compile) and must run once per dimension. Without the lock,
+                // concurrent first-chunks would each build a WorldContext, and
+                // the loser's Rust handle + coordinator would leak forever.
+                synchronized (DIM_STATES) {
+                    ds = DIM_STATES.get(settings);
+                    if (ds == null) {
+                        ds = initDimState(settings, noiseConfig, chunk);
+                        if (ds != null) {
+                            DIM_STATES.put(settings, ds);
                         }
-                        chans.putAll(extra);
-                        chans.put("veinToggle", CR.veinToggle());
-                        chans.put("veinRidged", CR.veinRidged());
-                        chans.put("veinGap", CR.veinGap());
-                        int sx = chunk.getPos().getStartX();
-                        int sz = chunk.getPos().getStartZ();
-                        for (var e : chans.entrySet()) {
-                            sb.append("CHANNEL ").append(e.getKey()).append('\n');
-                            net.minecraft.world.gen.densityfunction.DensityFunction fd = e.getValue();
-                            // Router channels are wrapped in RegistryEntryHolder;
-                            // sampling the holder returns 0. Unwrap exactly like
-                            // NoiseRouterBlobifier.writeDF does before serializing.
-                            net.minecraft.world.gen.densityfunction.DensityFunction raw = fd;
-                            // Unwrap registry holders AND cache wrappers. Cache
-                            // nodes (FlatCache/CacheOnce/Cache2D) are pure
-                            // memoization but their sample() reads a cache
-                            // array that is only valid inside the sampler loop,
-                            // so standalone sampling returns 0/garbage. Stripping
-                            // them makes single-shot sampling equal the wrapped
-                            // value (this is exactly what NoiseRouterBlobifier
-                            // does when serializing to the GPU).
-                            for (int guard = 0; guard < 32; guard++) {
-                                if (fd instanceof
-                                        net.minecraft.world.gen.densityfunction.DensityFunctionTypes.RegistryEntryHolder h) {
-                                    fd = h.function().value();
-                                } else if (fd instanceof
-                                        net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Wrapper w) {
-                                    fd = w.wrapped();
-                                } else {
-                                    break;
-                                }
-                            }
-                            for (int j = 0; j < GRID_Y; j++) {
-                                int wy = GRID_MINY + j * GRID_CH;
-                                for (int k = 0; k < GRID_Z; k++) {
-                                    int wz = sz + k * GRID_CW;
-                                    for (int i = 0; i < GRID_X; i++) {
-                                        int wx = sx + i * GRID_CW;
-                                        double v = fd.sample(
-                                                new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(
-                                                        wx, wy, wz));
-                                        sb.append(i).append(' ').append(j).append(' ').append(k)
-                                          .append(' ').append((float) v).append('\n');
-                                    }
-                                }
-                            }
-                        }
-                        String refPath = dumpPath + ".ref.txt";
-                        java.nio.file.Files.writeString(java.nio.file.Path.of(refPath), sb.toString());
-                        LOGGER.info("[c2me-wgpu] dumped corner reference ({} lines) to {}",
-                                2425, refPath);
-                    } catch (Throwable t) {
-                        LOGGER.warn("[c2me-wgpu] corner reference dump failed", t);
                     }
                 }
-                trySendToRust(blob);
-            }
-
-            long world = WORLD_HANDLE.get();
-            if (world == 0L) {
-                return;
-            }
-            WgpuBatchCoordinator coord = COORDINATOR;
-            if (coord == null) {
-                synchronized (MixinChunkGenerator.class) {
-                    if (COORDINATOR == null) {
-                        COORDINATOR = new WgpuBatchCoordinator(world);
-                    }
-                    coord = COORDINATOR;
+                if (ds == null) {
+                    return; // fall back to vanilla CPU path
                 }
             }
 
@@ -302,7 +113,7 @@ public abstract class MixinChunkGenerator {
             // the whole batch; batchIndex selects this chunk's slice.
             WgpuBatchCoordinator.GpuChunk gpu;
             try {
-                gpu = coord.request(chunk.getPos().x, chunk.getPos().z);
+                gpu = ds.coordinator.request(chunk.getPos().x, chunk.getPos().z);
             } catch (Throwable t) {
                 LOGGER.warn("[c2me-wgpu] GPU batch request failed, falling back to CPU", t);
                 return; // vanilla CPU path runs
@@ -325,7 +136,7 @@ public abstract class MixinChunkGenerator {
                                     .callCreateChunkNoiseSampler(cs, fSa, fBlender, fNc));
             net.minecraft.world.gen.chunk.AquiferSampler aquifer = sampler.getAquiferSampler();
 
-            writeDensityToChunk(chunk, seg, aquifer, gpu.batchIndex, structureAccessor);
+            writeDensityToChunk(chunk, seg, aquifer, gpu.batchIndex, structureAccessor, ds);
             maybeDumpBlocks(chunk, "gpu");
 
             // Cancel vanilla generation and hand back the (now filled) chunk.
@@ -386,17 +197,6 @@ public abstract class MixinChunkGenerator {
         }
     }
 
-    private static void trySendToRust(ByteBuffer blob) {
-        try {
-            long inst = WgpuThinBinding.getInstanceHandle();
-            long world = WgpuThinBinding.worldNew(inst, blob);
-            WORLD_HANDLE.set(world);
-            LOGGER.info("[c2me-wgpu] Rust WorldContext created, handle={}", world);
-        } catch (Throwable t) {
-            LOGGER.error("[c2me-wgpu] Rust world_new failed; staying on CPU path", t);
-        }
-    }
-
     /**
      * Write the GPU finalDensity channel (channel 11) to {@code chunk} as
      * STONE / AIR. Cell grid = (16/cellW) × (height/cellH) × (16/cellW)
@@ -405,16 +205,17 @@ public abstract class MixinChunkGenerator {
     private static void writeDensityToChunk(Chunk chunk, java.lang.foreign.MemorySegment seg,
                                             net.minecraft.world.gen.chunk.AquiferSampler aquifer,
                                             int batchIndex,
-                                            StructureAccessor structureAccessor) {
+                                            StructureAccessor structureAccessor,
+                                            DimState ds) {
         final int CHANNEL = 11;                 // finalDensity
-        final int CELLS_X = GRID_X;
-        final int CELLS_Y = GRID_Y;
-        final int CELLS_Z = GRID_Z;
+        final int CELLS_X = ds.gridX;
+        final int CELLS_Y = ds.gridY;
+        final int CELLS_Z = ds.gridZ;
         final int CELLS_PER_CHANNEL = CELLS_X * CELLS_Y * CELLS_Z;
         final int PAYLOAD_BASE = 0x88;
-        final int CELL_W = GRID_CW;
-        final int CELL_H = GRID_CH;
-        final int MIN_Y = GRID_MINY;
+        final int CELL_W = ds.cellW;
+        final int CELL_H = ds.cellH;
+        final int MIN_Y = ds.minY;
 
         // Blob layout (multi-chunk): payload = chunk0[16 channels][CPC],
         // chunk1[16 channels][CPC], ... The header channel_offsets only
@@ -432,7 +233,7 @@ public abstract class MixinChunkGenerator {
         int base = (int) (PAYLOAD_BASE + (long) batchIndex * chunkStride
                 + CHANNEL * CELLS_PER_CHANNEL * 4);
 
-        BlockState stone = Blocks.STONE.getDefaultState();
+        BlockState stone = ds.defaultBlock;   // dim-specific solid (stone/netherrack/end_stone)
         BlockState air = Blocks.AIR.getDefaultState();
         Heightmap oceanFloorWg = chunk.getHeightmap(Heightmap.Type.OCEAN_FLOOR_WG);
         Heightmap worldSurfaceWg = chunk.getHeightmap(Heightmap.Type.WORLD_SURFACE_WG);
@@ -484,7 +285,7 @@ public abstract class MixinChunkGenerator {
         // between the two neighbouring cells in each axis. Without this,
         // an entire 4x4x4 cell flips between stone/air at once, which
         // fills the top few blocks of every ocean cell with stone.
-        for (int by = 0; by < GRID_H; by++) {
+        for (int by = 0; by < ds.height; by++) {
             int globalY = MIN_Y + by;
             int secIdx = chunk.getSectionIndex(globalY);
             if (secIdx < 0 || secIdx >= chunk.getSectionArray().length) continue;
@@ -583,12 +384,6 @@ public abstract class MixinChunkGenerator {
             }
         }
 
-        // One-shot: dump ch10's raw structure.
-        if (TRUTH_DUMPED.compareAndSet(false, true) && RAW_ROUTER != null) {
-            String ds = RAW_ROUTER.initialDensityWithoutJaggedness().toString();
-            LOGGER.info("[c2me-wgpu][ch10] len={} head={}", ds.length(),
-                    ds.substring(0, Math.min(2500, ds.length())));
-        }
     }
 
 
@@ -596,6 +391,174 @@ public abstract class MixinChunkGenerator {
 
     /** Strip RegistryEntryHolder + Wrapper(cache) layers so a router
      *  node can be single-shot sampled for diagnostics. */
+    /** Per-dimension GPU state: world handle, batch coordinator, grid dims. */
+    private static final class DimState {
+        final long worldHandle;
+        final WgpuBatchCoordinator coordinator;
+        final int gridX, gridY, gridZ;   // corner counts per axis
+        final int cellW, cellH;          // cell size in blocks
+        final int minY, height;
+        final NoiseRouter rawRouter;
+        /** Dimension's solid block (Overworld stone / Nether netherrack /
+         *  End end_stone). The aquifer returns null for "solid", and we must
+         *  fill with THIS, not a hard-coded stone — otherwise the Nether got
+         *  filled with stone. */
+        final net.minecraft.block.BlockState defaultBlock;
+        DimState(long worldHandle, WgpuBatchCoordinator coordinator,
+                 int gridX, int gridY, int gridZ, int cellW, int cellH,
+                 int minY, int height, NoiseRouter rawRouter,
+                 net.minecraft.block.BlockState defaultBlock) {
+            this.worldHandle = worldHandle;
+            this.coordinator = coordinator;
+            this.gridX = gridX; this.gridY = gridY; this.gridZ = gridZ;
+            this.cellW = cellW; this.cellH = cellH;
+            this.minY = minY; this.height = height;
+            this.rawRouter = rawRouter;
+            this.defaultBlock = defaultBlock;
+        }
+    }
+
+    /** Build a WorldContext for one dimension's noise settings. Returns null
+     *  on any failure so the caller can fall back to the vanilla CPU path. */
+    private static DimState initDimState(ChunkGeneratorSettings settings,
+                                         NoiseConfig noiseConfig, Chunk chunk) {
+        try {
+            NoiseRouter router = decompileRouter(noiseConfig.getNoiseRouter());
+            if (router == null) {
+                LOGGER.warn("[c2me-wgpu] NoiseRouter is null, falling back to CPU");
+                return null;
+            }
+            net.minecraft.world.gen.chunk.GenerationShapeConfig gsc =
+                    settings.generationShapeConfig();
+            int hc = gsc.horizontalCellBlockCount();
+            int vc = gsc.verticalCellBlockCount();
+            int minY = gsc.minimumY();
+            int height = gsc.height();
+            int gx = 16 / hc + 1;
+            int gz = 16 / hc + 1;
+            int gy = height / vc + 1;
+            LOGGER.info("[c2me-wgpu] shape: minY={} h={} cell={}x{} grid={}x{}x{}",
+                    minY, height, hc, vc, gx, gy, gz);
+            NoiseRouterBlobifier.ShapeConfig shape =
+                    new NoiseRouterBlobifier.ShapeConfig(minY, height, hc, vc);
+            ByteBuffer blob = NoiseRouterBlobifier.blobify(router, shape, noiseConfig);
+            LOGGER.info("[c2me-wgpu] first chunk [{} {}], blob size={} bytes",
+                    chunk.getPos().x, chunk.getPos().z, blob.remaining());
+
+            maybeDumpBlobAndRef(router, noiseConfig, chunk, blob,
+                    minY, height, hc, vc, gx, gy, gz);
+
+            long inst = WgpuThinBinding.getInstanceHandle();
+            long world = WgpuThinBinding.worldNew(inst, blob);
+            if (world == 0L) {
+                LOGGER.error("[c2me-wgpu] world_new returned 0; staying on CPU path");
+                return null;
+            }
+            LOGGER.info("[c2me-wgpu] Rust WorldContext created, handle={}", world);
+            WgpuBatchCoordinator coord = new WgpuBatchCoordinator(world);
+            return new DimState(world, coord, gx, gy, gz, hc, vc, minY, height, router,
+                    settings.defaultBlock());
+        } catch (Throwable t) {
+            LOGGER.error("[c2me-wgpu] world init failed; staying on CPU path", t);
+            return null;
+        }
+    }
+
+    /** Optional diagnostic: dump the router blob and a per-channel corner
+     *  reference grid when a dump marker / system property is set. No-op
+     *  otherwise (this is the source of src/test/resources/real_router.bin). */
+    private static void maybeDumpBlobAndRef(NoiseRouter router, NoiseConfig noiseConfig,
+                                            Chunk chunk, ByteBuffer blob,
+                                            int minY, int height, int cellW, int cellH,
+                                            int gx, int gy, int gz) {
+        String dumpPath = System.getProperty("c2me.dumpBlob");
+        if (dumpPath == null || dumpPath.isEmpty()) {
+            dumpPath = System.getenv("C2ME_DUMP_BLOB");
+        }
+        if ((dumpPath == null || dumpPath.isEmpty())
+                && java.nio.file.Files.exists(java.nio.file.Path.of("/tmp/c2me_dump_blob"))) {
+            dumpPath = "/tmp/real_router.bin";
+        }
+        if (dumpPath == null || dumpPath.isEmpty()) {
+            return;
+        }
+        // Per-dimension suffix so the three dimensions don't overwrite each
+        // other's dumps, and we never clobber the committed Overworld fixture
+        // src/test/resources/real_router.bin.
+        dumpPath = dumpPath + "." + minY + "_" + height + "_" + cellW + "_" + cellH;
+        try {
+            java.nio.ByteBuffer dup = blob.duplicate();
+            byte[] bytes = new byte[dup.remaining()];
+            dup.get(bytes);
+            java.nio.file.Files.write(java.nio.file.Path.of(dumpPath), bytes);
+            LOGGER.info("[c2me-wgpu] dumped router blob ({} bytes) to {}", bytes.length, dumpPath);
+        } catch (Throwable t) {
+            LOGGER.warn("[c2me-wgpu] blob dump failed", t);
+        }
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append("# cx cz startX startZ\n");
+            sb.append("CHUNK ").append(chunk.getPos().x).append(' ')
+              .append(chunk.getPos().z).append('\n');
+            sb.append("DIMS ").append(gx).append(" ").append(gy).append(" ").append(gz).append("\n");
+            sb.append("CELL_W ").append(cellW).append("\nMIN_Y ").append(minY).append("\n");
+            NoiseRouter CR = noiseConfig.getNoiseRouter();
+            java.util.LinkedHashMap<String, net.minecraft.world.gen.densityfunction.DensityFunction> chans =
+                    new java.util.LinkedHashMap<>();
+            chans.put("barrierNoise", CR.barrierNoise());
+            chans.put("fluidLevelFloodednessNoise", CR.fluidLevelFloodednessNoise());
+            chans.put("fluidLevelSpreadNoise", CR.fluidLevelSpreadNoise());
+            chans.put("lavaNoise", CR.lavaNoise());
+            chans.put("temperature", CR.temperature());
+            chans.put("vegetation", CR.vegetation());
+            chans.put("continents", CR.continents());
+            chans.put("erosion", CR.erosion());
+            chans.put("depth", CR.depth());
+            chans.put("ridges", CR.ridges());
+            chans.put("initialDensityWithoutJaggedness", CR.initialDensityWithoutJaggedness());
+            chans.put("finalDensity", CR.finalDensity());
+            chans.put("veinToggle", CR.veinToggle());
+            chans.put("veinRidged", CR.veinRidged());
+            chans.put("veinGap", CR.veinGap());
+            int sx = chunk.getPos().getStartX();
+            int sz = chunk.getPos().getStartZ();
+            for (var e : chans.entrySet()) {
+                sb.append("CHANNEL ").append(e.getKey()).append('\n');
+                net.minecraft.world.gen.densityfunction.DensityFunction fd = e.getValue();
+                for (int guard = 0; guard < 32; guard++) {
+                    if (fd instanceof
+                            net.minecraft.world.gen.densityfunction.DensityFunctionTypes.RegistryEntryHolder h) {
+                        fd = h.function().value();
+                    } else if (fd instanceof
+                            net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Wrapper w) {
+                        fd = w.wrapped();
+                    } else {
+                        break;
+                    }
+                }
+                for (int j = 0; j < gy; j++) {
+                    int wy = minY + j * cellH;
+                    for (int k = 0; k < gz; k++) {
+                        int wz = sz + k * cellW;
+                        for (int i = 0; i < gx; i++) {
+                            int wx = sx + i * cellW;
+                            double v = fd.sample(
+                                    new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(
+                                            wx, wy, wz));
+                            sb.append(i).append(' ').append(j).append(' ').append(k)
+                              .append(' ').append((float) v).append('\n');
+                        }
+                    }
+                }
+            }
+            String refPath = dumpPath + ".ref.txt";
+            java.nio.file.Files.writeString(java.nio.file.Path.of(refPath), sb.toString());
+            LOGGER.info("[c2me-wgpu] dumped corner reference to {}", refPath);
+        } catch (Throwable t) {
+            LOGGER.warn("[c2me-wgpu] corner reference dump failed", t);
+        }
+    }
+
     /** Get the raw (un-compiled) tree behind a c2me-opts-dfc compiled node.
      *  CompiledDensityFunction keeps the original DensityFunction in its
      *  blendingFallback; JIT evaluation is numerically identical to it. */
