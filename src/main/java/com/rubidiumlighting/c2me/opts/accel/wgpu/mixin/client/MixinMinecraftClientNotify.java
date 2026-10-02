@@ -25,6 +25,7 @@
 package com.rubidiumlighting.c2me.opts.accel.wgpu.mixin.client;
 
 import com.rubidiumlighting.c2me.opts.accel.wgpu.ModuleEntryPoint;
+import com.rubidiumlighting.c2me.opts.accel.wgpu.NativeLoader;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.hud.ChatHud;
 import net.minecraft.text.Text;
@@ -65,8 +66,10 @@ public class MixinMinecraftClientNotify {
         };
         if (msg != null) chat.addMessage(msg);
 
-        // 2. GC hint (once per session)
-        if (!c2me$gcWarned && !c2me$isZgc()) {
+        // 2. GC hint (once per session). NOT on Android: the custom Android JVM
+        // does not support ZGC (enabling it crashes the whole app on launch),
+        // so the desktop-oriented advice would be actively harmful there.
+        if (!NativeLoader.IS_ANDROID && !c2me$gcWarned && !c2me$isZgc()) {
             c2me$gcWarned = true;
             chat.addMessage(Text.literal("[c2me-wgpu] ")
                     .append(Text.literal("检测到未使用 ZGC，区块生成可能因 GC 停顿而变慢。").formatted(Formatting.YELLOW))
