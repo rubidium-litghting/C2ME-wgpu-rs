@@ -32,45 +32,64 @@ public class ModuleEntryPoint {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu");
 
-    private static final boolean enabled;
+    /** GPU acceleration status, consumed by the client notifier. */
+    public enum Status {
+        OK,                 // GPU acceleration active
+        NATIVE_UNAVAILABLE, // native library missing for this platform
+        FFM_DISABLED,       // --enable-native-access not set
+        INIT_FAILED         // wgpu instance / adapter creation failed
+    }
+
+    private static final Status status;
+    private static final String detail;
 
     static {
-        /*boolean configured = new ConfigSystem.ConfigAccessor()
-                .key("worldGenOptimizations.wgpuAcceleration.enabled")
-                .comment("""
-                        Enable GPU-accelerated world generation using wgpu.
-                        If the GPU is unavailable or initialization fails, this will automatically
-                        fall back to the vanilla CPU path with a warning log.
-                        """)
-                .getBoolean(true, false);
-        */
-        boolean actuallyEnabled = false;
-            try {
-                actuallyEnabled = NativeLoader.isAvailable();
-                if (actuallyEnabled) {
-                    String gpuName = WgpuThinBinding.getGpuName();
-                    LOGGER.info("[c2me-wgpu] wgpu acceleration enabled, GPU: {}", gpuName);
-                } else {
-                    LOGGER.warn("[c2me-wgpu] Native library not available for this platform, falling back to CPU");
-                }
-            } catch (IllegalCallerException e) {
-                LOGGER.warn("""
-                                
-                                [c2me-wgpu] Panama FFM native access is not enabled.
-                                Please add the following JVM argument:
-                                  --enable-native-access=com.rubidiumlighting.c2me.opts.accel.wgpu
-                                Falling back to CPU world generation.
-                                """);
-                actuallyEnabled = false;
-            } catch (Throwable t) {
-                LOGGER.warn("[c2me-wgpu] Failed to initialize wgpu acceleration, falling back to CPU", t);
-                actuallyEnabled = false;
+        Status st;
+        String dt;
+        try {
+            if (!NativeLoader.isAvailable()) {
+                st = Status.NATIVE_UNAVAILABLE;
+                dt = "native library not available for this platform";
+                LOGGER.warn("[c2me-wgpu] {}, falling back to CPU", dt);
+            } else if (!WgpuThinBinding.isAvailable()) {
+                // Library loaded but no usable adapter (driver missing/blocked,
+                // unsupported GPU, etc.). WgpuThinBinding logs the reason.
+                st = Status.INIT_FAILED;
+                dt = "no suitable wgpu adapter (driver missing or unsupported GPU)";
+                LOGGER.warn("[c2me-wgpu] {}, falling back to CPU", dt);
+            } else {
+                dt = WgpuThinBinding.getGpuName();
+                st = Status.OK;
+                LOGGER.info("[c2me-wgpu] wgpu acceleration enabled, GPU: {}", dt);
             }
-        enabled = actuallyEnabled;
+        } catch (IllegalCallerException e) {
+            st = Status.FFM_DISABLED;
+            dt = "--enable-native-access=com.rubidiumlighting.c2me.opts.accel.wgpu";
+            LOGGER.warn("""
+
+                    [c2me-wgpu] Panama FFM native access is not enabled.
+                    Please add the following JVM argument:
+                      {}
+                    Falling back to CPU world generation.
+                    """, dt);
+        } catch (Throwable t) {
+            st = Status.INIT_FAILED;
+            dt = String.valueOf(t.getMessage());
+            LOGGER.warn("[c2me-wgpu] Failed to initialise wgpu acceleration, falling back to CPU", t);
+        }
+        status = st;
+        detail = dt;
     }
 
     public static boolean isEnabled() {
-        return enabled;
+        return status == Status.OK;
     }
 
+    public static Status getStatus() {
+        return status;
+    }
+
+    public static String getDetail() {
+        return detail;
+    }
 }

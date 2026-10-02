@@ -10,7 +10,9 @@
     "ChunkNoiseSamplerAccessor",
     "NoiseChunkGeneratorInvoker"
   ],
-  "client": [],
+  "client": [
+    "client.MixinMinecraftClientNotify"
+  ],
   "server": [],
   "injectors": {
     "defaultRequire": 1

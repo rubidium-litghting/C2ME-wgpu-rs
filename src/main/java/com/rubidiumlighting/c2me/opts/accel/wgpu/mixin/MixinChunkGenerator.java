@@ -24,6 +24,7 @@
 
 package com.rubidiumlighting.c2me.opts.accel.wgpu.mixin;
 
+import com.rubidiumlighting.c2me.opts.accel.wgpu.ModuleEntryPoint;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.NoiseRouterBlobifier;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuBatchCoordinator;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuThinBinding;
@@ -73,7 +74,11 @@ public abstract class MixinChunkGenerator {
     private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,
                                  StructureAccessor structureAccessor, Chunk chunk,
                                  CallbackInfoReturnable<CompletableFuture<Chunk>> cir) {
-        if (!WgpuThinBinding.isAvailable()) {
+        // GPU availability: use ModuleEntryPoint (which captures init failure
+        // safely). WgpuThinBinding.isAvailable() would itself trigger the
+        // class <clinit>; though now failure-safe, ModuleEntryPoint is the
+        // single source of truth and also reports the reason to the player.
+        if (!ModuleEntryPoint.isEnabled()) {
             return;
         }
 

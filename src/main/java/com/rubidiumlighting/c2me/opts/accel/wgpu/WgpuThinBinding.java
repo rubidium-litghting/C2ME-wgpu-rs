@@ -46,16 +46,19 @@ public class WgpuThinBinding {
     public static final int STATUS_ERROR = 2;
     public static final int STATUS_INVALID_HANDLE = -1;
 
-    private static final MethodHandle MH_create_instance;
-    private static final MethodHandle MH_world_new;
-    private static final MethodHandle MH_request_chunks;
-    private static final MethodHandle MH_poll_status;
-    private static final MethodHandle MH_take_result_blob;
-    private static final MethodHandle MH_get_gpu_name;
+    private static MethodHandle MH_create_instance;
+    private static MethodHandle MH_world_new;
+    private static MethodHandle MH_request_chunks;
+    private static MethodHandle MH_poll_status;
+    private static MethodHandle MH_take_result_blob;
+    private static MethodHandle MH_get_gpu_name;
 
-    private static final long instanceHandle;
+    private static long instanceHandle;
+    /** True only if the native lib linked AND a wgpu instance was created. */
+    private static boolean available;
 
     static {
+        boolean linked = true;
         try {
             MH_create_instance = NativeLoader.linker.downcallHandle(
                     NativeLoader.lookup.find("c2me_wgpu_create_instance").orElseThrow(),
@@ -116,29 +119,39 @@ public class WgpuThinBinding {
                     )
             );
         } catch (Throwable t) {
-            throw new RuntimeException("[c2me-wgpu] Failed to link FFM downcall handles", t);
+            System.err.println("[c2me-wgpu] FFM link failed: " + t);
+            linked = false;
         }
 
-        // Auto-create the singleton WgpuInstance on class load
-        try (Arena errArena = Arena.ofConfined()) {
-            MemorySegment errBuf = errArena.allocate(1024);
-            long h = (long) MH_create_instance.invokeExact(
-                    0L,                    // features_mask: 0 = default
-                    errBuf,
-                    errBuf.byteSize()
-            );
-            if (h == 0) {
-                String msg = errBuf.getString(0);
-                throw new RuntimeException("[c2me-wgpu] Failed to create wgpu instance: " + msg);
+        // Auto-create the singleton WgpuInstance on class load. IMPORTANT: this
+        // block must NEVER throw — a class whose <clinit> throws is permanently
+        // poisoned (NoClassDefFoundError afterwards), so the fallback guard in
+        // callers would itself explode. On any failure we just leave
+        // instanceHandle=0 / available=false.
+        if (linked) {
+            try (Arena errArena = Arena.ofConfined()) {
+                MemorySegment errBuf = errArena.allocate(1024);
+                long h = (long) MH_create_instance.invokeExact(
+                        0L,                    // features_mask: 0 = default
+                        errBuf,
+                        errBuf.byteSize()
+                );
+                if (h == 0) {
+                    System.err.println("[c2me-wgpu] Failed to create wgpu instance: " + errBuf.getString(0));
+                } else {
+                    instanceHandle = h;
+                    available = true;
+                }
+            } catch (Throwable t) {
+                System.err.println("[c2me-wgpu] create_instance failed: " + t);
             }
-            instanceHandle = h;
-        } catch (Throwable t) {
-            if (t instanceof RuntimeException re) throw re;
-            throw new RuntimeException("[c2me-wgpu] create_instance failed", t);
         }
     }
 
     public static String getGpuName() {
+        if (MH_get_gpu_name == null) {
+            return "unknown (not linked)";
+        }
         try {
             var result = MH_get_gpu_name.invoke();
             if (result instanceof MemorySegment) {
@@ -170,7 +183,7 @@ public class WgpuThinBinding {
     }
 
     public static boolean isAvailable() {
-        return NativeLoader.isAvailable();
+        return available;
     }
 
     /**
