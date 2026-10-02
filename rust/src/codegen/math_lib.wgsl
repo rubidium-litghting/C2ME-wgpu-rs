@@ -829,7 +829,15 @@ fn end_islands(perm_index: i32, block_x: i32, block_z: i32) -> f32 {
     let z2 = z / 2;
     let xr = x % 2;
     let zr = z % 2;
-    var d = clamp(100.0 - sqrt(f32(x * x + z * z)) * 8.0, -100.0, 80.0);
+    // MC keeps x*x in int (i32) and lets it overflow; a negative i32 then
+    // goes through Math.sqrt(negative) = NaN. WGSL's sqrt(neg) is undefined
+    // (some GPUs return 0 -> fabricates terrain). Detect the overflowed
+    // negative sum and return NaN explicitly, matching Java.
+    let ss: i32 = x * x + z * z;
+    if (ss < 0) {
+        return bitcast<f32>(0x7fc00000u); // quiet NaN
+    }
+    var d = clamp(100.0 - sqrt(f32(ss)) * 8.0, -100.0, 80.0);
     for (var dx: i32 = -12; dx <= 12; dx = dx + 1) {
         for (var dz: i32 = -12; dz <= 12; dz = dz + 1) {
             let lx = x2 + dx;
