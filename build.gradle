@@ -204,6 +204,68 @@ if (!project.hasProperty('skipRust') || !project.property('skipRust').toBoolean(
     sourcesJar.dependsOn rustBuild
     checkLicenseMain.dependsOn rustBuild
 
+    // -- Android cross-compilation (opt-in: needs NDK + cargo-ndk) ----------
+    // Runs when ANDROID_NDK_HOME is set; disable with -PskipAndroid.
+    // ABIs via -PandroidAbis=arm64-v8a,armeabi-v7a (default arm64-v8a).
+    def androidAbis = (project.findProperty('androidAbis') ?: 'arm64-v8a').toString().split(',')
+    def abiToTarget = ['arm64-v8a':'aarch64-linux-android',
+                       'armeabi-v7a':'armv7-linux-androideabi',
+                       'x86_64':'x86_64-linux-android',
+                       'x86':'i686-linux-android']
+    def abiToArchDir = ['arm64-v8a':'aarch64',
+                        'armeabi-v7a':'armv7',
+                        'x86_64':'x86_64',
+                        'x86':'x86_32']
+    boolean buildAndroid = System.getenv('ANDROID_NDK_HOME') != null
+            && !(project.hasProperty('skipAndroid') && project.property('skipAndroid').toBoolean())
+
+    if (buildAndroid) {
+        tasks.register('rustBuildAndroid') {
+            group = 'build'
+            description = 'Cross-compile the Rust cdylib for Android ABIs (cargo-ndk).'
+            inputs.dir(new File(rustDir, 'src'))
+            inputs.file(new File(rustDir, 'Cargo.toml'))
+            inputs.file(new File(rustDir, 'Cargo.lock'))
+            outputs.dir(rustNativesRoot)
+
+            doLast {
+                androidAbis.each { abi ->
+                    abi = abi.trim()
+                    def target = abiToTarget[abi]
+                    def archDir = abiToArchDir[abi]
+                    if (target == null) {
+                        throw new GradleException("Unknown Android ABI: ${abi}")
+                    }
+                    logger.lifecycle("[c2me-wgpu] cargo ndk -t ${abi} build --release")
+                    def proc = new ProcessBuilder('cargo', 'ndk', '-t', abi, 'build', '--release')
+                            .directory(rustDir)
+                            .inheritIO()
+                            .start()
+                    int code = proc.waitFor()
+                    if (code != 0) {
+                        throw new GradleException("cargo ndk build for ${abi} failed (exit ${code})")
+                    }
+                    def built = new File(rustDir, "target/${target}/release/${rustLibName}")
+                    if (!built.exists()) {
+                        throw new GradleException("Android lib not found: ${built}")
+                    }
+                    def stageDir = new File(rustNativesRoot, "natives/android-${archDir}")
+                    stageDir.mkdirs()
+                    copy {
+                        from built
+                        into stageDir
+                    }
+                    logger.lifecycle("[c2me-wgpu] Staged Android native -> ${stageDir}/${rustLibName}")
+                }
+            }
+        }
+        processResources.dependsOn rustBuildAndroid
+        sourcesJar.dependsOn rustBuildAndroid
+        checkLicenseMain.dependsOn rustBuildAndroid
+    } else {
+        logger.lifecycle("[c2me-wgpu] Android build skipped (ANDROID_NDK_HOME unset or -PskipAndroid)")
+    }
+
     // Package the staged natives into the JAR explicitly (avoids registering
     // build/rust-natives as a source set, which would confuse license/source scans).
     processResources {

@@ -41,8 +41,13 @@ public class NativeLoader {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(NativeLoader.class);
 
+    /** Android's custom JVM reports os.name as "Linux"; detect it explicitly so
+     *  we look under natives/android-<arch>/ instead of linux-<arch>/. The two
+     *  are NOT ABI-compatible (Android = bionic, desktop Linux = glibc). */
+    public static final boolean IS_ANDROID = detectAndroid();
+
     public static final String NORMALIZED_ARCH = normalizeArch(SystemPropertyUtil.get("os.arch", ""));
-    public static final String NORMALIZED_OS = normalizeOs(SystemPropertyUtil.get("os.name", ""));
+    public static final String NORMALIZED_OS = IS_ANDROID ? "android" : normalizeOs(SystemPropertyUtil.get("os.name", ""));
 
     private static final Arena arena = Arena.ofAuto();
     public static final SymbolLookup lookup;
@@ -64,6 +69,19 @@ public class NativeLoader {
             return "Available";
         } else {
             return String.format("Unavailable (no native library for %s-%s)", NORMALIZED_OS, NORMALIZED_ARCH);
+        }
+    }
+
+    private static boolean detectAndroid() {
+        try {
+            if (System.getenv("ANDROID_ROOT") != null || System.getenv("ANDROID_DATA") != null) {
+                return true;
+            }
+        } catch (Throwable ignored) {}
+        try {
+            return Files.exists(Path.of("/system/build.prop"));
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 
@@ -102,6 +120,9 @@ public class NativeLoader {
         }
         if ("aarch64".equals(value)) {
             return "aarch64";
+        }
+        if (value.matches("^(armv7l|armv7|armeabi|armeabiv7a)$")) {
+            return "armv7";
         }
         return "unknown";
     }
