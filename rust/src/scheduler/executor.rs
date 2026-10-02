@@ -80,6 +80,13 @@ pub struct SingleBatchExecutor {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     staging: StagingChain,
+    /// Persistent GPU buffers reused across dispatches. Allocating these per
+    /// batch leaked: wgpu defers buffer destruction until in-flight work
+    /// completes, so on slow GPUs (Mali) the un-reclaimed buffers piled up and
+    /// OOM'd. Sizes are fixed by max_batch_size, so one set suffices.
+    params_buf: wgpu::Buffer,
+    positions_buf: wgpu::Buffer,
+    output_buf: wgpu::Buffer,
     #[allow(dead_code)]
     bind_group_layout: wgpu::BindGroupLayout,
     #[allow(dead_code)]
@@ -100,6 +107,27 @@ impl SingleBatchExecutor {
         let max_buffer_size = bytes_per_chunk * config.max_batch_size.max(1);
         let staging = StagingChain::new(&device, config.staging_capacity, max_buffer_size);
 
+        // Persistent buffers (see struct doc). output_buf is sized for the
+        // max batch; smaller batches use a prefix.
+        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("c2me_wgpu_params"),
+            size: std::mem::size_of::<WorldgenParams>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let positions_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("c2me_wgpu_positions"),
+            size: (config.max_batch_size.max(1) * 2 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("c2me_wgpu_out_buf"),
+            size: max_buffer_size as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
         let bind_group_layout = bind_group::create_layout(&device)
             .map_err(|e| format!("bind group layout: {e}"))?;
         let pipeline_layout = bind_group::create_pipeline_layout(&device, &bind_group_layout)
@@ -109,6 +137,9 @@ impl SingleBatchExecutor {
             device,
             queue,
             staging,
+            params_buf,
+            positions_buf,
+            output_buf,
             bind_group_layout,
             pipeline_layout,
             config,
@@ -129,6 +160,11 @@ impl SingleBatchExecutor {
             .ok_or_else(|| "pipeline not compiled".to_string())?;
 
         let t0 = std::time::Instant::now();
+        if batch.positions.len() > self.config.max_batch_size {
+            return Err(format!(
+                "batch size {} exceeds max_batch_size {}",
+                batch.positions.len(), self.config.max_batch_size));
+        }
         let num_chunks = batch.positions.len() as u32;
         let f32_per_chunk = 16 * 2425; // 16 channels × (5×97×5 corner grid)
         let total_f32s = (num_chunks as usize) * f32_per_chunk;
@@ -158,12 +194,8 @@ impl SingleBatchExecutor {
             _pad: [0; 8],
         };
 
-        // Create params buffer (binding 0)
-        let params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("c2me_wgpu_params"),
-            contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
+        // Update the persistent params buffer (binding 0).
+        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
         // Packed chunk positions [cx,cz,...] for the shader (binding 4).
         // Sorted + deduped by PendingQueue::flush, matching the output order.
@@ -172,11 +204,8 @@ impl SingleBatchExecutor {
             packed_positions.push(cx);
             packed_positions.push(cz);
         }
-        let positions_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("c2me_wgpu_positions"),
-            contents: bytemuck::cast_slice(&packed_positions),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        // Update the persistent positions buffer (binding 4).
+        self.queue.write_buffer(&self.positions_buf, 0, bytemuck::cast_slice(&packed_positions));
 
         // Get or create perm buffer (binding 1)
         let perm_buf = world.perm_buffer()
@@ -186,13 +215,8 @@ impl SingleBatchExecutor {
         let simplex_buf = world.simplex_buffer()
             .ok_or_else(|| "simplex buffer not uploaded".to_string())?;
 
-        // Create output buffer (binding 2)
-        let output_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("c2me_wgpu_out_buf"),
-            size: total_bytes as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        // Reuse the persistent output buffer (binding 2).
+
 
         // Acquire staging slot
         let (staging_buf, slot_handle) = self
@@ -207,7 +231,7 @@ impl SingleBatchExecutor {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: params_buf.as_entire_binding(),
+                    resource: self.params_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -215,7 +239,7 @@ impl SingleBatchExecutor {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: output_buf.as_entire_binding(),
+                    resource: self.output_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -223,7 +247,7 @@ impl SingleBatchExecutor {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: positions_buf.as_entire_binding(),
+                    resource: self.positions_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
@@ -265,7 +289,7 @@ impl SingleBatchExecutor {
 
         // Copy output buffer → staging buffer for CPU readback
         encoder.copy_buffer_to_buffer(
-            &output_buf,
+            &self.output_buf,
             0,
             &staging_buf,
             0,

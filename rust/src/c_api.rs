@@ -365,10 +365,21 @@ pub unsafe extern "C" fn c2me_wgpu_take_result_blob(
     }
     let (ptr, len) = blob.into_raw_parts();
     unsafe {
-        ptr::write(out_ptr, ptr);
+        ptr::write(out_ptr, ptr as *const u8);
         ptr::write(out_len, len);
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// ⑥ Free a result blob handed out by c2me_wgpu_take_result_blob.
+//
+/// # Safety
+/// `ptr`/`len` must come from exactly one `take_result_blob` call and must not
+/// have been freed already.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2me_wgpu_free_result_blob(ptr: *mut u8, len: usize) {
+    unsafe { ResultBlob::free_raw_parts(ptr, len) };
 }
 
 // ---------------------------------------------------------------------------

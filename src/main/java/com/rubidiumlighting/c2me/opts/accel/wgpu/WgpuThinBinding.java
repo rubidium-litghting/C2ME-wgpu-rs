@@ -52,6 +52,7 @@ public class WgpuThinBinding {
     private static MethodHandle MH_poll_status;
     private static MethodHandle MH_take_result_blob;
     private static MethodHandle MH_get_gpu_name;
+    private static MethodHandle MH_free_result_blob;
 
     private static long instanceHandle;
     /** True only if the native lib linked AND a wgpu instance was created. */
@@ -116,6 +117,14 @@ public class WgpuThinBinding {
                     NativeLoader.lookup.find("c2me_wgpu_get_gpu_name").orElseThrow(),
                     FunctionDescriptor.of(
                             ValueLayout.ADDRESS          // -> *const c_char (static UTF-8)
+                    )
+            );
+
+            MH_free_result_blob = NativeLoader.linker.downcallHandle(
+                    NativeLoader.lookup.find("c2me_wgpu_free_result_blob").orElseThrow(),
+                    FunctionDescriptor.ofVoid(
+                            ValueLayout.ADDRESS,         // ptr: *mut u8
+                            ValueLayout.JAVA_LONG        // len: usize
                     )
             );
         } catch (Throwable t) {
@@ -280,7 +289,21 @@ public class WgpuThinBinding {
             }
             MemorySegment dataPtr = outPtr.get(ValueLayout.ADDRESS, 0);
             long len = outLen.get(ValueLayout.JAVA_LONG, 0);
-            return dataPtr.reinterpret(len);
+            if (dataPtr.address() == 0 || len <= 0) {
+                if (MH_free_result_blob != null) {
+                    MH_free_result_blob.invokeExact(dataPtr, len);
+                }
+                return MemorySegment.ofArray(new byte[0]);
+            }
+            // Copy the Rust-owned blob into a Java heap array, then reclaim the
+            // native buffer immediately. Without this, each batch's result Vec
+            // leaked (into_raw_parts forgot it, nothing ever freed) -> ~10 GB
+            // after ~65k chunks.
+            byte[] copy = new byte[(int) len];
+            MemorySegment.copy(dataPtr.reinterpret(len), 0,
+                    MemorySegment.ofArray(copy), 0, len);
+            MH_free_result_blob.invokeExact(dataPtr, len);
+            return MemorySegment.ofArray(copy);
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
             throw new RuntimeException(t);

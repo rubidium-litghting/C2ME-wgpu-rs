@@ -90,13 +90,29 @@ impl ResultBlob {
         Self { data: v }
     }
 
-    /// Returns (data_ptr, data_len). Leaks the backing Vec; caller must
-    /// arrange to reclaim it later (TODO: real ownership via Arc+Drop).
-    pub fn into_raw_parts(self) -> (*const u8, usize) {
-        let len = self.data.len();
-        let ptr = self.data.as_ptr();
-        std::mem::forget(self.data);
+    /// Returns (data_ptr, data_len). Transfers ownership of the backing
+    /// buffer to the caller, which MUST reclaim it via `free_raw_parts`
+    /// (exposed to Java as `c2me_wgpu_free_result_blob`) or it leaks.
+    pub fn into_raw_parts(self) -> (*mut u8, usize) {
+        // into_boxed_slice shrinks capacity to len, so free_raw_parts can
+        // rebuild an exact Box<[u8]> without tracking capacity separately.
+        let boxed: Box<[u8]> = self.data.into_boxed_slice();
+        let len = boxed.len();
+        let ptr = Box::into_raw(boxed) as *mut u8;
         (ptr, len)
+    }
+
+    /// Reclaim a buffer previously handed out by `into_raw_parts`.
+    ///
+    /// # Safety
+    /// `ptr`/`len` must come from exactly one `into_raw_parts` call and not
+    /// have been freed already.
+    pub unsafe fn free_raw_parts(ptr: *mut u8, len: usize) {
+        if ptr.is_null() {
+            return;
+        }
+        let slice = std::ptr::slice_from_raw_parts_mut(ptr, len);
+        drop(unsafe { Box::from_raw(slice) });
     }
 
     /// Verify the 4-byte CRC32 trailer matches the rest of the blob.
