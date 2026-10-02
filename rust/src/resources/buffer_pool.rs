@@ -59,9 +59,6 @@ impl Bucket {
     fn push(&mut self, buf: wgpu::Buffer) {
         self.buffers.push_back(buf);
     }
-    fn len(&self) -> usize {
-        self.buffers.len()
-    }
 }
 
 /// Recycle GPU buffers by size bucket instead of reallocating per dispatch.
@@ -188,7 +185,7 @@ mod tests {
 
     #[test]
     fn acquire_release_roundtrip() {
-        let mut pool = BufferPool::new(false);
+        let pool = BufferPool::new(false);
         // No GPU in unit tests — we can't create real buffers.
         // Just test the round_up logic and pool bookkeeping.
         assert_eq!(pool.total_free(), 0);

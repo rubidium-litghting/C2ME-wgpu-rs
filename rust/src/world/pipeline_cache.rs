@@ -35,8 +35,10 @@
 //!        * `pass_id == 2` → two-pass `main_pass_b`
 //!      Hit → clone the `Arc`-backed `wgpu::ComputePipeline` and return.
 //!      Miss → compile via `device.create_compute_pipeline` then insert.
-//!   2. **On-disk** (TODO): `$XDG_CACHE_HOME/c2me/wgpu_pipeline_<hex>.cache`,
-//!      LZ4_flex-compressed `wgpu::PipelineCache` data blob.
+//!   2. **On-disk**: `$XDG_CACHE_HOME/c2me/wgpu_pipelines/<fingerprint>.cache`,
+//!      LZ4_flex-compressed `wgpu::PipelineCache` data blob (see `load`/`save`).
+//!      Populated in `get_or_compile`: loaded before `create_compute_pipeline`,
+//!      persisted after via `PipelineCache::get_data`.
 //!
 //! ## Cross-world sharing
 //!
@@ -165,7 +167,7 @@ pub fn get_or_compile(
 }
 
 // ============================================================================
-// On-disk LZ4_flex-compressed pipeline cache (TODO — phase 4+)
+// On-disk LZ4_flex-compressed pipeline cache
 // ============================================================================
 
 /// Directory holding on-disk pipeline caches.

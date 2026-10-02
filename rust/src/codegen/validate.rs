@@ -144,12 +144,7 @@ mod tests {
         validate_wgsl(&src).expect("mixed-noise Root must be valid WGSL");
     }
 
-    /// Cache wrappers — phase 4-3 real shared-memory implementation.
-    /// Verifies that Cache2D + CacheFlat + CacheInterpolated all emit valid
-    /// WGSL with proper `var<workgroup>` declarations, `workgroupBarrier()`,
-    /// and shared-memory reads — all within a single-pass `main_entry`.
-    #[test]
-    /// Cache wrappers - all three degrade to pass-through memoisation.
+    /// Cache wrappers — all three degrade to pass-through memoisation.
     /// Cache2D / CacheFlat skip shared memory (avoids barrier-in-loop UB);
     /// CacheInterpolated likewise passes through because the dispatch grid
     /// now IS the corner grid (cell_count + 1 per axis).

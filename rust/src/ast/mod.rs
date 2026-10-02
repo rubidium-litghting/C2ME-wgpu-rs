@@ -551,16 +551,6 @@ mod tests {
         h.finish()
     }
 
-    fn assert_hash_eq_if_partial_eq(a: &AstNode, b: &AstNode) {
-        if a == b {
-            assert_eq!(
-                hash_one(a),
-                hash_one(b),
-                "Hash/PartialEq inconsistency: a==b but hash(a)!=hash(b)"
-            );
-        }
-    }
-
     #[test]
     fn float_zero_plus_minus_hash_identical() {
         // +0.0 == -0.0（PartialEq 为 true），所以哈希必须相同

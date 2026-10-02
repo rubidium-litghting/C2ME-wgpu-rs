@@ -431,7 +431,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../src/test/resources/real_router.bin"
         );
-        let mut blob: Vec<u8> = if std::path::Path::new(real_path).exists() {
+        let blob: Vec<u8> = if std::path::Path::new(real_path).exists() {
             let b = std::fs::read(real_path).expect("read real_router.bin");
             println!("[bench] using REAL router blob: {} bytes", b.len());
             b
@@ -1871,7 +1871,7 @@ mod tests {
             .unwrap_or((5, 97, 5));
         let (dx, dy, dz) = dims;
         let _ = dy;
-        let CPC: usize = dx * dy * dz;
+        let cpc: usize = dx * dy * dz;
         let mut chunk = (0i32, 0i32);
         // name -> (gpu_channel, values)
         let chan_map: &[(&str, usize)] = &[
@@ -1908,7 +1908,7 @@ mod tests {
             if let Some(name) = line.strip_prefix("CHANNEL ") {
                 cur_ch = chan_map.iter().find(|(n, _)| *n == name).map(|(_, c)| *c);
                 if let Some(c) = cur_ch {
-                    ref_data.entry(c).or_insert_with(|| vec![0f32; CPC]);
+                    ref_data.entry(c).or_insert_with(|| vec![0f32; cpc]);
                 }
                 continue;
             }
@@ -1956,9 +1956,9 @@ mod tests {
             if let Some(exp_vec) = ref_data.get(rch) {
                 let mut best = (usize::MAX, f64::MAX);
                 for gch in 0..16usize {
-                    let gbase = gch * CPC * 4;
+                    let gbase = gch * cpc * 4;
                     let mut ss = 0.0f64;
-                    for idx in 0..CPC {
+                    for idx in 0..cpc {
                         let gpu = f32::from_le_bytes(
                             payload[gbase + idx * 4..gbase + idx * 4 + 4]
                                 .try_into()
@@ -1967,7 +1967,7 @@ mod tests {
                         let d = (gpu - exp_vec[idx]) as f64;
                         ss += d * d;
                     }
-                    let rms = (ss / CPC as f64).sqrt();
+                    let rms = (ss / cpc as f64).sqrt();
                     if rms < best.1 {
                         best = (gch, rms);
                     }
@@ -1988,12 +1988,12 @@ mod tests {
                     continue;
                 }
             };
-            let base = ch * CPC * 4;
+            let base = ch * cpc * 4;
             let mut max_diff = 0.0f32;
             let mut sum_sq = 0.0f64;
             let mut nan_both = 0usize;
             let mut nan_mismatch = 0usize;
-            for idx in 0..CPC {
+            for idx in 0..cpc {
                 let gpu = f32::from_le_bytes(
                     payload[base + idx * 4..base + idx * 4 + 4]
                         .try_into()
@@ -2011,7 +2011,7 @@ mod tests {
             if nan_both > 0 || nan_mismatch > 0 {
                 println!("  ch{:2} NaN: both={} mismatch={}", ch, nan_both, nan_mismatch);
             }
-            let rms = (sum_sq / CPC as f64).sqrt();
+            let rms = (sum_sq / cpc as f64).sqrt();
             // Pass criterion: RMS below the fp32 budget (计划.md §0). max_diff
             // is reported but not decisive — a handful of outlier cells can
             // exceed 1e-4 purely from fp32 rounding in deep expressions
@@ -2029,7 +2029,7 @@ mod tests {
                 if ok { "OK" } else { "FAIL" }
             );
             if *ch == 11 {
-                let mut worst: Vec<(f32, usize)> = (0..CPC)
+                let mut worst: Vec<(f32, usize)> = (0..cpc)
                     .map(|idx| {
                         let gpu = f32::from_le_bytes(
                             payload[base + idx * 4..base + idx * 4 + 4]
@@ -2303,7 +2303,6 @@ mod tests {
             .unwrap();
         let bytes = br.as_bytes();
         let payload = &bytes[0x88..];
-        const CPC: usize = 5 * 97 * 5;
 
         let mut max_diff = 0.0f32;
         let mut n_hit = 0;

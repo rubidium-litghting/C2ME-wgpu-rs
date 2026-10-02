@@ -646,13 +646,3 @@ mod tests {
     }
 
 }
-
-/// Extract a variable name from either `let <name>: f32 = …;` or
-/// `var <name>: TYPE = …;` — returns the bare identifier before `:`.
-fn extract_var_name_prefix(line: &str) -> String {
-    let t = line.trim();
-    let after = t.strip_prefix("let ").or_else(|| t.strip_prefix("var "))
-        .expect("caller must pass a `let` or `var` line");
-    let colon = after.find(':').expect("line must contain `:` type-annotation");
-    after[..colon].trim().to_string()
-}

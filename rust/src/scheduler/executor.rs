@@ -36,7 +36,6 @@ use std::thread::{self, JoinHandle};
 
 use rustc_hash::FxHashMap;
 use crossbeam::channel;
-use wgpu::util::DeviceExt;
 
 use crate::result::ResultBlob;
 use crate::scheduler::batcher::Batch;
@@ -272,8 +271,8 @@ impl SingleBatchExecutor {
 
             // Cell grid per chunk = (16/cell_width, height/cell_height, 16/cell_width).
             // Workgroup size is (4,4,4), so dispatch that many workgroups.
-            let cw = (shape.cell_width.max(1) as u32);
-            let chh = (shape.cell_height.max(1) as u32);
+            let cw = shape.cell_width.max(1) as u32;
+            let chh = shape.cell_height.max(1) as u32;
             // Corner grid: one more corner than cells per axis.
             let ccx = 16 / cw + 1;
             let ccz = 16 / cw + 1;

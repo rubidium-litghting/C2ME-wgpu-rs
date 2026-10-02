@@ -658,7 +658,9 @@ fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
             }
             Root(channels)
         }
-        // TODO: implement all remaining tags (0x10..0xDF, 0x90..0x9F, etc.) recursively
+        // All tags emitted by NoiseRouterBlobifier are handled above.
+        // Unknown tags are a hard error (Java side logs UNSUPPORTED NODE
+        // and falls back to a constant 0, so they should not reach here).
         other => return Err(anyhow!("unsupported AST node tag: 0x{other:02X}")),
     };
     Ok((node, cursor - offset))
