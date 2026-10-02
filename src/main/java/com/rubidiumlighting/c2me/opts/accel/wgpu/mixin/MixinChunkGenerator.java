@@ -61,6 +61,7 @@ public abstract class MixinChunkGenerator {
      *  was reused for any later, differently-shaped dimension. */
     private static final java.util.concurrent.ConcurrentHashMap<ChunkGeneratorSettings, DimState>
             DIM_STATES = new java.util.concurrent.ConcurrentHashMap<>();
+
     /** Marker file: when present, skip GPU entirely so MC generates vanilla
      *  blocks; the RETURN injection then dumps them for comparison. */
     private static final java.nio.file.Path VANILLA_REF_MARKER =
@@ -135,8 +136,10 @@ public abstract class MixinChunkGenerator {
                             ((NoiseChunkGeneratorInvoker) (Object) gen)
                                     .callCreateChunkNoiseSampler(cs, fSa, fBlender, fNc));
             net.minecraft.world.gen.chunk.AquiferSampler aquifer = sampler.getAquiferSampler();
+            net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler oreVein =
+                    ((ChunkNoiseSamplerAccessor) (Object) sampler).getBlockStateSampler();
 
-            writeDensityToChunk(chunk, seg, aquifer, gpu.batchIndex, structureAccessor, ds);
+            writeDensityToChunk(chunk, seg, aquifer, oreVein, gpu.batchIndex, structureAccessor, ds);
             maybeDumpBlocks(chunk, "gpu");
 
             // Cancel vanilla generation and hand back the (now filled) chunk.
@@ -204,6 +207,7 @@ public abstract class MixinChunkGenerator {
      */
     private static void writeDensityToChunk(Chunk chunk, java.lang.foreign.MemorySegment seg,
                                             net.minecraft.world.gen.chunk.AquiferSampler aquifer,
+                                            net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler oreVein,
                                             int batchIndex,
                                             StructureAccessor structureAccessor,
                                             DimState ds) {
@@ -276,6 +280,13 @@ public abstract class MixinChunkGenerator {
             if (d > dmax) dmax = d;
             if (d > 0.0f) stoneCells++; else airCells++;
         }
+        // veinToggle (ch12) corner cells — used only as a cheap coarse filter
+        // for ore veins (the real vein logic is per-block + randomised).
+        final int CHANNEL_VT = 12;
+        int vtBase = (int) (PAYLOAD_BASE + (long) batchIndex * chunkStride
+                + CHANNEL_VT * CELLS_PER_CHANNEL * 4);
+        float[] vtCells = new float[CELLS_PER_CHANNEL];
+        for (int i = 0; i < CELLS_PER_CHANNEL; i++) vtCells[i] = bb.getFloat(vtBase + i * 4);
         // Block-level trilinear interpolation.
         //
         // MC's ChunkNoiseSampler evaluates the density at every BLOCK via
@@ -346,7 +357,38 @@ public abstract class MixinChunkGenerator {
                     double beard = (structureWeight != null)
                             ? structureWeight.sample(npos) : 0.0;
                     BlockState bs = aquifer.apply(npos, (double) d + beard);
-                    if (bs == null) bs = stone;
+                    if (bs == null) {
+                        // Solid. Ore veins are per-block + randomised, so they
+                        // cannot live on the corner grid. Only compute the
+                        // veinToggle filter for solid blocks inside the vein Y
+                        // band (copper 0..48, iron -60..-8 -> use -64..56);
+                        // everything else skips the interpolation entirely.
+                        BlockState vein = null;
+                        if (oreVein != null && globalY >= -64 && globalY <= 56) {
+                            float v000 = vtCells[cx0 + cz0 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
+                            float v100 = vtCells[cx1 + cz0 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
+                            float v010 = vtCells[cx0 + cz0 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
+                            float v110 = vtCells[cx1 + cz0 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
+                            float v001 = vtCells[cx0 + cz1 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
+                            float v101 = vtCells[cx1 + cz1 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
+                            float v011 = vtCells[cx0 + cz1 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
+                            float v111 = vtCells[cx1 + cz1 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
+                            float vx00 = v000 + tx * (v100 - v000);
+                            float vx10 = v010 + tx * (v110 - v010);
+                            float vx01 = v001 + tx * (v101 - v001);
+                            float vx11 = v011 + tx * (v111 - v011);
+                            float vy0 = vx00 + ty * (vx10 - vx00);
+                            float vy1 = vx01 + ty * (vx11 - vx01);
+                            float vt = vy0 + tz * (vy1 - vy0);
+                            // MC's real gate is |veinToggle| + yClamp < 0.4
+                            // -> skip. Interpolated vt is smoothed, so use a
+                            // matching 0.4 threshold; this keeps oreCalls low.
+                            if (Math.abs(vt) >= 0.4f) {
+                                vein = oreVein.sample(npos);
+                            }
+                        }
+                        bs = (vein != null) ? vein : stone;
+                    }
                     if (bs == air) continue;
                     if (densityDump != null) {
                         int gx = chunk.getPos().getStartX() + bx;
