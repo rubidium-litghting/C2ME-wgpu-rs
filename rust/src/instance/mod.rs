@@ -81,14 +81,28 @@ impl WgpuInstance {
 
         let (device, queue) = pollster::block_on(
         adapter.request_device(&DeviceDescriptor{
-            required_features: wgpu::Features::PIPELINE_CACHE,
+            required_features: if crate::no_pipeline_cache() {
+                wgpu::Features::empty()
+            } else {
+                wgpu::Features::PIPELINE_CACHE
+            },
             required_limits: wgpu::Limits::default(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             label: None,
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
         }))?;
-        
+
+        // Surface wgpu validation/OOM errors through our log instead of letting
+        // the default handler panic (which, across the FFM boundary, aborts
+        // the whole process with no message — exactly what we saw on Mali).
+        device.on_uncaptured_error(std::sync::Arc::new(|err| {
+            let msg = format!("[c2me-wgpu-rs][wgpu-error] {err}");
+            eprintln!("{msg}");
+            crate::debug_log_line(&msg);
+        }));
+        crate::wgpu_debug!("[c2me-wgpu-rs] device created, uncaptured-error handler installed");
+
         Ok(Self {
             instance,
             adapter,

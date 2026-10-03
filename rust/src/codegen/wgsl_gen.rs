@@ -221,12 +221,121 @@ pub fn requires_two_pass(_root: &AstNode) -> bool {
 /// Most callers should use `emit_shader` (which auto-selects `Pass::Single`
 /// when possible); use this directly only when explicitly compiling the
 /// A/B pair for a `CacheInterpolated`-containing AST.
+/// Prune `math_lib.wgsl` down to the top-level items (fn/struct/const)
+/// that are reachable from `usage` (the concatenated shared-decls + prologue
+/// + entry body).
+///
+/// The full lib is ~860 lines but a given NoiseRouter only references a
+/// fraction of it. Mali-G610 aborts when asked to compile a ~5.4k-line
+/// shader, so shaving unused helpers matters. Blocks are emitted in their
+/// original order, so any declaration-order assumptions stay intact.
+///
+/// Safety: if any referenced name cannot be matched to a block, we fall back
+/// to the full library rather than risk emitting an incomplete module.
+fn emit_pruned_math_lib(usage: &str) -> String {
+    use std::collections::HashSet;
+
+    let lib = super::MATH_LIB_WGSL;
+
+    struct Block {
+        name: String,
+        text: String,
+    }
+
+    // Split into blocks: a block starts at a top-level `fn`/`struct`/`const`
+    // line (column 0) and runs until the next such line.
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_name: Option<String> = None;
+    for line in lib.lines() {
+        let is_start = line.starts_with("fn ")
+            || line.starts_with("struct ")
+            || line.starts_with("const ");
+        if is_start {
+            if let Some(n) = cur_name.take() {
+                blocks.push(Block { name: n, text: std::mem::take(&mut cur) });
+            } else {
+                cur.clear(); // drop leading license/comment header
+            }
+            let rest = line.split_whitespace().nth(1).unwrap_or("");
+            let name = rest
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or("")
+                .to_string();
+            cur_name = Some(name);
+        }
+        cur.push_str(line);
+        cur.push('\n');
+    }
+    if let Some(n) = cur_name.take() {
+        blocks.push(Block { name: n, text: cur });
+    }
+
+    let name_set: HashSet<&str> = blocks.iter().map(|b| b.name.as_str()).collect();
+
+    // Whole-word scan: collect defined names that appear in `text`.
+    fn refs_in(text: &str, name_set: &HashSet<&str>) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c.is_ascii_alphabetic() || c == '_' {
+                let start = i;
+                while i < bytes.len() {
+                    let d = bytes[i] as char;
+                    if d.is_ascii_alphanumeric() || d == '_' { i += 1; } else { break; }
+                }
+                let word = &text[start..i];
+                if name_set.contains(word) {
+                    out.insert(word.to_string());
+                }
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    // Transitive closure from the usage roots.
+    let mut needed: HashSet<String> = refs_in(usage, &name_set);
+    let mut queue: Vec<String> = needed.iter().cloned().collect();
+    while let Some(n) = queue.pop() {
+        let Some(b) = blocks.iter().find(|b| b.name == n) else {
+            // Unknown name referenced — bail out to the full library.
+            return lib.to_string();
+        };
+        for r in refs_in(&b.text, &name_set) {
+            if needed.insert(r.clone()) {
+                queue.push(r);
+            }
+        }
+    }
+
+    let mut out = String::new();
+    for b in &blocks {
+        if needed.contains(&b.name) {
+            out.push_str(&b.text);
+        }
+    }
+    out
+}
+
 pub fn emit_shader_for_pass(root: &AstNode, pass: Pass) -> Result<String> {
     let AstNode::Root(_) = root else {
         return Err(anyhow!(
             "emit_shader_for_pass: expected AstNode::Root, got {root:?}"
         ));
     };
+
+    if crate::minimal_shader() && matches!(pass, Pass::Single) {
+        crate::wgpu_debug!("[c2me-wgpu][codegen] MINIMAL shader requested");
+        let mut out = String::with_capacity(2048);
+        out.push_str(BINDINGS_HEADER);
+        out.push_str(MINIMAL_ENTRY);
+        return Ok(out);
+    }
 
     let mut ctx = GenCtx::new(pass);
 
@@ -235,19 +344,34 @@ pub fn emit_shader_for_pass(root: &AstNode, pass: Pass) -> Result<String> {
     emitters::root::emit(root, &mut ctx)?;
 
     // Phase B — assemble final shader source in the correct WGSL order.
-    let mut out = String::with_capacity(8192);
-    out.push_str(super::MATH_LIB_WGSL);
-    out.push_str(BINDINGS_HEADER);
-    for decl in &ctx.shared_decls {
-        out.push_str(decl);
-        out.push('\n');
-    }
-    // Pick the right prologue for this pass.
     let prologue = match pass {
         Pass::Single => MAIN_ENTRY_PROLOGUE,
         Pass::A => MAIN_PASS_A_PROLOGUE,
         Pass::B => MAIN_PASS_B_PROLOGUE,
     };
+
+    // Collect the code that actually *uses* the math library, so we can prune
+    // unreferenced helpers out of it.
+    let mut usage = String::new();
+    for decl in &ctx.shared_decls {
+        usage.push_str(decl);
+        usage.push('\n');
+    }
+    usage.push_str(prologue);
+    for line in &ctx.lines {
+        usage.push_str(line);
+        usage.push('\n');
+    }
+
+    let math_lib = emit_pruned_math_lib(&usage);
+
+    let mut out = String::with_capacity(8192);
+    out.push_str(&math_lib);
+    out.push_str(BINDINGS_HEADER);
+    for decl in &ctx.shared_decls {
+        out.push_str(decl);
+        out.push('\n');
+    }
     out.push_str(prologue);
     for line in &ctx.lines {
         out.push_str(line);
@@ -268,6 +392,25 @@ pub fn emit_shader_for_pass(root: &AstNode, pass: Pass) -> Result<String> {
 pub fn emit_shader(root: &AstNode) -> Result<String> {
     emit_shader_for_pass(root, Pass::Single)
 }
+
+/// Minimal `main_entry` used by `C2ME_WGPU_MINIMAL_SHADER=1` (bring-up test).
+///
+/// Keeps the same bind group layout and entry signature; body just writes a
+/// deterministic value into `out_buf`. If a device compiles+runs this but
+/// aborts on the full shader, the problem is shader size, not wgpu integration.
+const MINIMAL_ENTRY: &str = r#"
+@compute @workgroup_size(4, 4, 4)
+fn main_entry(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(local_invocation_id)  lid: vec3<u32>,
+) {
+  let idx: u32 = gid.x + gid.y * 4u + gid.z * 16u;
+  if (idx < arrayLength(&out_buf)) {
+    out_buf[idx] = f32(gid.x) + f32(gid.y) * 0.5 + f32(gid.z) * 0.25
+                 + f32(lid.x) * 0.0;
+  }
+}
+"#;
 
 /// Storage bindings — one-to-one with `world/bind_group.rs::create_layout`
 /// and `world/constants.rs::WorldgenParams` field order/offsets.

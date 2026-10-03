@@ -80,6 +80,56 @@ pub struct WorldContext {
     pub(crate) origin_buffer: Option<wgpu::Buffer>,
 }
 
+/// Create a GPU buffer pre-filled with `contents`.
+///
+/// Default path is `create_buffer_init` (`mapped_at_creation`), which is the
+/// fastest way to upload and is used on desktop. On **Android** we instead
+/// default to `create_buffer` + `queue.write_buffer`: some Mali drivers
+/// (observed on Mali-G610 / Dimensity 8100) reject the mapped-at-creation
+/// path and abort the process, while Mali-G76 (Kirin 980) accepts it. The
+/// write_buffer path costs one extra copy, but only once at init time.
+///
+/// Override with `C2ME_WGPU_MAPPED_AT_CREATION=1` (force mapped) or `=0`
+/// (force write_buffer) for debugging.
+fn create_init_buffer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    contents: &[u8],
+    usage: wgpu::BufferUsages,
+) -> wgpu::Buffer {
+    let use_mapped = std::env::var("C2ME_WGPU_MAPPED_AT_CREATION")
+        .ok()
+        .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(!cfg!(target_os = "android"));
+
+    if use_mapped {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents,
+            usage,
+        })
+    } else {
+        // create_buffer requires COPY_DST and a non-zero size.
+        let size = contents.len().max(4) as u64;
+        crate::wgpu_debug!("[c2me-wgpu] create_buffer({label}, {size} bytes)...");
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        crate::wgpu_debug!("[c2me-wgpu] create_buffer({label}) ok, write_buffer...");
+        queue.write_buffer(&buf, 0, contents);
+        crate::wgpu_debug!("[c2me-wgpu] write_buffer({label}) done");
+        buf
+    }
+}
+
 impl WorldContext {
     /// Parse the Java-side blob, run AST opto passes, compute fingerprint,
     /// emit WGSL, and **smoke-test validate** the shader via naga (pure CPU).
@@ -160,9 +210,16 @@ impl WorldContext {
         if self.pipeline.is_some() {
             return Ok(());
         }
+        // The queue comes from the same global `WgpuInstance` as `device`,
+        // so there is no need to thread it through every caller.
+        let queue = &crate::instance::WgpuInstance::instance()?.queue;
+        crate::wgpu_debug!("[c2me-wgpu][compile] compile_pipeline start");
 
+        crate::wgpu_debug!("[c2me-wgpu][compile] creating bind group layout...");
         let bg_layout = bind_group::create_layout(device)?;
+        crate::wgpu_debug!("[c2me-wgpu][compile] bind group layout ok, creating pipeline layout...");
         let pipeline_layout = bind_group::create_pipeline_layout(device, &bg_layout)?;
+        crate::wgpu_debug!("[c2me-wgpu][compile] pipeline layout ok, compiling pipeline...");
 
         let pipeline = pipeline_cache::get_or_compile(
             self.fingerprint,
@@ -171,6 +228,7 @@ impl WorldContext {
             device,
             &pipeline_layout,
         )?;
+        crate::wgpu_debug!("[c2me-wgpu][compile] pipeline compiled ok");
         self.pipeline = Some(pipeline);
 
         // Upload the permutation table buffer (binding 1). Even if the
@@ -183,11 +241,13 @@ impl WorldContext {
             } else {
                 self.perm_table_set.buffer.clone()
             };
-            let perm_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("c2me_wgpu_permutations"),
-                contents: bytemuck::cast_slice(&buffer_data),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            });
+            crate::wgpu_debug!("[c2me-wgpu][compile] uploading perm buffer ({} i32)...", buffer_data.len());
+            let perm_buffer = create_init_buffer(
+                device, queue, "c2me_wgpu_permutations",
+                bytemuck::cast_slice(&buffer_data),
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            );
+            crate::wgpu_debug!("[c2me-wgpu][compile] perm buffer ok");
             self.perm_buffer = Some(perm_buffer);
         }
 
@@ -198,11 +258,13 @@ impl WorldContext {
             } else {
                 self.perm_table_set.origins.clone()
             };
-            let ob = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("c2me_wgpu_perm_origins"),
-                contents: bytemuck::cast_slice(&origin_data),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            });
+            crate::wgpu_debug!("[c2me-wgpu][compile] uploading origin buffer...");
+            let ob = create_init_buffer(
+                device, queue, "c2me_wgpu_perm_origins",
+                bytemuck::cast_slice(&origin_data),
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            );
+            crate::wgpu_debug!("[c2me-wgpu][compile] origin buffer ok");
             self.origin_buffer = Some(ob);
         }
 
@@ -214,14 +276,17 @@ impl WorldContext {
                 data.extend_from_slice(&e.perm);
             }
             if data.is_empty() { data.push(0); }
-            let sb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("c2me_wgpu_simplex"),
-                contents: bytemuck::cast_slice(&data),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            });
+            crate::wgpu_debug!("[c2me-wgpu][compile] uploading simplex buffer ({} i32)...", data.len());
+            let sb = create_init_buffer(
+                device, queue, "c2me_wgpu_simplex",
+                bytemuck::cast_slice(&data),
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            );
+            crate::wgpu_debug!("[c2me-wgpu][compile] simplex buffer ok");
             self.simplex_buffer = Some(sb);
         }
 
+        crate::wgpu_debug!("[c2me-wgpu][compile] compile_pipeline done");
         Ok(())
     }
 
@@ -2611,4 +2676,51 @@ mod tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod compile_time_scale {
+    use crate::ast::deserialize::deserialize_full_with_perm;
+    use crate::ast::opto;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn compile_time_vs_channels() {
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+        let blob = std::fs::read(bin).unwrap();
+        let inst = crate::instance::WgpuInstance::instance().unwrap();
+        let bg = crate::world::bind_group::create_layout(&inst.device).unwrap();
+        let pl = crate::world::bind_group::create_pipeline_layout(&inst.device, &bg).unwrap();
+
+        for n in [1usize, 2, 4, 8, 10, 11, 12, 15] {
+            let (ast, _, _, _, _) = deserialize_full_with_perm(&blob).unwrap();
+            let ast = opto::run_pipeline(ast).unwrap();
+            let AstNode::Root(chans) = &ast else { panic!() };
+            let taken: Vec<_> = chans.iter().take(n).cloned().collect();
+            let sub = AstNode::Root(taken);
+            let src = crate::codegen::wgsl_gen::emit_shader(&sub).unwrap();
+            let lines = src.lines().count();
+
+            let t0 = Instant::now();
+            let shader = inst.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            let t_sm = t0.elapsed();
+            let t1 = Instant::now();
+            let _p = inst.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&pl),
+                module: &shader,
+                entry_point: Some("main_entry"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            let t_cp = t1.elapsed();
+            println!("channels={n:2}  lines={lines:5}  shader_module={t_sm:?}  compute_pipeline={t_cp:?}");
+        }
+    }
+
+    use crate::ast::AstNode;
 }

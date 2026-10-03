@@ -125,6 +125,7 @@ Set these only when troubleshooting. All of them are read once at startup.
 | `C2ME_DUMP_DENSITY` | `1` | Dump the GPU density values of the chunk at (0, 0). |
 | `C2ME_DUMP_BLOCKS` | `1` | Dump the block states of the chunk at (0, 0), for offline comparison against vanilla. |
 | `C2ME_DUMP_BLOB` | file path | Dump the serialized NoiseRouter blob to the given path. |
+| `C2ME_WGPU_MAPPED_AT_CREATION` | `0` / `1` | Override how init-time buffers are uploaded. Default is `1` on desktop (fast mapped upload) and `0` on Android (Mali-G610 drivers reject the mapped path). Set `0` to force `queue.write_buffer`, `1` to force the mapped upload. |
 
 The blob dump can also be set with the JVM property `-Dc2me.dumpBlob=<path>`;
 the environment variable is only a fallback when the property is unset.
@@ -146,7 +147,7 @@ the environment variable is only a fallback when the property is unset.
 | Variable | Effect |
 |---|---|
 | `C2ME_FABRIC_HOME` | Location of a C2ME-fabric checkout for the composite build. |
-| `ANDROID_NDK_HOME` | If set, the build also cross-compiles the native library for Android. |
+| `ANDROID_NDK_HOME` | When present, the build **automatically** cross-compiles the native library for Android (aarch64) and stages it into the jar under `natives/android-aarch64/`. Unset it (or pass `-PskipAndroid`) to skip. |
 
 ---
 

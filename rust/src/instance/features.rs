@@ -43,7 +43,10 @@ pub fn check_required(adapter: &wgpu::Adapter) -> Result<()> {
     if adapter.limits().max_storage_buffer_binding_size < 256 * 1024 * 1024 {
         return Err(anyhow::anyhow!("max_storage_buffer_binding_size < 256 * 1024 * 1024"));
     }
-    if !adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
+    // PIPELINE_CACHE is only required when we actually use it. With
+    // C2ME_WGPU_NO_PIPELINE_CACHE=1 we skip it, so adapters that lack the
+    // feature can still run.
+    if !crate::no_pipeline_cache() && !adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
         return Err(anyhow::anyhow!("Features::PIPELINE_CACHE not present"));
     }
     Ok(())

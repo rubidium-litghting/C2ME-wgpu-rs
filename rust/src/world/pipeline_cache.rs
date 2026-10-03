@@ -121,38 +121,54 @@ pub fn get_or_compile(
     crate::wgpu_debug!("[c2me-wgpu][compile] create_shader_module done in {:?}",
               t_src0.elapsed());
 
-    // On-disk pipeline cache: load any previous blob for this fingerprint,
-    // hand it to wgpu, then persist the (possibly extended) result.
-    let cached_data = load(fingerprint).ok().flatten();
-    // SAFETY: `cached_data` is either None or bytes previously returned by
-    // PipelineCache::get_data (our own cache file); `fallback: true` makes
-    // wgpu ignore corrupt data rather than UB.
-    let pc = unsafe {
-        device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
-            label: Some(&format!("c2me_wgpu_pcache_{fingerprint:08x}")),
-            data: cached_data.as_deref(),
-            fallback: true,
-        })
-    };
-
+    // Build the compute pipeline. The `wgpu::PipelineCache` is optional:
+    // some Vulkan drivers (Mali-G610) abort inside it, so
+    // `C2ME_WGPU_NO_PIPELINE_CACHE=1` skips it entirely.
     let t_pipe0 = std::time::Instant::now();
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(&format!("c2me_wgpu_pipeline_{fingerprint:08x}_p{}", pass_id(pass))),
-        layout: Some(pipeline_layout),
-        module: &shader,
-        entry_point: Some(entry_point),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
-        cache: Some(&pc),
-    });
+    let pipeline = if crate::no_pipeline_cache() {
+        crate::wgpu_debug!("[c2me-wgpu][compile] pipeline cache disabled; compiling without it");
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(&format!("c2me_wgpu_pipeline_{fingerprint:08x}_p{}", pass_id(pass))),
+            layout: Some(pipeline_layout),
+            module: &shader,
+            entry_point: Some(entry_point),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        })
+    } else {
+        // On-disk pipeline cache: load any previous blob for this fingerprint,
+        // hand it to wgpu, then persist the (possibly extended) result.
+        let cached_data = load(fingerprint).ok().flatten();
+        // SAFETY: `cached_data` is either None or bytes previously returned by
+        // PipelineCache::get_data (our own cache file); `fallback: true` makes
+        // wgpu ignore corrupt data rather than UB.
+        let pc = unsafe {
+            device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                label: Some(&format!("c2me_wgpu_pcache_{fingerprint:08x}")),
+                data: cached_data.as_deref(),
+                fallback: true,
+            })
+        };
+
+        let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(&format!("c2me_wgpu_pipeline_{fingerprint:08x}_p{}", pass_id(pass))),
+            layout: Some(pipeline_layout),
+            module: &shader,
+            entry_point: Some(entry_point),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: Some(&pc),
+        });
+
+        if let Some(data) = pc.get_data() {
+            if let Err(e) = save(fingerprint, &data) {
+                crate::wgpu_debug!("[c2me-wgpu][cache] save failed: {e}");
+            }
+        }
+        p
+    };
 
     crate::wgpu_debug!("[c2me-wgpu][compile] create_compute_pipeline done in {:?}",
               t_pipe0.elapsed());
-
-    if let Some(data) = pc.get_data() {
-        if let Err(e) = save(fingerprint, &data) {
-            crate::wgpu_debug!("[c2me-wgpu][cache] save failed: {e}");
-        }
-    }
 
     // 3. Insert. If another thread raced us, drop the loser.
     {
