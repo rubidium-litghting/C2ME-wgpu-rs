@@ -1099,7 +1099,30 @@ cargo test --lib real_router_vs_vanilla -- --nocapture     # GPU vs ref（需 GP
 
 ## §9 发布
 
-### v0.1.0（首个版本）
+### v0.1.1（Modrinth 首个公开版本）
+
+> Modrinth 规则：版本上传后**主文件不可替换**。0.1.0 已上传（含下述
+> 兼容性 bug），故以 **0.1.1** 重新发布修复后的 jar。
+
+**修复（相对 0.1.0）**：加入 Tectonic 等引入自定义密度函数节点的
+数据包时暴露的两个问题——
+1. **静默错误地形**：遇到不认识的节点（如 Tectonic 的 `Invert`）时，
+   旧代码打印警告后**写常量 0 继续**，若 buffer 恰好够大就会让 GPU
+   生成错误地形。改为**抛异常硬失败**，干净回退 CPU。
+2. **日志爆炸 + 无提示**：回退后每个区块重试、每次重刷整段节点反射
+   dump，`latest.log` 涨到 **615 MB**，且玩家在游戏内看不到任何提示。
+   改为：失败维度永久记入 `FAILED_DIMS` 不再重试；`UNSUPPORTED NODE`
+   每类只 dump 一次；新增线程安全的 `WgpuFallbackNotice` + client tick
+   消费，在聊天栏提示回退原因。
+3. 密度树缓冲区 **4 MiB → 32 MiB**（大型数据包溢出会触发
+   `BufferOverflowException`）。
+
+**实测**（Tectonic + lithostitched）：日志 **615 MB → 48 KB**，
+`UNSUPPORTED NODE` / `world init failed` 各 1 次，聊天栏正确提示。
+
+**遗留**：Tectonic 目前仍走 CPU（`Invert` 节点尚未支持，见 §10）。
+
+### v0.1.0（首个版本，已被 0.1.1 取代）
 
 - **Modrinth**：已提交，**审核中**（首次项目人工审核）。
   - 项目：`C2ME-wgpu-rs`（slug `c2me-wgpu-rs`）。
@@ -1108,7 +1131,7 @@ cargo test --lib real_router_vs_vanilla -- --nocapture     # GPU vs ref（需 GP
   - 分类：Optimization / Worldgen / Technology；环境 Client + Server；License MIT。
 - **CurseForge**：暂不发布。
 - **仓库**：已公开 https://gitee.com/rubidium-lighting/C2ME-wgpu-rs
-- **tag**：`v0.1.0` → commit `ee5c4c8`（已推 Gitee）。
+- **tag**：`v0.1.0` → commit `ee5c4c8`；`v0.1.1` → 修复提交（已推 Gitee）。
 
 三端实测：
 | 平台 | 结果 |
