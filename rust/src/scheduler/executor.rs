@@ -155,8 +155,10 @@ impl SingleBatchExecutor {
             return Err("empty batch".into());
         }
 
-        let pipeline = world.pipeline()
-            .ok_or_else(|| "pipeline not compiled".to_string())?;
+        let pipelines = world.pipelines();
+        if pipelines.is_empty() {
+            return Err("pipeline not compiled".to_string());
+        }
 
         let t0 = std::time::Instant::now();
         if batch.positions.len() > self.config.max_batch_size {
@@ -266,7 +268,6 @@ impl SingleBatchExecutor {
                 label: Some("c2me_wgpu_batch_compute"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
 
             // Cell grid per chunk = (16/cell_width, height/cell_height, 16/cell_width).
@@ -283,7 +284,13 @@ impl SingleBatchExecutor {
             let wg_x = (ccx + 3) / 4;
             let wg_y = (ccy + 3) / 4;
             let wg_z = (ccz * num_chunks + 3) / 4;
-            cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
+
+            // One dispatch per shard; every shard writes its own channels'
+            // global out_buf slots, so order is irrelevant to correctness.
+            for pipeline in pipelines {
+                cpass.set_pipeline(pipeline);
+                cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
+            }
         }
 
         // Copy output buffer → staging buffer for CPU readback

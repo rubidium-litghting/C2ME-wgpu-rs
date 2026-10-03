@@ -71,6 +71,7 @@ fn pass_id(pass: Pass) -> u8 {
         Pass::Single => 0,
         Pass::A => 1,
         Pass::B => 2,
+        Pass::C => 3,
     }
 }
 
@@ -270,5 +271,6 @@ mod tests {
         assert_eq!(pass_id(Pass::Single), 0);
         assert_eq!(pass_id(Pass::A), 1);
         assert_eq!(pass_id(Pass::B), 2);
+        assert_eq!(pass_id(Pass::C), 3);
     }
 }

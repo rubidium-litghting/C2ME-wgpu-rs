@@ -32,7 +32,7 @@ use crate::ast::equality::hash_ast;
 use crate::ast::opto;
 #[cfg(debug_assertions)]
 use crate::codegen::validate::validate_wgsl;
-use crate::codegen::wgsl_gen::{self, Pass};
+use crate::codegen::wgsl_gen;
 use crate::world::bind_group;
 use crate::world::constants::PermutationTableSet;
 use crate::world::pipeline_cache;
@@ -51,11 +51,12 @@ pub struct WorldContext {
     pub(crate) biome_source: AstNode,
     /// 32-bit fingerprint = hash(ast). Used for pipeline_cache lookups.
     pub(crate) fingerprint: u32,
-    /// Emitted WGSL source for the single-pass `main_entry` shader.
-    /// CacheInterpolated runs entirely within this single dispatch using
-    /// `workgroupBarrier()` to synchronise corner computation and trilinear
-    /// lerp. Validated via naga at `new` time.
-    pub(crate) shader_src: String,
+    /// Channel shards (see `wgsl_gen::Shard`). Every shard is a separate
+    /// WGSL module + pipeline + dispatch, but all write `out_buf` at the
+    /// channel's global index, so the readback layout is unchanged.
+    pub(crate) shards: Vec<wgsl_gen::Shard>,
+    /// Emitted WGSL source per shard, parallel to `shards`.
+    pub(crate) shader_srcs: Vec<String>,
     /// Permutation tables for all `PerlinSampler` seeds discovered in the
     /// AST, packed into one flat `Vec<i32>` ready to upload to
     /// `@group(0) @binding(1)`.
@@ -66,10 +67,10 @@ pub struct WorldContext {
     #[allow(dead_code)]
     pub(crate) perm_entries: Vec<PermEntry>,
     pub(crate) simplex_entries: Vec<crate::ast::deserialize::SimplexEntry>,
-    /// Compiled single-pass pipeline — `None` until `compile_pipeline` is
-    /// called. Cached globally in `pipeline_cache::IN_MEMORY_CACHE` keyed
-    /// by `(fingerprint, Pass::Single)`.
-    pub(crate) pipeline: Option<wgpu::ComputePipeline>,
+    /// Compiled pipelines per shard, parallel to `shards`. Empty until
+    /// `compile_pipeline` is called. Cached globally in
+    /// `pipeline_cache::IN_MEMORY_CACHE` keyed by `(fingerprint, pass_id)`.
+    pub(crate) pipelines: Vec<wgpu::ComputePipeline>,
     /// GPU-side permutation buffer (binding 1). Created in
     /// `compile_pipeline`, kept alive for the lifetime of this
     /// `WorldContext` so the scheduler can bind it without re-uploading.
@@ -154,22 +155,39 @@ impl WorldContext {
         // 3. Fingerprint = stable hash of optimized AST (Java ↔ Rust consistency)
         let fingerprint = hash_ast(&ast_root);
 
-        // 4. Emit single-pass WGSL and smoke-test via naga.
-        //    CacheInterpolated runs in single-pass mode using workgroupBarrier()
-        //    to synchronise corner computation and trilinear lerp within one
-        //    dispatch (var<workgroup> memory does NOT persist across dispatches).
-        let shader_src = wgsl_gen::emit_shader(&ast_root)?;
-        crate::wgpu_debug!(
-            "[c2me-wgpu][codegen] WGSL emitted: {} lines, {} bytes",
-            shader_src.lines().count(),
-            shader_src.len()
-        );
-        // Debug-only smoke test: wgpu's create_shader_module re-runs naga on
-        // this same source, so in release builds the extra parse+validate is
-        // pure duplication (a large chunk of first-launch shader compile time).
-        #[cfg(debug_assertions)]
-        validate_wgsl(&shader_src)
-            .map_err(|e| anyhow::anyhow!("emitted WGSL failed naga validation:\n{e}"))?;
+        // 4. Emit one WGSL module per channel shard and smoke-test via naga.
+        //    Sharding keeps every module under the Mali-G610 driver's safe
+        //    compile budget (计划.md §5.15.5).
+        let channel_count = match &ast_root {
+            AstNode::Root(chs) => chs.len(),
+            _ => 0,
+        };
+        let shards = if crate::force_single() {
+            crate::wgpu_debug!("[c2me-wgpu][codegen] FORCE_SINGLE: one shader over all channels");
+            if channel_count > 0 {
+                vec![wgsl_gen::Shard { pass: wgsl_gen::Pass::Single, start: 0, end: channel_count }]
+            } else {
+                Vec::new()
+            }
+        } else {
+            wgsl_gen::plan_shards(channel_count)
+        };
+        let mut shader_srcs: Vec<String> = Vec::with_capacity(shards.len());
+        for shard in &shards {
+            let src = wgsl_gen::emit_shader_for_shard(&ast_root, *shard)?;
+            crate::wgpu_debug!(
+                "[c2me-wgpu][codegen] shard {:?} [{}..{}) WGSL: {} lines, {} bytes",
+                shard.pass, shard.start, shard.end,
+                src.lines().count(), src.len()
+            );
+            // Debug-only smoke test: wgpu's create_shader_module re-runs naga
+            // on this same source, so in release builds the extra parse+validate
+            // is pure duplication.
+            #[cfg(debug_assertions)]
+            validate_wgsl(&src)
+                .map_err(|e| anyhow::anyhow!("emitted WGSL failed naga validation:\n{e}"))?;
+            shader_srcs.push(src);
+        }
 
         // 5. Build the packed permutation-table buffer from the REAL tables
         //    shipped in the Java PERM_RESOURCE trailer. `from_entries` returns
@@ -183,11 +201,12 @@ impl WorldContext {
             shape,
             biome_source,
             fingerprint,
-            shader_src,
+            shards,
+            shader_srcs,
             perm_table_set,
             perm_entries,
             simplex_entries,
-            pipeline: None,
+            pipelines: Vec::new(),
             perm_buffer: None,
             simplex_buffer: None,
             origin_buffer: None,
@@ -207,7 +226,7 @@ impl WorldContext {
     /// entirely within one dispatch, so no two-pass split is needed.
     pub fn compile_pipeline(&mut self, device: &wgpu::Device) -> Result<()> {
         // Fast path: already compiled.
-        if self.pipeline.is_some() {
+        if !self.pipelines.is_empty() {
             return Ok(());
         }
         // The queue comes from the same global `WgpuInstance` as `device`,
@@ -221,15 +240,24 @@ impl WorldContext {
         let pipeline_layout = bind_group::create_pipeline_layout(device, &bg_layout)?;
         crate::wgpu_debug!("[c2me-wgpu][compile] pipeline layout ok, compiling pipeline...");
 
-        let pipeline = pipeline_cache::get_or_compile(
-            self.fingerprint,
-            Pass::Single,
-            &self.shader_src,
-            device,
-            &pipeline_layout,
-        )?;
-        crate::wgpu_debug!("[c2me-wgpu][compile] pipeline compiled ok");
-        self.pipeline = Some(pipeline);
+        let mut pipelines: Vec<wgpu::ComputePipeline> =
+            Vec::with_capacity(self.shards.len());
+        for (i, shard) in self.shards.iter().enumerate() {
+            crate::wgpu_debug!(
+                "[c2me-wgpu][compile] compiling shard {:?} [{}..{})...",
+                shard.pass, shard.start, shard.end
+            );
+            let pipeline = pipeline_cache::get_or_compile(
+                self.fingerprint,
+                shard.pass,
+                &self.shader_srcs[i],
+                device,
+                &pipeline_layout,
+            )?;
+            pipelines.push(pipeline);
+        }
+        crate::wgpu_debug!("[c2me-wgpu][compile] {} pipeline(s) compiled ok", pipelines.len());
+        self.pipelines = pipelines;
 
         // Upload the permutation table buffer (binding 1). Even if the
         // perm_table_set is empty (no PerlinSampler in the AST), we still
@@ -290,10 +318,10 @@ impl WorldContext {
         Ok(())
     }
 
-    /// Borrow the compiled single-pass pipeline (None before
-    /// `compile_pipeline` has been called).
-    pub fn pipeline(&self) -> Option<&wgpu::ComputePipeline> {
-        self.pipeline.as_ref()
+    /// Borrow the compiled per-shard pipelines (empty before
+    /// `compile_pipeline` has been called). Dispatched in order.
+    pub fn pipelines(&self) -> &[wgpu::ComputePipeline] {
+        &self.pipelines
     }
 
     /// Borrow the uploaded permutation buffer (binding 1), if
@@ -337,6 +365,24 @@ impl WorldContext {
 // ======================================================================
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn report_shard_line_counts() {
+        use super::WorldContext;
+        let bin_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../src/test/resources/real_router.bin"
+        );
+        let blob = std::fs::read(bin_path).expect("read real_router.bin");
+        let ctx = WorldContext::new(&blob).expect("WorldContext::new");
+        let mut total = 0usize;
+        for (sh, src) in ctx.shards.iter().zip(ctx.shader_srcs.iter()) {
+            let n = src.lines().count();
+            total += n;
+            println!("shard {:?} [{}..{}) = {} lines", sh.pass, sh.start, sh.end, n);
+        }
+        println!("total = {} lines across {} shards", total, ctx.shards.len());
+    }
+
     #[test]
     fn integration_full_nodes_pipeline() {
         use crate::ast::deserialize::deserialize_full;
@@ -2720,6 +2766,57 @@ mod compile_time_scale {
             let t_cp = t1.elapsed();
             println!("channels={n:2}  lines={lines:5}  shader_module={t_sm:?}  compute_pipeline={t_cp:?}");
         }
+    }
+
+    /// Measure per-shard shader_module + compute_pipeline compile time on
+    /// the actual A/B/C split (计划.md §5.15.5). Ignored by default.
+    #[test]
+    #[ignore]
+    fn compile_time_shards() {
+        use crate::codegen::wgsl_gen::{emit_shader_for_shard, plan_shards, Pass};
+        use crate::world::WorldContext;
+
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+        let blob = std::fs::read(bin).unwrap();
+        let ctx = WorldContext::new(&blob).unwrap();
+        let inst = crate::instance::WgpuInstance::instance().unwrap();
+        let bg = crate::world::bind_group::create_layout(&inst.device).unwrap();
+        let pl = crate::world::bind_group::create_pipeline_layout(&inst.device, &bg).unwrap();
+
+        let _ = plan_shards; // keep import used even if ctx path changes
+
+        let mut total_sm = std::time::Duration::ZERO;
+        let mut total_cp = std::time::Duration::ZERO;
+        for (sh, src) in ctx.shards.iter().zip(ctx.shader_srcs.iter()) {
+            let _ = emit_shader_for_shard; // silence unused in this branch
+            let lines = src.lines().count();
+            let t0 = Instant::now();
+            let shader = inst.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(sh.pass.entry_point()),
+                source: wgpu::ShaderSource::Wgsl(src.clone().into()),
+            });
+            let t_sm = t0.elapsed();
+            let t1 = Instant::now();
+            let _p = inst.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&pl),
+                module: &shader,
+                entry_point: Some(sh.pass.entry_point()),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            let t_cp = t1.elapsed();
+            total_sm += t_sm;
+            total_cp += t_cp;
+            println!(
+                "shard {:?} [{}..{})  lines={lines:5}  shader_module={t_sm:?}  compute_pipeline={t_cp:?}",
+                sh.pass, sh.start, sh.end
+            );
+        }
+        println!("TOTAL shader_module={total_sm:?}  compute_pipeline={total_cp:?}");
+
+        // Keep the old single-shader measurement for comparison.
+        let _ = Pass::Single;
     }
 
     use crate::ast::AstNode;

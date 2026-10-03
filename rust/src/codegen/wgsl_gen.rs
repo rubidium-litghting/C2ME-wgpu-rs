@@ -57,15 +57,16 @@ use anyhow::anyhow;
 /// Which pass to emit a shader for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Pass {
-    /// Single-pass mode — no CacheInterpolated in AST. Entry point
-    /// `main_entry`. Use this when `requires_two_pass(root) == false`.
+    /// Single-pass mode — the whole Root in one shader. Entry point
+    /// `main_entry`. Used for tests and as the pre-split fallback.
     Single,
-    /// Pass A — compute cell-corners and write to shared memory only.
-    /// Entry point `main_pass_a`. `out_buf` is not written.
+    /// Shard A — channels `[0, 11)` (barrier ... initialDensityWithoutJaggedness).
+    /// Entry point `main_pass_a`.
     A,
-    /// Pass B — trilinear-interpolate shared memory and write `out_buf`.
-    /// Entry point `main_pass_b`.
+    /// Shard B — channel 11 (`finalDensity`). Entry point `main_pass_b`.
     B,
+    /// Shard C — channels `[12, N)` (vein x3). Entry point `main_pass_c`.
+    C,
 }
 
 impl Pass {
@@ -74,8 +75,34 @@ impl Pass {
             Pass::Single => "main_entry",
             Pass::A => "main_pass_a",
             Pass::B => "main_pass_b",
+            Pass::C => "main_pass_c",
         }
     }
+}
+
+/// One channel shard: a contiguous `[start, end)` range of Root channels
+/// emitted into its own shader module + pipeline + dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shard {
+    pub pass: Pass,
+    pub start: usize,
+    pub end: usize,
+}
+
+pub fn plan_shards(channel_count: usize) -> Vec<Shard> {
+    const A_END: usize = 11;
+    const B_END: usize = 12;
+    let mut out = Vec::new();
+    if channel_count > 0 {
+        out.push(Shard { pass: Pass::A, start: 0, end: A_END.min(channel_count) });
+    }
+    if channel_count > A_END {
+        out.push(Shard { pass: Pass::B, start: A_END, end: B_END.min(channel_count) });
+    }
+    if channel_count > B_END {
+        out.push(Shard { pass: Pass::C, start: B_END, end: channel_count });
+    }
+    out
 }
 
 /// Code generation context — accumulates WGSL source lines + var counter.
@@ -113,6 +140,9 @@ pub struct GenCtx {
     /// Memoization is bypassed entirely then, because the same AST
     /// evaluates to a different value at shadowed coordinates.
     pub in_shadow: bool,
+    /// Channel range `[start, end)` this shader is responsible for.
+    /// `(0, usize::MAX)` means "all channels" (single-pass mode).
+    pub channel_range: (usize, usize),
 }
 
 impl GenCtx {
@@ -127,6 +157,7 @@ impl GenCtx {
             pass,
             memo_stack: vec![(false, rustc_hash::FxHashMap::default())],
             in_shadow: false,
+            channel_range: (0, usize::MAX),
         }
     }
     pub fn fresh_var(&mut self, prefix: &str) -> String {
@@ -323,13 +354,27 @@ fn emit_pruned_math_lib(usage: &str) -> String {
 }
 
 pub fn emit_shader_for_pass(root: &AstNode, pass: Pass) -> Result<String> {
+    let ctx = GenCtx::new(pass);
+    emit_shader_inner(root, ctx)
+}
+
+/// Emit the shader module for one channel `shard` (see [`Shard`]).
+pub fn emit_shader_for_shard(root: &AstNode, shard: Shard) -> Result<String> {
+    let mut ctx = GenCtx::new(shard.pass);
+    ctx.channel_range = (shard.start, shard.end);
+    emit_shader_inner(root, ctx)
+}
+
+fn emit_shader_inner(root: &AstNode, mut ctx: GenCtx) -> Result<String> {
     let AstNode::Root(_) = root else {
         return Err(anyhow!(
             "emit_shader_for_pass: expected AstNode::Root, got {root:?}"
         ));
     };
 
-    if crate::minimal_shader() && matches!(pass, Pass::Single) {
+    // Bring-up: emit the tiny shader for *every* pass, so the diagnostic
+    // keeps working now that WorldContext emits per-shard modules.
+    if crate::minimal_shader() {
         crate::wgpu_debug!("[c2me-wgpu][codegen] MINIMAL shader requested");
         let mut out = String::with_capacity(2048);
         out.push_str(BINDINGS_HEADER);
@@ -337,17 +382,15 @@ pub fn emit_shader_for_pass(root: &AstNode, pass: Pass) -> Result<String> {
         return Ok(out);
     }
 
-    let mut ctx = GenCtx::new(pass);
-
-    // Phase A — emit entry-point body. Recursively walks the AST and
-    // populates `ctx.lines` (body) + `ctx.shared_decls` (workgroup vars).
+    // Phase A — emit entry-point body.
     emitters::root::emit(root, &mut ctx)?;
 
     // Phase B — assemble final shader source in the correct WGSL order.
-    let prologue = match pass {
+    let prologue = match ctx.pass {
         Pass::Single => MAIN_ENTRY_PROLOGUE,
         Pass::A => MAIN_PASS_A_PROLOGUE,
         Pass::B => MAIN_PASS_B_PROLOGUE,
+        Pass::C => MAIN_PASS_C_PROLOGUE,
     };
 
     // Collect the code that actually *uses* the math library, so we can prune
@@ -599,6 +642,53 @@ fn main_pass_b(
   let cell_y: f32 = f32(world_y_i32);
   let cell_z: f32 = f32(world_z_i32);
 "#;
+/// `main_pass_c` opening — same prologue as B, entry point `main_pass_c`.
+const MAIN_PASS_C_PROLOGUE: &str = r#"
+@compute @workgroup_size(4, 4, 4)
+fn main_pass_c(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(local_invocation_id)  lid: vec3<u32>,
+) {
+  let lx: u32 = lid.x;
+  let ly: u32 = lid.y;
+  let lz: u32 = lid.z;
+  let cx_i32: i32 = i32(gid.x);
+  let cy_i32: i32 = i32(gid.y);
+  let cz_i32: i32 = i32(gid.z);
+  let cell_count_x: i32 = 16 / i32(params.cell_width) + 1;
+  let cell_count_z: i32 = 16 / i32(params.cell_width) + 1;
+  let cell_count_y: i32 = i32(params.height_f) / i32(params.cell_height) + 1;
+  let cells_per_chunk: u32 = u32(cell_count_x * cell_count_y * cell_count_z);
+
+  // ── multi-chunk dispatch: gid.z spans cell_count_z × num_chunks ─────
+  // Every chunk in the batch owns a contiguous band of `cell_count_z`
+  // z-slices, so ONE dispatch generates all of them. The chunk's world
+  // origin comes from the `positions` buffer (sorted [cx,cz,...]).
+  let num_chunks: i32 = i32(arrayLength(&positions)) / 2;
+  let chunk_index: i32 = cz_i32 / cell_count_z;
+  let cz_local: i32 = cz_i32 % cell_count_z;
+  if (cx_i32 >= cell_count_x || cy_i32 >= cell_count_y
+      || cz_local >= cell_count_z || chunk_index >= num_chunks) {
+    return;
+  }
+
+  let origin_x: i32 = positions[chunk_index * 2] * 16;
+  let origin_z: i32 = positions[chunk_index * 2 + 1] * 16;
+  // Local cell index within this chunk (MC-native stride).
+  let cell_idx: u32 = u32(cx_i32
+                         + cz_local * cell_count_x
+                         + cy_i32 * cell_count_x * cell_count_z);
+  // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
+  // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
+  let chunk_cell_base: u32 = u32(chunk_index) * 16u * cells_per_chunk;
+  let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
+  let world_z_i32: i32 = origin_z + cz_local * i32(params.cell_width);
+  let world_y_i32: i32 = i32(params.min_y_f) + cy_i32 * i32(params.cell_height);
+  let cell_x: f32 = f32(world_x_i32);
+  let cell_y: f32 = f32(world_y_i32);
+  let cell_z: f32 = f32(world_z_i32);
+"#;
+
 
 #[cfg(test)]
 mod tests {
@@ -606,6 +696,34 @@ mod tests {
     use crate::ast::AstNode;
 
     // ── helpers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn plan_shards_splits_16_channels() {
+        let shards = plan_shards(16);
+        assert_eq!(shards.len(), 3);
+        assert_eq!((shards[0].pass, shards[0].start, shards[0].end), (Pass::A, 0, 11));
+        assert_eq!((shards[1].pass, shards[1].start, shards[1].end), (Pass::B, 11, 12));
+        assert_eq!((shards[2].pass, shards[2].start, shards[2].end), (Pass::C, 12, 16));
+        // Ranges must tile [0, N) with no gaps or overlap.
+        let mut next = 0;
+        for sh in &shards {
+            assert_eq!(sh.start, next);
+            next = sh.end;
+        }
+        assert_eq!(next, 16);
+    }
+
+    #[test]
+    fn plan_shards_handles_small_roots() {
+        assert!(plan_shards(0).is_empty());
+        let one = plan_shards(1);
+        assert_eq!(one.len(), 1);
+        assert_eq!((one[0].start, one[0].end), (0, 1));
+        let twelve = plan_shards(12);
+        assert_eq!(twelve.len(), 2);
+        assert_eq!((twelve[0].start, twelve[0].end), (0, 11));
+        assert_eq!((twelve[1].start, twelve[1].end), (11, 12));
+    }
 
     fn tiny_root(channels: Vec<AstNode>) -> AstNode {
         AstNode::Root(channels)

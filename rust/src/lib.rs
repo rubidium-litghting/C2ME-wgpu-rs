@@ -102,6 +102,16 @@ pub(crate) fn minimal_shader() -> bool {
     })
 }
 
+/// Force single-shader (pre-split) mode. Set `C2ME_WGPU_FORCE_SINGLE=1`
+/// to compile one `main_entry` shader over all channels instead of the
+/// A/B/C shard split. Benchmarking switch + emergency fallback.
+pub(crate) fn force_single() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var_os("C2ME_WGPU_FORCE_SINGLE").is_some_and(|v| !v.is_empty())
+    })
+}
+
 /// Test-only: limit how many router channels are emitted (0 = all).
 ///
 /// Set `C2ME_WGPU_MAX_CHANNELS=N` to emit only the first N channels. Used to
