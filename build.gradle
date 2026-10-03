@@ -40,43 +40,19 @@ tasks.withType(AbstractArchiveTask) {
 
 repositories {
     maven { url = 'https://maven.fabricmc.net/' }
-    maven { url = 'https://repo.codemc.io/repository/relativitymc/' }
-    // JitPack — builds C2ME-fabric directly from GitHub tags/commits/master-SNAPSHOT
-    // https://jitpack.io/#RelativityMC/C2ME-fabric
-    maven { url = 'https://jitpack.io' }
-    maven {
-        url = 'https://maven.bawnorton.com/releases'
-        content { includeGroup 'com.github.bawnorton.mixinsquared' }
-    }
     mavenLocal()
     mavenCentral()
 }
-
-// Choose C2ME dependency coordinates based on c2me_resolution from gradle.properties.
-// Coordinates are materialized here (rather than inline) so settings.gradle
-// includeBuild dependencySubstitution can still match the remote module names.
-def c2meGroup    = project.hasProperty('c2me_resolution') && project.c2me_resolution == 'jitpack'
-                  ? 'com.github.RelativityMC.C2ME-fabric'
-                  : 'com.ishland.c2me'
-def c2meVersion  = project.hasProperty('c2me_resolution') && project.c2me_resolution == 'jitpack'
-                  ? project.c2me_jitpack_version
-                  : project.c2me_version
 
 dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
-    // C2ME modules.
-    // When a local C2ME-fabric checkout exists, settings.gradle includeBuild
-    // substitutes these coordinates with live Gradle projects regardless of
-    // c2me_resolution setting.
-    compileOnly "${c2meGroup}:c2me-base:${c2meVersion}"
-    compileOnly "${c2meGroup}:c2me-opts-dfc:${c2meVersion}"
 
-    // Shared runtime libs — keep aligned with C2ME-fabric/gradle.properties versions
-    implementation "com.ibm.async:asyncutil:${async_util_version}"
-    implementation "com.electronwill.night-config:toml:${night_config_version}"
-    implementation annotationProcessor("com.github.bawnorton.mixinsquared:mixinsquared-fabric:${mixinsquared_version}")
+    // NOTE: no C2ME compile dependency. Our Java code does not reference any
+    // C2ME class; we ship our own access widener instead of borrowing theirs.
+    // C2ME is declared as a required *runtime* dependency in fabric.mod.json
+    // (it supplies the chunk-generation parallelism the GPU batching relies on).
 
     testImplementation platform("org.junit:junit-bom:${junit_version}")
     testImplementation 'org.junit.jupiter:junit-jupiter'
@@ -93,10 +69,10 @@ test {
 // ---------------------------------------------------------------------------
 
 loom {
-    // Reuse c2me-base's access widener directly (source path via composite build).
-    // This widens DensityFunctionTypes$* inner classes so our instanceof matches
-    // work, and avoids the namespace-mismatch of transitive AW analysis.
-    accessWidenerPath = file("../C2ME-fabric/c2me-base/src/main/resources/c2me-base.accesswidener")
+    // Our own access widener (no longer borrowed from C2ME). Widens the
+    // package-private DensityFunctionTypes$* inner classes our serializer
+    // touches; required at runtime too, not just compile time.
+    accessWidenerPath = file("src/main/resources/c2me-opts-accel-wgpu.accesswidener")
     enableTransitiveAccessWideners = false
 
     runs {

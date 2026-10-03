@@ -28,6 +28,15 @@ onto the GPU.
 Java 22 or newer is required because the mod talks to its Rust core through
 the Panama FFM API.
 
+> **Why still named "C2ME-wgpu-rs"?** This mod has **no compile-time
+> dependency** on C2ME — its Java code references no C2ME class and it ships
+> its own access widener. But it depends on C2ME at **runtime** for the
+> multi-threaded chunk generation that keeps the GPU batch pipeline fed: with
+> C2ME, desktop throughput reaches ~144 chunks/s; without it, the GPU starves
+> and throughput collapses to ~13 (roughly phone level). So it remains a
+> **C2ME companion module** — C2ME supplies the parallelism, this mod supplies
+> the GPU compute — and keeps the name.
+
 ---
 
 ## Installation
@@ -146,7 +155,6 @@ the environment variable is only a fallback when the property is unset.
 
 | Variable | Effect |
 |---|---|
-| `C2ME_FABRIC_HOME` | Location of a C2ME-fabric checkout for the composite build. |
 | `ANDROID_NDK_HOME` | When present, the build **automatically** cross-compiles the native library for Android (aarch64) and stages it into the jar under `natives/android-aarch64/`. Unset it (or pass `-PskipAndroid`) to skip. |
 
 ---
@@ -162,9 +170,6 @@ The built mod jar is written to `build/libs/`.
 Building requires:
 - JDK 25 (for the Java toolchain) and JDK 21 (for the Gradle JVM);
 - a Rust toolchain (the native library is compiled as part of the build);
-- **C2ME-fabric source**, cloned next to this repository (the build uses it
-  as a Gradle composite build; see `settings.gradle` for the search paths
-  `../C2ME-fabric` and `$C2ME_FABRIC_HOME`);
 - **`cargo-ndk`** *only if* you build for Android
   (`cargo install cargo-ndk`, plus an Android NDK; the Android build is
   skipped automatically when `ANDROID_NDK_HOME` is not set,

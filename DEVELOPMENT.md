@@ -45,23 +45,17 @@
 
 ## §2 工程结构（关键变更）
 
-### 2.1 复合构建（对标 C2ME-fabric 的 FlowSched 方案）
+> **2026-10：已与 C2ME 解耦构建依赖**（详见 §10）。不再使用 C2ME 复合构建、
+> 不再借用 C2ME 的 access widener。C2ME 仅作为**运行时必需依赖**保留在
+> `fabric.mod.json`（它提供 GPU 批处理赖以吞吐的多线程区块生成并行度）。
 
-`C2ME-wgpu-rs` 通过 Gradle `includeBuild` 把本地 `C2ME-fabric` 作为复合构建引入：
+### 2.1 构建（无 C2ME 复合构建）*
 
-```groovy
-// settings.gradle
-includeBuild(c2meHome) {
-    dependencySubstitution {
-        substitute module('com.ishland.c2me:c2me-base')     using project(':c2me-base')
-        substitute module('com.ishland.c2me:c2me-opts-dfc') using project(':c2me-opts-dfc')
-    }
-}
-```
+历史：曾用 Gradle `includeBuild` 把本地 `C2ME-fabric` 作为复合构建引入，
+并用 `compileOnly` 引入 `c2me-base` / `c2me-opts-dfc`。**现已全部移除**——
+我们的 Java 代码不引用任何 C2ME 类（见 §10），构建不需要 C2ME 源码。
 
-自动探测 `../C2ME-fabric` 或 `$C2ME_FABRIC_HOME`；找不到则回退远程 Maven。
-
-### 2.2 版本对齐（与 C2ME-fabric 保持一致）
+### 2.2 版本对齐
 
 | 项 | 值 |
 |---|---|
@@ -75,20 +69,22 @@ includeBuild(c2meHome) {
 
 ### 2.3 C2ME 依赖方式
 
-`c2me-base` / `c2me-opts-dfc` 用 **`compileOnly`** 引入（不是 `modApi`）——绕过 Loom 对 mod 依赖的重映射/AW 分析，根治 `Namespace mismatch` 错误。运行时它们由 Fabric 单独加载。
+- **编译期**：无依赖。代码零 C2ME 引用，构建不需 C2ME 源码。
+- **运行时**：`fabric.mod.json` 声明 `"c2me": "*"` 为**硬依赖**。
+  实测（§10）：无 C2ME 时本 mod 仍能运行，但桌面 CPS 从 ~144 掉到 ~13
+  （≈ 手机水平）——因缺少 C2ME 的多线程区块生成，GPU 批处理攒不满批、
+  利用率极低。故 C2ME 是**性能上的硬需求**，声明为必需。
 
-### 2.4 Access Widener
+### 2.4 Access Widener（自写）
 
-直接复用 `c2me-base.accesswidener`：
+`src/main/resources/c2me-opts-accel-wgpu.accesswidener`（~45 行）：
+只放宽我们真正访问的 `DensityFunctionTypes$*` 内部类与少量字段/构造。
+`fabric.mod.json` 用 `"accessWidener"` 字段声明它。
 
-```groovy
-loom {
-    accessWidenerPath = file("../C2ME-fabric/c2me-base/src/main/resources/c2me-base.accesswidener")
-    enableTransitiveAccessWideners = false
-}
-```
-
-该 AW 已把 `DensityFunctionTypes$*` 内部类全部 `accessible`，使 `instanceof` 模式匹配成为可能。
+历史：曾**直接借用** `c2me-base.accesswidener`（编译期指向 C2ME 源码路径，
+运行期靠 C2ME 的 AW 生效）。问题：把我们代码的可访问性契约寄生在 C2ME 上
+——C2ME 哪天删掉某个它不再需要的条目，我们就会 `IllegalAccessError`（实测
+移除 C2ME 时确曾触发）。自写 AW 后契约归自己，只随 Minecraft 版本变。
 
 ---
 
@@ -1147,4 +1143,65 @@ cargo test --lib real_router_vs_vanilla -- --nocapture     # GPU vs ref（需 GP
 3. 建 tag：`git tag -a v<ver> -m "..."`，push。
 4. Modrinth：dashboard → 项目 → Versions → Create version，上传 jar，
    Loader=Fabric、MC=1.21.1、依赖 C2ME=required。
+
+---
+
+## §10 与 C2ME 的关系（构建解耦 + 运行时依赖）
+
+### 10.1 结论
+
+- **编译期：无依赖**。Java 代码零 C2ME 引用（无 `com.ishland` import）；
+  已移除复合构建、`compileOnly` 依赖、以及借用的 `c2me-base.accesswidener`。
+- **运行时：硬依赖**（`fabric.mod.json` 的 `"c2me": "*"`）。
+- **名字保留** `C2ME-wgpu-rs`：定位就是 C2ME 的 GPU 加速配套模块。
+
+### 10.2 为什么运行时仍依赖 C2ME（实测）
+
+移除 C2ME 后（自写 AW 已就位、功能不崩），桌面 RADV 实测：
+
+| 环境 | CPS |
+|---|---|
+| 桌面 + C2ME | **峰值 144** |
+| 桌面 − C2ME | **平均 13.0**（≈ 麒麟 980 的 ~14） |
+
+根因：C2ME 提供**多线程并行区块生成**。没有它，原版基本主线程串行产出
+区块请求，`WgpuBatchCoordinator` 攒不满批 → 小 batch 频繁 dispatch →
+GPU 利用率极低。**「C2ME 提供并行度，我们提供 GPU 算力」** 缺一不可。
+
+### 10.3 为什么自写 AW（不再借 C2ME 的）
+
+`build.gradle` 曾直接指向 `../C2ME-fabric/c2me-base/.../c2me-base.accesswidener`
+（编译期），运行期靠 C2ME 的 AW 生效。问题：**把可访问性契约寄生在 C2ME 上**
+——C2ME 一旦删掉某个它不再需要的条目，我们即 `IllegalAccessError`（实测移除
+C2ME 时确曾触发）。现改为 `src/main/resources/c2me-opts-accel-wgpu.accesswidener`
+（~45 行，只放宽我们真正访问的 `DensityFunctionTypes$*` 与少量字段/构造），
+契约归自己，只随 Minecraft 版本变。
+
+### 10.4 为什么不自己实现并行（评估）
+
+C2ME 并行核心模块规模（`.java` 行数）：
+
+| 模块 | 文件 | 行数 | 作用 |
+|---|---|---|---|
+| FlowSched | 29 | 2784 | 任务调度框架（工作线程池 / 依赖 DAG） |
+| c2me-rewrites-chunk-system | 55 | 4169 | 重写 MC 区块系统为并行 |
+| c2me-opts-scheduling | 26 | 696 | 调度优化 |
+| c2me-opts-worldgen-general | 7 | 191 | 世界生成并行 |
+| c2me-base | 107 | 3660 | 基础设施（含调度/线程工具） |
+
+核心合计 **~11,000+ 行**，且深度耦合 MC 内部（替换 `ChunkHolder` /
+`ChunkStatus` / `ThreadedAnvilChunkStorage` 状态机），含大量线程安全 bug 修复
+mixin。复刻 = 重走 C2ME 的踩坑史 + 接下每个 MC 大版本的维护负担，投入产出比
+极差。**保留 C2ME 运行时依赖是理性选择。**
+
+### 10.5 采样器优化已"白嫖"
+
+`settings.noiseRouter()` 是**原始可序列化树**，其 Noise 的 sampler 为 null；
+我们用 `NoiseConfig.getOrCreateSampler(key)` 现场生成。这个 sampler 与 C2ME
+DFC 用的是**同一个** `NoiseConfig` 产出，**已带 C2ME 的增强**（`c2me$arena`
+等注入字段）——我们无需 import C2ME 任何类即可吃到其采样器优化。
+
+注：`noiseConfig.getNoiseRouter()` 是 c2me-opts-dfc **编译后的 JVM 字节码**
+（`CompiledDensityFunction`），**不可序列化**——这正是 §3.3 放弃它、改从
+`settings` 取树的原因。
 

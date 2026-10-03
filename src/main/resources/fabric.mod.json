@@ -24,5 +24,6 @@
     "fabricloader": ">=0.17.2",
     "java": ">=22",
     "c2me": "*"
-  }
+  },
+  "accessWidener": "c2me-opts-accel-wgpu.accesswidener"
 }
