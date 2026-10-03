@@ -77,6 +77,9 @@ public class NoiseRouterBlobifier {
     public static final java.util.List<Object> SEEN_INS = new java.util.ArrayList<>();
     private static final java.util.Map<String, Boolean> PLACEHOLDER_SEEN =
             new java.util.concurrent.ConcurrentHashMap<>();
+    /** Dedup for UNSUPPORTED NODE field-dumps: one full dump per node class. */
+    private static final java.util.Map<String, Boolean> UNSUPPORTED_SEEN =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     // ── Tags ────────────────────────────────────────────────────────
     private static final byte TAG_CONSTANT = 0x01;
@@ -115,7 +118,10 @@ public class NoiseRouterBlobifier {
 
     public static ByteBuffer blobify(NoiseRouter router, ShapeConfig shape, NoiseConfig noiseConfig) {
         CURRENT_NOISE_CONFIG = noiseConfig;
-        ByteBuffer buf = ByteBuffer.allocate(4 * 1024 * 1024).order(ByteOrder.LITTLE_ENDIAN);
+        // 32 MiB: modded datapacks (e.g. Tectonic) build far larger density
+        // trees than vanilla. Overflow here previously surfaced as a
+        // BufferOverflowException deep in writeStack and a CPU fallback.
+        ByteBuffer buf = ByteBuffer.allocate(32 * 1024 * 1024).order(ByteOrder.LITTLE_ENDIAN);
         SEEN_PERM.clear();
         PERM_SAMPLERS.clear();
         DPS_INFO.clear();
@@ -420,21 +426,36 @@ public class NoiseRouterBlobifier {
             return;
         }
 
-        // ── Unknown node — diagnostic dump ──────────────────────
-        System.err.println("[c2me-wgpu] UNSUPPORTED NODE: " + df.getClass().getName());
-        for (Field f : df.getClass().getDeclaredFields()) {
-            try {
-                f.setAccessible(true);
-                Object v = f.get(df);
-                String repr = (v instanceof DensityFunction d)
-                        ? ("DensityFunction(" + d.getClass().getSimpleName() + ")")
-                        : String.valueOf(v);
-                System.err.println("[c2me-wgpu]   field " + f.getName()
-                        + " : " + f.getType().getSimpleName() + " = " + repr);
-            } catch (Throwable ignored) {
+        // ── Unknown node — diagnostic dump, then HARD FAIL ──────
+        // Do NOT substitute a constant here: a silently-wrong density tree
+        // would generate visibly wrong terrain on the GPU. Aborting lets the
+        // caller fall back to the vanilla CPU path instead.
+        final String cls = df.getClass().getName();
+        if (UNSUPPORTED_SEEN.putIfAbsent(cls, Boolean.TRUE) == null) {
+            System.err.println("[c2me-wgpu] UNSUPPORTED NODE: " + cls);
+            for (Field f : df.getClass().getDeclaredFields()) {
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(df);
+                    String repr = (v instanceof DensityFunction d)
+                            ? ("DensityFunction(" + d.getClass().getSimpleName() + ")")
+                            : String.valueOf(v);
+                    System.err.println("[c2me-wgpu]   field " + f.getName()
+                            + " : " + f.getType().getSimpleName() + " = " + repr);
+                } catch (Throwable ignored) {
+                }
             }
         }
-        writeConstant(buf, 0.0f);
+        throw new UnsupportedDensityFunctionException(cls);
+    }
+
+    /** Thrown when the density tree contains a node this mod cannot serialize.
+     *  Aborting is intentional: emitting a placeholder constant would silently
+     *  generate wrong terrain. The caller falls back to vanilla CPU generation. */
+    public static final class UnsupportedDensityFunctionException extends RuntimeException {
+        public UnsupportedDensityFunctionException(String nodeClass) {
+            super("unsupported density function node: " + nodeClass);
+        }
     }
 
     /** Recursively serialize a MC Spline tree. FixedFloatFunction -> Constant. */

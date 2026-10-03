@@ -26,6 +26,7 @@ package com.rubidiumlighting.c2me.opts.accel.wgpu.mixin.client;
 
 import com.rubidiumlighting.c2me.opts.accel.wgpu.ModuleEntryPoint;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.NativeLoader;
+import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuFallbackNotice;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.hud.ChatHud;
 import net.minecraft.text.Text;
@@ -43,6 +44,19 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public class MixinMinecraftClientNotify {
 
     private static boolean c2me$gcWarned = false;
+
+    /** Drain GPU→CPU fallback notices queued by worker threads. */
+    @Inject(method = "tick", at = @At("HEAD"))
+    private void c2me$drainFallbackNotices(CallbackInfo ci) {
+        MinecraftClient mc = (MinecraftClient) (Object) this;
+        if (mc.inGameHud == null) return;
+        ChatHud chat = mc.inGameHud.getChatHud();
+        if (chat == null) return;
+        String m;
+        while ((m = WgpuFallbackNotice.poll()) != null) {
+            chat.addMessage(Text.literal(m).formatted(Formatting.YELLOW));
+        }
+    }
 
     @Inject(method = "joinWorld", at = @At("RETURN"))
     private void c2me$notifyOnJoin(CallbackInfo ci) {

@@ -27,6 +27,7 @@ package com.rubidiumlighting.c2me.opts.accel.wgpu.mixin;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.ModuleEntryPoint;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.NoiseRouterBlobifier;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuBatchCoordinator;
+import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuFallbackNotice;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuThinBinding;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
@@ -62,6 +63,11 @@ public abstract class MixinChunkGenerator {
      *  was reused for any later, differently-shaped dimension. */
     private static final java.util.concurrent.ConcurrentHashMap<ChunkGeneratorSettings, DimState>
             DIM_STATES = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Dimensions whose GPU init already failed. Once here we stay on the
+     *  vanilla CPU path and never retry: re-running blobify + shader compile
+     *  for every chunk would flood the log and waste CPU. */
+    private static final java.util.Set<ChunkGeneratorSettings> FAILED_DIMS =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /** Debug export switches, read once at class-init from the environment.
      *   - {@code C2ME_VANILLA_REF=1}  : skip GPU, let vanilla generate, then
@@ -104,6 +110,10 @@ public abstract class MixinChunkGenerator {
             ChunkGeneratorSettings settings = selfGen.getSettings().value();
             DimState ds = DIM_STATES.get(settings);
             if (ds == null) {
+                // This dimension already failed to initialise: stay on CPU.
+                if (FAILED_DIMS.contains(settings)) {
+                    return;
+                }
                 // Double-checked locking: world init is expensive (~7s shader
                 // compile) and must run once per dimension. Without the lock,
                 // concurrent first-chunks would each build a WorldContext, and
@@ -111,9 +121,15 @@ public abstract class MixinChunkGenerator {
                 synchronized (DIM_STATES) {
                     ds = DIM_STATES.get(settings);
                     if (ds == null) {
+                        if (FAILED_DIMS.contains(settings)) {
+                            return;
+                        }
                         ds = initDimState(settings, noiseConfig, chunk);
                         if (ds != null) {
                             DIM_STATES.put(settings, ds);
+                        } else {
+                            // Remember the failure so later chunks don't retry.
+                            FAILED_DIMS.add(settings);
                         }
                     }
                 }
@@ -517,6 +533,11 @@ public abstract class MixinChunkGenerator {
                     settings.defaultBlock());
         } catch (Throwable t) {
             LOGGER.error("[c2me-wgpu] world init failed; staying on CPU path", t);
+            String reason = (t.getMessage() != null)
+                    ? t.getMessage()
+                    : t.getClass().getSimpleName();
+            WgpuFallbackNotice.report("dim-init",
+                    "[c2me-wgpu] 该维度已回退 CPU：GPU 无法处理此地形（" + reason + "）");
             return null;
         }
     }
