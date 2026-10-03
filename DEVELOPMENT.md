@@ -1094,3 +1094,34 @@ cargo test --lib real_router_vs_vanilla -- --nocapture     # GPU vs ref（需 GP
   （~14 CPS，峰值 20–22）。三端全部通过。
 
 **§8 至此清空。** 后续新方向按需开新章节。
+
+---
+
+## §9 发布
+
+### v0.1.0（首个版本）
+
+- **Modrinth**：已提交，**审核中**（首次项目人工审核）。
+  - 项目：`C2ME-wgpu-rs`（slug `c2me-wgpu-rs`）。
+  - 平台：Fabric 1.21.1，Loader ≥ 0.17.2，Java ≥ 22。
+  - 依赖：**C2ME**（required）。
+  - 分类：Optimization / Worldgen / Technology；环境 Client + Server；License MIT。
+- **CurseForge**：暂不发布。
+- **仓库**：已公开 https://gitee.com/rubidium-lighting/C2ME-wgpu-rs
+- **tag**：`v0.1.0` → commit `ee5c4c8`（已推 Gitee）。
+
+三端实测：
+| 平台 | 结果 |
+|---|---|
+| 桌面 AMD RADV | 峰值 144 CPS；拆分零退化（402.5 vs 395.5 区块/秒） |
+| 天玑 8100（Mali-G610） | 15 通道稳定不崩；磁盘 cache 冷启动 B 从 9.77s → 20ms |
+| 麒麟 980（Mali-G76） | 裸跑无回归，~14 CPS（峰值 20–22） |
+
+### 发布流程备忘
+
+1. 构建：`ANDROID_NDK_HOME=<ndk> ./gradlew build`（自动交叉编译 aarch64 native）。
+2. 产物：`build/libs/c2me-opts-accel-wgpu-mc1.21.1-<ver>.jar`。
+3. 建 tag：`git tag -a v<ver> -m "..."`，push。
+4. Modrinth：dashboard → 项目 → Versions → Create version，上传 jar，
+   Loader=Fabric、MC=1.21.1、依赖 C2ME=required。
+
