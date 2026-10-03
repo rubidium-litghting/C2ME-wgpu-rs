@@ -34,7 +34,7 @@
 //! n-ary associative flattening (e.g. Add(Add(a,b), c) → length-3 list) is
 //! intentionally NOT implemented yet; the current AstNode enum only has
 //! binary variants. We will revisit this when the WGSL emitter needs
-//! KahanSum for long chains (see issue tracker / 计划.txt §5).
+//! KahanSum for long chains (see issue tracker).
 
 use crate::ast::AstNode;
 use rustc_hash::FxHasher;

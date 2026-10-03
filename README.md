@@ -172,6 +172,15 @@ Building requires:
 
 ---
 
+## Development note
+
+This mod was developed with heavy **AI assistance** — the code, documentation
+and tests were largely AI-generated under maintainer review. Treat it
+accordingly: verify behaviour on your own hardware before relying on it.
+Bug reports and pull requests are welcome.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

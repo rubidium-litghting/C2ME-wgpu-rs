@@ -24,7 +24,7 @@
 
 //! 5 `pub extern "C"` entry points — the only surface area of this shared library.
 //!
-//! Contract (see 计划.txt §3):
+//! Contract:
 //!   • Returns i64 handle → 0 on failure, error NUL-terminated string in err_buf
 //!   • Returns i32 status → 0 PENDING / 1 DONE / 2 ERROR / -1 INVALID_HANDLE
 //!   • All pointer pairs are (ptr, len). No bare un-sized pointers allowed.

@@ -157,7 +157,7 @@ impl WorldContext {
 
         // 4. Emit one WGSL module per channel shard and smoke-test via naga.
         //    Sharding keeps every module under the Mali-G610 driver's safe
-        //    compile budget (计划.md §5.15.5).
+        //    compile budget (DEVELOPMENT.md §5.15.5).
         let channel_count = match &ast_root {
             AstNode::Root(chs) => chs.len(),
             _ => 0,
@@ -2123,7 +2123,7 @@ mod tests {
                 println!("  ch{:2} NaN: both={} mismatch={}", ch, nan_both, nan_mismatch);
             }
             let rms = (sum_sq / cpc as f64).sqrt();
-            // Pass criterion: RMS below the fp32 budget (计划.md §0). max_diff
+            // Pass criterion: RMS below the fp32 budget (DEVELOPMENT.md §0). max_diff
             // is reported but not decisive — a handful of outlier cells can
             // exceed 1e-4 purely from fp32 rounding in deep expressions
             // (ch10/ch11), which is accepted, not a bug. NaN must match exactly.
@@ -2768,7 +2768,7 @@ mod compile_time_scale {
     }
 
     /// Measure per-shard shader_module + compute_pipeline compile time on
-    /// the actual A/B/C split (计划.md §5.15.5). Ignored by default.
+    /// the actual A/B/C split (DEVELOPMENT.md §5.15.5). Ignored by default.
     #[test]
     #[ignore]
     fn compile_time_shards() {

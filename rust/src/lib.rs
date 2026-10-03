@@ -32,8 +32,8 @@
 //!
 //! Java side must call:  create_instance → world_new → request_chunks → poll* → take_result_blob
 //!
-//! All numeric density values are pure `f32`. See 计划.txt §5 for the
-//! three precision compensation mechanisms (offset coords, Kahan sum, i32 boundaries).
+//! All numeric density values are pure `f32`. Three precision compensation
+//! mechanisms are used (offset coords, Kahan sum, i32 boundaries).
 
 pub mod c_api;
 pub mod error;

@@ -1,7 +1,7 @@
 // ============================================================================
 //  C2ME wgpu math_lib.wgsl  —  fp32 precision
 //  License: MIT
-//  铁律 (from 计划.txt §5):
+//  铁律:
 //    ① 局部 offset 坐标系 — noise_position_with_origin()
 //    ② Kahan 累加器      — struct KahanSum + kahan_add(), for len ≥ 3
 //    ③ 整数边界          — i32 粗判 + f32 细插 for aquifer/find_top/y_clamped

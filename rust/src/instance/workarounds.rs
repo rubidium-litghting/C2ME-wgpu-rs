@@ -3,7 +3,6 @@
 //! 这些 workaround 都是基于实测发现的 driver bug，必须按 vendor/device/driver
 //! 精确匹配，避免误伤正常硬件。
 //!
-//! 参考 计划.txt §2：
 //!   - Intel UHD 620 on Mesa: fma(a,b,c) != a*b+c，会导致 Perlin 噪声漂移
 //!   - Mesa RADV (AMD): storage buffer 大小未对齐 256 字节时偶发读到上一次
 //!     dispatch 的脏数据

@@ -24,7 +24,7 @@
 
 //! Deserialize Java NoiseRouterBlobifier binary format → AstNode.
 //!
-//! Protocol: 计划.txt §4
+//! Protocol:
 //!   Header:  magic(u32=0x4D433257 LE)  version(u16=1)  reserved([u8;4])
 //!   Tree  :  [tag:u8][payload]  (recursive)
 //!   Tail  :  SHAPE_CONFIG  BIOME_SOURCE
@@ -42,7 +42,7 @@ use crate::ast::OctaveSampler;
 
 /// Parse a full blob including header. Returns (Root node, Shape config, BiomeTree).
 ///
-/// Protocol layout (计划.txt §4):
+/// Protocol layout:
 ///   [HEADER 10B] [NODE_TREE (recursive)] [SHAPE_CONFIG 16B] [BIOME_SOURCE (BiomeTree)]
 /// A single Perlin permutation table + its origin offset, as shipped in the
 /// optional PERM_RESOURCE trailer appended by the Java side.

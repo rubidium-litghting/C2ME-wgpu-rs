@@ -24,7 +24,7 @@
 
 //! Capability check — MUST PASS or we refuse to use the adapter.
 //!
-//! 4 mandatory checks (计划.txt §2 Instance 模块):
+//! 4 mandatory checks:
 //!   1. max_storage_buffer_binding_size ≥ 256 MiB
 //!   2. max_compute_workgroups_per_dimension ≥ 65535
 //!   3. max_buffer_address_space_bits ≥ 31  (i.e. ≥ 2 GiB addressable)
