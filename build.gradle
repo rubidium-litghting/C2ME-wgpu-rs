@@ -180,6 +180,67 @@ if (!project.hasProperty('skipRust') || !project.property('skipRust').toBoolean(
     sourcesJar.dependsOn rustBuild
     checkLicenseMain.dependsOn rustBuild
 
+    // -- Windows cross-compilation (optional) -------------------------------
+    // When a windows rustup target is installed and we're not already on
+    // Windows, also build the DLL and stage it into natives/windows-<arch>/,
+    // so the same jar runs on Windows. Silently skipped otherwise.
+    def windowsTargets = []
+    try {
+        def p = new ProcessBuilder('rustup', 'target', 'list', '--installed').start()
+        p.inputStream.withReader { r -> r.readLines().each { line ->
+            def t = line.trim()
+            if (t == 'x86_64-pc-windows-gnu' || t == 'x86_64-pc-windows-msvc'
+                    || t == 'aarch64-pc-windows-msvc') {
+                windowsTargets.add(t)
+            }
+        } }
+        p.waitFor()
+    } catch (Throwable ignored) {}
+    // Prefer gnu (self-contained linker) over msvc (needs a Windows SDK).
+    windowsTargets = windowsTargets.sort { a, b ->
+        (a.endsWith('-gnu') ? 0 : 1) <=> (b.endsWith('-gnu') ? 0 : 1)
+    }
+
+    if (rustOs != 'windows' && !windowsTargets.isEmpty()
+            && (!project.hasProperty('skipRust') || !project.property('skipRust').toBoolean())) {
+        def winTarget = windowsTargets.get(0)
+        def winArch = winTarget.startsWith('aarch64') ? 'aarch64' : 'x86_64'
+        def winStageDir = new File(rustNativesRoot, "natives/windows-${winArch}")
+
+        tasks.register('rustBuildWindows') {
+            group = 'build'
+            description = "Cross-compile the Rust cdylib for ${winTarget} and stage the DLL."
+            inputs.dir(new File(rustDir, 'src'))
+            inputs.file(new File(rustDir, 'Cargo.toml'))
+            inputs.file(new File(rustDir, 'Cargo.lock'))
+            outputs.dir(winStageDir)
+
+            doLast {
+                logger.lifecycle("[c2me-wgpu] Cross-compiling Windows native (${winTarget})")
+                def proc = new ProcessBuilder('cargo', 'build', '--release', '--target', winTarget)
+                        .directory(rustDir)
+                        .inheritIO()
+                        .start()
+                int code = proc.waitFor()
+                if (code != 0) {
+                    throw new GradleException("cargo build --target ${winTarget} failed with exit code ${code}")
+                }
+                def built = new File(rustDir, "target/${winTarget}/release/c2me_wgpu.dll")
+                if (!built.exists()) {
+                    throw new GradleException("Windows DLL not found after build: ${built}")
+                }
+                winStageDir.mkdirs()
+                copy {
+                    from built
+                    into winStageDir
+                }
+                logger.lifecycle("[c2me-wgpu] Staged Windows native -> ${winStageDir}/c2me_wgpu.dll")
+            }
+        }
+        processResources.dependsOn rustBuildWindows
+        sourcesJar.dependsOn rustBuildWindows
+    }
+
     // -- Android cross-compilation (opt-in: needs NDK + cargo-ndk) ----------
     // Runs when ANDROID_NDK_HOME is set; disable with -PskipAndroid.
     // ABIs via -PandroidAbis=arm64-v8a,armeabi-v7a (default arm64-v8a).

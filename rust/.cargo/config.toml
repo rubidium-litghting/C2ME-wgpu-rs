@@ -1,0 +1,9 @@
+# Project-level cargo config. Kept here (not ~/.cargo) so cross-compilation
+# settings travel with the repo and don't affect other projects.
+#
+# Windows cross-compilation from Linux uses the mingw-w64 GNU toolchain.
+# Build the DLL with:
+#   cargo build --release --target x86_64-pc-windows-gnu
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
