@@ -366,6 +366,23 @@ impl WorldContext {
 #[cfg(test)]
 mod tests {
     #[test]
+    #[ignore]
+    fn dump_shard_sources() {
+        use super::WorldContext;
+        let bin_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../src/test/resources/real_router.bin"
+        );
+        let blob = std::fs::read(bin_path).expect("read real_router.bin");
+        let ctx = WorldContext::new(&blob).expect("WorldContext::new");
+        for (sh, src) in ctx.shards.iter().zip(ctx.shader_srcs.iter()) {
+            let f = format!("/tmp/shard_{:?}.wgsl", sh.pass);
+            std::fs::write(&f, src).unwrap();
+            println!("wrote {} ({} lines)", f, src.lines().count());
+        }
+    }
+
+    #[test]
     fn report_shard_line_counts() {
         use super::WorldContext;
         let bin_path = concat!(
