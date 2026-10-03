@@ -426,6 +426,32 @@ public class NoiseRouterBlobifier {
             return;
         }
 
+        // ── Tectonic `Invert`: transform(d) = 1.0 / d ───────────
+        // Tectonic's density functions are not a compile-time dependency, so
+        // match by class name. Invert is NOT downgraded by mapAll(), so it
+        // survives into the raw tree we serialize. min/max are pure range
+        // metadata and do not affect the value.
+        if (df.getClass().getName()
+                .equals("dev.worldgen.tectonic.worldgen.densityfunction.Invert")) {
+            DensityFunction in;
+            try {
+                Field inf = df.getClass().getDeclaredField("input");
+                inf.setAccessible(true);
+                in = (DensityFunction) inf.get(df);
+            } catch (Throwable t) {
+                throw new UnsupportedDensityFunctionException(df.getClass().getName());
+            }
+            if (in == null) {
+                throw new UnsupportedDensityFunctionException(df.getClass().getName());
+            }
+            // 1.0 / input
+            buf.put(TAG_DIV);
+            buf.put(TAG_CONSTANT);
+            buf.putFloat(1.0f);
+            writeDF(buf, in);
+            return;
+        }
+
         // ── Unknown node — diagnostic dump, then HARD FAIL ──────
         // Do NOT substitute a constant here: a silently-wrong density tree
         // would generate visibly wrong terrain on the GPU. Aborting lets the
