@@ -3,7 +3,7 @@
 GPU-accelerated world generation for Minecraft, powered by
 [wgpu](https://wgpu.rs/) (Vulkan / Metal / DX12 / WebGPU).
 
-A standalone companion mod for [C2ME](https://modrinth.com/mod/c2me-fabric)
+A companion mod for [C2ME](https://modrinth.com/mod/c2me-fabric)
 that offloads the heavy noise / density-function pipeline of chunk generation
 onto the GPU.
 
