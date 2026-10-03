@@ -383,24 +383,6 @@ mod tests {
     }
 
     #[test]
-    fn report_shard_line_counts() {
-        use super::WorldContext;
-        let bin_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../src/test/resources/real_router.bin"
-        );
-        let blob = std::fs::read(bin_path).expect("read real_router.bin");
-        let ctx = WorldContext::new(&blob).expect("WorldContext::new");
-        let mut total = 0usize;
-        for (sh, src) in ctx.shards.iter().zip(ctx.shader_srcs.iter()) {
-            let n = src.lines().count();
-            total += n;
-            println!("shard {:?} [{}..{}) = {} lines", sh.pass, sh.start, sh.end, n);
-        }
-        println!("total = {} lines across {} shards", total, ctx.shards.len());
-    }
-
-    #[test]
     fn integration_full_nodes_pipeline() {
         use crate::ast::deserialize::deserialize_full;
         use crate::ast::opto::run_pipeline;
@@ -2790,7 +2772,6 @@ mod compile_time_scale {
     #[test]
     #[ignore]
     fn compile_time_shards() {
-        use crate::codegen::wgsl_gen::{emit_shader_for_shard, plan_shards, Pass};
         use crate::world::WorldContext;
 
         let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
@@ -2800,12 +2781,9 @@ mod compile_time_scale {
         let bg = crate::world::bind_group::create_layout(&inst.device).unwrap();
         let pl = crate::world::bind_group::create_pipeline_layout(&inst.device, &bg).unwrap();
 
-        let _ = plan_shards; // keep import used even if ctx path changes
-
         let mut total_sm = std::time::Duration::ZERO;
         let mut total_cp = std::time::Duration::ZERO;
         for (sh, src) in ctx.shards.iter().zip(ctx.shader_srcs.iter()) {
-            let _ = emit_shader_for_shard; // silence unused in this branch
             let lines = src.lines().count();
             let t0 = Instant::now();
             let shader = inst.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2831,9 +2809,6 @@ mod compile_time_scale {
             );
         }
         println!("TOTAL shader_module={total_sm:?}  compute_pipeline={total_cp:?}");
-
-        // Keep the old single-shader measurement for comparison.
-        let _ = Pass::Single;
     }
 
     use crate::ast::AstNode;
