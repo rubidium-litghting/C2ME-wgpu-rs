@@ -1266,7 +1266,27 @@ G = cells_per_chunk (5×97×5)
   `5 external (CPU-evaluated) density subtree(s)`，**无 CPU 回退**，
   地形正确，CPS ~74。
 
-### 11.6 已知边界
+### 11.6 真实模组测试（2026-10）
+
+尝试用主流 Fabric 地形模组触发外部输入路径，结果：
+
+| 模组 | 结果 |
+|---|---|
+| Tectonic | 只用 `Invert`（已直接支持），不触发 |
+| lithostitched | 库模组，单独装不引入未知节点 |
+| More Density Functions (MDF) | 未触发 |
+| WorldGen Editor (WGE) | 未触发 |
+| Ultimate Scaler (US) | **崩溃**，但与 C2ME 冲突，与我们无关（见下） |
+
+**结论**：主流 Fabric 地形模组基本不引入自定义密度函数节点——
+它们大多通过**数据包**组合原版节点。混合执行是"保险"，不是高频路径。
+
+**US 崩溃分析**（记录备查）：US 的 `MixinInterpolatedNoiseSampler` 想用
+`@At("STORE")` 注入 `class_5822::modifyBlockX`，但 **C2ME 的
+`c2me-opts-natives-math`**（priority 1100 > US 的 1000）已先改写该方法，
+导致 US 的注入点定位失败。**冲突双方是 US ↔ C2ME，我们的 mod 不在崩溃链**。
+
+### 11.7 已知边界
 
 - **未在 Android 实测**：无未知节点时走 dummy 路径、与改动前一致；
   有外部输入时的 Android 表现待验证。
