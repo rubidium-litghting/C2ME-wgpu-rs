@@ -104,6 +104,11 @@ it would exclude most mobile GPUs.
   placement, never the terrain itself.
 - At extremely far End coordinates (~370k blocks), a partial NaN fallback is
   used to reproduce vanilla's void bands.
+- **Modded density functions**: a custom density node the GPU serializer does
+  not natively understand (e.g. from a terrain mod) is evaluated on the CPU at
+  the same corner grid and fed to the GPU as an "external input". The rest of
+  the tree still runs on the GPU, so modded worldgen keeps working — only the
+  unsupported subtree pays a CPU cost.
 
 ---
 

@@ -644,6 +644,15 @@ fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
             BiomeTree { seed }
         }
 
+        0xFD => {
+            // ExternalInput — a subtree the serializer could not translate;
+            // values come from the external-input buffer (binding 6).
+            ensure(bytes.len() >= cursor + 4, "ExternalInput index")?;
+            let index = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            cursor += 4;
+            ExternalInput { index }
+        }
+
         0xFE => {
             // ROOT — tag 0xFE + channel_count(u16 LE) + [channel_count × recursive nodes]
             // MC NoiseRouter always has 16 channels but tests can use fewer.

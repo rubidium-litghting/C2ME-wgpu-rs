@@ -123,6 +123,17 @@ pub fn create_layout(device: &wgpu::Device) -> Result<wgpu::BindGroupLayout> {
                 },
                 count: None,
             },
+            // binding 6: external-input values for CPU-evaluated subtrees
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
     Ok(layout)

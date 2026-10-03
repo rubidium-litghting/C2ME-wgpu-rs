@@ -528,7 +528,14 @@ public abstract class MixinChunkGenerator {
                 return null;
             }
             LOGGER.info("[c2me-wgpu] Rust WorldContext created, handle={}", world);
-            WgpuBatchCoordinator coord = new WgpuBatchCoordinator(world);
+            java.util.List<net.minecraft.world.gen.densityfunction.DensityFunction> extNodes =
+                    new java.util.ArrayList<>(NoiseRouterBlobifier.EXTERNAL_NODES);
+            if (!extNodes.isEmpty()) {
+                LOGGER.info("[c2me-wgpu] {} external (CPU-evaluated) density subtree(s)",
+                        extNodes.size());
+            }
+            WgpuBatchCoordinator coord = new WgpuBatchCoordinator(world, extNodes,
+                    gx, gy, gz, hc, vc, minY);
             return new DimState(world, coord, gx, gy, gz, hc, vc, minY, height, router,
                     settings.defaultBlock());
         } catch (Throwable t) {

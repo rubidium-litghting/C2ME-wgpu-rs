@@ -120,6 +120,14 @@ pub enum AstNode {
     // ── Scalars ─────────────────────────────────────────────────────────
     Constant(f32),
 
+    /// A density subtree the serializer could not translate (e.g. a
+    /// modded node like Tectonic's `Invert`). Its values are evaluated on
+    /// the CPU at the same corner grid and uploaded via the external-input
+    /// buffer; the WGSL side just reads them. `index` selects the slot.
+    ExternalInput {
+        index: i32,
+    },
+
     // ── Inputs ──────────────────────────────────────────────────────────
     InputX,
     InputY,
@@ -525,6 +533,11 @@ impl Hash for AstNode {
             AstNode::BiomeTree { seed } => {
                 0xF0u8.hash(state);
                 seed.hash(state);
+            }
+
+            AstNode::ExternalInput { index } => {
+                0xFDu8.hash(state);
+                index.hash(state);
             }
 
             // ── Root ────────────────────────────────────────────────────────

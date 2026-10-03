@@ -45,7 +45,7 @@ fn rec(node: AstNode) -> AstNode {
     use AstNode::*;
     match node {
         // Levers / leaves that can't possibly fold ------------------------
-        Constant(_) | InputX | InputY | InputZ => node,
+        Constant(_) | InputX | InputY | InputZ | ExternalInput { .. } => node,
 
         // Binary arithmetic ----------------------------------------------
         Add(a, b) => {

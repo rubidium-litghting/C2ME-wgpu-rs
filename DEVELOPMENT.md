@@ -1104,7 +1104,9 @@ cargo test --lib real_router_vs_vanilla -- --nocapture     # GPU vs ref（需 GP
 数据包时暴露的两个问题——
 1. **静默错误地形**：遇到不认识的节点（如 Tectonic 的 `Invert`）时，
    旧代码打印警告后**写常量 0 继续**，若 buffer 恰好够大就会让 GPU
-   生成错误地形。改为**抛异常硬失败**，干净回退 CPU。
+   生成错误地形。当时改为**抛异常硬失败**、干净回退 CPU；
+   **后续（§11）升级为「混合执行」**：该子树交 CPU 求值、作为外部输入
+   喂给 GPU，不再整体回退。
 2. **日志爆炸 + 无提示**：回退后每个区块重试、每次重刷整段节点反射
    dump，`latest.log` 涨到 **615 MB**，且玩家在游戏内看不到任何提示。
    改为：失败维度永久记入 `FAILED_DIMS` 不再重试；`UNSUPPORTED NODE`
@@ -1116,7 +1118,8 @@ cargo test --lib real_router_vs_vanilla -- --nocapture     # GPU vs ref（需 GP
 **实测**（Tectonic + lithostitched）：日志 **615 MB → 48 KB**，
 `UNSUPPORTED NODE` / `world init failed` 各 1 次，聊天栏正确提示。
 
-**遗留**：Tectonic 目前仍走 CPU（`Invert` 节点尚未支持，见 §10）。
+**遗留**：~~Tectonic 目前仍走 CPU~~ → 已解决：`Invert` 节点直接支持（§11.2），
+其余任意未知节点走混合执行（§11）。
 
 ### v0.1.0（首个版本，已被 0.1.1 取代）
 
@@ -1205,3 +1208,67 @@ DFC 用的是**同一个** `NoiseConfig` 产出，**已带 C2ME 的增强**（`c
 （`CompiledDensityFunction`），**不可序列化**——这正是 §3.3 放弃它、改从
 `settings` 取树的原因。
 
+---
+
+## §11 混合执行（任意 modded 密度函数的通用兜底）
+
+### 11.1 动机
+
+§5.15.7 的"遇到未知节点整体回退 CPU"过于粗暴：只要地形树里有一个
+不认识的节点（如 Tectonic 的 `Invert`），整个维度就失去 GPU 加速。
+而实践中未知节点往往是**小包装**（`Invert` 包一个 clamp），真正庞大的
+子树（噪声、插值）都是已支持的。
+
+### 11.2 设计：黑盒外部输入
+
+**方案**：无法翻译的子树不再回退，而是当作**黑盒外部输入**——
+1. blobify 遇到未知节点 → 登记为「外部输入 #i」，blob 写 `ExternalInput(index)`
+2. Java 在**角点网格**（每 chunk 5×97×5）上用 `DensityFunction.sample()`
+   求值该子树
+3. 上传到 GPU 新 buffer（binding 6）
+4. WGSL 里 `ExternalInput(i)` 直接读该 buffer，不计算
+
+GPU 算它懂的，CPU 补它不懂的，**任意改地形的 mod 都能共存**，无需逐个适配。
+
+> 为什么不递归遍历未知节点的子树？因为**节点自身的运算不透明**——
+> 知道子节点值，却不知道对它施加什么变换（`1/x`? `clamp`?），无法重建。
+> `mapAll` 降级（若节点作者实现了）能覆盖一部分，但不通用、有正确性
+> 风险，故不采用；黑盒方案通用且稳。
+
+### 11.3 实现清单
+
+| 层 | 改动 |
+|---|---|
+| Rust AST | `ExternalInput { index }` + Hash |
+| Rust deserialize | tag `0xFD` → `ExternalInput` |
+| Rust emitter | `external_input.rs` 读 `external_inputs[]` |
+| WGSL / BindGroup | 新 `@binding(6) external_inputs`（read-only） |
+| Rust executor | `params._pad[0]` = 外部输入数；惰性分配/上传专用 buffer（无外部输入时绑 4 字节 dummy，避免与 binding 2 的 read-write 存储别名） |
+| Rust WorldContext | `set_external_inputs` / `external_count` / `external_data` |
+| Rust FFM | `c2me_wgpu_set_external_inputs(world, count, ptr, len)` |
+| Java blobify | 未知节点 → 登记 + 写 `ExternalInput(index)` |
+| Java coordinator | 逐 chunk/子树/角点求值，dispatch 前上传 |
+| opto passes | `ExternalInput` 视为叶子 |
+
+### 11.4 布局
+
+```
+external_inputs[] = [chunk0: ext0[G], ext1[G], ...][chunk1: ...]
+G = cells_per_chunk (5×97×5)
+索引 = chunk_index * (num_ext * G) + i * G + cell_idx
+```
+
+### 11.5 实测（桌面 RADV，Tectonic）
+
+- **Invert 直接支持**（默认）：`numExt=0`，外部路径不激活，CPS 正常。
+- **强制外部化**（临时禁用 `Invert` 支持）：日志
+  `UNSUPPORTED NODE (externalized to CPU): ...Invert` +
+  `5 external (CPU-evaluated) density subtree(s)`，**无 CPU 回退**，
+  地形正确，CPS ~74。
+
+### 11.6 已知边界
+
+- **未在 Android 实测**：无未知节点时走 dummy 路径、与改动前一致；
+  有外部输入时的 Android 表现待验证。
+- **求值成本**：外部子树越大，CPU 成本越高。实践中未知节点多为小包装，
+  成本小；若某 mod 的未知节点包着大子树，可据实再优化。

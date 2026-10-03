@@ -6,6 +6,7 @@ pub mod cache_like;
 pub mod constant;
 pub mod coordinate;
 pub mod end_islands;
+pub mod external_input;
 pub mod find_top_surface;
 pub mod interval_select;
 pub mod noise_interpolated;
@@ -216,6 +217,7 @@ pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
         AstNode::FindTopSurface { .. } => find_top_surface::emit(node, ctx),
         AstNode::Aquifer { .. } => aquifer::emit(node, ctx),
         AstNode::BiomeTree { .. } => biome_tree::emit(node, ctx),
+        AstNode::ExternalInput { .. } => external_input::emit(node, ctx),
         AstNode::Root(_) => unreachable!("Root should be handled by root::emit"),
     };
 

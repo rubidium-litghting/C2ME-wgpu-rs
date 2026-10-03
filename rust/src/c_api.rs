@@ -383,6 +383,37 @@ pub unsafe extern "C" fn c2me_wgpu_free_result_blob(ptr: *mut u8, len: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// ⑦ Set CPU-evaluated external-input values for the given world.
+//
+/// # Safety
+/// `data_ptr` must point to `data_len` f32 values (or be null with len 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2me_wgpu_set_external_inputs(
+    world_h: i64,
+    count: i32,
+    data_ptr: *const f32,
+    data_len: usize,
+) -> i32 {
+    if world_h == 0 {
+        return STATUS_INVALID_HANDLE;
+    }
+    let world_arc = {
+        let table = get_handle_table().lock().unwrap();
+        match table.get(&world_h) {
+            Some(arc) => arc.clone(),
+            None => return STATUS_INVALID_HANDLE,
+        }
+    };
+    let data: Vec<f32> = if data_ptr.is_null() {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(data_ptr, data_len) }.to_vec()
+    };
+    world_arc.set_external_inputs(count.max(0) as usize, data);
+    0
+}
+
+// ---------------------------------------------------------------------------
 // Extra helper: GPU name.
 /// Returns a statically-allocated UTF-8 C string. Caller must NOT free.
 #[unsafe(no_mangle)]

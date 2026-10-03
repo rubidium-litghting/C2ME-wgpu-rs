@@ -53,6 +53,7 @@ public class WgpuThinBinding {
     private static MethodHandle MH_take_result_blob;
     private static MethodHandle MH_get_gpu_name;
     private static MethodHandle MH_free_result_blob;
+    private static MethodHandle MH_set_external_inputs;
 
     private static long instanceHandle;
     /** True only if the native lib linked AND a wgpu instance was created. */
@@ -125,6 +126,17 @@ public class WgpuThinBinding {
                     FunctionDescriptor.ofVoid(
                             ValueLayout.ADDRESS,         // ptr: *mut u8
                             ValueLayout.JAVA_LONG        // len: usize
+                    )
+            );
+
+            MH_set_external_inputs = NativeLoader.linker.downcallHandle(
+                    NativeLoader.lookup.find("c2me_wgpu_set_external_inputs").orElseThrow(),
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,        // -> i32 status
+                            ValueLayout.JAVA_LONG,       // world_h: i64
+                            ValueLayout.JAVA_INT,        // count: i32
+                            ValueLayout.ADDRESS,         // data_ptr: *const f32
+                            ValueLayout.JAVA_LONG        // data_len: usize
                     )
             );
         } catch (Throwable t) {
@@ -237,6 +249,36 @@ public class WgpuThinBinding {
      * @param positions  packed [cx0,cz0, cx1,cz1, ...]
      * @return request handle
      */
+    /**
+     * Upload CPU-evaluated external-input values for the given world.
+     * The data is copied into native memory by Rust, so the caller's array
+     * can be GC'd afterwards; nothing is retained across calls.
+     *
+     * @param worldH world handle
+     * @param count  number of external subtrees
+     * @param data   flat [chunk][ext][cell] f32 values
+     */
+    public static void setExternalInputs(long worldH, int count, float[] data) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment dataSeg = (data != null && data.length > 0)
+                    ? arena.allocateFrom(ValueLayout.JAVA_FLOAT, data)
+                    : MemorySegment.NULL;
+            long len = (data != null) ? data.length : 0;
+            int st = (int) MH_set_external_inputs.invokeExact(
+                    worldH,
+                    count,
+                    dataSeg,
+                    len
+            );
+            if (st != 0) {
+                throw new RuntimeException("[c2me-wgpu] set_external_inputs status=" + st);
+            }
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException(t);
+        }
+    }
+
     public static long requestChunks(long worldH, int[] positions) {
         try (Arena arena = Arena.ofConfined(); Arena errArena = Arena.ofConfined()) {
             MemorySegment posSeg = arena.allocateFrom(ValueLayout.JAVA_INT, positions);

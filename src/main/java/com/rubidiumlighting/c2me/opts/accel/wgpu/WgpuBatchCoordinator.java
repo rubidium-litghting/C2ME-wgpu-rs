@@ -27,6 +27,8 @@ package com.rubidiumlighting.c2me.opts.accel.wgpu;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import net.minecraft.world.gen.densityfunction.DensityFunction;
+
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
@@ -83,6 +85,14 @@ public final class WgpuBatchCoordinator {
     private final long worldHandle;
     private volatile boolean running = true;
 
+    // ── external (CPU-evaluated) density subtrees ──────────────────
+    /** Nodes the GPU serializer could not translate. Their values are
+     *  computed here on the CPU at the corner grid and uploaded to binding 6. */
+    private final List<DensityFunction> externalNodes;
+    private final int gx, gy, gz;      // corner counts per axis
+    private final int cellW, cellH;    // cell size in blocks
+    private final int minY;
+
     // ── throughput stats (logged every STATS_INTERVAL_NS) ──────────
     private static final long STATS_INTERVAL_NS = 2_000_000_000L;
     private final AtomicLong statBatches = new AtomicLong();
@@ -90,8 +100,14 @@ public final class WgpuBatchCoordinator {
     private final AtomicLong statGpuNanos = new AtomicLong();
     private volatile long statsWindowStart = System.nanoTime();
 
-    public WgpuBatchCoordinator(long worldHandle) {
+    public WgpuBatchCoordinator(long worldHandle,
+                                List<DensityFunction> externalNodes,
+                                int gx, int gy, int gz, int cellW, int cellH, int minY) {
         this.worldHandle = worldHandle;
+        this.externalNodes = externalNodes;
+        this.gx = gx; this.gy = gy; this.gz = gz;
+        this.cellW = cellW; this.cellH = cellH;
+        this.minY = minY;
         Thread t = new Thread(this::run, "c2me-wgpu-batch");
         t.setDaemon(true);
         t.start();
@@ -153,9 +169,42 @@ public final class WgpuBatchCoordinator {
         }
     }
 
+    /** Evaluate every external subtree at each chunk's corner grid, in the
+     *  exact [chunk][ext][cell] order the WGSL external_inputs[] index uses. */
+    private void uploadExternalInputs(List<Job> batch) {
+        int numExt = externalNodes.size();
+        if (numExt == 0) {
+            // No external subtrees: binding 6 is never read, skip the FFM call.
+            return;
+        }
+        int cellsPerChunk = gx * gy * gz;
+        float[] data = new float[batch.size() * numExt * cellsPerChunk];
+        int idx = 0;
+        for (Job job : batch) {
+            int sx = job.cx * 16;
+            int sz = job.cz * 16;
+            for (DensityFunction ext : externalNodes) {
+                for (int j = 0; j < gy; j++) {
+                    int wy = minY + j * cellH;
+                    for (int k = 0; k < gz; k++) {
+                        int wz = sz + k * cellW;
+                        for (int i = 0; i < gx; i++) {
+                            int wx = sx + i * cellW;
+                            double v = ext.sample(
+                                    new DensityFunction.UnblendedNoisePos(wx, wy, wz));
+                            data[idx++] = (float) v;
+                        }
+                    }
+                }
+            }
+        }
+        WgpuThinBinding.setExternalInputs(worldHandle, numExt, data);
+    }
+
     private void dispatch(List<Job> batch, int[] positions) {
         long __t0 = System.nanoTime();
         long req;
+        uploadExternalInputs(batch);
         try {
             req = WgpuThinBinding.requestChunks(worldHandle, positions);
         } catch (Throwable t) {

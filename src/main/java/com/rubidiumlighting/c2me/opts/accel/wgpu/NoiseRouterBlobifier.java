@@ -81,6 +81,11 @@ public class NoiseRouterBlobifier {
     private static final java.util.Map<String, Boolean> UNSUPPORTED_SEEN =
             new java.util.concurrent.ConcurrentHashMap<>();
 
+    /** Density subtrees we could not translate, evaluated on the CPU and fed
+     *  to the GPU as external inputs (binding 6). Cleared per blobify(). */
+    public static final java.util.List<DensityFunction> EXTERNAL_NODES =
+            new java.util.ArrayList<>();
+
     // ── Tags ────────────────────────────────────────────────────────
     private static final byte TAG_CONSTANT = 0x01;
     private static final byte TAG_INPUT_X = 0x02;
@@ -114,6 +119,7 @@ public class NoiseRouterBlobifier {
     private static final byte TAG_FIND_TOP_SURF = (byte) 0xD0;
     private static final byte TAG_AQUIFER = (byte) 0xE0;
     private static final byte TAG_BIOME_TREE = (byte) 0xF0;
+    private static final byte TAG_EXTERNAL_INPUT = (byte) 0xFD;
     private static final byte TAG_ROOT = (byte) 0xFE;
 
     public static ByteBuffer blobify(NoiseRouter router, ShapeConfig shape, NoiseConfig noiseConfig) {
@@ -127,6 +133,7 @@ public class NoiseRouterBlobifier {
         DPS_INFO.clear();
         SEEN_INS.clear();
         SIMPLEX_SAMPLERS.clear();
+        EXTERNAL_NODES.clear();
         // ── HEADER (10B) ─────────────────────────────────────────
         buf.put((byte) 0x4D);
         buf.put((byte) 0x43);
@@ -452,27 +459,19 @@ public class NoiseRouterBlobifier {
             return;
         }
 
-        // ── Unknown node — diagnostic dump, then HARD FAIL ──────
-        // Do NOT substitute a constant here: a silently-wrong density tree
-        // would generate visibly wrong terrain on the GPU. Aborting lets the
-        // caller fall back to the vanilla CPU path instead.
+        // ── Unknown node — register as a CPU-evaluated external input ──
+        // We can't translate this node, so we emit ExternalInput(index) and let
+        // the CPU evaluate the whole subtree at the corner grid. The GPU reads
+        // the values from binding 6. This keeps arbitrary modded density
+        // functions working without per-node adapters.
         final String cls = df.getClass().getName();
         if (UNSUPPORTED_SEEN.putIfAbsent(cls, Boolean.TRUE) == null) {
-            System.err.println("[c2me-wgpu] UNSUPPORTED NODE: " + cls);
-            for (Field f : df.getClass().getDeclaredFields()) {
-                try {
-                    f.setAccessible(true);
-                    Object v = f.get(df);
-                    String repr = (v instanceof DensityFunction d)
-                            ? ("DensityFunction(" + d.getClass().getSimpleName() + ")")
-                            : String.valueOf(v);
-                    System.err.println("[c2me-wgpu]   field " + f.getName()
-                            + " : " + f.getType().getSimpleName() + " = " + repr);
-                } catch (Throwable ignored) {
-                }
-            }
+            System.err.println("[c2me-wgpu] UNSUPPORTED NODE (externalized to CPU): " + cls);
         }
-        throw new UnsupportedDensityFunctionException(cls);
+        int extIndex = EXTERNAL_NODES.size();
+        EXTERNAL_NODES.add(df);
+        buf.put(TAG_EXTERNAL_INPUT);
+        buf.putInt(extIndex);
     }
 
     /** Thrown when the density tree contains a node this mod cannot serialize.

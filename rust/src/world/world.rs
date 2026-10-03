@@ -79,6 +79,11 @@ pub struct WorldContext {
     pub(crate) simplex_buffer: Option<wgpu::Buffer>,
     /// GPU-side per-entry origin buffer (binding 3), f32 x3 per entry.
     pub(crate) origin_buffer: Option<wgpu::Buffer>,
+    /// Number of CPU-evaluated (external) subtrees in this world's AST.
+    pub(crate) external_count: std::sync::atomic::AtomicUsize,
+    /// CPU-computed values for those subtrees, laid out
+    /// [chunk][ext][cell]. Uploaded to binding 6 before each dispatch.
+    pub(crate) external_data: std::sync::Mutex<Vec<f32>>,
 }
 
 /// Create a GPU buffer pre-filled with `contents`.
@@ -210,6 +215,8 @@ impl WorldContext {
             perm_buffer: None,
             simplex_buffer: None,
             origin_buffer: None,
+            external_count: std::sync::atomic::AtomicUsize::new(0),
+            external_data: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -326,6 +333,22 @@ impl WorldContext {
 
     /// Borrow the uploaded permutation buffer (binding 1), if
     /// `compile_pipeline` has been called.
+    /// Record CPU-computed external-input values (flat [chunk][ext][cell]).
+    /// Called by Java right before a batch dispatch.
+    pub fn set_external_inputs(&self, count: usize, data: Vec<f32>) {
+        self.external_count
+            .store(count, std::sync::atomic::Ordering::Relaxed);
+        *self.external_data.lock().unwrap() = data;
+    }
+
+    pub fn external_count(&self) -> usize {
+        self.external_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn external_data(&self) -> Vec<f32> {
+        self.external_data.lock().unwrap().clone()
+    }
+
     pub fn perm_buffer(&self) -> Option<&wgpu::Buffer> {
         self.perm_buffer.as_ref()
     }
@@ -2446,6 +2469,7 @@ mod tests {
         fn walk(node: &AstNode, out: &mut BTreeMap<String, usize>) {
             let name = match node {
                 AstNode::Constant(_) => "Constant",
+                AstNode::ExternalInput { .. } => "ExternalInput",
                 AstNode::InputX => "InputX",
                 AstNode::InputY => "InputY",
                 AstNode::InputZ => "InputZ",

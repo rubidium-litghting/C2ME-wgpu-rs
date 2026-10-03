@@ -476,6 +476,7 @@ struct WorldgenParams {
 @group(0) @binding(3) var<storage, read>        perm_origin:  array<f32>;
 @group(0) @binding(4) var<storage, read>        positions:    array<i32>;
 @group(0) @binding(5) var<storage, read>        simplex_perm: array<u32>;
+@group(0) @binding(6) var<storage, read>        external_inputs: array<f32>;
 "#;
 
 /// `main_entry` opening (single-pass mode) — sets up `cell_x / cell_y /

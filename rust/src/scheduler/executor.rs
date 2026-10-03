@@ -86,6 +86,8 @@ pub struct SingleBatchExecutor {
     params_buf: wgpu::Buffer,
     positions_buf: wgpu::Buffer,
     output_buf: wgpu::Buffer,
+    /// External-input values (binding 6), lazily (re)created to fit the batch.
+    external_buf: Option<wgpu::Buffer>,
     #[allow(dead_code)]
     bind_group_layout: wgpu::BindGroupLayout,
     #[allow(dead_code)]
@@ -139,6 +141,7 @@ impl SingleBatchExecutor {
             params_buf,
             positions_buf,
             output_buf,
+            external_buf: None,
             bind_group_layout,
             pipeline_layout,
             config,
@@ -195,7 +198,44 @@ impl SingleBatchExecutor {
             _pad: [0; 8],
         };
 
+        // External inputs for CPU-evaluated subtrees (binding 6).
+        let ext_count = world.external_count();
+        let ext_data = world.external_data();
+        let ext_bytes = (ext_data.len() * 4).max(4);
+        let ext_buf = if ext_count > 0 {
+            let need_recreate = match &self.external_buf {
+                Some(b) => b.size() < ext_bytes as u64 || b.size() < 4,
+                None => true,
+            };
+            if need_recreate {
+                self.external_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("c2me_wgpu_external_inputs"),
+                    size: ext_bytes as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            let buf = self.external_buf.as_ref().unwrap();
+            self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&ext_data));
+            buf.as_entire_binding()
+        } else {
+            // No external inputs: bind a dedicated 4-byte dummy so binding 6
+            // stays valid. (Reusing output_buf here would alias binding 2's
+            // read-write storage and can trip wgpu validation.)
+            if self.external_buf.is_none() {
+                self.external_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("c2me_wgpu_external_dummy"),
+                    size: 4,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            self.external_buf.as_ref().unwrap().as_entire_binding()
+        };
+
         // Update the persistent params buffer (binding 0).
+        let mut params = params;
+        params._pad[0] = ext_count as u32;
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
         // Packed chunk positions [cx,cz,...] for the shader (binding 4).
@@ -253,6 +293,10 @@ impl SingleBatchExecutor {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: simplex_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: ext_buf,
                 },
             ],
         });
