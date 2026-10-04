@@ -1095,6 +1095,30 @@ cargo test --lib real_router_vs_vanilla -- --nocapture     # GPU vs ref（需 GP
 
 ## §9 发布
 
+### v0.1.2（待发 Modrinth）
+
+**相对 0.1.1 的新增**：
+
+1. **Tectonic `Invert` 节点直接支持**（§11.2）：映射为 `Div(Constant(1.0), input)`，
+   实机验证 GPU 路径启用、地形正确。
+2. **编译期与 C2ME 解耦**（§10）：移除复合构建 / `compileOnly` 依赖 /
+   借用的 `c2me-base.accesswidener`；自写 `c2me-opts-accel-wgpu.accesswidener`
+   （~45 行）；删除 3 个从未引用的库（asyncutil / night-config / mixinsquared）。
+   C2ME 仍为运行时硬依赖。
+3. **混合执行**（§11）：无法翻译的密度子树交 CPU 在角点网格求值、作为外部
+   输入（binding 6）喂给 GPU，不再整体回退。任意 modded 密度函数可共存。
+4. **Windows 支持**：build.gradle 检测到 windows rust target 时自动交叉编译
+   DLL，jar 现含 `natives/windows-x86_64/c2me_wgpu.dll`。
+
+**三端验证**：
+| 平台 | 结果 |
+|---|---|
+| Linux (RADV) | ✅ 功能正常 |
+| Windows (AMD 驱动, mingw DLL) | ✅ 功能正常，原版 CPS avg 89.5 / max 123.8 |
+| Android | ⏳ 待测（无设备） |
+
+**tag**：`v0.1.2` → 本轮发布提交。
+
 ### v0.1.1（Modrinth 首个公开版本）
 
 > Modrinth 规则：版本上传后**主文件不可替换**。0.1.0 已上传（含下述
