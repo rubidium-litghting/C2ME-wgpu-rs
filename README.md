@@ -134,7 +134,8 @@ Set these only when troubleshooting. All of them are read once at startup.
 
 | Variable | Value | Effect |
 |---|---|---|
-| `C2ME_WGPU_DEBUG` | any non-empty value | Enables verbose logging: shader-compile timings, pipeline-cache hits/misses, and periodic chunk-per-second (`CPS=`) throughput stats. Silent by default. |
+| `C2ME_WGPU_DEBUG` | any non-empty value | Enables verbose logging: shader-compile timings, pipeline-cache hits/misses, and periodic chunk-per-second (`CPS=`) throughput stats. Written to `<gameDir>/logs/c2me-wgpu.log`. Silent by default. |
+| `C2ME_WGPU_PROFILE` | any non-empty value | Emits per-stage GPU batch timing (encode / submit / readback / decode), aggregated as one averaged line every 64 batches. Written to `<gameDir>/logs/c2me-wgpu.log`. Independent of `C2ME_WGPU_DEBUG`. |
 | `C2ME_VANILLA_REF` | `1` | Skip the GPU entirely, let vanilla generate the chunk, then dump its blocks for offline comparison against GPU output. |
 | `C2ME_DUMP_DENSITY` | `1` | Dump the GPU density values of the chunk at (0, 0). |
 | `C2ME_DUMP_BLOCKS` | `1` | Dump the block states of the chunk at (0, 0), for offline comparison against vanilla. |
@@ -143,6 +144,11 @@ Set these only when troubleshooting. All of them are read once at startup.
 
 The blob dump can also be set with the JVM property `-Dc2me.dumpBlob=<path>`;
 the environment variable is only a fallback when the property is unset.
+
+> **Rust-side log file:** the native library writes its diagnostics to
+> `<gameDir>/logs/c2me-wgpu.log` (the path is passed from Java at startup).
+> This is separate from Minecraft's own `logs/latest.log`, which only captures
+> Java logging.
 
 ### Cache location
 

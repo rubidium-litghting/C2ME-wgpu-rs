@@ -54,6 +54,7 @@ public class WgpuThinBinding {
     private static MethodHandle MH_get_gpu_name;
     private static MethodHandle MH_free_result_blob;
     private static MethodHandle MH_set_external_inputs;
+    private static MethodHandle MH_set_log_path;
 
     private static long instanceHandle;
     /** True only if the native lib linked AND a wgpu instance was created. */
@@ -139,6 +140,14 @@ public class WgpuThinBinding {
                             ValueLayout.JAVA_LONG        // data_len: usize
                     )
             );
+
+            MH_set_log_path = NativeLoader.linker.downcallHandle(
+                    NativeLoader.lookup.find("c2me_wgpu_set_log_path").orElseThrow(),
+                    FunctionDescriptor.ofVoid(
+                            ValueLayout.ADDRESS,         // ptr: *const u8
+                            ValueLayout.JAVA_LONG        // len: usize
+                    )
+            );
         } catch (Throwable t) {
             System.err.println("[c2me-wgpu] FFM link failed: " + t);
             linked = false;
@@ -149,6 +158,24 @@ public class WgpuThinBinding {
         // poisoned (NoClassDefFoundError afterwards), so the fallback guard in
         // callers would itself explode. On any failure we just leave
         // instanceHandle=0 / available=false.
+        if (linked) {
+            // Point the Rust logger at <gameDir>/logs/c2me-wgpu.log. Best-effort:
+            // never let this break class init.
+            try {
+                java.nio.file.Path logPath = net.fabricmc.loader.api.FabricLoader
+                        .getInstance().getGameDir()
+                        .resolve("logs").resolve("c2me-wgpu.log");
+                byte[] bytes = logPath.toAbsolutePath().toString()
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                try (Arena a = Arena.ofConfined()) {
+                    MemorySegment seg = a.allocateFrom(ValueLayout.JAVA_BYTE, bytes);
+                    MH_set_log_path.invokeExact(seg, (long) bytes.length);
+                }
+            } catch (Throwable t) {
+                System.err.println("[c2me-wgpu] set_log_path failed: " + t);
+            }
+        }
+
         if (linked) {
             try (Arena errArena = Arena.ofConfined()) {
                 MemorySegment errBuf = errArena.allocate(1024);

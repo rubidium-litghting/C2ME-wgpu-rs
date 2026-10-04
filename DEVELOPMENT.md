@@ -1316,3 +1316,81 @@ G = cells_per_chunk (5×97×5)
   有外部输入时的 Android 表现待验证。
 - **求值成本**：外部子树越大，CPU 成本越高。实践中未知节点多为小包装，
   成本小；若某 mod 的未知节点包着大子树，可据实再优化。
+
+---
+
+## §12 诊断基础设施（2026-10）
+
+### 12.1 Rust 日志文件（弃用 `C2ME_WGPU_DEBUG_LOG`）
+
+**旧机制**：Rust 诊断靠环境变量 `C2ME_WGPU_DEBUG_LOG=<path>` 指定写文件路径。
+Android 上必需（`latest.log` 只抓 Java stdout，Rust stderr 崩溃时丢失）。
+
+**问题**：要多设一个环境变量；且 `wgpu_debug!` 还要求 `C2ME_WGPU_DEBUG`
+非空才输出，两个开关易混淆。
+
+**新机制**：Java 启动时通过 FFM `c2me_wgpu_set_log_path` 把
+`<gameDir>/logs/c2me-wgpu.log` 传给 Rust（`FabricLoader.getGameDir()`）。
+Rust 无路径时回退到 `<cwd>/logs/c2me-wgpu.log`。**不再需要任何环境变量。**
+
+### 12.2 `C2ME_WGPU_PROFILE`（执行阶段计时）
+
+独立于 `C2ME_WGPU_DEBUG` 的开关，输出每个 GPU 批次的阶段耗时
+（encode / submit / readback / decode），**每 64 批聚合一行平均**（避免刷屏）。
+
+实测（桌面 RADV，原版，垂直同步关闭）：
+
+| 阶段 | 耗时 | 占比 |
+|---|---|---|
+| encode | ~0.015 ms | ~0.2% |
+| submit | ~0.27 ms | ~3% |
+| **readback** | **5–20 ms** | **~90%** |
+| ├─ `poll(Wait)`（等 GPU） | 5–20 ms | ← 全在这 |
+| └─ `map+copy`（拷贝数据） | 0.03–1 ms | ~0.5% |
+| decode | ~0.1–0.9 ms | ~3% |
+
+**关键结论**：瓶颈是 `device.poll(PollType::Wait)` **等待 GPU 完成**（~5ms 固定
+开销，批越大越高），**不是**数据回读带宽。曾设想的"只回读 2 通道"优化
+（省 87.5% 带宽）**证伪**——`map+copy` 本就 <1 ms。
+
+**推测**：核显上 GPU 被渲染占满，我们的 compute 只能在渲染帧的空隙跑，
+还要付同步开销。故在"高 U 低显"设备上 GPU 卸载的收益可能天生有限
+（除非有独显 / GPU 空闲 / CPU 被占满）。见 §13。
+
+### 12.3 环境变量现状
+
+| 变量 | 状态 |
+|---|---|
+| `C2ME_WGPU_DEBUG_LOG` | **退役**（路径改由 Java 传入） |
+| `C2ME_WGPU_DEBUG` | 保留（编译/缓存诊断，输出到 c2me-wgpu.log） |
+| `C2ME_WGPU_PROFILE` | 新增（阶段计时，独立开关） |
+
+---
+
+## §13 待验证：GPU 卸载在"高 U 低显"设备上的收益
+
+### 13.1 观察
+
+- 桌面（5800U + Vega8 核显）：用户用 Chunky 对比，**纯 C2ME CPU 恒 >100 CPS**，
+  不逊于甚至优于 GPU 路径。
+- 天玑 8100 / 麒麟 980：同样疑似 CPU 路径不慢。
+
+### 13.2 假设
+
+多数装 C2ME 的设备是**强 CPU + 弱 GPU（核显）**，而 C2ME 的 CPU 路径已被
+极致优化（DFC 编译字节码 + native math）。§12.2 的 profile 显示 GPU 路径 ~90%
+时间花在 `poll(Wait)` 等 GPU——核显上 GPU 被渲染占满，卸载过去只能抢空隙、
+还付同步开销。**故在这些设备上 GPU 卸载可能天生不划算。**
+
+### 13.3 尚未做的严格验证
+
+**需要同一世界、同一批区块的 A/B**：纯 C2ME vs C2ME+GPU mod，比 CPS。
+现有数字（Chunky vs 游戏内）条件不一致，**不足以定论**。
+
+### 13.4 影响
+
+- **宣发口径**：在数据出来前，不应宣传成"所有设备加速"。已知受益场景可能是
+  独显 / GPU 空闲 / CPU 被占满。
+- **产品定位**：若 A/B 证实核显无收益，需重新定位（而非当作通用加速器）。
+
+**结论：开放问题，待 A/B 数据。**

@@ -414,6 +414,22 @@ pub unsafe extern "C" fn c2me_wgpu_set_external_inputs(
 }
 
 // ---------------------------------------------------------------------------
+// ⑧ Set the Rust-side log file path (called by Java at startup).
+//
+/// # Safety
+/// `ptr` must point to `len` UTF-8 bytes (or be null with len 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2me_wgpu_set_log_path(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        crate::set_log_path(s);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Extra helper: GPU name.
 /// Returns a statically-allocated UTF-8 C string. Caller must NOT free.
 #[unsafe(no_mangle)]

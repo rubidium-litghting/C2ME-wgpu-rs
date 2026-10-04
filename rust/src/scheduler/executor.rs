@@ -301,6 +301,9 @@ impl SingleBatchExecutor {
             ],
         });
 
+        let prof = crate::profile_enabled();
+        let t_encode0 = std::time::Instant::now();
+
         // Encode: clear staging, then copy output→staging (after compute writes to output)
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("c2me_wgpu_batch_encode"),
@@ -346,17 +349,30 @@ impl SingleBatchExecutor {
             total_bytes as u64,
         );
 
+        let encode_ms = t_encode0.elapsed().as_secs_f64() * 1e3;
+        let t_submit0 = std::time::Instant::now();
         self.queue.submit(Some(encoder.finish()));
+        let submit_ms = t_submit0.elapsed().as_secs_f64() * 1e3;
 
         // Mark staging as ready (copies GPU data to CPU)
+        let t_readback0 = std::time::Instant::now();
         self.staging.mark_ready(slot_handle, &self.device, total_bytes);
+        let readback_ms = t_readback0.elapsed().as_secs_f64() * 1e3;
 
         // Read results from staging buffer
+        let t_decode0 = std::time::Instant::now();
         let result_map = self.read_results(batch, slot_handle)?;
+        let decode_ms = t_decode0.elapsed().as_secs_f64() * 1e3;
 
         self.staging.consume(slot_handle);
 
         let dispatch_time = t0.elapsed();
+
+        if prof {
+            profile_accumulate(batch.positions.len() as u64,
+                encode_ms, submit_ms, readback_ms, decode_ms,
+                dispatch_time.as_secs_f64() * 1e3);
+        }
 
         Ok(Arc::new(ExecutedBatch {
             batch: batch.clone(),
@@ -516,5 +532,43 @@ mod tests {
             max_priority: Priority::Normal,
         };
         assert_eq!(batch.positions.len(), 3);
+    }
+}
+
+// ── profiling aggregator ────────────────────────────────────────────────
+// One averaged line every PROFILE_EVERY batches, so the log doesn't flood
+// at tens of batches per second.
+static P_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static P_CHUNKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static P_ENC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static P_SUB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static P_RB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static P_DEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static P_TOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn profile_accumulate(chunks: u64, enc: f64, sub: f64, rb: f64, dec: f64, tot: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const N: u64 = 64; // ~1-2 s of activity per line
+    let n = P_N.fetch_add(1, Relaxed) + 1;
+    P_CHUNKS.fetch_add(chunks, Relaxed);
+    P_ENC.fetch_add((enc * 1000.0) as u64, Relaxed);
+    P_SUB.fetch_add((sub * 1000.0) as u64, Relaxed);
+    P_RB.fetch_add((rb * 1000.0) as u64, Relaxed);
+    P_DEC.fetch_add((dec * 1000.0) as u64, Relaxed);
+    P_TOT.fetch_add((tot * 1000.0) as u64, Relaxed);
+    if n >= N {
+        let bn = n as f64;
+        crate::profile_log(&format!(
+            "[c2me-wgpu][profile] avg over {} batches ({} chunks): encode={:.2} submit={:.2} readback={:.2} decode={:.2} total={:.2} ms/batch",
+            n, P_CHUNKS.load(Relaxed),
+            P_ENC.load(Relaxed) as f64 / 1000.0 / bn,
+            P_SUB.load(Relaxed) as f64 / 1000.0 / bn,
+            P_RB.load(Relaxed) as f64 / 1000.0 / bn,
+            P_DEC.load(Relaxed) as f64 / 1000.0 / bn,
+            P_TOT.load(Relaxed) as f64 / 1000.0 / bn,
+        ));
+        P_N.store(0, Relaxed); P_CHUNKS.store(0, Relaxed);
+        P_ENC.store(0, Relaxed); P_SUB.store(0, Relaxed);
+        P_RB.store(0, Relaxed); P_DEC.store(0, Relaxed); P_TOT.store(0, Relaxed);
     }
 }
