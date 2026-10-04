@@ -84,7 +84,9 @@ public abstract class MixinChunkGenerator {
             "1".equals(System.getenv("C2ME_DUMP_DENSITY"));
     private static final boolean DUMP_BLOCKS =
             "1".equals(System.getenv("C2ME_DUMP_BLOCKS"));
-
+    /** Coarse per-stage timing of the CPU write-back path. Diagnostic only. */
+    private static final boolean PROFILE =
+            "1".equals(System.getenv("C2ME_WGPU_PROFILE"));
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
     private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,
                                  StructureAccessor structureAccessor, Chunk chunk,
@@ -166,8 +168,14 @@ public abstract class MixinChunkGenerator {
                             ((NoiseChunkGeneratorInvoker) (Object) gen)
                                     .callCreateChunkNoiseSampler(cs, fSa, fBlender, fNc));
             net.minecraft.world.gen.chunk.AquiferSampler aquifer = sampler.getAquiferSampler();
-            net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler oreVein =
+            net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler fullBss =
                     ((ChunkNoiseSamplerAccessor) (Object) sampler).getBlockStateSampler();
+            net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler veinOnly =
+                    extractOreVeinSampler(fullBss);
+            // Fall back to the chained source if extraction failed (the
+            // air/water guard above keeps that path correct).
+            net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler oreVein =
+                    (veinOnly != null) ? veinOnly : fullBss;
 
             writeDensityToChunk(chunk, seg, aquifer, oreVein, gpu.batchIndex, structureAccessor, ds);
             if (DUMP_BLOCKS) {
@@ -198,9 +206,84 @@ public abstract class MixinChunkGenerator {
         }));
     }
 
-    /** Dump chunk (0,0) block states for offline GPU-vs-vanilla comparison. */
+    /** Target chunk(s) for block dumping. Default (0,0). Override with
+     *  C2ME_DUMP_CHUNK=x,z (or x1,z1,x2,z2 for a rectangle, inclusive). */
+    private static final int[] DUMP_CHUNK = parseDumpChunk();
+
+    private static int[] parseDumpChunk() {
+        String v = System.getenv("C2ME_DUMP_CHUNK");
+        if (v == null || v.isBlank()) return new int[]{0, 0, 0, 0};
+        try {
+            String[] p = v.split(",");
+            if (p.length == 2) {
+                int x = Integer.parseInt(p[0].trim()), z = Integer.parseInt(p[1].trim());
+                return new int[]{x, z, x, z};
+            }
+            if (p.length == 4) {
+                return new int[]{
+                        Integer.parseInt(p[0].trim()), Integer.parseInt(p[1].trim()),
+                        Integer.parseInt(p[2].trim()), Integer.parseInt(p[3].trim())};
+            }
+        } catch (Throwable ignored) {}
+        return new int[]{0, 0, 0, 0};
+    }
+
+    // Aggregated CPU write-back timing: one averaged line every 128 chunks,
+    // so the log isn't flooded (was ~1 line/chunk).
+    private static final java.util.concurrent.atomic.AtomicLong CPUPROF_N =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong CPUPROF_US =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    private static void profileCpuAccumulate(long us) {
+        long n = CPUPROF_N.incrementAndGet();
+        CPUPROF_US.addAndGet(us);
+        if (n >= 128) {
+            long total = CPUPROF_US.getAndSet(0);
+            long cnt = CPUPROF_N.getAndSet(0);
+            LOGGER.info("[c2me-wgpu][profile-cpu] avg over {} chunks: write={}us/chunk",
+                    cnt, total / cnt);
+        }
+    }
+
+    /** ChunkNoiseSampler.getBlockStateSampler() returns a ChainedBlockSource
+     *  = [aquifer, oreVein]. Calling it re-runs the aquifer with the raw
+     *  (non-interpolated) density, which can wrongly return air/water and
+     *  clobber our solid result. Pull the ore-vein element out instead.
+     *  Returns null when there is no separate vein sampler (oreVeins off). */
+    private static net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler
+            extractOreVeinSampler(
+                    net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler full) {
+        if (full == null) return null;
+        try {
+            for (java.lang.reflect.Field f : full.getClass().getDeclaredFields()) {
+                if (java.util.List.class.isAssignableFrom(f.getType())) {
+                    f.setAccessible(true);
+                    java.util.List<?> list = (java.util.List<?>) f.get(full);
+                    if (list == null) continue;
+                    // Find the OreVein sampler by lambda enclosing class name;
+                    // do NOT assume it is the last element (datapacks/mods can
+                    // add more sources to the chain).
+                    for (Object o : list) {
+                        if (o != null && o.getClass().getName().contains("OreVein")) {
+                            return (net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler) o;
+                        }
+                    }
+                    // Not found: no separate vein sampler in this chain.
+                    return null;
+                }
+            }
+        } catch (Throwable t) {
+            LOGGER.warn("[c2me-wgpu] extractOreVeinSampler failed", t);
+        }
+        return null;
+    }
+
+    /** Dump selected chunk block states for offline GPU-vs-vanilla comparison. */
     private static void maybeDumpBlocks(Chunk chunk, String mode) {
-        if (chunk.getPos().x != 0 || chunk.getPos().z != 0) {
+        int cx = chunk.getPos().x, cz = chunk.getPos().z;
+        if (cx < DUMP_CHUNK[0] || cx > DUMP_CHUNK[2]
+                || cz < DUMP_CHUNK[1] || cz > DUMP_CHUNK[3]) {
             return;
         }
         try {
@@ -223,7 +306,8 @@ public abstract class MixinChunkGenerator {
                     }
                 }
             }
-            String path = "/tmp/chunk_blocks_" + mode + ".txt";
+            String path = "/tmp/chunk_blocks_" + mode
+                    + "_" + cx + "_" + cz + ".txt";
             java.nio.file.Files.writeString(java.nio.file.Path.of(path), sb.toString());
             LOGGER.info("[c2me-wgpu] dumped {} block states ({} blocks) to {}",
                     mode, sb.length(), path);
@@ -269,13 +353,19 @@ public abstract class MixinChunkGenerator {
         int base = (int) (PAYLOAD_BASE + (long) batchIndex * chunkStride
                 + CHANNEL * CELLS_PER_CHANNEL * 4);
 
+        final long tWriteStart = PROFILE ? System.nanoTime() : 0L;
+        final int startX = chunk.getPos().getStartX();
+        final int startZ = chunk.getPos().getStartZ();
+
         BlockState stone = ds.defaultBlock;   // dim-specific solid (stone/netherrack/end_stone)
         BlockState air = Blocks.AIR.getDefaultState();
         Heightmap oceanFloorWg = chunk.getHeightmap(Heightmap.Type.OCEAN_FLOOR_WG);
         Heightmap worldSurfaceWg = chunk.getHeightmap(Heightmap.Type.WORLD_SURFACE_WG);
 
         StringBuilder densityDump = null;
-        if (DUMP_DENSITY && chunk.getPos().x == 0 && chunk.getPos().z == 0) {
+        if (DUMP_DENSITY
+                && chunk.getPos().x >= DUMP_CHUNK[0] && chunk.getPos().x <= DUMP_CHUNK[2]
+                && chunk.getPos().z >= DUMP_CHUNK[1] && chunk.getPos().z <= DUMP_CHUNK[3]) {
             densityDump = new StringBuilder();
         }
 
@@ -301,6 +391,12 @@ public abstract class MixinChunkGenerator {
 
         float dmin = Float.POSITIVE_INFINITY, dmax = Float.NEGATIVE_INFINITY;
         int stoneCells = 0, airCells = 0;
+        int aqCalls = 0;
+        // Sample every 16th aquifer call to estimate its cost without
+        // wrecking JIT inlining of the hot block loop.
+        int aqProbeCounter = 0;
+        long aqProbeNanos = 0L;
+        int aqProbeCalls = 0;
 
         // Precompute all cell values so we can trilinearly interpolate.
         float[] cells = new float[CELLS_PER_CHANNEL];
@@ -378,8 +474,7 @@ public abstract class MixinChunkGenerator {
                     // otherwise water / lava / air per local fluid level.
                     net.minecraft.world.gen.densityfunction.DensityFunction.NoisePos npos =
                             new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(
-                                    chunk.getPos().getStartX() + bx, globalY,
-                                    chunk.getPos().getStartZ() + bz);
+                                    startX + bx, globalY, startZ + bz);
                     // Beard is applied PER BLOCK (not at cell corners):
                     // MC's mapAll swaps Beardifier for StructureWeightSampler
                     // as a direct density node, so it is NOT trilinearly
@@ -387,7 +482,17 @@ public abstract class MixinChunkGenerator {
                     // foundations and made buildings float again.
                     double beard = (structureWeight != null)
                             ? structureWeight.sample(npos) : 0.0;
-                    BlockState bs = aquifer.apply(npos, (double) d + beard);
+                    BlockState bs;
+                    if (PROFILE && (aqProbeCounter & 15) == 0) {
+                        long tAq = System.nanoTime();
+                        bs = aquifer.apply(npos, (double) d + beard);
+                        aqProbeNanos += System.nanoTime() - tAq;
+                        aqProbeCalls++;
+                    } else {
+                        bs = aquifer.apply(npos, (double) d + beard);
+                    }
+                    aqProbeCounter++;
+                    if (PROFILE) aqCalls++;
                     if (bs == null) {
                         // Solid. Ore veins are per-block + randomised, so they
                         // cannot live on the corner grid. Only compute the
@@ -416,20 +521,30 @@ public abstract class MixinChunkGenerator {
                             // matching 0.4 threshold; this keeps oreCalls low.
                             if (Math.abs(vt) >= 0.4f) {
                                 vein = oreVein.sample(npos);
+                                // Guard: if extraction fell back to the
+                                // chained source, its aquifer stage can return
+                                // air/water (re-evaluated with raw density).
+                                // OreVeinSampler never returns those.
+                                if (vein != null && (vein.isAir()
+                                        || vein.isOf(Blocks.WATER)
+                                        || vein.isOf(Blocks.LAVA))) {
+                                    vein = null;
+                                }
                             }
                         }
                         bs = (vein != null) ? vein : stone;
                     }
-                    if (bs == air) continue;
                     if (densityDump != null) {
-                        int gx = chunk.getPos().getStartX() + bx;
-                        int gz = chunk.getPos().getStartZ() + bz;
-                        densityDump.append(gx).append(' ').append(globalY).append(' ')
-                          .append(gz).append(' ').append((double) d + beard)
+                        int lx0 = bx & 15, lz0 = bz & 15;
+                        densityDump.append(lx0).append(' ').append(globalY).append(' ')
+                          .append(lz0).append(' ').append((double) d + beard)
                           .append(' ')
-                          .append(net.minecraft.registry.Registries.BLOCK
-                              .getId(bs.getBlock()).toString()).append('\n');
+                          .append(bs == air ? "air"
+                              : net.minecraft.registry.Registries.BLOCK
+                                  .getId(bs.getBlock()).toString())
+                          .append('\n');
                     }
+                    if (bs == air) continue;
                     int lx = bx & 15;
                     int ly = globalY & 15;
                     int lz = bz & 15;
@@ -445,10 +560,16 @@ public abstract class MixinChunkGenerator {
 
 
 
+        if (PROFILE) {
+            long totalUs = (System.nanoTime() - tWriteStart) / 1_000L;
+            profileCpuAccumulate(totalUs);
+        }
+
         if (densityDump != null) {
             try {
                 java.nio.file.Files.writeString(
-                        java.nio.file.Path.of("/tmp/chunk_density_gpu.txt"),
+                        java.nio.file.Path.of("/tmp/chunk_density_gpu_"
+                                + chunk.getPos().x + "_" + chunk.getPos().z + ".txt"),
                         densityDump.toString());
                 LOGGER.info("[c2me-wgpu] dumped GPU density ({} blocks)",
                         densityDump.length());

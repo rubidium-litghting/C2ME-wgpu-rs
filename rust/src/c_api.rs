@@ -263,6 +263,10 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
         }
     };
 
+    // Capture per-chunk cell count BEFORE the Arc is moved into the executor.
+    // Shape-dependent (e.g. 5×49×5 vanilla, 5×65×5 with taller datapacks).
+    let cells_per_channel_units: u64 = world_arc.cells_per_chunk() as u64;
+
     let executor_result = executor.lock()
         .map_err(|e| {
             unsafe { write_err(err_buf, err_buf_len, &format!("executor lock: {e}")) };
@@ -275,10 +279,9 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
         Ok(executed) => {
             // Merge all per-chunk results into one combined blob
             let mut all_f32s: Vec<f32> = Vec::new();
-            const CELLS_PER_CHANNEL: u64 = 5 * 97 * 5;
             let mut combined_offsets = [0u64; 16];
             for (ch, off) in combined_offsets.iter_mut().enumerate() {
-                *off = (ch as u64) * CELLS_PER_CHANNEL * 4;
+                *off = (ch as u64) * cells_per_channel_units * 4;
             }
             let mut chunk_idx = 0u16;
 

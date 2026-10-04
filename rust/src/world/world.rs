@@ -341,6 +341,20 @@ impl WorldContext {
         *self.external_data.lock().unwrap() = data;
     }
 
+    /// Corner-grid cells per chunk for this world's shape:
+    /// cell_count_x * cell_count_y * cell_count_z, where
+    ///   cell_count = 16/cell_width + 1  (x, z)  and
+    ///   cell_count_y = height/cell_height + 1.
+    /// Must match the WGSL prologue's cells_per_chunk exactly.
+    pub fn cells_per_chunk(&self) -> usize {
+        let cw = self.shape.cell_width.max(1);
+        let ch = self.shape.cell_height.max(1);
+        let gx = 16 / cw + 1;
+        let gy = self.shape.height / ch + 1;
+        let gz = 16 / cw + 1;
+        (gx * gy * gz) as usize
+    }
+
     pub fn external_count(&self) -> usize {
         self.external_count.load(std::sync::atomic::Ordering::Relaxed)
     }

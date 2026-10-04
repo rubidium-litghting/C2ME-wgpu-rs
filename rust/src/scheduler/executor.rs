@@ -102,9 +102,12 @@ impl SingleBatchExecutor {
         queue: Arc<wgpu::Queue>,
         config: ExecutorConfig,
     ) -> Result<Self, String> {
-        // One chunk = 16 channels × 16×16×16 cells × 4 bytes = 256 KiB.
-        // Staging must hold a full batch (config.max_batch_size chunks).
-        let bytes_per_chunk: usize = 16 * 2425 * 4;
+        // Size persistent buffers for the worst realistic shape. The real
+        // per-chunk size is derived per-batch from world.cells_per_chunk();
+        // this bound must be >= any shape we might see. 5×129×5 covers
+        // height up to 512 with cell_height down to 4.
+        const MAX_CELLS_PER_CHUNK: usize = 5 * 129 * 5;
+        let bytes_per_chunk: usize = 16 * MAX_CELLS_PER_CHUNK * 4;
         let max_buffer_size = bytes_per_chunk * config.max_batch_size.max(1);
         let staging = StagingChain::new(&device, config.staging_capacity, max_buffer_size);
 
@@ -170,7 +173,12 @@ impl SingleBatchExecutor {
                 batch.positions.len(), self.config.max_batch_size));
         }
         let num_chunks = batch.positions.len() as u32;
-        let f32_per_chunk = 16 * 2425; // 16 channels × (5×97×5 corner grid)
+        // Cells per chunk is shape-dependent (e.g. 5×49×5 vanilla, 5×65×5
+        // with taller datapacks) — must match the shader's grid exactly, or
+        // the readback stride is wrong. Previously hard-coded to 2425
+        // (5×97×5), which only matched the cell_height=4 test blob.
+        let cells_per_chunk = world.cells_per_chunk();
+        let f32_per_chunk = 16 * cells_per_chunk;
         let total_f32s = (num_chunks as usize) * f32_per_chunk;
         let total_bytes = total_f32s * 4;
 
