@@ -22,7 +22,7 @@
   "depends": {
     "minecraft": "~1.21.1",
     "fabricloader": ">=0.17.2",
-    "java": ">=22",
+    "java": ">=25",
     "c2me": "*"
   },
   "accessWidener": "c2me-opts-accel-wgpu.accesswidener"

@@ -30,11 +30,11 @@ onto the GPU.
 | Minecraft | 1.21.1 (Fabric) |
 | Fabric Loader | >= 0.17.2 |
 | **C2ME** | **required** (this is a companion module, not standalone) |
-| Java | 22+ (built with the Java 25 toolchain) |
+| Java | 25+ (the mod is built against Java 25 and uses the Panama FFM API) |
 | GPU | Any GPU with a working wgpu backend |
 
-Java 22 or newer is required because the mod talks to its Rust core through
-the Panama FFM API.
+Java 25 or newer is required: the mod is compiled for Java 25 (and talks to
+its Rust core through the Panama FFM API, which is stable from Java 24).
 
 > **Why still named "C2ME-wgpu-rs"?** This mod has **no compile-time
 > dependency** on C2ME — its Java code references no C2ME class and it ships
@@ -118,7 +118,7 @@ it would exclude most mobile GPUs.
   the tree still runs on the GPU, so modded worldgen keeps working — only the
   unsupported subtree pays a CPU cost.
 - **May be a net slowdown on weak GPUs**: ~90% of GPU-path time is spent
-  waiting for the GPU (`poll`), not computing. On integrated/mobile GPUs that
+  queued behind the renderer (`poll`), not computing. On integrated/mobile GPUs that
   are already busy rendering, this can make chunk generation slower than pure
   CPU. See the note at the top.
 

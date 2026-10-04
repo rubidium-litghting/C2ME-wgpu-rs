@@ -64,7 +64,7 @@
 | Yarn | 1.21.1+build.1 |
 | Fabric Loader | 0.17.2 |
 | Loom | fabric-loom 1.13-SNAPSHOT |
-| Java | toolchain 25（FFM 需要 ≥22） |
+| Java | toolchain 25（编译产物为 Java 25 字节码，运行时要求 ≥25） |
 | Gradle JVM | 21 |
 
 ### 2.3 C2ME 依赖方式
@@ -1149,7 +1149,7 @@ cargo test --lib real_router_vs_vanilla -- --nocapture     # GPU vs ref（需 GP
 
 - **Modrinth**：已提交，**审核中**（首次项目人工审核）。
   - 项目：`C2ME-wgpu-rs`（slug `c2me-wgpu-rs`）。
-  - 平台：Fabric 1.21.1，Loader ≥ 0.17.2，Java ≥ 22。
+  - 平台：Fabric 1.21.1，Loader ≥ 0.17.2，Java ≥ 25。
   - 依赖：**C2ME**（required）。
   - 分类：Optimization / Worldgen / Technology；环境 Client + Server；License MIT。
 - **CurseForge**：暂不发布。
