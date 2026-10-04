@@ -7,6 +7,14 @@ A companion mod for [C2ME](https://modrinth.com/mod/c2me-fabric)
 that offloads the heavy noise / density-function pipeline of chunk generation
 onto the GPU.
 
+> ⚠️ **Experimental — read before installing.** Strict A/B testing shows that
+> on **strong-CPU / weak-GPU** machines (integrated graphics, most phones and
+> laptops) GPU offload can be **slower than plain C2ME on the CPU** — on a
+> Kirin 980, ~16.6 vs 23.2 chunks/s under Chunky. The GPU ends up waiting on
+> the renderer; the noise compute itself is not the bottleneck. Likely wins
+> only when the GPU is otherwise idle or you have a discrete GPU. Benchmark
+> on your own hardware before relying on it.
+
 > **Compatibility-first.** This mod is deliberately built on **fp32** so it can
 > run on the *widest possible range of GPUs* — including integrated graphics
 > and mobile SoCs. The official C2ME accelerator targets `fp64` via OpenCL;
@@ -109,6 +117,10 @@ it would exclude most mobile GPUs.
   the same corner grid and fed to the GPU as an "external input". The rest of
   the tree still runs on the GPU, so modded worldgen keeps working — only the
   unsupported subtree pays a CPU cost.
+- **May be a net slowdown on weak GPUs**: ~90% of GPU-path time is spent
+  waiting for the GPU (`poll`), not computing. On integrated/mobile GPUs that
+  are already busy rendering, this can make chunk generation slower than pure
+  CPU. See the note at the top.
 
 ---
 
