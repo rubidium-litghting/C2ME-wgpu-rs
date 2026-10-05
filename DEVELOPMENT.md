@@ -1162,6 +1162,94 @@ CPS **不会**因这两刀提升——§15.7 已证 GPU 富余 6 倍，瓶颈是
 而那三条已逐一验证排除。
 
 
+---
+
+## §5.17 2n 里程碑 —— 群系气候 GPU 加速（design 2，2026-10）
+
+> **代码位置：`experiment/biome-gpu` 分支。** main 上仅保留本节 + §16 的
+> 记录。结论（§16.6）：功能正确但**净负优化**（关键路径延迟），默认关闭。
+
+### 5.17.1 动机与可行性
+
+MC 的群系放置用 `MultiNoiseBiomeSource` + 六参数气候采样
+（temperature/humidity/continentalness/erosion/depth/weirdness）。这六个
+参数正是 NoiseRouter 的 ch4–9（temperature/vegetation/continents/erosion/
+depth/ridges），**emitter 早已存在**，§5.10.2 验证过。GPU 化可行性成立
+（C2ME OpenCL 模块也做过同一件事）。
+
+### 5.17.2 关键事实：BIOMES 在 NOISE 之前
+
+从 1.21.1 字节码确认 `ChunkStatus` 依赖链：
+EMPTY → STRUCTURE_STARTS → STRUCTURE_REFERENCES → BIOMES → NOISE → …
+即 `populateBiomes` **先于** `populateNoise`。群系**不能**搭地形的顺风车
+（地形请求还没来）。这决定了架构：**两条独立 GPU 路径**（design 2）。
+
+### 5.17.3 量化公式：一行
+
+MC `MultiNoiseSampler.sample(x,y,z)` 反编译后等价于：
+
+    NoisePos pos = new UnblendedNoisePos(BiomeCoords.toBlock(x), ...);
+    float t = (float) temperature.sample(pos);   // 六个通道各一次
+    ... createNoiseValuePoint(t,h,c,e,d,w);      // toLong(f) = (long)(f*10000)
+
+`BiomeCoords.toBlock(i) = i << 2`，即**群系格 = 每 4 方块**（三轴）。
+没有查表、没有非线性、没有随机——这是"可行"最硬的依据。C2ME OpenCL
+承认的"边界偏移一两格"，很可能就是没复现这个 ×10000 截断。
+
+### 5.17.4 实现（Rust）
+
+- 新增 `Pass::D`（群系 shard），emit ch4–9；`ShardMode` 三值：
+  `Terrain`（B/C）、`BiomeOnly`（只 D）、`TerrainPlusBiome`（测试用）。
+- **Y 网格独立**：群系 Y cell = 4（`BIOME_CELL_HEIGHT`），地形是 8。两段
+  在 `out_buf` 分开：terrain 段 `OUT_BUF_CHANNELS=16` 槽/chunk，biome 段
+  6 槽/chunk。段基址经 `params._pad` 传入，WGSL 无字面量。
+- 新 C API：`c2me_wgpu_world_new_biome` / `c2me_wgpu_request_biomes` /
+  `c2me_wgpu_biome_channel_count`。
+- **数值验证**（`biome_climate_vs_vanilla`）：GPU 与 vanilla 差
+  **1.6e-5 ~ 4.9e-5**（fp32 预算内）；量化 delta ≤ 1（MC 用 double→float，
+  我们全程 fp32，±1 固有）。
+
+### 5.17.5 实现（Java）
+
+- `BiomeAccel`：per-dimension biome-only WorldContext + coordinator，门控
+  `C2ME_WGPU_BIOME=1`（默认关）。
+- `MixinChunkGeneratorBiomes`：inject `populateBiomes` HEAD，用 GPU 六参数
+  构造 `NoiseValuePoint` 喂 `mns.getBiomeAtPoint(...)`，复用 MC 自己的群系
+  容器填充（`chunk.populateBiomes(supplier, sampler)`）。
+- **target 必须是 `NoiseChunkGenerator`，不是 `ChunkGenerator`**：子类
+  override 了 `populateBiomes`，挂基类永不触发（第一次测试踩到）。
+
+### 5.17.6 修复的真 bug
+
+1. **`num_chunks` 用错来源**（关键）：shader 里
+   `num_chunks = arrayLength(&positions)/2`。但 `positions_buf` 按
+   `max_batch_size=64` 持久分配 → `arrayLength` 恒 128 → 恒认为 64 个
+   chunk。地形 shard 不受影响（基址不含 num_chunks），但 biome 段基址
+   `num_chunks * …` 差一个数量级，读到全 0。改用 `params.batch_count_x`。
+2. **`PendingQueue` 全局单例**：terrain 和 biome 共用一个队列 → flush
+   互相窃取请求 + `PendingQueue overflow`。改为**每 world 一份**
+   （`WorldContext.pending_queue`）。
+
+### 5.17.7 实测（桌面 RADV）
+
+| 指标 | 值 |
+|---|---|
+| shard D | 1426 行 |
+| biome grid | 5×129×5（h=512, cell=4）|
+| biome-batch CPS | 70–85 |
+| terrain CPS | 65–75 |
+| 溢出/回退 | 0 |
+
+群系目视与 vanilla 一致（边界锐利、无系统性偏移）。
+
+### 5.17.8 关键教训
+
+- **override 陷阱**：mixin 挂基类，实际调用的是子类 override。terrain 早已
+  挂 `NoiseChunkGenerator`，biome 却挂了 `ChunkGenerator`——同类错误。
+- **全局单例在多 world 下必炸**：队列、executor 都必须 per-world 或明确分片。
+- **`arrayLength` 反映容量不反映活批**：持久 buffer 场景下不能当批大小用。
+
+
 ## §8 待办（更新）
 
 - ~~ch10/ch11 残差~~ ✅ ch10 = fp32 固有（§5.8）；ch11 的额外残差 = octave 顺序 bug（§5.9.3），已修。
@@ -1665,3 +1753,95 @@ deopt/异常（正常）、搬 aquifer（代价 > 收益）。
     端到端不涨（§15.6 surface-cache）——不值得再赌。
 
 **最终**：该 mod 在目标设备上是净负优化，**所有方向均已逐一验证、排除**。方向终止。
+
+
+---
+
+## §16 GC 对"高 U 低显"负优化的贡献 —— 实测排除（2026-10）
+
+### 16.1 动机
+
+§13 把"高 U 低显"设备的负优化归因于"GPU 被渲染占满、poll 等待"。但有一个
+从未验证的假设：**分配压力在弱 GC（手机）下造成停顿**。§5.17 的 biome 路径
+新增了每 chunk 的分配（`float[6*cpc]` ≈ 77 KB/chunk，blob 拷贝 ~1.2 MB/batch），
+合计约 **25 MB/s**。若这是主因，手机应受益于"减少分配"。
+
+### 16.2 方法
+
+同一世界、同一构建（开 biome 加速），仅改 GC 配置跑四轮，`-Xlog:gc*` 记录：
+
+| 配置 | GC 次数 | 平均停顿 | 最长停顿 | `Can't keep up` |
+|---|---|---|---|---|
+| Zulu + ZGC | — | 亚毫秒 | 低 | 2 × 2.0 s |
+| Zulu + G1 | 79 | 19.3 ms | 43 ms | 1 × 2.0 s |
+| OpenJDK + 默认(G1) | 61 | 21.0 ms | 160 ms | 0 |
+| OpenJDK + **SerialGC** | ~301 | **36.6 ms** | **528 ms** | 2 × 2.7 s |
+
+（每轮约 30–150 s 游戏时间，飞行生成新区块。）
+
+### 16.3 结论
+
+1. **GC 实现不是变量**：G1 两轮平均停顿都在 ~20 ms，与 ZGC 体感无差。
+   **分配速率才是**（两轮 G1 都是 60–80 次 Young GC，速率一致）。
+2. **那个 ~2 s 的 `Can't keep up` 与 GC 无关**：ZGC（亚毫秒停顿）有它，
+   SerialGC（528 ms 停顿）也有它，四轮都有。**它另有原因**——最可能是
+   Rust executor 是全局单例，terrain / biome 两条路径抢同一把锁、串行化。
+3. **SerialGC 是最坏情况**（单线程 STW，avg 36 ms、max 528 ms）——即便
+   如此，桌面**体感与 ZGC 无差**。手机 GC 再差 ~3×，也要累积多次才明显；
+   而 §15.7 已证 CPU 逐方块写回在手机上同样 ×3–5，**那才是主因**。
+
+### 16.4 对"手动管理内存 / 减少分配"方向的裁定
+
+**收益极低，不做。** 实测证明 GC 不是"高 U 低显"负优化的主要来源；把 25 MB/s
+的分配降到接近 0，也不会改变端到端体感。方向终止。
+
+### 16.5 executor 串行假设（实测证伪）
+
+一度怀疑 ~2 s 停顿来自 executor 串行：`get_or_create_executor()` 返回全局
+单例 `ExecutorThread`，`request_chunks` / `request_biomes` 都
+`executor.lock()` 并**持锁跑完整个 GPU 往返**。biome `avgBatch` 13–26 ms 而
+shader 更小，像是排队等锁。
+
+**实测证伪**：拆成 per-world executor（terrain / biome 各一个线程 + buffer）
+后，biome `avgBatch` 仍 13–22 ms（没变），`Can't keep up` 反增（2→4）。
+executor 拆/合对该停顿**无确定影响**，已回退（无收益 + 多花 ~36 MB native）。
+
+### 16.6 决定性实验：biome 路径 = 2s 停顿的元凶（2026-10）
+
+同飞法、同时长，仅切 `C2ME_WGPU_BIOME`：
+
+| 配置 | `Can't keep up` | terrain CPS |
+|---|---|---|
+| biome **ON** | **4 次**（~2 s 级）| 49–68 |
+| biome **OFF** | **0 次** | **73–91** |
+
+**结论：biome GPU 加速是净负优化。**
+
+- BIOMES 在 NOISE **之前**（§5.17.2）。biome 每 chunk 等一次 GPU 往返
+  （avgBatch 14–21 ms），**拉长了整条 chunk 生成链的关键路径** → Server
+  tick 停摆。
+- 它还**拖累 terrain**（CPS 49–68 → 73–91）：biome 请求占用共享 GPU
+  executor 队列，terrain batch 到得更慢。
+- **根因认知**：vanilla 的 biome 采样是**纯 CPU 六参数噪声**，本来就快。
+  搬到 GPU 换来的不是"更快"，而是**引入 ~14 ms 往返延迟**，还落在关键路径。
+
+这印证 §13/§16 的总判断：**GPU 卸载在关键路径上是负优化**。biome 比地形更
+糟——地形的 GPU 计算量真的大（值得省 CPU），biome 计算量本来就小（省不了
+多少，却付出往返延迟）。
+
+**处置**：biome 代码移到分支 `experiment/biome-gpu` 保存；main 上不启用
+（`C2ME_WGPU_BIOME` 默认关）。作为**技术验证保留**（证明 6 气候参数可精确
+复现 1e-5、调用链可接入），不作为性能特性。
+
+### 16.7 关键教训
+
+- **"听起来合理"的假设必须实测**：弱 GC → 卡顿（四轮 GC 数据证伪）、
+  executor 串行 → 停顿（拆开实测证伪）。两个"合理"假设都错。
+- **关键路径上的延迟 > 吞吐**：GPU 往返的固定延迟，落在 chunk 生成的关键
+  路径上，比 CPU 上的批量计算更致命。
+- **"能搬" ≠ "值得搬"**：biome 完全可复现、可接入，但计算量太小，搬运的
+  延迟成本盖过计算收益。
+- **平均停顿 ≠ 端到端体感**：SerialGC avg 36 ms/max 528 ms，体感却与 ZGC
+  无差——瓶颈在别处，GC 停顿被吸收。
+- **对照实验要切单变量**：biome ON/OFF 这一刀，比之前所有 GC/executor 折腾
+  都更能说明问题。
