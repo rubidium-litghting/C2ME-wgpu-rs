@@ -1453,3 +1453,40 @@ BinaryOperation(min)
 
 Epic 等"interpolated 外包了非线性节点"的模组地形下，本 mod 结果不精确（多填方块）。
 **这类地形建议禁用本 mod。**
+
+---
+
+## §15 JFR 热点分析（2026-10，验证 §13 的"写回瓶颈"）
+
+用 JFR（`-XX:StartFlightRecording=...settings=profile`）对游戏跑图 94 秒采样，
+零侵入（不像 per-block `nanoTime` 会破坏 JIT）。
+
+### 15.1 热点方法（ExecutionSample）
+
+| 方法 | 占比 | 归属 |
+|---|---|---|
+| `AquiferSampler$Impl.apply` | **14.73%** | MC 含水层逐方块 |
+| `DoublePerlinNoiseSampler.sample` | **14.31%** | 噪声（多由含水层调用） |
+| `InvocationShim.invokeDensityFunctionSample` | 6.16% | C2ME DFC 运行时 |
+| `ChunkSection.setBlockState` | 5.84% | 写方块 |
+| `aquiferExtracted$refreshDistPosIdx` | 3.59% | 含水层内部 |
+| `PalettedContainer` 相关 | ~3% | 方块调色板 |
+| `StructureWeightSampler.sample` | 2.23% | Beardifier 逐方块 |
+| `Heightmap` | 1.58% | 高度图更新 |
+| **`writeDensityToChunk`（我们）** | **1.44%** | 循环框架 |
+
+**~45% 在"含水层 + 其噪声"，~13% 在"写方块 + 调色板 + 高度图"，全是 MC 逐方块操作。我们的代码仅 1.44%。**
+
+### 15.2 排除的项（都不是瓶颈）
+
+- **deopt**：4143 次散布数十站点，最高 28 次/站点（≈44/s），Minecraft 多态代码的正常水平。
+- **异常**：10406 次，主要是 C2ME 的文件 IO（`UnixException` 7019）、调度
+  （`CancellationException` 1420）、反射（`NoSuchMethodError` 1312）——**无一是我们的**。
+- **分配**：`NoisePosVanillaInterface` 6.69%（C2ME DFC 包装）；消除我们自己的
+  `UnblendedNoisePos` 分配（§MutableNoisePos）后 CPS 无变化。
+- **poll/GPU**：执行器 ~79% 时间空闲（批间隔 20ms vs 处理 4ms）→ GPU 不是瓶颈。
+
+### 15.3 结论
+
+**瓶颈 = MC 的逐方块写回（含水层 + 写方块 + 高度图），与原版同构、无法卸载。**
+三重确认 §13 的负优化判断：poll / GC / deopt 均非因，唯逐方块写回是。
