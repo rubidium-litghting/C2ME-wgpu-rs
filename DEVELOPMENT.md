@@ -6,7 +6,7 @@
 ---
 # C2ME WGPU 加速模块 — 进度计划
 
-> 最后更新：2026-10-02
+> 最后更新：2026-10-05
 > 状态：**2k 里程碑** —— 桌面（Linux x86_64）+ Android（aarch64；Kirin 980 / 天玑 8100 实测）
 > 双端 GPU 地形生成跑通。多维度（Nether/End）、矿脉、EndIslands、内存泄漏修复均已完成；
 > **§8 待办已清空**。
@@ -1071,6 +1071,97 @@ cargo test --lib real_router_vs_vanilla -- --nocapture     # GPU vs ref（需 GP
   阈值不是固定行数。安全区取 11 通道的 1.6s 量级。
 
 
+---
+
+## §5.16 2m 里程碑 —— 只算/只回读被消费的通道（2026-10）
+
+### 5.16.1 动机：16 通道里只有 2 个有人读
+
+`MixinChunkGenerator.writeDensityToChunk` 只消费两个通道：
+- **ch11 `finalDensity`** —— 实心/空气判定，兼作 `AquiferSampler` 的输入；
+- **ch12 `veinToggle`** —— 矿脉粗筛。
+
+`AquiferSampler` 与 `StructureWeightSampler` 都用 MC 自己的 CPU 采样器
+（§5.6.4 / §5.5.5），**不读** GPU 的 barrier / fluid / lava 通道。其余
+14 个通道算了、传了、却从没有人读。而 `CacheInterpolated` 早已改为直通
+（§5.6.2），shard A 当年存在的唯一理由（跨片共享内存）也已消失。
+
+### 5.16.2 第一刀：只 emit 被消费的通道
+
+`wgsl_gen::plan_shards` 从「A=[0,11) + B=[11,12) + C=[12,16)」改为
+「B=[11,12) + C=[12,13)」：
+
+| shard | 旧 | 新 |
+|---|---|---|
+| A [0..11) | 2142–3364 行 | **删除** |
+| B [11..12) | 2503 行 | 2503 行（逐字节不变）|
+| C | [12..15) 356 行 | [12..13) 237 行 |
+
+实测同一份 `real_router.bin`：
+- **旧**：shard A 3364 行 + B 2503 行 + C 356 行 = **6223 行**
+- **新**：shard B 2503 行 + C 237 行 = **2740 行（-56%）**
+
+`out_buf` 仍按**全局通道号**写（ch11 落在 slot 11），所以 Java 侧偏移
+不用改。小测试 blob（通道数 ≤ 11）自动回退到 `Pass::Single` 单 shader，
+保证单元测试仍能触及所有 emitter。
+
+天玑 8100 上 shard A 的 ~1.15s 编译随之消失——那是唯一每次启动都要付的
+编译（shard B 有磁盘 cache，§5.15.5）。
+
+### 5.16.3 第二刀：只回读被消费的通道
+
+shader 与 `output_buf` **不动**（16 通道照写，pipeline cache 保持有效），
+只改回读：
+
+- `WorldContext::readback_channels()` 从 `shards` 推导要回读的全局通道
+  （真实 router = `[11,12]`）。
+- executor 的 copy 循环按这些通道从每 chunk 的 `output_buf` 里各拷一段
+  到紧凑 staging（ch11+ch12 相邻 → 每 chunk 实际一次 2×CPC 连续拷贝）。
+- 结果 blob 从 **16 通道降到 2 通道**：每 chunk 155 KB → **19 KB（-87.5%）**。
+
+`staging` 仍按 16 通道宽度预留（executor 跨 world 复用，Single 模式可能回读
+更多通道），但每批只 map/copy `total_bytes`，所以回读节省不受影响。
+
+### 5.16.4 实测（桌面 RADV，真实 router，带 Epic Terrain）
+
+| 指标 | 值 |
+|---|---|
+| shader 总行数 | **6223 → 2740（-56%）** |
+| 回读 blob | 155 KB → **19 KB/chunk（-87.5%）** |
+| profile `readback` | ~3.1–4.0 ms（旧 §12.2 记录 5–20 ms）|
+| profile `decode` | 0.01 ms（紧凑布局读回未错位）|
+| CPS | 稳定段 **75–86**（峰值 86.5）|
+| 回退/报错 | **无** |
+
+**地形正确性**：维护者目视确认——连已知的极端坐标"怪坑"（§5.9.6 原版行为）
+都在，与 vanilla 一致。
+
+### 5.16.5 附带修复：一个从不断言的测试
+
+`real_router_vs_vanilla` 原来对超出 fp32 预算的通道只 `eprintln!` 警告、
+**从不 assert**——等于永远"通过"。本次改为只校验真正被消费的
+ch11/ch12，并加 `assert!`。实测 ch11 rms **2.55e-5**、ch12 rms **2.22e-6**，
+均在 fp32 预算内。
+
+### 5.16.6 关键教训
+
+- **先数消费者，再决定算多少**：14/16 通道的算力与回读量被浪费了很久，
+  因为"16 通道"是早期架构的默认，没人回头核对谁在真正读。
+- **裁剪要保住协议**：out_buf 全局槽位不变，只动 emit 范围与回读拷贝，
+  Java 布局零改动——这让第一刀几乎无风险。
+- **回读与计算可分离优化**：shader 照写 16 通道（cache 有效），只在回读
+  阶段挑 2 个通道，两刀互不耦合。
+- **假通过的测试比没有测试更危险**：`eprintln` 而非 `assert` 的判据会
+  在回归发生时保持沉默。
+
+### 5.16.7 诚实的边界
+
+CPS **不会**因这两刀提升——§15.7 已证 GPU 富余 6 倍，瓶颈是 CPU 逐方块
+写回（aquifer/heightmap/vein）。本轮的收益是 **shader 编译时间、回读带宽、
+显存/功耗**，不是吞吐。要动 CPS 只能碰 §15.7 定位的三条 CPU 写回路径，
+而那三条已逐一验证排除。
+
+
 ## §8 待办（更新）
 
 - ~~ch10/ch11 残差~~ ✅ ch10 = fp32 固有（§5.8）；ch11 的额外残差 = octave 顺序 bug（§5.9.3），已修。
@@ -1088,6 +1179,10 @@ cargo test --lib real_router_vs_vanilla -- --nocapture     # GPU vs ref（需 GP
   B 的 3083 行经查无冗余可裁。**Mali-G610 遗留风险清零。**
 - ~~桌面 RADV + 麒麟 980 复测~~ ✅ 桌面峰值 144 CPS；麒麟 980 裸跑无回归
   （~14 CPS，峰值 20–22）。三端全部通过。
+
+- ~~只算/只回读被消费的通道~~ ✅ 已做（§5.16）：shader 6223→2740 行（-56%），
+  回读 blob 155KB→19KB/chunk（-87.5%）；CPS 不变（瓶颈是 CPU 写回，§15.7），
+  收益在编译时间/带宽/功耗。桌面实测稳定 75–86 CPS，地形目视与 vanilla 一致。
 
 **§8 至此清空。** 后续新方向按需开新章节。
 

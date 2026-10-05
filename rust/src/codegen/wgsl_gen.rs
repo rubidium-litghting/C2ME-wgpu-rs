@@ -90,17 +90,34 @@ pub struct Shard {
 }
 
 pub fn plan_shards(channel_count: usize) -> Vec<Shard> {
-    const A_END: usize = 11;
-    const B_END: usize = 12;
+    // Only two channels are consumed by the Java write-back:
+    //   11 = finalDensity  (solid/air decision + aquifer input)
+    //   12 = veinToggle    (ore-vein coarse filter)
+    // Channels 0..11 and 13.. are computed but never read back. Shard A
+    // existed only to populate shared memory that CacheInterpolated no
+    // longer uses (see cache_like.rs — it is now a pure pass-through),
+    // so emitting channels 0..11 is pure waste. Dropping it cuts
+    // Mali-G610 startup compile time (shard A ~= 1.15s) and GPU power,
+    // with no change to the Java reader: out_buf slots remain global,
+    // so ch11 / ch12 still land at their original offsets.
+    const FD: usize = 11;  // finalDensity
+    const VT: usize = 12;  // veinToggle
+    const VT_END: usize = 13;
+    // Small diagnostic / unit-test blobs carry fewer channels than
+    // finalDensity's index (11). They cannot use the sharded layout, so
+    // fall back to a single all-channel shader — the emitters they
+    // exercise stay reachable, and the numerical-validation tests keep
+    // working unchanged. Real NoiseRouters always have >= 13 channels.
+    if channel_count <= FD {
+        if channel_count == 0 {
+            return Vec::new();
+        }
+        return vec![Shard { pass: Pass::Single, start: 0, end: channel_count }];
+    }
     let mut out = Vec::new();
-    if channel_count > 0 {
-        out.push(Shard { pass: Pass::A, start: 0, end: A_END.min(channel_count) });
-    }
-    if channel_count > A_END {
-        out.push(Shard { pass: Pass::B, start: A_END, end: B_END.min(channel_count) });
-    }
-    if channel_count > B_END {
-        out.push(Shard { pass: Pass::C, start: B_END, end: channel_count });
+    out.push(Shard { pass: Pass::B, start: FD, end: (FD + 1).min(channel_count) });
+    if channel_count > VT {
+        out.push(Shard { pass: Pass::C, start: VT, end: VT_END.min(channel_count) });
     }
     out
 }
@@ -699,31 +716,36 @@ mod tests {
     // ── helpers ─────────────────────────────────────────────────────────
 
     #[test]
-    fn plan_shards_splits_16_channels() {
+    fn plan_shards_only_emits_consumed_channels() {
+        // Only ch11 (finalDensity) and ch12 (veinToggle) are read back
+        // by Java; everything else is dropped to save shader compile time.
         let shards = plan_shards(16);
-        assert_eq!(shards.len(), 3);
-        assert_eq!((shards[0].pass, shards[0].start, shards[0].end), (Pass::A, 0, 11));
-        assert_eq!((shards[1].pass, shards[1].start, shards[1].end), (Pass::B, 11, 12));
-        assert_eq!((shards[2].pass, shards[2].start, shards[2].end), (Pass::C, 12, 16));
-        // Ranges must tile [0, N) with no gaps or overlap.
-        let mut next = 0;
-        for sh in &shards {
-            assert_eq!(sh.start, next);
-            next = sh.end;
-        }
-        assert_eq!(next, 16);
+        assert_eq!(shards.len(), 2);
+        assert_eq!((shards[0].pass, shards[0].start, shards[0].end), (Pass::B, 11, 12));
+        assert_eq!((shards[1].pass, shards[1].start, shards[1].end), (Pass::C, 12, 13));
     }
 
     #[test]
     fn plan_shards_handles_small_roots() {
         assert!(plan_shards(0).is_empty());
-        let one = plan_shards(1);
-        assert_eq!(one.len(), 1);
-        assert_eq!((one[0].start, one[0].end), (0, 1));
+        // 1..=11 channels: finalDensity absent -> single all-channel shader
+        // so unit-test blobs can still exercise every emitter.
+        for n in [1usize, 6, 11] {
+            let shards = plan_shards(n);
+            assert_eq!(shards.len(), 1, "n={n}");
+            assert_eq!((shards[0].pass, shards[0].start, shards[0].end), (Pass::Single, 0, n), "n={n}");
+        }
+        // 12 channels: ch11 present, ch12 absent -> shard B only.
         let twelve = plan_shards(12);
-        assert_eq!(twelve.len(), 2);
-        assert_eq!((twelve[0].start, twelve[0].end), (0, 11));
-        assert_eq!((twelve[1].start, twelve[1].end), (11, 12));
+        assert_eq!(twelve.len(), 1);
+        assert_eq!((twelve[0].pass, twelve[0].start, twelve[0].end), (Pass::B, 11, 12));
+        // 13+ channels: both ch11 and ch12 -> shards B and C.
+        for n in [13usize, 14, 15, 16] {
+            let shards = plan_shards(n);
+            assert_eq!(shards.len(), 2, "n={n}");
+            assert_eq!((shards[0].pass, shards[0].start, shards[0].end), (Pass::B, 11, 12), "n={n}");
+            assert_eq!((shards[1].pass, shards[1].start, shards[1].end), (Pass::C, 12, 13), "n={n}");
+        }
     }
 
     fn tiny_root(channels: Vec<AstNode>) -> AstNode {

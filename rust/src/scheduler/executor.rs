@@ -46,6 +46,14 @@ use crate::world::WorldContext;
 use crate::world::constants::WorldgenParams;
 use crate::world::bind_group;
 
+/// Number of channels Java actually reads back. Only finalDensity (global
+/// ch11) and veinToggle (global ch12) are consumed (see
+/// `wgsl_gen::plan_shards`); the shader still writes a 16-channel out_buf,
+/// we just copy these two out, shrinking the readback 8x.
+const OUT_CHANNELS: usize = 2;
+/// Global channel index of the first read-back channel (finalDensity).
+const CH_FIRST: usize = 11;
+
 /// 执行器配置。
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
@@ -107,9 +115,16 @@ impl SingleBatchExecutor {
         // this bound must be >= any shape we might see. 5×129×5 covers
         // height up to 512 with cell_height down to 4.
         const MAX_CELLS_PER_CHUNK: usize = 5 * 129 * 5;
-        let bytes_per_chunk: usize = 16 * MAX_CELLS_PER_CHUNK * 4;
-        let max_buffer_size = bytes_per_chunk * config.max_batch_size.max(1);
-        let staging = StagingChain::new(&device, config.staging_capacity, max_buffer_size);
+        // output_buf still holds the full 16-channel layout the shader writes.
+        let out_bytes_per_chunk: usize = 16 * MAX_CELLS_PER_CHUNK * 4;
+        // staging receives only the read-back channels, but the executor is
+        // shared across worlds (real router = 2 channels, Single-mode test
+        // blobs = up to N), so reserve the full 16-channel width. Only
+        // `total_bytes` is actually mapped/copied per batch, so the 8x
+        // readback saving is unaffected by this slack.
+        let max_buffer_size = out_bytes_per_chunk * config.max_batch_size.max(1);
+        let staging_size = max_buffer_size;
+        let staging = StagingChain::new(&device, config.staging_capacity, staging_size);
 
         // Persistent buffers (see struct doc). output_buf is sized for the
         // max batch; smaller batches use a prefix.
@@ -178,9 +193,11 @@ impl SingleBatchExecutor {
         // the readback stride is wrong. Previously hard-coded to 2425
         // (5×97×5), which only matched the cell_height=4 test blob.
         let cells_per_chunk = world.cells_per_chunk();
-        let f32_per_chunk = 16 * cells_per_chunk;
-        let total_f32s = (num_chunks as usize) * f32_per_chunk;
-        let total_bytes = total_f32s * 4;
+        // Channels Java actually reads back, derived from the shard layout.
+        let readback: Vec<usize> = world.readback_channels();
+        let out_channels = readback.len().max(1);
+        // Bytes copied into staging: only the read-back channels.
+        let total_bytes = (num_chunks as usize) * out_channels * cells_per_chunk * 4;
 
         let shape = world.shape();
 
@@ -348,14 +365,21 @@ impl SingleBatchExecutor {
             }
         }
 
-        // Copy output buffer → staging buffer for CPU readback
-        encoder.copy_buffer_to_buffer(
-            &self.output_buf,
-            0,
-            &staging_buf,
-            0,
-            total_bytes as u64,
-        );
+        // Copy only the read-back channels into staging. output_buf keeps
+        // the full 16-channel layout the shader writes; we pluck each
+        // consumed channel out of every chunk into a compact chunk-major
+        // staging layout. For the real router that is ch11+ch12 (adjacent,
+        // so effectively one 2*CPC run per chunk) — an 8x smaller readback.
+        let cpc = cells_per_chunk;
+        for ci in 0..num_chunks as usize {
+            for (k, &ch) in readback.iter().enumerate() {
+                let src_off = ((ci * 16 + ch) * cpc) as u64 * 4;
+                let dst_off = ((ci * out_channels + k) * cpc) as u64 * 4;
+                let len = cpc as u64 * 4;
+                encoder.copy_buffer_to_buffer(
+                    &self.output_buf, src_off, &staging_buf, dst_off, len);
+            }
+        }
 
         let encode_ms = t_encode0.elapsed().as_secs_f64() * 1e3;
         let t_submit0 = std::time::Instant::now();
@@ -369,7 +393,7 @@ impl SingleBatchExecutor {
 
         // Read results from staging buffer
         let t_decode0 = std::time::Instant::now();
-        let result_map = self.read_results(batch, slot_handle)?;
+        let result_map = self.read_results(batch, slot_handle, out_channels)?;
         let decode_ms = t_decode0.elapsed().as_secs_f64() * 1e3;
 
         self.staging.consume(slot_handle);
@@ -393,6 +417,7 @@ impl SingleBatchExecutor {
         &mut self,
         batch: &Batch,
         slot_handle: SlotHandle,
+        out_channels: usize,
     ) -> Result<FxHashMap<i64, ResultBlob>, String> {
         let data: &[u8] = self.staging.get_data(slot_handle)
             .ok_or_else(|| "failed to get staging data".to_string())?;
@@ -407,13 +432,14 @@ impl SingleBatchExecutor {
         // Derive cells-per-channel from the staging size so this stays in
         // sync with the shader's shape (5*97*5 before, 5*49*5 after the
         // vertical-cell-height fix). total = num_chunks*16*CPC*4 bytes.
-        let nc = batch.positions.len().max(1);
-        let cells_per_channel = (f32s.len() / (nc * 16)).max(1);
+                let nc = batch.positions.len().max(1);
+        let cells_per_channel = (f32s.len() / (nc * out_channels)).max(1);
+        // offsets[0..out_channels] describe the compact per-chunk layout.
         let mut channel_offsets = [0u64; 16];
-        for (ch, off) in channel_offsets.iter_mut().enumerate() {
-            *off = (ch * cells_per_channel * 4) as u64;
+        for ch in 0..out_channels {
+            channel_offsets[ch] = (ch * cells_per_channel * 4) as u64;
         }
-        let chunk_size_f32 = 16 * cells_per_channel;
+        let chunk_size_f32 = out_channels * cells_per_channel;
 
         for (i, &pos) in batch.positions.iter().enumerate() {
             let start = i * chunk_size_f32;

@@ -327,7 +327,10 @@ public abstract class MixinChunkGenerator {
                                             int batchIndex,
                                             StructureAccessor structureAccessor,
                                             DimState ds) {
-        final int CHANNEL = 11;                 // finalDensity
+        // Rust now copies out only the two consumed channels
+        // (finalDensity -> slot 0, veinToggle -> slot 1); the other 14 are
+        // never read back. See executor.rs OUT_CHANNELS.
+        final int CHANNEL = 0;                  // finalDensity
         final int CELLS_X = ds.gridX;
         final int CELLS_Y = ds.gridY;
         final int CELLS_Z = ds.gridZ;
@@ -336,12 +339,13 @@ public abstract class MixinChunkGenerator {
         final int CELL_W = ds.cellW;
         final int CELL_H = ds.cellH;
         final int MIN_Y = ds.minY;
+        final int OUT_CHANNELS = 2;
 
-        // Blob layout (multi-chunk): payload = chunk0[16 channels][CPC],
-        // chunk1[16 channels][CPC], ... The header channel_offsets only
+        // Blob layout (multi-chunk): payload = chunk0[2 channels][CPC],
+        // chunk1[2 channels][CPC], ... The header channel_offsets only
         // describe chunk 0, so chunk i's channel c lives at
-        //   PAYLOAD_BASE + i * 16 * CPC * 4 + c * CPC * 4
-        long chunkStride = 16L * CELLS_PER_CHANNEL * 4;
+        //   PAYLOAD_BASE + i * 2 * CPC * 4 + c * CPC * 4
+        long chunkStride = (long) OUT_CHANNELS * CELLS_PER_CHANNEL * 4;
         long need = PAYLOAD_BASE + (long) batchIndex * chunkStride
                 + (long) (CHANNEL + 1) * CELLS_PER_CHANNEL * 4;
         if (seg.byteSize() < need) {
@@ -409,7 +413,7 @@ public abstract class MixinChunkGenerator {
         }
         // veinToggle (ch12) corner cells — used only as a cheap coarse filter
         // for ore veins (the real vein logic is per-block + randomised).
-        final int CHANNEL_VT = 12;
+        final int CHANNEL_VT = 1;
         int vtBase = (int) (PAYLOAD_BASE + (long) batchIndex * chunkStride
                 + CHANNEL_VT * CELLS_PER_CHANNEL * 4);
         float[] vtCells = new float[CELLS_PER_CHANNEL];

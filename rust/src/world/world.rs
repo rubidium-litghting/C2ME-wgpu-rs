@@ -346,6 +346,24 @@ impl WorldContext {
     ///   cell_count = 16/cell_width + 1  (x, z)  and
     ///   cell_count_y = height/cell_height + 1.
     /// Must match the WGSL prologue's cells_per_chunk exactly.
+    /// Global channel indices that the CPU actually reads back, derived
+    /// from the shard layout. Shard B covers [start,end) = one channel
+    /// (finalDensity); shard C covers the vein channels. In Single mode
+    /// (small test blobs) every channel is read back. The executor uses
+    /// this to size staging and to pluck the right out_buf slices.
+    pub fn readback_channels(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for sh in &self.shards {
+            for ch in sh.start..sh.end {
+                out.push(ch);
+            }
+        }
+        if out.is_empty() {
+            out.push(0);
+        }
+        out
+    }
+
     pub fn cells_per_chunk(&self) -> usize {
         let cw = self.shape.cell_width.max(1);
         let ch = self.shape.cell_height.max(1);
@@ -2080,6 +2098,8 @@ mod tests {
 
         // ── run GPU ──────────────────────────────────────────────────
         let mut ctx = WorldContext::new(&blob).unwrap();
+        // Which global channels the blob actually carries, in slot order.
+        let readback = ctx.readback_channels();
         let instance = WgpuInstance::instance().unwrap();
         ctx.compile_pipeline(&instance.device).unwrap();
         let world_arc = Arc::new(ctx);
@@ -2097,13 +2117,15 @@ mod tests {
         let br = result.results.values().next().unwrap();
         let bytes = br.as_bytes();
         let payload = &bytes[0x88..];
+        // slot k of the compact blob holds global channel readback[k].
+        let slot_of = |global: usize| readback.iter().position(|&c| c == global);
 
-        // ── cross-match: for each ref channel, find best GPU channel ──
-        println!("  -- cross-match (ref channel -> best GPU channel) --");
+        // ── cross-match: for each ref channel, find best GPU slot ──
+        println!("  -- cross-match (ref channel -> best GPU slot) --");
         for (name, rch) in chan_map {
             if let Some(exp_vec) = ref_data.get(rch) {
                 let mut best = (usize::MAX, f64::MAX);
-                for gch in 0..16usize {
+                for gch in 0..readback.len() {
                     let gbase = gch * cpc * 4;
                     let mut ss = 0.0f64;
                     for idx in 0..cpc {
@@ -2127,8 +2149,16 @@ mod tests {
             }
         }
 
+        // Only ch11 (finalDensity) and ch12 (veinToggle) are computed now
+        // (see wgsl_gen::plan_shards). The other channels' out_buf slots are
+        // no longer written, so comparing them against vanilla would always
+        // fail and say nothing about codegen correctness.
+        let checked: &[usize] = &[11, 12];
         let mut any_fail = false;
         for (name, ch) in chan_map {
+            if !checked.contains(ch) {
+                continue;
+            }
             let exp_vec = match ref_data.get(ch) {
                 Some(v) => v,
                 None => {
@@ -2136,7 +2166,11 @@ mod tests {
                     continue;
                 }
             };
-            let base = ch * cpc * 4;
+            let slot = match slot_of(*ch) {
+                Some(s) => s,
+                None => continue,
+            };
+            let base = slot * cpc * 4;
             let mut max_diff = 0.0f32;
             let mut sum_sq = 0.0f64;
             let mut nan_both = 0usize;
@@ -2204,11 +2238,9 @@ mod tests {
                 }
             }
         }
-        if any_fail {
-            eprintln!("[WARN] GPU vs vanilla: some channel exceeds the fp32 RMS budget");
-        } else {
-            println!("  all channels within fp32 budget (RMS < 1e-3), NaN matched");
-        }
+        assert!(!any_fail,
+            "GPU vs vanilla: a consumed channel (ch11/ch12) exceeds the fp32 RMS budget");
+        println!("  consumed channels within fp32 budget (RMS < 1e-3), NaN matched");
     }
 
     /// Three-way: CPU-f32 interpreter vs GPU vs ref(double). If CPU-f32 ~= GPU
