@@ -1404,3 +1404,52 @@ C2ME 官方 CPU 路径已被极致优化（DFC 编译字节码 + native math）�
 - **决策**：不再继续推进此方向。
 
 **结论：已验证的负优化，方向终止。**
+
+---
+
+## §14 Epic Terrain 暴露的 interpolated-边界 bug（已知，未修）
+
+### 14.1 现象
+
+修完 §13 后的两个 bug（stride + 矿脉）后：
+- **vanilla 地形**：块级 A/B diff 差异 = **0**（100% 正确）✅
+- **Epic Terrain 地形**：出现 **1639 个**我们多填的石头方块（GPU 比 vanilla 多）
+
+### 14.2 根因（运行时树 dump 确认）
+
+Epic 的 `final_density` 运行时结构：
+
+```
+BinaryOperation(min)
+├── UnaryOperation(squeeze)          ← 外层，非线性
+│   └── BinaryOperation(mul)
+│       ├── Constant(0.64)
+│       └── Wrapper(Interpolated)    ← MC 的插值边界
+│           └── BlendDensity(...)
+└── RangeChoice(... noodle 洞穴树 ...)
+```
+
+- **MC**：只对 `interpolated` **内部**做角点采样+插值；外部（`squeeze`/`mul`/`min`/
+  `range_choice`）**逐方块**求值 → `外层(插值(inner))`
+- **我们**：对**整棵树**在角点采样，再插值 → `插值(外层(inner))`
+
+`squeeze` 非线性 → 两者不等。**vanilla 结构相同，只是地形平缓未暴露；Epic 放大起伏后暴露。**
+
+### 14.3 为何未修
+
+正确修复需拦截 MC 的 `DensityInterpolator.fill()`，用 GPU 角点值填充 MC 缓冲，
+让 MC 自己完成插值 + 外层求值。实测：
+- `final_density` 树里有 **8 个** `DensityInterpolator`（含含水层噪声通道）
+- 需枚举全部 interpolated 节点、建立实例↔子树映射、改 blobify 协议、处理线程安全
+
+**评估**：4–6 小时的高侵入改动，且本 mod 已确认负优化（§13），投入产出比低。
+
+### 14.4 决定
+
+**不做完整重构。** 保留：
+- 实验分支 `experiment/interp-boundary`：含设计文档 `INTERP_REFACTOR.md` +
+  hook 验证（`DensityInterpolator.fill` 可达，densities.len=65）+ interpolator 计数诊断
+- 主线 `main`：vanilla 100% 正确
+
+Epic 等"interpolated 外包了非线性节点"的模组地形下，本 mod 结果不精确（多填方块）。
+**这类地形建议禁用本 mod。**
