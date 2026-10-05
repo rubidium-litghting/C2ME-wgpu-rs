@@ -1522,3 +1522,26 @@ deopt/异常（正常）、搬 aquifer（代价 > 收益）。
 
 **唯一瓶颈 = MC 逐方块写回（aquifer + 写方块 + 高度图），与原版同构、搬不动。**
 这从 JFR 证据三重确认了 §13 的负优化判断。
+
+### 15.6 后续尝试（全部证伪，2026-10）
+
+在 §15.5 之后又验证了两个方向，均无正收益：
+
+- **surfaceHeightEstimate 预填（对 C2ME OpenCL 思路的可行性验证）**：
+  实测 `ChunkNoiseSampler.calculateSurfaceHeightEstimate` 单次 ~79µs、约 200 万次未命中
+  （JFR 漏报，因其 sample() 归到叶子帧）。用 GPU 通道 10 预填 `surfaceHeightEstimateCache`
+  后，**桌面 CPS 无变化**（51.5→52.3）——**CPU 非端到端瓶颈**，省下的 CPU 被富余吸收。
+  （分支 `experiment/surface-height-cache`）
+
+- **异步写回**：`submit()` 立即返回 future，写回在独立线程池（`WRITEBACK_THREADS` 可配）。
+  桌面（16 核）：CPS **51.5→68.9（+34%）**，批 1.3→2.5。
+  但麒麟 980（8 核）：批同样变大，**CPS 仍 ~12 不变**，且移动新区域时**冻结 62 秒**
+  （WRITEBACK_POOL 与 C2ME worker 在少核上互相饥饿，依赖图停摆）。同步版不冻结。
+  **会冻游戏的优化不可接受。**
+  （分支 `experiment/async-writeback`）
+
+**async + surface-cache 组合**（桌面）：CPS 73.7，与 async 单独（68.9）在噪声内，**无叠加**。
+
+**总账**：所有"省 CPU"方向均无效（CPU 富余）；"流水线"在桌面有效但手机死锁。
+瓶颈 = **每批 dispatch 的固定同步延迟**，而解决它（流水线）会引入移动端死锁——两难，无干净解。
+**最终结论：该 mod 在目标设备（强 CPU + 弱 GPU）上是净负优化，方向终止。**
