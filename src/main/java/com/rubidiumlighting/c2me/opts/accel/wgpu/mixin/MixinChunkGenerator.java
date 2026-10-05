@@ -423,6 +423,11 @@ public abstract class MixinChunkGenerator {
         // between the two neighbouring cells in each axis. Without this,
         // an entire 4x4x4 cell flips between stone/air at once, which
         // fills the top few blocks of every ocean cell with stone.
+        // Reusable noise position — one allocation per chunk instead of one
+        // per block (~131k/chunk). See MutableNoisePos.
+        final com.rubidiumlighting.c2me.opts.accel.wgpu.MutableNoisePos mutablePos =
+                new com.rubidiumlighting.c2me.opts.accel.wgpu.MutableNoisePos();
+
         for (int by = 0; by < ds.height; by++) {
             int globalY = MIN_Y + by;
             int secIdx = chunk.getSectionIndex(globalY);
@@ -472,9 +477,8 @@ public abstract class MixinChunkGenerator {
 
                     // Let MC's aquifer decide: null = solid (stone),
                     // otherwise water / lava / air per local fluid level.
-                    net.minecraft.world.gen.densityfunction.DensityFunction.NoisePos npos =
-                            new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(
-                                    startX + bx, globalY, startZ + bz);
+                    com.rubidiumlighting.c2me.opts.accel.wgpu.MutableNoisePos npos =
+                            mutablePos.set(startX + bx, globalY, startZ + bz);
                     // Beard is applied PER BLOCK (not at cell corners):
                     // MC's mapAll swaps Beardifier for StructureWeightSampler
                     // as a direct density node, so it is NOT trilinearly
