@@ -29,10 +29,24 @@ java {
 tasks.withType(JavaCompile) {
     options.encoding = 'UTF-8'
 }
+
+// Compile-time stubs for C2ME types we call (see src/stub). They are
+// compiled into their own source set and added to `compileOnly` below, so
+// the main classes get type-checked against them but they are NOT packaged
+// into the jar — at runtime C2ME provides the real classes. Declaring only
+// the members we use avoids pinning a C2ME version.
+sourceSets {
+    stub {
+        java.srcDir 'src/stub/java'
+    }
+}
 tasks.withType(AbstractArchiveTask) {
     preserveFileTimestamps = false
     reproducibleFileOrder = true
 }
+
+// Stub classes must exist before the main sources that reference them compile.
+compileJava.dependsOn tasks.named('compileStubJava')
 
 // ---------------------------------------------------------------------------
 // Fabric Loom + Minecraft deps (versions come from gradle.properties)
@@ -45,16 +59,19 @@ repositories {
 }
 
 dependencies {
+    // Type-checked against the stub signatures; the stub classes are not
+    // shipped (compileOnly + separate source set). See the stub sourceSet.
+    compileOnly sourceSets.stub.output
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
 
-    // C2ME compile dependency (experiment/c2me-scheduling): we now reference
-    // c2me-base's SchedulingManager to enqueue write-back onto C2ME's worker
-    // pool (see DEVELOPMENT.md §18.6b). The jar is the nested base module
-    // extracted from the runtime c2me-fabric jar; Loom remaps it.
-    // The old note (no C2ME compile dep) applied to the decoupled design.
-    modImplementation files('libs/c2me-base-lib.jar')
+    // NOTE: no C2ME compile dependency. The async scheduling path (DEVELOPMENT
+    // §18.6b) reaches c2me-base's SchedulingManager via REFLECTION, so we do
+    // not link against C2ME at build time. Rationale: C2ME class names are not
+    // remapped by Loom, and reflection degrades gracefully (falls back to the
+    // synchronous path) if C2ME's API changes — a compile dependency would
+    // hard-crash at runtime on a signature mismatch.
 
     testImplementation platform("org.junit:junit-bom:${junit_version}")
     testImplementation 'org.junit.jupiter:junit-jupiter'

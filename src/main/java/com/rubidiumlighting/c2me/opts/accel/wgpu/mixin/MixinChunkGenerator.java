@@ -87,9 +87,10 @@ public abstract class MixinChunkGenerator {
     /** Coarse per-stage timing of the CPU write-back path. Diagnostic only. */
     private static final boolean PROFILE =
             "1".equals(System.getenv("C2ME_WGPU_PROFILE"));
-    /** Async scheduling path (§18.6b): non-blocking GPU request + write-back
-     *  on C2ME's worker pool. Default ON; set C2ME_WGPU_ASYNC_SCHED=0 to
-     *  fall back to the original synchronous path (for A/B). */
+    /** Async scheduling (§18.6b): non-blocking GPU request + write-back on
+     *  C2ME's worker pool. This is the only GPU path. Set C2ME_WGPU_ASYNC_SCHED=0
+     *  to disable it entirely (GPU off for this run, plain C2ME CPU generation),
+     *  useful as an A/B baseline. */
     private static final boolean ASYNC_SCHED =
             !"0".equals(System.getenv("C2ME_WGPU_ASYNC_SCHED"));
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
@@ -172,13 +173,13 @@ public abstract class MixinChunkGenerator {
             // worker pool (positionedExecutor — same pool, no new thread).
             // Returning a pending future frees the worker to submit more
             // chunks, so batches can grow.
-            com.ishland.c2me.base.common.scheduler.SchedulingManager sched =
+            final long pos = chunk.getPos().toLong();
+            final com.ishland.c2me.base.common.scheduler.SchedulingManager sched =
                     ASYNC_SCHED ? schedulingManagerOf(structureAccessor) : null;
             if (sched != null) {
                 final Chunk fChunk = chunk;
                 final DimState fDs = ds;
                 final CompletableFuture<Chunk> result = new CompletableFuture<>();
-                final long pos = chunk.getPos().toLong();
                 ds.coordinator.requestAsync(chunk.getPos().x, chunk.getPos().z)
                         .whenComplete((gpu, err) -> {
                             if (err != null) {
@@ -207,19 +208,14 @@ public abstract class MixinChunkGenerator {
                 return;
             }
 
-            // ── synchronous path (original) ──────────────────────
-            WgpuBatchCoordinator.GpuChunk gpu;
-            try {
-                gpu = ds.coordinator.request(chunk.getPos().x, chunk.getPos().z);
-            } catch (Throwable t) {
-                LOGGER.warn("[c2me-wgpu] GPU batch request failed, falling back to CPU", t);
-                return; // vanilla CPU path runs
-            }
-            writeDensityToChunk(chunk, gpu.seg, aquifer, oreVein, gpu.batchIndex, structureAccessor, ds);
-            if (DUMP_BLOCKS) {
-                maybeDumpBlocks(chunk, "gpu");
-            }
-            cir.setReturnValue(CompletableFuture.completedFuture(chunk));
+            // ── no async scheduling available ────────────────────
+            // Async scheduling is the ONLY GPU path. If C2ME's scheduler
+            // cannot be reached (or is disabled), do NOT fall back to a
+            // synchronous GPU request: §10.2 measured plain C2ME on the CPU
+            // (desktop ~144 CPS) faster than our synchronous GPU path
+            // (~80-110 CPS). Returning without cancelling lets vanilla/C2ME
+            // CPU generation run.
+            return;
         } catch (Throwable t) {
             LOGGER.error("[c2me-wgpu] GPU populateNoise failed, falling back to CPU", t);
         }
@@ -285,7 +281,8 @@ public abstract class MixinChunkGenerator {
     /** Resolve C2ME's SchedulingManager from the worldgen StructureAccessor:
      *  world (ChunkRegion during worldgen) -> ServerWorld -> ServerChunkManager
      *  -> chunkLoadingManager (IVanillaChunkManager). Returns null on any
-     *  failure so the caller falls back to the synchronous path. */
+     *  failure, in which case the caller leaves generation to vanilla/C2ME on
+     *  the CPU (no synchronous GPU fallback). */
     private static com.ishland.c2me.base.common.scheduler.SchedulingManager
             schedulingManagerOf(StructureAccessor sa) {
         try {

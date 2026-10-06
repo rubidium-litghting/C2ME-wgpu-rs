@@ -37,13 +37,18 @@ Java 25 or newer is required: the mod is compiled for Java 25 (and talks to
 its Rust core through the Panama FFM API, which is stable from Java 24).
 
 > **Why still named "C2ME-wgpu-rs"?** This mod has **no compile-time
-> dependency** on C2ME — its Java code references no C2ME class and it ships
-> its own access widener. But it depends on C2ME at **runtime** for the
-> multi-threaded chunk generation that keeps the GPU batch pipeline fed: with
+> dependency** on C2ME — it ships its own access widener, and its (optional)
+> use of C2ME's `SchedulingManager` is done **via reflection**, so nothing
+> links against C2ME at build time. It depends on C2ME at **runtime**: for the
+> multi-threaded chunk generation that keeps the GPU batch pipeline fed (with
 > C2ME, desktop throughput reaches ~144 chunks/s; without it, the GPU starves
-> and throughput collapses to ~13 (roughly phone level). So it remains a
-> **C2ME companion module** — C2ME supplies the parallelism, this mod supplies
-> the GPU compute — and keeps the name.
+> and collapses to ~13, roughly phone level), and — when `C2ME_WGPU_ASYNC_SCHED`
+> is on (default) — to run the CPU write-back on C2ME's worker pool, so chunk
+> requests never block a worker (see "How it works"). If the C2ME scheduling
+> API is unavailable, GPU acceleration is simply left off for that run and
+> plain C2ME generates terrain on the CPU (there is no synchronous GPU
+> fallback). So it remains a **C2ME companion module** — C2ME supplies the
+> parallelism, this mod supplies the GPU compute — and keeps the name.
 
 ---
 
@@ -53,9 +58,10 @@ its Rust core through the Panama FFM API, which is stable from Java 24).
 2. Put **C2ME** and **C2ME-wgpu-rs** into your `mods/` folder.
 3. Launch the game.
 
-No configuration is needed. If a compatible GPU is found, terrain generation
-is offloaded automatically; otherwise the mod stays silent and Minecraft runs
-as usual.
+No configuration is needed. If a compatible GPU is found **and** C2ME's
+scheduling API is available, terrain generation is offloaded automatically;
+otherwise the mod stays silent and plain C2ME generates terrain on the CPU,
+exactly as usual.
 
 ---
 
@@ -65,7 +71,7 @@ as usual.
 |---|---|
 | Linux x86_64 | ✅ tested |
 | Android aarch64 (custom JVM) | ✅ tested (Kirin 980) |
-| Windows (DX12) | ⚠️ wgpu backend available, not officially tested |
+| Windows x86_64 | ✅ tested (AMD, mingw DLL) |
 | macOS (Metal) | ⚠️ wgpu backend available, not officially tested |
 
 On Android, `-XX:+UseZGC` is **not** supported by the custom JVM and the mod
