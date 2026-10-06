@@ -87,6 +87,11 @@ public abstract class MixinChunkGenerator {
     /** Coarse per-stage timing of the CPU write-back path. Diagnostic only. */
     private static final boolean PROFILE =
             "1".equals(System.getenv("C2ME_WGPU_PROFILE"));
+    /** Async scheduling path (§18.6b): non-blocking GPU request + write-back
+     *  on C2ME's worker pool. Default ON; set C2ME_WGPU_ASYNC_SCHED=0 to
+     *  fall back to the original synchronous path (for A/B). */
+    private static final boolean ASYNC_SCHED =
+            !"0".equals(System.getenv("C2ME_WGPU_ASYNC_SCHED"));
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
     private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,
                                  StructureAccessor structureAccessor, Chunk chunk,
@@ -141,24 +146,10 @@ public abstract class MixinChunkGenerator {
             }
 
             // ── GPU compute via the batch coordinator ────────────
-            // Requests from all worker threads are coalesced into one
-            // dispatch (see WgpuBatchCoordinator). The returned blob holds
-            // the whole batch; batchIndex selects this chunk's slice.
-            WgpuBatchCoordinator.GpuChunk gpu;
-            try {
-                gpu = ds.coordinator.request(chunk.getPos().x, chunk.getPos().z);
-            } catch (Throwable t) {
-                LOGGER.warn("[c2me-wgpu] GPU batch request failed, falling back to CPU", t);
-                return; // vanilla CPU path runs
-            }
-            java.lang.foreign.MemorySegment seg = gpu.seg;
-
-            // Reuse MC's own AquiferSampler: it decides water/lava/air vs
-            // solid from the density value we computed on the GPU. This
-            // replaces the crude global sea-level fill.
-            // Reuse the chunk's cached sampler (vanilla buildSurface does the
-            // same). Creating a fresh ChunkNoiseSampler per call was a large
-            // CPU cost (it rebuilds the whole density-function graph).
+            // Setup (synchronous): sampler + aquifer + ore-vein. Reuse MC's
+            // own AquiferSampler; reuse the chunk's cached sampler (vanilla
+            // buildSurface does the same — a fresh one per call rebuilds the
+            // whole density-function graph).
             NoiseChunkGenerator gen = (NoiseChunkGenerator) (Object) this;
             final Blender fBlender = blender;
             final StructureAccessor fSa = structureAccessor;
@@ -167,22 +158,67 @@ public abstract class MixinChunkGenerator {
                     chunk.getOrCreateChunkNoiseSampler(cs ->
                             ((NoiseChunkGeneratorInvoker) (Object) gen)
                                     .callCreateChunkNoiseSampler(cs, fSa, fBlender, fNc));
-            net.minecraft.world.gen.chunk.AquiferSampler aquifer = sampler.getAquiferSampler();
+            final net.minecraft.world.gen.chunk.AquiferSampler aquifer = sampler.getAquiferSampler();
             net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler fullBss =
                     ((ChunkNoiseSamplerAccessor) (Object) sampler).getBlockStateSampler();
             net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler veinOnly =
                     extractOreVeinSampler(fullBss);
-            // Fall back to the chained source if extraction failed (the
-            // air/water guard above keeps that path correct).
-            net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler oreVein =
+            final net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler oreVein =
                     (veinOnly != null) ? veinOnly : fullBss;
 
-            writeDensityToChunk(chunk, seg, aquifer, oreVein, gpu.batchIndex, structureAccessor, ds);
+            // ── async scheduling path (§18.6b) ───────────────────
+            // If enabled and we can reach C2ME's SchedulingManager, submit the
+            // GPU request WITHOUT blocking, and run the write-back on C2ME's
+            // worker pool (positionedExecutor — same pool, no new thread).
+            // Returning a pending future frees the worker to submit more
+            // chunks, so batches can grow.
+            com.ishland.c2me.base.common.scheduler.SchedulingManager sched =
+                    ASYNC_SCHED ? schedulingManagerOf(structureAccessor) : null;
+            if (sched != null) {
+                final Chunk fChunk = chunk;
+                final DimState fDs = ds;
+                final CompletableFuture<Chunk> result = new CompletableFuture<>();
+                final long pos = chunk.getPos().toLong();
+                ds.coordinator.requestAsync(chunk.getPos().x, chunk.getPos().z)
+                        .whenComplete((gpu, err) -> {
+                            if (err != null) {
+                                LOGGER.warn("[c2me-wgpu] async GPU request failed", err);
+                                result.completeExceptionally(err);
+                                return;
+                            }
+                            // Enqueue write-back onto C2ME's worker pool. The
+                            // chunk's position lock is held by C2ME's
+                            // ScheduledTask until `result` completes (§18.6b).
+                            sched.positionedExecutor(pos).execute(() -> {
+                                try {
+                                    writeDensityToChunk(fChunk, gpu.seg, aquifer, oreVein,
+                                            gpu.batchIndex, fSa, fDs);
+                                    if (DUMP_BLOCKS) {
+                                        maybeDumpBlocks(fChunk, "gpu");
+                                    }
+                                    result.complete(fChunk);
+                                } catch (Throwable t) {
+                                    LOGGER.error("[c2me-wgpu] async write-back failed", t);
+                                    result.completeExceptionally(t);
+                                }
+                            });
+                        });
+                cir.setReturnValue(result);
+                return;
+            }
+
+            // ── synchronous path (original) ──────────────────────
+            WgpuBatchCoordinator.GpuChunk gpu;
+            try {
+                gpu = ds.coordinator.request(chunk.getPos().x, chunk.getPos().z);
+            } catch (Throwable t) {
+                LOGGER.warn("[c2me-wgpu] GPU batch request failed, falling back to CPU", t);
+                return; // vanilla CPU path runs
+            }
+            writeDensityToChunk(chunk, gpu.seg, aquifer, oreVein, gpu.batchIndex, structureAccessor, ds);
             if (DUMP_BLOCKS) {
                 maybeDumpBlocks(chunk, "gpu");
             }
-
-            // Cancel vanilla generation and hand back the (now filled) chunk.
             cir.setReturnValue(CompletableFuture.completedFuture(chunk));
         } catch (Throwable t) {
             LOGGER.error("[c2me-wgpu] GPU populateNoise failed, falling back to CPU", t);
@@ -244,6 +280,34 @@ public abstract class MixinChunkGenerator {
             LOGGER.info("[c2me-wgpu][profile-cpu] avg over {} chunks: write={}us/chunk",
                     cnt, total / cnt);
         }
+    }
+
+    /** Resolve C2ME's SchedulingManager from the worldgen StructureAccessor:
+     *  world (ChunkRegion during worldgen) -> ServerWorld -> ServerChunkManager
+     *  -> chunkLoadingManager (IVanillaChunkManager). Returns null on any
+     *  failure so the caller falls back to the synchronous path. */
+    private static com.ishland.c2me.base.common.scheduler.SchedulingManager
+            schedulingManagerOf(StructureAccessor sa) {
+        try {
+            Object w = sa.world;   // widened by accesswidener
+            net.minecraft.server.world.ServerWorld sw;
+            if (w instanceof net.minecraft.world.ChunkRegion cr) {
+                sw = cr.toServerWorld();
+            } else if (w instanceof net.minecraft.server.world.ServerWorld s) {
+                sw = s;
+            } else {
+                return null;
+            }
+            net.minecraft.server.world.ServerChunkManager scm =
+                    (net.minecraft.server.world.ServerChunkManager) sw.getChunkManager();
+            net.minecraft.server.world.ServerChunkLoadingManager sclm = scm.chunkLoadingManager;
+            if (sclm instanceof com.ishland.c2me.base.common.scheduler.IVanillaChunkManager vm) {
+                return vm.c2me$getSchedulingManager();
+            }
+        } catch (Throwable t) {
+            LOGGER.warn("[c2me-wgpu] scheduling-manager lookup failed", t);
+        }
+        return null;
     }
 
     /** ChunkNoiseSampler.getBlockStateSampler() returns a ChainedBlockSource

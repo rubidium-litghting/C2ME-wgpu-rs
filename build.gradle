@@ -49,10 +49,12 @@ dependencies {
     mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
 
-    // NOTE: no C2ME compile dependency. Our Java code does not reference any
-    // C2ME class; we ship our own access widener instead of borrowing theirs.
-    // C2ME is declared as a required *runtime* dependency in fabric.mod.json
-    // (it supplies the chunk-generation parallelism the GPU batching relies on).
+    // C2ME compile dependency (experiment/c2me-scheduling): we now reference
+    // c2me-base's SchedulingManager to enqueue write-back onto C2ME's worker
+    // pool (see DEVELOPMENT.md §18.6b). The jar is the nested base module
+    // extracted from the runtime c2me-fabric jar; Loom remaps it.
+    // The old note (no C2ME compile dep) applied to the decoupled design.
+    modImplementation files('libs/c2me-base-lib.jar')
 
     testImplementation platform("org.junit:junit-bom:${junit_version}")
     testImplementation 'org.junit.jupiter:junit-jupiter'

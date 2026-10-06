@@ -120,6 +120,16 @@ public final class WgpuBatchCoordinator {
         return job.future.get();
     }
 
+    /** Submit one chunk and return a future completed when its result is
+     *  ready. Does NOT block the caller — the C2ME-scheduling async path
+     *  (§18.6b) uses this so the worker is freed to submit more chunks and
+     *  batches can grow. */
+    public java.util.concurrent.CompletableFuture<GpuChunk> requestAsync(int cx, int cz) {
+        Job job = new Job(cx, cz);
+        queue.add(job);
+        return job.future;
+    }
+
     /** Stop the coordinator thread. */
     public void shutdown() {
         running = false;

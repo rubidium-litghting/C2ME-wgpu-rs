@@ -60,7 +60,14 @@ fn get_handle_table() -> &'static Mutex<HashMap<i64, Arc<WorldContext>>> {
 }
 
 fn get_pending_queue() -> &'static Mutex<PendingQueue> {
-    PENDING_QUEUE.get_or_init(|| Mutex::new(PendingQueue::default()))
+    PENDING_QUEUE.get_or_init(|| {
+        // Size the queue to hold one full request. `request_chunks` pushes
+        // ALL positions of a request before flushing, so the hard cap must be
+        // >= the executor's max batch size, or a large batch overflows.
+        // (Previously 16*2 = 32 < 64 => overflow once batches grew.)
+        let cap = ExecutorConfig::default().max_batch_size;
+        Mutex::new(PendingQueue::with_capacity(16, 50, cap))
+    })
 }
 
 fn get_or_create_executor() -> Result<&'static Mutex<ExecutorThread>, String> {

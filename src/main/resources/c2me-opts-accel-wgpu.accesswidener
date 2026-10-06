@@ -43,3 +43,7 @@ accessible method net/minecraft/world/gen/densityfunction/DensityFunctionTypes$R
 accessible field net/minecraft/util/math/noise/SimplexNoiseSampler GRADIENTS [[I
 accessible field net/minecraft/world/gen/chunk/AquiferSampler$FluidLevel y I
 accessible field net/minecraft/world/gen/chunk/AquiferSampler$FluidLevel state Lnet/minecraft/block/BlockState;
+
+# §18.6b: reach StructureAccessor.world -> ServerWorld -> chunkLoadingManager
+# -> IVanillaChunkManager.c2me$getSchedulingManager().
+accessible field net/minecraft/world/gen/StructureAccessor world Lnet/minecraft/world/WorldAccess;

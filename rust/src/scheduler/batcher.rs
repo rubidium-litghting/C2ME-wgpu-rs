@@ -76,23 +76,37 @@ pub struct PendingQueue {
     /// Maximum time (ms) a chunk can wait before being flushed with
     /// whatever is available.
     max_wait_ms: u64,
+    /// Hard cap on buffered chunks. Must be >= the largest single request
+    /// that can be pushed before a flush (i.e. ExecutorConfig.max_batch_size),
+    /// or `request_chunks`'s push-all-then-flush will overflow. Derived from
+    /// the executor config by the caller; the `new()` default keeps the old
+    /// (small) bound for unit tests.
+    max_pending: usize,
 }
 
 impl PendingQueue {
     /// Create a new queue with the given batching parameters.
     pub fn new(batch_threshold: usize, max_wait_ms: u64) -> Self {
+        // Legacy default: capacity = 2x the batch threshold. Callers that
+        // serve a specific executor size should use `with_capacity`.
+        Self::with_capacity(batch_threshold, max_wait_ms, batch_threshold * 2)
+    }
+
+    /// Like `new`, but with an explicit hard cap on buffered chunks.
+    pub fn with_capacity(batch_threshold: usize, max_wait_ms: u64, max_pending: usize) -> Self {
         Self {
             pending: Vec::with_capacity(batch_threshold),
             first_added: None,
             batch_threshold,
             max_wait_ms,
+            max_pending: max_pending.max(1),
         }
     }
 
     /// Add a chunk request to the pending queue.
     /// Returns `Ok(())` on success, `Err` if the queue is full.
     pub fn push(&mut self, pos: ChunkPos) -> Result<()> {
-        if self.pending.len() >= self.batch_threshold * 2 {
+        if self.pending.len() >= self.max_pending {
             return Err(anyhow!("PendingQueue overflow — too many pending chunks"));
         }
         if self.first_added.is_none() {
