@@ -2093,6 +2093,48 @@ batch 上限就 ~3–6。
 跑、不等待。风险：在途请求暴涨 → 内存/调度压力，弱 CPU 上可能同样崩（与
 async-writeback 同型的坑）。
 
+### 18.6b C2ME 的真实并行模型 + 我们的对应设计（2026-10，源码验证）
+
+读完 C2ME `dev/1.21.11` 源码后，"非阻塞请求 + 写回并行"这条路的机制**完全清楚**了。
+它不是"又一个看起来行"的方向——每一步都有 C2ME 对应实现。
+
+C2ME 的模型（源码事实）：
+- FlowSched `ScheduledTask.run(releaseLocks)` 只是 `action.get().whenComplete(...)`
+  挂回调就返回 → **worker 不阻塞在 task 上**。
+- GPU 完成后，写回通过 `schedulingManager.positionedExecutor(pos).execute(writeback)`
+  enqueue 回**同一个 `prioritizedScheduler` worker 池**（`WrappingTask`，无独立池）。
+- `ScheduledTask` 按 `blockStateWriteRadius` 持有**位置锁**，直到 future 完成才
+  `releaseLocks` → 邻 chunk 读不到半成品，并发度由依赖图限制，不线程爆炸。
+
+关键洞察：**高效的核心不是"4×4 方阵"，而是"写回与 worker 共池 + 位置锁"。**
+`async-writeback`（§18.6）错在开了独立 `WRITEBACK_POOL`——两池在 8 核上互抢，
+依赖图停摆 → 冻 62s。回同池就不会。
+
+我们对应的设计（照搬该模型）：
+1. `populateNoise` 提交 GPU 请求后**返回 pending future**（worker 释放 → batch 攒大）。
+2. GPU 完成 → 协调器线程 `schedulingManager.positionedExecutor(chunkPos)`
+   enqueue 写回任务。
+3. 写回在 C2ME worker 池里跑（不新开线程）→ 写方块 → 完成 future。
+4. future 完成 → C2ME 释放位置锁 → 邻 chunk 继续。
+
+API 可达性（已确认）：
+- `IVanillaChunkManager.c2me$getSchedulingManager()` → `SchedulingManager`
+  （`c2me-base`）。
+- 我们的 hook 有 `StructureAccessor`，其 `world` 字段 → `ServerWorld`
+  → `getChunkManager().chunkLoadingManager` → 拿到该接口。
+- `SchedulingManager.positionedExecutor(pos)` 是 public。
+
+两个真实风险：
+1. **依赖 C2ME 内部 API**（`c2me-base` 的非公开约定接口 `IVanillaChunkManager`）。
+   维护者认为"mod 本名 C2ME-wgpu-rs、运行时硬依赖 C2ME，用它的 API 比 §10 的
+   '编译期解耦'更名正言顺"，接受此依赖。
+2. **弱 CPU 死锁仍未知**：回同池避免了"两池互抢"，但"pending future →
+   位置锁长期持有 → 依赖图等待"在 8 核上会否停摆，**只有实测知道**
+   （async-writeback 没验证到这一点）。
+
+工作量：天级（改 chunk 生成主路径 + 接入 C2ME 调度 API），非小时级。
+这是目前唯一"机制上说得通、且有 C2ME 先例"的方向。
+
 ### 18.7 关键教训
 
 - **"省 CPU 不转化为 CPS"是过度概括**：桌面小改动被并行吸收，但 MIN_STAGE
