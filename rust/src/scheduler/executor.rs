@@ -54,6 +54,26 @@ const OUT_CHANNELS: usize = 2;
 /// Global channel index of the first read-back channel (finalDensity).
 const CH_FIRST: usize = 11;
 
+/// Diagnostic probe: artificially delay each completed batch by N ms, to
+/// measure how sensitive end-to-end throughput is to "GPU residency time"
+/// (which bounds how long C2ME's position lock is held). Set
+/// `C2ME_WGPU_FAKE_GPU_MS=<n>`. 0 (default) = off. Pure sleep; results and
+/// correctness are unaffected.
+fn fake_gpu_delay() -> Duration {
+    use std::sync::OnceLock;
+    static D: OnceLock<Duration> = OnceLock::new();
+    *D.get_or_init(|| {
+        let ms = std::env::var("C2ME_WGPU_FAKE_GPU_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if ms > 0 {
+            crate::wgpu_debug!("[c2me-wgpu][probe] fake GPU delay = {} ms/batch", ms);
+        }
+        Duration::from_millis(ms)
+    })
+}
+
 /// 执行器配置。
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
@@ -397,6 +417,13 @@ impl SingleBatchExecutor {
         let decode_ms = t_decode0.elapsed().as_secs_f64() * 1e3;
 
         self.staging.consume(slot_handle);
+
+        // Diagnostic probe: simulate a longer GPU residency so we can measure
+        // how it affects end-to-end throughput (see fake_gpu_delay).
+        let fake = fake_gpu_delay();
+        if !fake.is_zero() {
+            std::thread::sleep(fake);
+        }
 
         let dispatch_time = t0.elapsed();
 

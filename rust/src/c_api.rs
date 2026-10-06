@@ -256,34 +256,37 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
     if batch.positions.is_empty() {
         let req = Box::new(BatchRequest {
             status: AtomicI32::new(STATUS_DONE),
-            result: Some(ResultBlob::new_empty()),
+            result: Mutex::new(Some(ResultBlob::new_empty())),
         });
         return Box::into_raw(req) as i64;
     }
 
-    // 3. Dispatch the batch through the executor thread.
-    let executor = match get_or_create_executor() {
-        Ok(e) => e,
-        Err(e) => {
-            unsafe { write_err(err_buf, err_buf_len, &e) };
-            return 0;
-        }
-    };
-
-    // Capture per-chunk cell count BEFORE the Arc is moved into the executor.
-    // Shape-dependent (e.g. 5×49×5 vanilla, 5×65×5 with taller datapacks).
+    // 3. Dispatch on a BACKGROUND thread; return a STATUS_PENDING handle
+    //    immediately so the coordinator can pipeline (submit the next batch
+    //    without waiting for this one). The worker fills result/status; Java
+    //    polls STATUS, then take_result_blob. See DEVELOPMENT §18.6.
+    let req = Arc::new(BatchRequest {
+        status: AtomicI32::new(STATUS_PENDING),
+        result: Mutex::new(None),
+    });
+    let req_bg = Arc::clone(&req);
+    // Shape-dependent per-chunk cell count, computed before the move.
     let cells_per_channel_units: u64 = world_arc.cells_per_chunk() as u64;
 
-    let executor_result = executor.lock()
-        .map_err(|e| {
-            unsafe { write_err(err_buf, err_buf_len, &format!("executor lock: {e}")) };
-            return 0;
-        })
-        .unwrap()
-        .request_chunks(world_arc, batch);
-
-    match executor_result {
-        Ok(executed) => {
+    std::thread::spawn(move || {
+        let executor = match get_or_create_executor() {
+            Ok(e) => e,
+            Err(_e) => {
+                req_bg.status.store(STATUS_ERROR, Ordering::Release);
+                return;
+            }
+        };
+        let executor_result = match executor.lock() {
+            Ok(g) => g.request_chunks(world_arc, batch),
+            Err(_e) => Err("executor lock poisoned".to_string()),
+        };
+        match executor_result {
+            Ok(executed) => {
             // Merge all per-chunk results into one combined blob.
             // Each per-chunk blob now carries only the 2 consumed channels
             // (finalDensity, veinToggle) — see executor.rs OUT_CHANNELS.
@@ -316,23 +319,17 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
             } else {
                 ResultBlob::from_f32_data(&all_f32s, combined_offsets, chunk_idx)
             };
-
-            let req = Box::new(BatchRequest {
-                status: AtomicI32::new(STATUS_DONE),
-                result: Some(result_blob),
-            });
-            Box::into_raw(req) as i64
+            *req_bg.result.lock().unwrap() = Some(result_blob);
+            req_bg.status.store(STATUS_DONE, Ordering::Release);
         }
-        Err(e) => {
-            let msg = format!("executor batch failed: {e}");
-            unsafe { write_err(err_buf, err_buf_len, &msg) };
-            let req = Box::new(BatchRequest {
-                status: AtomicI32::new(STATUS_ERROR),
-                result: Some(ResultBlob::new_empty()),
-            });
-            Box::into_raw(req) as i64
+        Err(_e) => {
+            // Cannot use err_buf from the worker thread; signal via status.
+            req_bg.status.store(STATUS_ERROR, Ordering::Release);
         }
     }
+    });
+
+    Arc::into_raw(req) as i64
 }
 
 // ---------------------------------------------------------------------------
@@ -365,12 +362,13 @@ pub unsafe extern "C" fn c2me_wgpu_take_result_blob(
     if out_ptr.is_null() || out_len.is_null() {
         return STATUS_ERROR;
     }
-    let mut req: Box<BatchRequest> = unsafe { Box::from_raw(request_h as *mut BatchRequest) };
+    let req: Arc<BatchRequest> =
+        unsafe { Arc::from_raw(request_h as *const BatchRequest) };
     let status = req.status.load(Ordering::Acquire);
     if status != STATUS_DONE {
         return STATUS_ERROR;
     }
-    let Some(blob) = req.result.take() else {
+    let Some(blob) = req.result.lock().unwrap().take() else {
         return -1;
     };
     if !blob.verify_crc() {
@@ -480,8 +478,11 @@ fn decode_blob_f32s(blob: &ResultBlob) -> Vec<f32> {
         .collect()
 }
 
-/// A BatchRequest tracks one GPU batch.
+/// A BatchRequest tracks one GPU batch. `status`/`result` are shared between
+/// the C caller and a background worker thread (which fills them), so they
+/// live behind an `Arc` and the result behind a `Mutex`. The request is
+/// returned to Java in STATUS_PENDING and completed asynchronously.
 pub(crate) struct BatchRequest {
     pub status: AtomicI32,
-    pub result: Option<ResultBlob>,
+    pub result: Mutex<Option<ResultBlob>>,
 }

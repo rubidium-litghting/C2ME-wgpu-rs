@@ -85,6 +85,24 @@ public final class WgpuBatchCoordinator {
     private final long worldHandle;
     private volatile boolean running = true;
 
+    /** Number of batches allowed in flight (submitted to Rust, not yet
+     *  completed). Matches the Rust staging chain depth so the GPU side can
+     *  stay busy while Java assembles the next batch. */
+    private static final int STAGING = 3;
+    /** Submitted-but-not-completed batches. Bounded => backpressure (the
+     *  submit loop blocks here instead of overflowing anything). */
+    private final BlockingQueue<Inflight> inflight = new LinkedBlockingQueue<>(STAGING);
+    /** Pipelining is safe only when there are no CPU-evaluated external
+     *  inputs, because those share one Rust buffer (binding 6) that a later
+     *  batch would overwrite. With externals we fall back to serial. */
+    private final boolean pipeline;
+
+    private static final class Inflight {
+        final List<Job> batch;
+        final long req;
+        Inflight(List<Job> batch, long req) { this.batch = batch; this.req = req; }
+    }
+
     // ── external (CPU-evaluated) density subtrees ──────────────────
     /** Nodes the GPU serializer could not translate. Their values are
      *  computed here on the CPU at the corner grid and uploaded to binding 6. */
@@ -98,6 +116,7 @@ public final class WgpuBatchCoordinator {
     private final AtomicLong statBatches = new AtomicLong();
     private final AtomicLong statChunks = new AtomicLong();
     private final AtomicLong statGpuNanos = new AtomicLong();
+    private final AtomicLong statSubmitNanos = new AtomicLong();
     private volatile long statsWindowStart = System.nanoTime();
 
     public WgpuBatchCoordinator(long worldHandle,
@@ -108,9 +127,15 @@ public final class WgpuBatchCoordinator {
         this.gx = gx; this.gy = gy; this.gz = gz;
         this.cellW = cellW; this.cellH = cellH;
         this.minY = minY;
+        this.pipeline = externalNodes.isEmpty();
         Thread t = new Thread(this::run, "c2me-wgpu-batch");
         t.setDaemon(true);
         t.start();
+        if (pipeline) {
+            Thread c = new Thread(this::completeLoop, "c2me-wgpu-complete");
+            c.setDaemon(true);
+            c.start();
+        }
     }
 
     /** Submit one chunk and return a future completed when its result is
@@ -162,7 +187,11 @@ public final class WgpuBatchCoordinator {
                     positions[i * 2 + 1] = job.cz;
                 }
 
-                dispatch(batch, positions);
+                if (pipeline) {
+                    submit(batch, positions);          // enqueue to inflight
+                } else {
+                    submitAndComplete(batch, positions); // serial (external inputs)
+                }
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 return;
@@ -204,7 +233,11 @@ public final class WgpuBatchCoordinator {
         WgpuThinBinding.setExternalInputs(worldHandle, numExt, data);
     }
 
-    private void dispatch(List<Job> batch, int[] positions) {
+    /** Pipeline mode: upload externals (no-op when none), submit to Rust
+     *  (returns a PENDING handle immediately), and hand the batch to the
+     *  completion thread. Blocks on `inflight` when STAGING batches are
+     *  already in flight (backpressure). */
+    private void submit(List<Job> batch, int[] positions) throws InterruptedException {
         long __t0 = System.nanoTime();
         long req;
         uploadExternalInputs(batch);
@@ -218,23 +251,62 @@ public final class WgpuBatchCoordinator {
             failAll(batch, new RuntimeException("requestChunks returned 0"));
             return;
         }
+        inflight.put(new Inflight(batch, req));
+        statSubmitNanos.addAndGet(System.nanoTime() - __t0);
+    }
 
+    /** Serial mode (external inputs present): submit then wait, like before. */
+    private void submitAndComplete(List<Job> batch, int[] positions) {
+        long __t0 = System.nanoTime();
+        long req;
+        uploadExternalInputs(batch);
+        try {
+            req = WgpuThinBinding.requestChunks(worldHandle, positions);
+        } catch (Throwable t) {
+            failAll(batch, t);
+            return;
+        }
+        if (req == 0L) {
+            failAll(batch, new RuntimeException("requestChunks returned 0"));
+            return;
+        }
+        complete(new Inflight(batch, req), __t0);
+    }
+
+    private void completeLoop() {
+        while (running) {
+            try {
+                Inflight ib = inflight.poll(50, TimeUnit.MILLISECONDS);
+                if (ib == null) continue;
+                complete(ib, System.nanoTime());
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (Throwable t) {
+                LOGGER.error("[c2me-wgpu] completion loop error", t);
+            }
+        }
+    }
+
+    /** Wait for one submitted batch, take its blob, complete the jobs. */
+    private void complete(Inflight ib, long t0) {
+        long req = ib.req;
         long deadline = System.nanoTime() + REQUEST_TIMEOUT_NS;
         int st;
         try {
             while ((st = WgpuThinBinding.pollStatus(req)) == WgpuThinBinding.STATUS_PENDING) {
                 if (System.nanoTime() > deadline) {
-                    failAll(batch, new RuntimeException("GPU request timed out"));
+                    failAll(ib.batch, new RuntimeException("GPU request timed out"));
                     return;
                 }
                 java.util.concurrent.locks.LockSupport.parkNanos(100_000L);
             }
         } catch (Throwable t) {
-            failAll(batch, t);
+            failAll(ib.batch, t);
             return;
         }
         if (st != WgpuThinBinding.STATUS_DONE) {
-            failAll(batch, new RuntimeException("GPU request status=" + st));
+            failAll(ib.batch, new RuntimeException("GPU request status=" + st));
             return;
         }
 
@@ -242,17 +314,15 @@ public final class WgpuBatchCoordinator {
         try {
             seg = WgpuThinBinding.takeResultBlob(req);
         } catch (Throwable t) {
-            failAll(batch, t);
+            failAll(ib.batch, t);
             return;
         }
 
-        // Hand the whole batch blob to each job; writeDensityToChunk slices
-        // out the job's chunk via batchIndex.
-        int n = batch.size();
+        int n = ib.batch.size();
         for (int i = 0; i < n; i++) {
-            batch.get(i).future.complete(new GpuChunk(seg, i));
+            ib.batch.get(i).future.complete(new GpuChunk(seg, i));
         }
-        recordStats(n, System.nanoTime() - __t0);
+        recordStats(n, System.nanoTime() - t0);
     }
 
     private void recordStats(int chunks, long gpuNanos) {
