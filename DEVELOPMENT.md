@@ -2258,3 +2258,36 @@ heightmap"，把关键路径上 CPU 的部分压到最小：
 - `experiment/c2me-scheduling`、`experiment/dedicated-writeback`
 - `experiment/heightmap-oneshot`、`experiment/interp-boundary`
 - `experiment/surface-height-cache`、`experiment/writeback-stages`
+
+### 20.5 写回天花板实测（2026-10，关键）
+
+在流水线协调器（§19 之后，main `23d16a1`）上，用诊断开关测"CPU 写回若全部
+移走，端到端能到多少"。Chunky r=500、同世界、同中心：
+
+| 配置 | Total | 开关 |
+|---|---|---|
+| 纯 C2ME CPU（无本 mod）| **23 s** | — |
+| 本 mod，完整写回 | **40 s** | — |
+| 本 mod，跳过 aquifer | 32 s | `C2ME_WGPU_SKIP_AQUIFER` |
+| **本 mod，跳过全部写回** | **11 s** | `C2ME_WGPU_MIN_STAGE` |
+
+**结论：**
+
+1. **写回占本 mod 40s 里的约 29s**（40−11）。之前判断的"GPU 往返税占一半"
+   **被推翻**——MIN_STAGE 下 GPU 路径仅 11s，远低于纯 CPU 23s，说明往返税
+   被"批够快 + GPU 富余"吸收了，**没有显现**。
+2. **GPU 密度管线本身很快**：写回一移走，11s ≪ 23s。
+   **整个净负全部来自"写回留在 CPU"。**
+3. 因此 §20 的赌注上调：不是"最多拿回 8s"，而是**写回搬得越多、越接近甚至
+   反超纯 CPU**。
+
+**caveat**：MIN_STAGE 写更少的方块（只有 `d>0` 的石头，无水/矿/地表），所以
+29s 里有一部分是"少写方块"而非"少跑 aquifer/beard/vein"。**这是天花板，不是
+精确值**——真实全卸载后写方块（palette 写入）仍要花时间。
+
+**另一个负面结果**：调大攒批窗口（`C2ME_WGPU_BATCH_WAIT_MS` 5→20）能让批
+从 ~5 涨到 ~10，但**端到端不变（44→46s）**——批大小受"请求到达速率"限制，
+不是窗口。调窗口是死路。
+
+**下一步**：最现实的第一步是 **aquifer 整体搬 GPU**（§17 的 3 个阻碍），
+因为它单项最大（~8s）。
