@@ -1923,3 +1923,80 @@ Native 采样同理：9597 个 NativeMethodSample 里，只有 **10 个**来自 
   内联把 CPS 打到 17（§5.11.5 的教训），采样式 JFR 无此问题。
 - **勘误要留痕**：§15.4 的错误论据保留在勘误框里，比直接删掉更有价值——它记录了
   "如何从一个合理的推断走向错误结论"。
+
+---
+
+## §18 待验证的"取巧"思路（2026-10，未验证）
+
+> 背景：三轮 GPU 尝试（biome/GC/aquifer，§16/§17）都得出"正面硬搬不划算"。
+> 换一个角度：**是不是我们现有实现本身就有浪费？** 下列思路按"收益×可行"
+> 排序，逐一验证后再决定去留。**先验证，不先写代码。**
+
+### 18.1 线索：heightmap 可能是我们自造的浪费
+
+§15.7 实测：
+| 配置 | CPS |
+|---|---|
+| 完整写回 | 51.5 |
+| 跳 heightmap（NO_HEIGHTMAP）| **93.3** |
+
+即"只跳 heightmap"就翻倍。**⚠️ 但这个 +42 的归因后来被 §18.2 的 A/B 两次
+实测推翻**（见下）：把 heightmap 更新换成任何更便宜的实现都零收益，说明
++42 并非来自 heightmap 更新本身。当时的"heightmap 是大头"读法存疑。
+
+当时没追问：
+
+**vanilla / C2ME 是怎么更新 heightmap 的？**
+
+- **我们**（§5.6.2，`writeDensityToChunk`）：**逐方块**调
+  `oceanFloorWg.trackUpdate(...)` + `worldSurfaceWg.trackUpdate(...)`。
+- **C2ME OpenCL**（§17 读到的真实代码）：写完整块数组后，调**一次**
+  `Heightmap.populateHeightmaps(chunk, {OCEAN_FLOOR_WG, WORLD_SURFACE_WG})`。
+- **vanilla `populateNoise`**：待验证（见 §18.2）。
+
+若 vanilla 也是一次性 populate，则**我们用了一个比 vanilla 更贵的等价实现**，
+凭空吃掉可能 ~40 CPS。这不是"要不要 GPU"的问题，是"实现选错了 API"。
+
+### 18.2 待验证清单
+
+**取巧 A：heightmap 改回一次性 populate —— ❌ 已证伪（2026-10）**
+- 假设：把逐方块 `trackUpdate` 换成循环后一次 `Heightmap.populateHeightmaps`，
+  拿回 §15.7 的 +42 CPS。
+- 事实核查：
+  - vanilla `populateNoise` **也是**逐方块 `Heightmap.trackUpdate`（我们没错）；
+  - C2ME OpenCL 确实用一次性 `populateHeightmaps({OCEAN_FLOOR_WG, WORLD_SURFACE_WG})`；
+  - `populateHeightmaps` 实现：每列从顶扫到底，逐深度 `chunk.getBlockState(pos)`。
+- **实测（干净 vanilla 地形，Epic/worldgenfeaturefix 禁用）：无提升。**
+  write= 大多 40–66 ms/chunk，CPS 75–106，与 §15.7 基线（46–60 ms、70–86）
+  持平。
+- **认知**：§15.7 的 +42 CPS 来自"**完全不读方块状态**"，不是"少调几个 API"。
+  `populateHeightmaps` 仍要逐深度 palette 查询——**成本在 `getBlockState`，
+  不在 API 调用次数**。换 API 省不掉。
+- 已撤回（避免引入与 vanilla 不同的 heightmap 时机）。
+
+**取巧 B：本地列顶数组替代逐方块 trackUpdate —— ❌ 已证伪（2026-10）**
+- 做法：写回热循环里用 `int[256]` 记每列最高匹配方块（世界 y+1），
+  热循环内**零 palette 读**（`bs` 已在手），循环后一次写回两个 Heightmap。
+  用 `@Invoker` 暴露 private `Heightmap.set`。
+- **语义正确**：实测结构无悬空/被埋（"每格只写一次、bottom-up"假设成立）。
+- **但零 CPS 提升**：write= 仍 40–60 ms/chunk，CPS 57–99，与基线持平。
+- **认知（重要）**：这比 A 更强的负结果——热循环里 palette 读已完全消除，
+  仍无收益 ⇒ **`trackUpdate` 不是瓶颈**。这**推翻了 §15.7 的
+  "+42 CPS 来自 heightmap"**读法：那 +42 要么测量有误（§15.6 早提过 perf
+  数噪声大），要么来自"跳 heightmap"顺带跳掉的别的东西。
+- 代码存 `experiment/heightmap-oneshot` 分支。
+
+**取巧 C：只做 4×4 方阵 + estimateSurfaceHeight 预计算**
+- 不碰 aquifer 控制流，只把 §17 阻碍1（跨 chunk 依赖）预计算
+- 为未来 aquifer GPU 化铺路；本身收益可能有限
+
+**取巧 D：复用 vanilla 的 heightmap / 表面规则路径**
+- 只接管密度，把 heightmap 交回 vanilla 某些路径
+
+### 18.3 验证顺序
+
+先 A（最便宜、可能最高收益、零架构改动）→ 再按结果决定 B/C/D。
+
+**A 的判据**：若 vanilla 确为 `populateHeightmaps`，则改我们为同款，实测
+CPS 是否从 ~51 回到 ~90 区间。若是，这是本项目第一个"正收益且零 GPU 成本"
+的优化。
