@@ -2067,7 +2067,33 @@ MIN_STAGE 把 CPU 压到 13 ms/chunk，CPS 仍只 33——因为 **readback（�
 被数据证实，但"只搬噪声"这根杠杆太短；够长的杠杆是整体架构重写，超出本
 项目范围。
 
-### 18.6 关键教训
+### 18.6 被动请求架构：为什么 batch 攒不起来（2026-10）
+
+观察：executor 79% 空闲（批间隔 20 ms vs 处理 4 ms），但 batch 只有 ~1.4 chunk
+（桌面）/ ~1.5（手机）。MAX_BATCH=64 从未达到。
+
+根因：WgpuBatchCoordinator.request() 是**阻塞**的——提交 job 后立刻
+`job.future.get()`，直到结果返回。每个 C2ME worker 提交一个请求后就卡在等待
+上，于是"并发在途请求数 ≈ worker 线程数"。攒批窗口再大也没用——窗口内不会
+有更多请求到达，因为能发请求的 worker 已经在等了。手机 worker 少（~3–6），
+batch 上限就 ~3–6。
+
+由此理解 C2ME OpenCL 为什么那样设计：它不是"被动等 chunk 请求凑批"，而是
+协调器**主动**为一个 4×4 区域一次性生成 16 个 chunk 的请求。这是请求模型的
+改变，不是窗口参数。调大 MAX_WAIT_MS（experiment/c2me-batching 探针）原理上
+无效，已确认。
+
+已试过的相关方向（都失败）：
+- experiment/c2me-batching：调大攒批窗口 → 原理无效（窗口内无请求可等）。
+- experiment/async-writeback（227b4a4）：把**写回**移出 worker 线程 → 桌面
+  +34%（batch 1.3→2.5），但 Kirin 980 冻死 62 秒（WRITEBACK_POOL 与 C2ME
+  worker 争 8 核，依赖图停摆）。能冻游戏的优化不可接受，废弃。
+
+真正没试过、也是官方核心的：让 worker **非阻塞提交**（异步请求），提交后继续
+跑、不等待。风险：在途请求暴涨 → 内存/调度压力，弱 CPU 上可能同样崩（与
+async-writeback 同型的坑）。
+
+### 18.7 关键教训
 
 - **"省 CPU 不转化为 CPS"是过度概括**：桌面小改动被并行吸收，但 MIN_STAGE
   （砍 90%）在桌面 51→179、手机 12→33。**转化与否取决于省的量和是否动了
