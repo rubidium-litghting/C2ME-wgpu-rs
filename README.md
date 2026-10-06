@@ -36,10 +36,12 @@ onto the GPU.
 Java 25 or newer is required: the mod is compiled for Java 25 (and talks to
 its Rust core through the Panama FFM API, which is stable from Java 24).
 
-> **Why still named "C2ME-wgpu-rs"?** This mod has **no compile-time
-> dependency** on C2ME — it ships its own access widener, and its (optional)
-> use of C2ME's `SchedulingManager` is done **via reflection**, so nothing
-> links against C2ME at build time. It depends on C2ME at **runtime**: for the
+> **Why still named "C2ME-wgpu-rs"?** This mod ships its own access widener
+> and does **not** link against C2ME at build time: the C2ME members it calls
+> (`SchedulingManager`) are declared by a small **compile-only stub**
+> (`src/stub`, `compileOnly` — not packaged into the jar), so no C2ME jar is
+> needed to build and no C2ME version is pinned. It depends on C2ME at
+> **runtime**: for the
 > multi-threaded chunk generation that keeps the GPU batch pipeline fed (with
 > C2ME, desktop throughput reaches ~144 chunks/s; without it, the GPU starves
 > and collapses to ~13, roughly phone level), and — when `C2ME_WGPU_ASYNC_SCHED`
