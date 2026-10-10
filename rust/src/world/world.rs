@@ -77,6 +77,8 @@ pub struct WorldContext {
     pub(crate) perm_buffer: Option<wgpu::Buffer>,
     /// SimplexNoiseSampler tables for EndIslands (binding 5).
     pub(crate) simplex_buffer: Option<wgpu::Buffer>,
+    /// §23: static 24^3 Beardifier weight table (binding 10), uploaded once.
+    pub(crate) beard_weight_buffer: Option<wgpu::Buffer>,
     /// GPU-side per-entry origin buffer (binding 3), f32 x3 per entry.
     pub(crate) origin_buffer: Option<wgpu::Buffer>,
     /// Number of CPU-evaluated (external) subtrees in this world's AST.
@@ -88,6 +90,9 @@ pub struct WorldContext {
     /// the compact Java-serialized table (magic + n + seedLo/Hi + per-cell
     /// lvl_y/state). Set via `c2me_wgpu_set_aquifer_table` before a request.
     pub(crate) aquifer_tables: std::sync::Mutex<std::collections::HashMap<(i32, i32), Vec<u8>>>,
+    /// §23: per-chunk Beardifier pieces/junctions, same stage pattern as
+    /// aquifer. Empty for structure-free chunks (beard contributes 0).
+    pub(crate) beard_tables: std::sync::Mutex<std::collections::HashMap<(i32, i32), Vec<u8>>>,
 }
 
 /// Create a GPU buffer pre-filled with `contents`.
@@ -218,10 +223,12 @@ impl WorldContext {
             pipelines: Vec::new(),
             perm_buffer: None,
             simplex_buffer: None,
+            beard_weight_buffer: None,
             origin_buffer: None,
             external_count: std::sync::atomic::AtomicUsize::new(0),
             external_data: std::sync::Mutex::new(Vec::new()),
             aquifer_tables: std::sync::Mutex::new(std::collections::HashMap::new()),
+            beard_tables: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -335,6 +342,17 @@ impl WorldContext {
             self.simplex_buffer = Some(sb);
         }
 
+        // §23: Beardifier static weight table (binding 10), once per world.
+        if self.beard_weight_buffer.is_none() {
+            let table = crate::world::beard::build_weight_table();
+            let bb = create_init_buffer(
+                device, queue, "c2me_wgpu_beard_weight",
+                bytemuck::cast_slice(&table),
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            );
+            self.beard_weight_buffer = Some(bb);
+        }
+
         crate::wgpu_debug!("[c2me-wgpu][compile] compile_pipeline done");
         Ok(())
     }
@@ -412,6 +430,10 @@ impl WorldContext {
     }
 
     /// Borrow the simplex table buffer (binding 5), if uploaded.
+    pub fn beard_weight_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.beard_weight_buffer.as_ref()
+    }
+
     pub fn simplex_buffer(&self) -> Option<&wgpu::Buffer> {
         self.simplex_buffer.as_ref()
     }

@@ -130,6 +130,8 @@ pub struct SingleBatchExecutor {
     aquifer_p_buf: wgpu::Buffer,
     /// §22 B-2: aquifer cell fluid state (u32/cell), binding 9.
     aquifer_s_buf: wgpu::Buffer,
+    /// §23: per-chunk Beardifier pieces/junctions (u32), binding 11.
+    beard_pj_buf: wgpu::Buffer,
     #[allow(dead_code)]
     bind_group_layout: wgpu::BindGroupLayout,
     /// §22: separate layout for the BlockOut shard (6 storage buffers).
@@ -209,6 +211,13 @@ impl SingleBatchExecutor {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // §23: fixed 4096-u32 stride per chunk (matches WGSL BEARD_STRIDE).
+        let beard_pj_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("c2me_wgpu_beard_pj"),
+            size: (4096usize * config.max_batch_size.max(1) * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let bind_group_layout = bind_group::create_layout(&device)
             .map_err(|e| format!("bind group layout: {e}"))?;
@@ -228,6 +237,7 @@ impl SingleBatchExecutor {
             external_buf: None,
             aquifer_p_buf,
             aquifer_s_buf,
+            beard_pj_buf,
             bind_group_layout,
             block_out_bg_layout,
             pipeline_layout,
@@ -380,6 +390,27 @@ impl SingleBatchExecutor {
             }
         }
 
+        // §23: pack per-chunk beard data (fixed 4096-u32 stride; empty chunks
+        // get a zeroed stride so `beard_pj[base]==0` disables beard).
+        {
+            const STRIDE: usize = 4096;
+            let mut pj = vec![0u32; STRIDE * batch.positions.len()];
+            if let Ok(mut tables) = world.beard_tables.lock() {
+                for (ci, &(cx, cz)) in batch.positions.iter().enumerate() {
+                    if let Some(bytes) = tables.remove(&(cx, cz)) {
+                        let n = (bytes.len() / 4).min(STRIDE);
+                        let dst = ci * STRIDE;
+                        for i in 0..n {
+                            pj[dst + i] = u32::from_le_bytes(
+                                bytes[i*4..i*4+4].try_into().unwrap());
+                        }
+                    }
+                }
+            }
+            self.queue.write_buffer(&self.beard_pj_buf, 0,
+                bytemuck::cast_slice(&pj));
+        }
+
         // Get or create perm buffer (binding 1)
         let perm_buf = world.perm_buffer()
             .ok_or_else(|| "perm buffer not uploaded".to_string())?;
@@ -387,6 +418,8 @@ impl SingleBatchExecutor {
             .ok_or_else(|| "origin buffer not uploaded".to_string())?;
         let simplex_buf = world.simplex_buffer()
             .ok_or_else(|| "simplex buffer not uploaded".to_string())?;
+        let beard_w_buf = world.beard_weight_buffer()
+            .ok_or_else(|| "beard weight buffer not uploaded".to_string())?;
 
         // Reuse the persistent output buffer (binding 2).
 
@@ -448,6 +481,8 @@ impl SingleBatchExecutor {
                 wgpu::BindGroupEntry { binding: 7, resource: self.block_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: self.aquifer_p_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 9, resource: self.aquifer_s_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: beard_w_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: self.beard_pj_buf.as_entire_binding() },
             ],
         });
 

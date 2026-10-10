@@ -56,6 +56,7 @@ public class WgpuThinBinding {
     private static MethodHandle MH_free_result_blob;
     private static MethodHandle MH_set_external_inputs;
     private static MethodHandle MH_set_aquifer_table;
+    private static MethodHandle MH_set_beard_table;
     private static MethodHandle MH_set_log_path;
 
     private static long instanceHandle;
@@ -153,6 +154,12 @@ public class WgpuThinBinding {
                     )
             );
 
+            MH_set_beard_table = NativeLoader.linker.downcallHandle(
+                    NativeLoader.lookup.find("c2me_wgpu_set_beard_table").orElseThrow(),
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
             MH_set_aquifer_table = NativeLoader.linker.downcallHandle(
                     NativeLoader.lookup.find("c2me_wgpu_set_aquifer_table").orElseThrow(),
                     FunctionDescriptor.of(
@@ -313,6 +320,18 @@ public class WgpuThinBinding {
      * §22 Step B: stage a per-chunk aquifer table for the next request.
      * `table` is the compact Java-serialized layout (magic + n + seed + cells).
      */
+    /** §23: stage a per-chunk Beardifier table (packed u32 LE). */
+    public static void setBeardTable(long worldH, int cx, int cz, byte[] table) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment seg = arena.allocateFrom(ValueLayout.JAVA_BYTE, table);
+            int st = (int) MH_set_beard_table.invokeExact(worldH, cx, cz, seg, (long) table.length);
+            if (st != 0) throw new RuntimeException("set_beard_table status=" + st);
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("[c2me-wgpu] set_beard_table failed", t);
+        }
+    }
+
     public static void setAquiferTable(long worldH, int cx, int cz, byte[] table) {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment seg = arena.allocateFrom(ValueLayout.JAVA_BYTE, table);

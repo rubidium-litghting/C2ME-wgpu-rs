@@ -486,6 +486,59 @@ pub fn emit_shader(root: &AstNode) -> Result<String> {
 /// This is the "GPU outputs block states" path; Java only writes the palette.
 /// (Aquifer/vein/beard are NOT applied here yet — this is the minimal loop.)
 const BLOCK_OUT_ENTRY: &str = r#"
+// §23 Beardifier. Layout of beard_pj (per chunk, fixed stride 16 u32):
+//   [0] piece_count, [1] junction_count,
+//   [2..2+7*pc] pieces (7 i32: minX,minY,minZ,maxX,maxY,maxZ,adapt,delta),
+//   junctions follow (3 i32 each).
+const BEARD_STRIDE: u32 = 4096u;
+const ADAPT_BURY: i32 = 1; const ADAPT_THIN: i32 = 2;
+const ADAPT_BOX: i32 = 3; const ADAPT_ENCAP: i32 = 4;
+
+fn beard_gsw(x: i32, y: i32, z: i32, yy: i32) -> f32 {
+  let i = x + 12; let j = y + 12; let k = z + 12;
+  if (i < 0 || i >= 24 || j < 0 || j >= 24 || k < 0 || k >= 24) { return 0.0; }
+  let d = f32(yy) + 0.5;
+  let e = f32(x * x) + d * d + f32(z * z);
+  // MC uses a double fastInverseSqrt; f32 with exact inverseSqrt is within
+  // ~1e-7 relative, negligible for structure shaping.
+  let f = -d * inverseSqrt(e / 2.0) / 2.0;
+  return f * beard_w[u32(k * 576 + i * 24 + j)];
+}
+fn beard_mag(x: f32, y: f32, z: f32) -> f32 {
+  let d = sqrt(x * x + y * y + z * z);
+  return 1.0 - clamp(d / 6.0, 0.0, 1.0);
+}
+fn beard_sample(base: u32, bx: i32, by: i32, bz: i32) -> f32 {
+  let pc = i32(beard_pj[base]);
+  let jc = i32(beard_pj[base + 1u]);
+  var d = 0.0;
+  var o = base + 2u;
+  for (var n: i32 = 0; n < pc; n = n + 1) {
+    let minx = i32(beard_pj[o]); let miny = i32(beard_pj[o+1u]);
+    let minz = i32(beard_pj[o+2u]); let maxx = i32(beard_pj[o+3u]);
+    let maxy = i32(beard_pj[o+4u]); let maxz = i32(beard_pj[o+5u]);
+    let ad = i32(beard_pj[o+6u]); let gld = i32(beard_pj[o+7u]);
+    o = o + 8u;
+    let m = max(0, max(minx - bx, bx - maxx));
+    let nn = max(0, max(minz - bz, bz - maxz));
+    let oo = miny + gld;
+    let p = by - oo;
+    var q = 0; if (ad == ADAPT_BURY || ad == ADAPT_THIN) { q = p; }
+    else if (ad == ADAPT_BOX) { q = max(0, max(oo - by, by - maxy)); }
+    else if (ad == ADAPT_ENCAP) { q = max(0, max(miny - by, by - maxy)); }
+    if (ad == ADAPT_BURY) { d = d + beard_mag(f32(m), f32(q) * 0.5, f32(nn)); }
+    else if (ad == ADAPT_THIN || ad == ADAPT_BOX) { d = d + beard_gsw(m, q, nn, p) * 0.8; }
+    else if (ad == ADAPT_ENCAP) { d = d + beard_mag(f32(m) * 0.5, f32(q) * 0.5, f32(nn) * 0.5) * 0.8; }
+  }
+  for (var n: i32 = 0; n < jc; n = n + 1) {
+    let sx = i32(beard_pj[o]); let sy = i32(beard_pj[o+1u]); let sz = i32(beard_pj[o+2u]);
+    o = o + 3u;
+    let r = bx - sx; let l = by - sy; let mm = bz - sz;
+    d = d + beard_gsw(r, l, mm, l) * 0.4;
+  }
+  return d;
+}
+
 fn aq_fdiv(a: i32, b: i32) -> i32 {
   let q = a / b; let r = a % b;
   if (r != 0 && ((r < 0) != (b < 0))) { return q - 1; }
@@ -539,15 +592,23 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
   let per_chunk: u32 = u32(16 * height_i * 16);
   let bidx: u32 = u32(chunk_index) * per_chunk + u32(cx_i32 + bz * 16 + cy_i32 * 256);
 
-  // d > 0 → solid stone (vanilla aquifer returns null).
-  if (d > 0.0) { block_buf[bidx] = 1u; return; }
-
   // §22 aquifer (12-cell scan + FluidLevel). Global block coords:
   let chunk_cx = positions[chunk_index * 2];
   let chunk_cz = positions[chunk_index * 2 + 1];
   let wx: i32 = chunk_cx * 16 + cx_i32;
   let wz: i32 = chunk_cz * 16 + bz;
   let wy: i32 = i32(params.min_y_f) + cy_i32;
+
+  // §23: add the Beardifier contribution (per block, before the d>0 test).
+  var dd = d;
+  {
+    let bbase = u32(chunk_index) * BEARD_STRIDE;
+    let bcount = beard_pj[bbase];
+    if (bcount > 0u) { dd = dd + beard_sample(bbase, wx, wy, wz); }
+  }
+
+  // d > 0 → solid stone (vanilla aquifer returns null).
+  if (dd > 0.0) { block_buf[bidx] = 1u; return; }
 
   // FluidLevelSampler: y < min(-54, seaLevel) → LAVA.
   if (wy < -54) { block_buf[bidx] = 3u; return; }
@@ -654,6 +715,8 @@ struct WorldgenParams {
 @group(0) @binding(7) var<storage, read_write>  block_buf: array<u32>;
 @group(0) @binding(8) var<storage, read>        aq_p:      array<vec4<i32>>;
 @group(0) @binding(9) var<storage, read>        aq_s:      array<u32>;
+@group(0) @binding(10) var<storage, read>       beard_w:   array<f32>;
+@group(0) @binding(11) var<storage, read>       beard_pj:  array<u32>;
 "#;
 
 /// `main_entry` opening (single-pass mode) — sets up `cell_x / cell_y /

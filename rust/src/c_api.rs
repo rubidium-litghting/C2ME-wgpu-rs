@@ -495,8 +495,31 @@ pub unsafe extern "C" fn c2me_wgpu_set_aquifer_table(
     0
 }
 
+// ⑨ Set a per-chunk Beardifier table (pieces/junctions), packed u32 LE.
+//
+/// # Safety
+/// `ptr` must point to `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2me_wgpu_set_beard_table(
+    world_h: i64,
+    cx: i32,
+    cz: i32,
+    ptr: *const u8,
+    len: usize,
+) -> i32 {
+    if world_h == 0 { return STATUS_INVALID_HANDLE; }
+    let world_arc = {
+        let table = get_handle_table().lock().unwrap();
+        match table.get(&world_h) { Some(a) => a.clone(), None => return STATUS_INVALID_HANDLE }
+    };
+    let bytes: Vec<u8> = if ptr.is_null() { Vec::new() }
+        else { unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec() };
+    if let Ok(mut m) = world_arc.beard_tables.lock() { m.insert((cx, cz), bytes); }
+    0
+}
+
 // ---------------------------------------------------------------------------
-// ⑨ Set the Rust-side log file path (called by Java at startup).
+// ⑩ Set the Rust-side log file path (called by Java at startup).
 //
 /// # Safety
 /// `ptr` must point to `len` UTF-8 bytes (or be null with len 0).

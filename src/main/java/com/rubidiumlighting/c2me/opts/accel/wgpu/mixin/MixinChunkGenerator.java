@@ -99,6 +99,10 @@ public abstract class MixinChunkGenerator {
      *  C2ME's worker pool. This is the only GPU path. Set C2ME_WGPU_ASYNC_SCHED=0
      *  to disable it entirely (GPU off for this run, plain C2ME CPU generation),
      *  useful as an A/B baseline. */
+    /** §23: stage the per-chunk Beardifier table for the GPU. */
+    private static final boolean BEARD_GPU =
+            "1".equals(System.getenv("C2ME_WGPU_BEARD"));
+
     /** §23: dump Beardifier pieces/junctions + per-block beard reference. */
     private static final boolean DUMP_BEARD =
             "1".equals(System.getenv("C2ME_DUMP_BEARD"));
@@ -184,6 +188,13 @@ public abstract class MixinChunkGenerator {
                     stageAquiferForGpu(ds, chunk, aquifer);
                 } catch (Throwable t) {
                     LOGGER.warn("[c2me-wgpu] aquifer stage failed", t);
+                }
+            }
+            if (BEARD_GPU) {
+                try {
+                    stageBeardForGpu(ds, chunk, structureAccessor);
+                } catch (Throwable t) {
+                    LOGGER.warn("[c2me-wgpu] beard stage failed", t);
                 }
             }
             if (DUMP_BEARD && BEARD_DUMPED.compareAndSet(false, true)) {
@@ -818,6 +829,55 @@ public abstract class MixinChunkGenerator {
      * the compact table (seed + per-cell lvl_y/state) and stage it to Rust.
      * blockPositions are recomputed on the Rust side from the seed.
      */
+    /**
+     * §23: pack the Beardifier's pieces/junctions (u32 LE) and stage to Rust.
+     * Layout: [0]=piece_count, [1]=junction_count, then per piece 8 i32
+     * (minX,minY,minZ,maxX,maxY,maxZ,adaptation,groundLevelDelta), then per
+     * junction 3 i32. Adaptation codes match beard.rs / WGSL.
+     */
+    private static void stageBeardForGpu(DimState ds, Chunk chunk,
+            StructureAccessor sa) {
+        boolean hasStruct = !sa.getStructureStarts(chunk.getPos(),
+                s2 -> s2.getTerrainAdaptation()
+                        != net.minecraft.world.gen.StructureTerrainAdaptation.NONE)
+                .isEmpty();
+        if (!hasStruct) return;
+        var sw = net.minecraft.world.gen.StructureWeightSampler
+                .createStructureWeightSampler(sa, chunk.getPos());
+        var pit = sw.pieceIterator;
+        java.util.List<net.minecraft.world.gen.StructureWeightSampler.Piece> pieces =
+                new java.util.ArrayList<>();
+        while (pit.hasNext()) pieces.add(pit.next());
+        pit.back(Integer.MAX_VALUE);
+        var jit = sw.junctionIterator;
+        java.util.List<net.minecraft.structure.JigsawJunction> juncs =
+                new java.util.ArrayList<>();
+        while (jit.hasNext()) juncs.add(jit.next());
+        jit.back(Integer.MAX_VALUE);
+        if (pieces.isEmpty() && juncs.isEmpty()) return;
+
+        int n = 2 + pieces.size() * 8 + juncs.size() * 3;
+        java.nio.ByteBuffer tb = java.nio.ByteBuffer.allocate(n * 4)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        tb.putInt(pieces.size());
+        tb.putInt(juncs.size());
+        for (var pc : pieces) {
+            var box = pc.box();
+            tb.putInt(box.getMinX()); tb.putInt(box.getMinY()); tb.putInt(box.getMinZ());
+            tb.putInt(box.getMaxX()); tb.putInt(box.getMaxY()); tb.putInt(box.getMaxZ());
+            tb.putInt(switch (pc.terrainAdjustment()) {
+                case NONE -> 0; case BURY -> 1; case BEARD_THIN -> 2;
+                case BEARD_BOX -> 3; case ENCAPSULATE -> 4; });
+            tb.putInt(pc.groundLevelDelta());
+        }
+        for (var jn : juncs) {
+            tb.putInt(jn.getSourceX()); tb.putInt(jn.getSourceGroundY());
+            tb.putInt(jn.getSourceZ());
+        }
+        WgpuThinBinding.setBeardTable(ds.worldHandle,
+                chunk.getPos().x, chunk.getPos().z, tb.array());
+    }
+
     /** §23: dump the Beardifier's per-chunk pieces/junctions and per-block
      *  beard values, for offline validation of the Rust/WGSL reproduction. */
     private static void dumpBeard(Chunk chunk,

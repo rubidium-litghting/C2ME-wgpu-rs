@@ -206,6 +206,24 @@ pub fn create_block_out_layout(device: &wgpu::Device) -> Result<wgpu::BindGroupL
                     has_dynamic_offset: false, min_binding_size: None },
                 count: None,
             },
+            // binding 10: static 24^3 Beardifier weight table (f32), §23.
+            wgpu::BindGroupLayoutEntry {
+                binding: 10,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+            // binding 11: per-chunk Beardifier pieces/junctions (u32), §23.
+            wgpu::BindGroupLayoutEntry {
+                binding: 11,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
         ],
     });
     Ok(layout)
