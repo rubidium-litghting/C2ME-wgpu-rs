@@ -84,6 +84,14 @@ public abstract class MixinChunkGenerator {
             "1".equals(System.getenv("C2ME_DUMP_DENSITY"));
     private static final boolean DUMP_BLOCKS =
             "1".equals(System.getenv("C2ME_DUMP_BLOCKS"));
+    /** Dump the aquifer per-cell table (waterLevels + blockPositions) for the
+     *  chunk at C2ME_DUMP_CHUNK, for §20 GPU reference. C2ME_DUMP_AQUIFER=1. */
+    private static final boolean DUMP_AQUIFER =
+            "1".equals(System.getenv("C2ME_DUMP_AQUIFER"));
+    /** Per-block aquifer reference: dump (x,y,z,d,beard,state) for the chunk
+     *  at C2ME_DUMP_CHUNK, y in [-64,64]. C2ME_DUMP_AQ_BLOCKS=1. */
+    private static final boolean DUMP_AQ_BLOCKS =
+            "1".equals(System.getenv("C2ME_DUMP_AQ_BLOCKS"));
     /** Coarse per-stage timing of the CPU write-back path. Diagnostic only. */
     private static final boolean PROFILE =
             "1".equals(System.getenv("C2ME_WGPU_PROFILE"));
@@ -192,8 +200,8 @@ public abstract class MixinChunkGenerator {
                             // ScheduledTask until `result` completes (§18.6b).
                             sched.positionedExecutor(pos).execute(() -> {
                                 try {
-                                    writeDensityToChunk(fChunk, gpu.seg, aquifer, oreVein,
-                                            gpu.batchIndex, fSa, fDs);
+                                    writeDensityToChunk(fChunk, gpu.seg, gpu.blockSeg,
+                                            aquifer, oreVein, gpu.batchIndex, fSa, fDs);
                                     if (DUMP_BLOCKS) {
                                         maybeDumpBlocks(fChunk, "gpu");
                                     }
@@ -268,13 +276,20 @@ public abstract class MixinChunkGenerator {
             new java.util.concurrent.atomic.AtomicLong();
 
     private static void profileCpuAccumulate(long us) {
-        long n = CPUPROF_N.incrementAndGet();
-        CPUPROF_US.addAndGet(us);
-        if (n >= 128) {
-            long total = CPUPROF_US.getAndSet(0);
-            long cnt = CPUPROF_N.getAndSet(0);
-            LOGGER.info("[c2me-wgpu][profile-cpu] avg over {} chunks: write={}us/chunk",
-                    cnt, total / cnt);
+        // Synchronized: with two separate atomics, two threads could both
+        // observe n>=128 and the second read cnt==0 after the first reset,
+        // causing a divide-by-zero that aborted the whole write-back.
+        synchronized (CPUPROF_N) {
+            long n = CPUPROF_N.incrementAndGet();
+            CPUPROF_US.addAndGet(us);
+            if (n >= 128) {
+                long cnt = CPUPROF_N.getAndSet(0);
+                long total = CPUPROF_US.getAndSet(0);
+                if (cnt > 0) {
+                    LOGGER.info("[c2me-wgpu][profile-cpu] avg over {} chunks: write={}us/chunk",
+                            cnt, total / cnt);
+                }
+            }
         }
     }
 
@@ -382,12 +397,57 @@ public abstract class MixinChunkGenerator {
      * STONE / AIR. Cell grid = (16/cellW) × (height/cellH) × (16/cellW)
      * = 4 × 96 × 4 = 1536 cells; each cell covers cellW×cellH×cellW blocks.
      */
+    /** §20: write a chunk from GPU block-state bytes (u32/block: 0=air,
+     *  1=stone). Chunk-major layout: [chunk][y][z][x] with x fastest,
+     *  then z, then y (matches BLOCK_OUT_ENTRY). */
+    private static void writeBlocksFromGpu(Chunk chunk, java.lang.foreign.MemorySegment blockSeg,
+                                           int batchIndex, DimState ds) {
+        final int BLOCKS_PER_CHUNK = 16 * ds.height * 16;
+        final int minY = ds.minY;
+        BlockState stone = ds.defaultBlock;
+        BlockState air = Blocks.AIR.getDefaultState();
+        Heightmap oceanFloorWg = chunk.getHeightmap(Heightmap.Type.OCEAN_FLOOR_WG);
+        Heightmap worldSurfaceWg = chunk.getHeightmap(Heightmap.Type.WORLD_SURFACE_WG);
+        java.nio.ByteBuffer bb = blockSeg.asByteBuffer();
+        bb.order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        long base = (long) batchIndex * BLOCKS_PER_CHUNK * 4;
+        if (blockSeg.byteSize() < base + (long) BLOCKS_PER_CHUNK * 4) {
+            LOGGER.warn("[c2me-wgpu] block blob too small for chunk {}", batchIndex);
+            return;
+        }
+        for (int by = 0; by < ds.height; by++) {
+            int globalY = minY + by;
+            int secIdx = chunk.getSectionIndex(globalY);
+            if (secIdx < 0 || secIdx >= chunk.getSectionArray().length) continue;
+            ChunkSection sec = chunk.getSection(secIdx);
+            int ly = globalY & 15;
+            for (int bz = 0; bz < 16; bz++) {
+                for (int bx = 0; bx < 16; bx++) {
+                    int idx = bx + bz * 16 + by * 256;
+                    int v = bb.getInt((int) (base + (long) idx * 4));
+                    if (v == 0) continue;           // air
+                    sec.setBlockState(bx, ly, bz, stone);
+                    oceanFloorWg.trackUpdate(bx, globalY, bz, stone);
+                    worldSurfaceWg.trackUpdate(bx, globalY, bz, stone);
+                }
+            }
+        }
+    }
+
     private static void writeDensityToChunk(Chunk chunk, java.lang.foreign.MemorySegment seg,
+                                            java.lang.foreign.MemorySegment blockSeg,
                                             net.minecraft.world.gen.chunk.AquiferSampler aquifer,
                                             net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler oreVein,
                                             int batchIndex,
                                             StructureAccessor structureAccessor,
                                             DimState ds) {
+        // §20 minimal loop: if the GPU produced per-block state bytes, write
+        // those directly (the GPU already did the d>0 decision). This skips
+        // the CPU trilinear interp + aquifer entirely.
+        if (blockSeg != null) {
+            writeBlocksFromGpu(chunk, blockSeg, batchIndex, ds);
+            return;
+        }
         // Rust now copies out only the two consumed channels
         // (finalDensity -> slot 0, veinToggle -> slot 1); the other 14 are
         // never read back. See executor.rs OUT_CHANNELS.
@@ -428,6 +488,12 @@ public abstract class MixinChunkGenerator {
         Heightmap worldSurfaceWg = chunk.getHeightmap(Heightmap.Type.WORLD_SURFACE_WG);
 
         StringBuilder densityDump = null;
+        StringBuilder aqBlocksDump = null;
+        if (DUMP_AQ_BLOCKS
+                && chunk.getPos().x >= DUMP_CHUNK[0] && chunk.getPos().x <= DUMP_CHUNK[2]
+                && chunk.getPos().z >= DUMP_CHUNK[1] && chunk.getPos().z <= DUMP_CHUNK[3]) {
+            aqBlocksDump = new StringBuilder();
+        }
         if (DUMP_DENSITY
                 && chunk.getPos().x >= DUMP_CHUNK[0] && chunk.getPos().x <= DUMP_CHUNK[2]
                 && chunk.getPos().z >= DUMP_CHUNK[1] && chunk.getPos().z <= DUMP_CHUNK[3]) {
@@ -613,6 +679,16 @@ public abstract class MixinChunkGenerator {
                                   .getId(bs.getBlock()).toString())
                           .append('\n');
                     }
+        if (aqBlocksDump != null) {
+                        aqBlocksDump.append(startX + bx).append(' ')
+                          .append(globalY).append(' ')
+                          .append(startZ + bz).append(' ')
+                          .append((double) d + beard).append(' ')
+                          .append(bs == air ? "air"
+                              : net.minecraft.registry.Registries.BLOCK
+                                  .getId(bs.getBlock()).toString())
+                          .append('\n');
+                    }
                     if (bs == air) continue;
                     int lx = bx & 15;
                     int ly = globalY & 15;
@@ -647,6 +723,172 @@ public abstract class MixinChunkGenerator {
             }
         }
 
+        if (DUMP_AQ_BLOCKS
+                && chunk.getPos().x >= DUMP_CHUNK[0] && chunk.getPos().x <= DUMP_CHUNK[2]
+                && chunk.getPos().z >= DUMP_CHUNK[1] && chunk.getPos().z <= DUMP_CHUNK[3]) {
+            try {
+                StringBuilder cb = new StringBuilder();
+                cb.append("CHUNK ").append(chunk.getPos().x).append(' ')
+                  .append(chunk.getPos().z).append('\n');
+                cb.append("GRID ").append(CELLS_X).append(' ').append(CELLS_Y)
+                  .append(' ').append(CELLS_Z).append(' ').append(CELL_W)
+                  .append(' ').append(CELL_H).append(' ').append(MIN_Y).append('\n');
+                for (int i = 0; i < CELLS_PER_CHANNEL; i++) {
+                    cb.append(i).append(' ').append(cells[i]).append('\n');
+                }
+                java.nio.file.Files.writeString(
+                        java.nio.file.Path.of("/tmp/aq_corners_"
+                                + chunk.getPos().x + "_" + chunk.getPos().z + ".txt"),
+                        cb.toString());
+                LOGGER.info("[c2me-wgpu] dumped ch11 corners ({} cells)", CELLS_PER_CHANNEL);
+            } catch (Throwable t) {
+                LOGGER.warn("[c2me-wgpu] corner dump failed", t);
+            }
+        }
+
+        if (aqBlocksDump != null) {
+            try {
+                java.nio.file.Files.writeString(
+                        java.nio.file.Path.of("/tmp/aq_blocks_"
+                                + chunk.getPos().x + "_" + chunk.getPos().z + ".txt"),
+                        aqBlocksDump.toString());
+                LOGGER.info("[c2me-wgpu] dumped per-block aquifer ref ({} blocks)",
+                        aqBlocksDump.length());
+            } catch (Throwable t) {
+                LOGGER.warn("[c2me-wgpu] aq block dump failed", t);
+            }
+        }
+
+        if (DUMP_AQUIFER
+                && chunk.getPos().x >= DUMP_CHUNK[0] && chunk.getPos().x <= DUMP_CHUNK[2]
+                && chunk.getPos().z >= DUMP_CHUNK[1] && chunk.getPos().z <= DUMP_CHUNK[3]) {
+            dumpAquifer(chunk, aquifer, ds.rawRouter);
+        }
+
+    }
+
+    /** §20 reference: dump the aquifer per-cell table so the GPU reimplementation
+     *  of getWaterLevel can be checked against vanilla. Format:
+     *    AQ startX startY startZ sizeX sizeZ
+     *    CELL index blockX blockY blockZ y state
+     *  blockPositions is a packed long = BlockPos.asLong(blockX,blockY,blockZ). */
+    private static void dumpAquifer(Chunk chunk,
+            net.minecraft.world.gen.chunk.AquiferSampler aquifer,
+            NoiseRouter router) {
+        try {
+            if (!(aquifer instanceof net.minecraft.world.gen.chunk.AquiferSampler.Impl impl)) {
+                LOGGER.warn("[c2me-wgpu] aquifer dump: not Impl, skipping");
+                return;
+            }
+            AquiferImplAccessor a = (AquiferImplAccessor) (Object) impl;
+            int startX = a.getStartX(), startY = a.getStartY(), startZ = a.getStartZ();
+            int sizeX = a.getSizeX(), sizeZ = a.getSizeZ();
+            net.minecraft.world.gen.chunk.AquiferSampler.FluidLevel[] wl = a.getWaterLevels();
+            long[] bp = a.getBlockPositions();
+            StringBuilder sb = new StringBuilder();
+            sb.append("CHUNK ").append(chunk.getPos().x).append(' ')
+              .append(chunk.getPos().z).append('\n');
+            sb.append("AQ ").append(startX).append(' ').append(startY).append(' ')
+              .append(startZ).append(' ').append(sizeX).append(' ').append(sizeZ)
+              .append('\n');
+            for (int i = 0; i < wl.length; i++) {
+                long packed = bp[i];
+                boolean none = (packed == Long.MAX_VALUE);
+                int bx = none ? 0 : net.minecraft.util.math.BlockPos.unpackLongX(packed);
+                int by = none ? 0 : net.minecraft.util.math.BlockPos.unpackLongY(packed);
+                int bz = none ? 0 : net.minecraft.util.math.BlockPos.unpackLongZ(packed);
+                var lvl = wl[i];
+                String state = (lvl == null) ? "null"
+                        : net.minecraft.registry.Registries.BLOCK
+                            .getId(lvl.state.getBlock()).toString();
+                int y = (lvl == null) ? Integer.MIN_VALUE : lvl.y;
+                sb.append(i).append(' ')
+                  .append(none ? "none" : (bx + " " + by + " " + bz)).append(' ')
+                  .append(y).append(' ').append(state).append('\n');
+            }
+            String path = "/tmp/aquifer_" + chunk.getPos().x + "_" + chunk.getPos().z + ".txt";
+            java.nio.file.Files.writeString(java.nio.file.Path.of(path), sb.toString());
+            LOGGER.info("[c2me-wgpu] dumped aquifer table ({} cells) to {}", wl.length, path);
+
+            // §20: dump, per cell, the 5 noise inputs at the exact points
+            // getFluidLevel samples + the expected output. Rust/WGSL then only
+            // needs to reproduce the control flow (no noise).
+            var flooded = unwrapRouter(router.fluidLevelFloodednessNoise());
+            var spread  = unwrapRouter(router.fluidLevelSpreadNoise());
+            var lava    = unwrapRouter(router.lavaNoise());
+            var erosion = unwrapRouter(router.erosion());
+            var depth   = unwrapRouter(router.depth());
+            StringBuilder nb = new StringBuilder();
+            nb.append("CHUNK ").append(chunk.getPos().x).append(' ')
+              .append(chunk.getPos().z).append('\n');
+            var flSampler = a.getFluidLevelSampler();
+            var cnsForSurf = a.getChunkNoiseSampler();
+            for (int i = 0; i < wl.length; i++) {
+                long packed = bp[i];
+                if (packed == Long.MAX_VALUE) continue;
+                int bx = net.minecraft.util.math.BlockPos.unpackLongX(packed);
+                int by = net.minecraft.util.math.BlockPos.unpackLongY(packed);
+                int bz = net.minecraft.util.math.BlockPos.unpackLongZ(packed);
+                var p0 = new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(bx, by, bz);
+                double f = flooded.sample(p0);
+                double e = erosion.sample(p0);
+                double d = depth.sample(p0);
+                var ps = new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(
+                        Math.floorDiv(bx,16), Math.floorDiv(by,40), Math.floorDiv(bz,16));
+                double sp = spread.sample(ps);
+                var pt = new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(
+                        Math.floorDiv(bx,64), Math.floorDiv(by,40), Math.floorDiv(bz,64));
+                double lv = lava.sample(pt);
+                var lvl = wl[i];
+                // initial FluidLevel from the sampler
+                var fl0 = flSampler.getFluidLevel(bx, by, bz);
+                nb.append(i).append(' ').append(bx).append(' ').append(by).append(' ')
+                  .append(bz).append(' ')
+                  .append((float) f).append(' ').append((float) sp).append(' ')
+                  .append((float) lv).append(' ').append((float) e).append(' ')
+                  .append((float) d).append(' ')
+                  .append(fl0.y).append(' ')
+                  .append(net.minecraft.registry.Registries.BLOCK.getId(fl0.state.getBlock()).toString())
+                  .append(' ');
+                // 13 neighbor surface heights
+                for (int[] cs : new int[][]{
+                        {0,0},{-2,-1},{-1,-1},{0,-1},{1,-1},{-3,0},{-2,0},{-1,0},{1,0},
+                        {-2,1},{-1,1},{0,1},{1,1}}) {
+                    int m = bx + cs[0] * 16;
+                    int n = bz + cs[1] * 16;
+                    nb.append(cnsForSurf.estimateSurfaceHeight(m, n)).append(' ');
+                }
+                nb.append(lvl == null ? Integer.MIN_VALUE : lvl.y).append(' ')
+                  .append(lvl == null ? "null"
+                        : net.minecraft.registry.Registries.BLOCK.getId(lvl.state.getBlock()).toString())
+                  .append('\n');
+            }
+            String nbPath = "/tmp/aquifer_noise_" + chunk.getPos().x + "_" + chunk.getPos().z + ".txt";
+            java.nio.file.Files.writeString(java.nio.file.Path.of(nbPath), nb.toString());
+            LOGGER.info("[c2me-wgpu] dumped aquifer noise inputs to {}", nbPath);
+
+            // Also dump the per-column surface-height cache: getWaterLevel
+            // needs estimateSurfaceHeight for 13 neighbour columns per cell,
+            // and this is the CPU-provided input for the GPU reimplementation.
+            net.minecraft.world.gen.chunk.ChunkNoiseSampler cns = a.getChunkNoiseSampler();
+            var shCache = ((ChunkNoiseSamplerAccessor) (Object) cns).getSurfaceHeightEstimateCache();
+            StringBuilder sh = new StringBuilder();
+            sh.append("CHUNK ").append(chunk.getPos().x).append(' ')
+              .append(chunk.getPos().z).append('\n');
+            for (var e : shCache.long2IntEntrySet()) {
+                long k = e.getLongKey();
+                int cx = net.minecraft.util.math.ColumnPos.getX(k);
+                int cz = net.minecraft.util.math.ColumnPos.getZ(k);
+                sh.append(cx).append(' ').append(cz).append(' ')
+                  .append(e.getIntValue()).append('\n');
+            }
+            String shPath = "/tmp/aquifer_surfaces_" + chunk.getPos().x + "_" + chunk.getPos().z + ".txt";
+            java.nio.file.Files.writeString(java.nio.file.Path.of(shPath), sh.toString());
+            LOGGER.info("[c2me-wgpu] dumped surface-height cache ({} columns) to {}",
+                    shCache.size(), shPath);
+        } catch (Throwable t) {
+            LOGGER.warn("[c2me-wgpu] aquifer dump failed", t);
+        }
     }
 
 
@@ -828,6 +1070,23 @@ public abstract class MixinChunkGenerator {
         } catch (Throwable t) {
             LOGGER.warn("[c2me-wgpu] corner reference dump failed", t);
         }
+    }
+
+    /** Unwrap RegistryEntryHolder/Wrapper layers (same as the ref-dump). */
+    private static net.minecraft.world.gen.densityfunction.DensityFunction unwrapRouter(
+            net.minecraft.world.gen.densityfunction.DensityFunction fd) {
+        for (int guard = 0; guard < 32; guard++) {
+            if (fd instanceof
+                    net.minecraft.world.gen.densityfunction.DensityFunctionTypes.RegistryEntryHolder h) {
+                fd = h.function().value();
+            } else if (fd instanceof
+                    net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Wrapper w) {
+                fd = w.wrapped();
+            } else {
+                break;
+            }
+        }
+        return fd;
     }
 
     /** Get the raw (un-compiled) tree behind a c2me-opts-dfc compiled node.

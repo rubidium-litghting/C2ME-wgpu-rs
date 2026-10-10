@@ -39,4 +39,9 @@ import org.spongepowered.asm.mixin.gen.Accessor;
 public interface ChunkNoiseSamplerAccessor {
     @Accessor("blockStateSampler")
     ChunkNoiseSampler.BlockStateSampler getBlockStateSampler();
+
+    /** Per-column surface-height cache (keyed by packed (x,z)), filled lazily
+     *  by estimateSurfaceHeight. Used only by the aquifer reference dump (§20). */
+    @Accessor("surfaceHeightEstimateCache")
+    it.unimi.dsi.fastutil.longs.Long2IntMap getSurfaceHeightEstimateCache();
 }

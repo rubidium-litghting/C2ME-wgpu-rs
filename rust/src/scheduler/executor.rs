@@ -54,6 +54,9 @@ const OUT_CHANNELS: usize = 2;
 /// Global channel index of the first read-back channel (finalDensity).
 const CH_FIRST: usize = 11;
 
+/// Block height in blocks for this world's shape (16*H*16 blocks/chunk).
+fn shape_height(world: &WorldContext) -> u32 { world.shape().height.max(1) as u32 }
+
 /// Diagnostic probe: artificially delay each completed batch by N ms, to
 /// measure how sensitive end-to-end throughput is to "GPU residency time"
 /// (which bounds how long C2ME's position lock is held). Set
@@ -100,6 +103,9 @@ pub struct ExecutedBatch {
     pub batch: Batch,
     pub results: FxHashMap<i64, ResultBlob>,
     pub dispatch_time: Duration,
+    /// §20 per-block state bytes (chunk-major, u32 per block: 0=air 1=stone).
+    /// Empty unless the BlockOut shard is enabled.
+    pub block_data: Vec<u32>,
 }
 
 /// 负责单次 GPU 命令提交的执行器。
@@ -114,6 +120,10 @@ pub struct SingleBatchExecutor {
     params_buf: wgpu::Buffer,
     positions_buf: wgpu::Buffer,
     output_buf: wgpu::Buffer,
+    /// §20 block-state output (binding 7): u32 per block, for the BlockOut
+    /// shard. Sized for the max batch; the block count per chunk is
+    /// 16 * height * 16 (up to 16*512*16 = 131072).
+    block_buf: wgpu::Buffer,
     /// External-input values (binding 6), lazily (re)created to fit the batch.
     external_buf: Option<wgpu::Buffer>,
     #[allow(dead_code)]
@@ -143,7 +153,11 @@ impl SingleBatchExecutor {
         // `total_bytes` is actually mapped/copied per batch, so the 8x
         // readback saving is unaffected by this slack.
         let max_buffer_size = out_bytes_per_chunk * config.max_batch_size.max(1);
-        let staging_size = max_buffer_size;
+        // §20: block-state output (u32/block), 16*512*16 blocks/chunk max.
+        const MAX_BLOCKS_PER_CHUNK: usize = 16 * 512 * 16;
+        let block_max = MAX_BLOCKS_PER_CHUNK * config.max_batch_size.max(1) * 4;
+        // Staging holds density readback + block bytes.
+        let staging_size = max_buffer_size + block_max;
         let staging = StagingChain::new(&device, config.staging_capacity, staging_size);
 
         // Persistent buffers (see struct doc). output_buf is sized for the
@@ -166,6 +180,12 @@ impl SingleBatchExecutor {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        let block_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("c2me_wgpu_block_buf"),
+            size: block_max as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
 
         let bind_group_layout = bind_group::create_layout(&device)
             .map_err(|e| format!("bind group layout: {e}"))?;
@@ -179,6 +199,7 @@ impl SingleBatchExecutor {
             params_buf,
             positions_buf,
             output_buf,
+            block_buf,
             external_buf: None,
             bind_group_layout,
             pipeline_layout,
@@ -217,7 +238,15 @@ impl SingleBatchExecutor {
         let readback: Vec<usize> = world.readback_channels();
         let out_channels = readback.len().max(1);
         // Bytes copied into staging: only the read-back channels.
-        let total_bytes = (num_chunks as usize) * out_channels * cells_per_chunk * 4;
+        let density_bytes = (num_chunks as usize) * out_channels * cells_per_chunk * 4;
+        // §20 BlockOut shard present? (reads ch11 corners, writes block bytes)
+        let has_block = world.shards().iter()
+            .any(|sh| sh.pass == crate::codegen::wgsl_gen::Pass::BlockOut);
+        let blocks_per_chunk = 16usize * (shape_height(world) as usize) * 16;
+        let block_bytes = if has_block {
+            (num_chunks as usize) * blocks_per_chunk * 4
+        } else { 0 };
+        let total_bytes = density_bytes + block_bytes;
 
         let shape = world.shape();
 
@@ -343,6 +372,10 @@ impl SingleBatchExecutor {
                     binding: 6,
                     resource: ext_buf,
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.block_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -377,11 +410,21 @@ impl SingleBatchExecutor {
             let wg_y = (ccy + 3) / 4;
             let wg_z = (ccz * num_chunks + 3) / 4;
 
-            // One dispatch per shard; every shard writes its own channels'
-            // global out_buf slots, so order is irrelevant to correctness.
-            for pipeline in pipelines {
+            // One dispatch per shard. Corner shards use the corner grid; the
+            // §20 BlockOut shard uses a per-BLOCK grid (16 x height x 16 per
+            // chunk). Both write disjoint buffers, so order is irrelevant.
+            let shards = world.shards();
+            let height = shape.height.max(1) as u32;
+            let bw_x = (16u32 + 3) / 4;              // 4
+            let bw_y = (height + 3) / 4;
+            let bw_z = (16u32 * num_chunks + 3) / 4;
+            for (i, pipeline) in pipelines.iter().enumerate() {
                 cpass.set_pipeline(pipeline);
-                cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
+                if shards[i].pass == crate::codegen::wgsl_gen::Pass::BlockOut {
+                    cpass.dispatch_workgroups(bw_x, bw_y, bw_z);
+                } else {
+                    cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
+                }
             }
         }
 
@@ -401,6 +444,12 @@ impl SingleBatchExecutor {
             }
         }
 
+        // §20: copy the per-block state bytes into staging after the density.
+        if has_block {
+            encoder.copy_buffer_to_buffer(
+                &self.block_buf, 0, &staging_buf, density_bytes as u64, block_bytes as u64);
+        }
+
         let encode_ms = t_encode0.elapsed().as_secs_f64() * 1e3;
         let t_submit0 = std::time::Instant::now();
         self.queue.submit(Some(encoder.finish()));
@@ -415,6 +464,18 @@ impl SingleBatchExecutor {
         let t_decode0 = std::time::Instant::now();
         let result_map = self.read_results(batch, slot_handle, out_channels)?;
         let decode_ms = t_decode0.elapsed().as_secs_f64() * 1e3;
+
+        // §20: extract the per-block state bytes (chunk-major) for Java.
+        let block_data: Vec<u32> = if has_block {
+            match self.staging.get_data(slot_handle) {
+                Some(d) if d.len() >= density_bytes + block_bytes => d
+                    [density_bytes..density_bytes + block_bytes]
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else { Vec::new() };
 
         self.staging.consume(slot_handle);
 
@@ -437,6 +498,7 @@ impl SingleBatchExecutor {
             batch: batch.clone(),
             results: result_map,
             dispatch_time,
+            block_data,
         }))
     }
 

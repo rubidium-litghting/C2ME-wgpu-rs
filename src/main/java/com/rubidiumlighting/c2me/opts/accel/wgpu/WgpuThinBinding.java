@@ -51,6 +51,7 @@ public class WgpuThinBinding {
     private static MethodHandle MH_request_chunks;
     private static MethodHandle MH_poll_status;
     private static MethodHandle MH_take_result_blob;
+    private static MethodHandle MH_take_block_blob;
     private static MethodHandle MH_get_gpu_name;
     private static MethodHandle MH_free_result_blob;
     private static MethodHandle MH_set_external_inputs;
@@ -112,6 +113,16 @@ public class WgpuThinBinding {
                             ValueLayout.JAVA_LONG,       // request_h: i64
                             ValueLayout.ADDRESS,         // out_ptr: *mut *const u8
                             ValueLayout.ADDRESS          // out_len: *mut usize
+                    )
+            );
+
+            MH_take_block_blob = NativeLoader.linker.downcallHandle(
+                    NativeLoader.lookup.find("c2me_wgpu_take_block_blob").orElseThrow(),
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_LONG,
+                            ValueLayout.ADDRESS,
+                            ValueLayout.ADDRESS
                     )
             );
 
@@ -348,6 +359,35 @@ public class WgpuThinBinding {
      * @return MemorySegment wrapping the Rust-owned blob (valid until take).
      * Use .asByteBuffer() then .asFloatBuffer() to read density channels.
      */
+    /**
+     * §20: take the per-block state blob (raw u32 per block, chunk-major).
+     * Same lifetime/copy semantics as {@link #takeResultBlob}.
+     */
+    public static MemorySegment takeBlockBlob(long requestH) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment outPtr = arena.allocate(ValueLayout.ADDRESS);
+            MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
+            int status = (int) MH_take_block_blob.invokeExact(requestH, outPtr, outLen);
+            if (status != 0) {
+                throw new RuntimeException("[c2me-wgpu] take_block_blob failed, status=" + status);
+            }
+            MemorySegment dataPtr = outPtr.get(ValueLayout.ADDRESS, 0);
+            long len = outLen.get(ValueLayout.JAVA_LONG, 0);
+            if (dataPtr.address() == 0 || len <= 0) {
+                if (MH_free_result_blob != null) MH_free_result_blob.invokeExact(dataPtr, len);
+                return MemorySegment.ofArray(new byte[0]);
+            }
+            byte[] copy = new byte[(int) len];
+            MemorySegment.copy(dataPtr.reinterpret(len), 0, MemorySegment.ofArray(copy), 0, len);
+            MH_free_result_blob.invokeExact(dataPtr, len);
+            // Skip the 8-byte ResultBlob header (magic+version+chunk_count).
+            return MemorySegment.ofArray(copy).asSlice(8);
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException(t);
+        }
+    }
+
     public static MemorySegment takeResultBlob(long requestH) {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment outPtr = arena.allocate(ValueLayout.ADDRESS);

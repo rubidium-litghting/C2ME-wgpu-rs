@@ -67,6 +67,11 @@ pub enum Pass {
     B,
     /// Shard C — channels `[12, N)` (vein x3). Entry point `main_pass_c`.
     C,
+    /// §20 block-output shard: reads the finalDensity corner channel from
+    /// `out_buf`, trilinearly interpolates per BLOCK, and writes one block
+    /// state byte per block to `block_buf` (binding 7). Entry point
+    /// `main_block`. Dispatched after the corner shards.
+    BlockOut,
 }
 
 impl Pass {
@@ -76,6 +81,7 @@ impl Pass {
             Pass::A => "main_pass_a",
             Pass::B => "main_pass_b",
             Pass::C => "main_pass_c",
+            Pass::BlockOut => "main_block",
         }
     }
 }
@@ -118,6 +124,11 @@ pub fn plan_shards(channel_count: usize) -> Vec<Shard> {
     out.push(Shard { pass: Pass::B, start: FD, end: (FD + 1).min(channel_count) });
     if channel_count > VT {
         out.push(Shard { pass: Pass::C, start: VT, end: VT_END.min(channel_count) });
+    }
+    // §20 block-output shard: not bound to any channel (start==end); it reads
+    // ch11 corners from out_buf and writes block-state bytes. Gated.
+    if block_out_enabled() {
+        out.push(Shard { pass: Pass::BlockOut, start: 0, end: 0 });
     }
     out
 }
@@ -377,6 +388,13 @@ pub fn emit_shader_for_pass(root: &AstNode, pass: Pass) -> Result<String> {
 
 /// Emit the shader module for one channel `shard` (see [`Shard`]).
 pub fn emit_shader_for_shard(root: &AstNode, shard: Shard) -> Result<String> {
+    if shard.pass == Pass::BlockOut {
+        // Standalone shader: no AST emitters, just bindings + the block entry.
+        let mut out = String::with_capacity(4096);
+        out.push_str(BINDINGS_HEADER);
+        out.push_str(BLOCK_OUT_ENTRY);
+        return Ok(out);
+    }
     let mut ctx = GenCtx::new(shard.pass);
     ctx.channel_range = (shard.start, shard.end);
     emit_shader_inner(root, ctx)
@@ -408,6 +426,9 @@ fn emit_shader_inner(root: &AstNode, mut ctx: GenCtx) -> Result<String> {
         Pass::A => MAIN_PASS_A_PROLOGUE,
         Pass::B => MAIN_PASS_B_PROLOGUE,
         Pass::C => MAIN_PASS_C_PROLOGUE,
+        // BlockOut is emitted by emit_shader_for_shard's early-return path
+        // and never reaches here.
+        Pass::BlockOut => unreachable!("BlockOut handled separately"),
     };
 
     // Collect the code that actually *uses* the math library, so we can prune
@@ -458,6 +479,74 @@ pub fn emit_shader(root: &AstNode) -> Result<String> {
 /// Keeps the same bind group layout and entry signature; body just writes a
 /// deterministic value into `out_buf`. If a device compiles+runs this but
 /// aborts on the full shader, the problem is shader size, not wgpu integration.
+/// §20 block-output entry point. Reads the finalDensity (ch11) corner values
+/// that the corner shards already wrote into `out_buf`, trilinearly
+/// interpolates one value per BLOCK, and writes a block-state byte:
+///   0 = air (d <= 0), 1 = stone (d > 0).
+/// This is the "GPU outputs block states" path; Java only writes the palette.
+/// (Aquifer/vein/beard are NOT applied here yet — this is the minimal loop.)
+const BLOCK_OUT_ENTRY: &str = r#"
+@group(0) @binding(7) var<storage, read_write> block_buf: array<u32>;
+
+@compute @workgroup_size(4, 4, 4)
+fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let num_chunks: i32 = params.batch_count_x;
+  let cx_i32: i32 = i32(gid.x);
+  let cy_i32: i32 = i32(gid.y);
+  let cz_i32: i32 = i32(gid.z);
+  let chunk_index: i32 = cz_i32 / 16;
+  let bz: i32 = cz_i32 % 16;
+  let height_i: i32 = i32(params.height_f);
+  if (cx_i32 >= 16 || cy_i32 >= height_i || bz >= 16 || chunk_index >= num_chunks) { return; }
+
+  let cell_w: i32 = i32(params.cell_width);
+  let cell_h: i32 = i32(params.cell_height);
+  let ccx: i32 = 16 / cell_w + 1;
+  let ccz: i32 = 16 / cell_w + 1;
+  let ccy: i32 = height_i / cell_h + 1;
+  let s: i32 = ccx * ccz;
+  let cpc: u32 = u32(ccx * ccy * ccz);
+  let ch11_base: u32 = u32(chunk_index) * 16u * cpc + 11u * cpc;
+
+  let ix: i32 = cx_i32 / cell_w;
+  let iz: i32 = bz / cell_w;
+  let iy: i32 = cy_i32 / cell_h;
+  let tx: f32 = f32(cx_i32 % cell_w) / f32(cell_w);
+  let tz: f32 = f32(bz % cell_w) / f32(cell_w);
+  let ty: f32 = f32(cy_i32 % cell_h) / f32(cell_h);
+
+  let c000 = out_buf[ch11_base + u32(ix + iz * ccx + iy * s)];
+  let c100 = out_buf[ch11_base + u32(ix + 1 + iz * ccx + iy * s)];
+  let c010 = out_buf[ch11_base + u32(ix + iz * ccx + (iy + 1) * s)];
+  let c110 = out_buf[ch11_base + u32(ix + 1 + iz * ccx + (iy + 1) * s)];
+  let c001 = out_buf[ch11_base + u32(ix + (iz + 1) * ccx + iy * s)];
+  let c101 = out_buf[ch11_base + u32(ix + 1 + (iz + 1) * ccx + iy * s)];
+  let c011 = out_buf[ch11_base + u32(ix + (iz + 1) * ccx + (iy + 1) * s)];
+  let c111 = out_buf[ch11_base + u32(ix + 1 + (iz + 1) * ccx + (iy + 1) * s)];
+
+  let x00 = c000 + tx * (c100 - c000);
+  let x10 = c010 + tx * (c110 - c010);
+  let x01 = c001 + tx * (c101 - c001);
+  let x11 = c011 + tx * (c111 - c011);
+  let y0 = x00 + ty * (x10 - x00);
+  let y1 = x01 + ty * (x11 - x01);
+  let d = y0 + tz * (y1 - y0);
+
+  let per_chunk: u32 = u32(16 * height_i * 16);
+  let bidx: u32 = u32(chunk_index) * per_chunk + u32(cx_i32 + bz * 16 + cy_i32 * 256);
+  block_buf[bidx] = select(0u, 1u, d > 0.0);
+}
+"#;
+
+/// `C2ME_WGPU_BLOCK_OUT=1` enables the block-output shard (§20 minimal loop).
+pub fn block_out_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("C2ME_WGPU_BLOCK_OUT")
+            .map(|v| !v.is_empty() && v != "0").unwrap_or(false)
+    })
+}
+
 const MINIMAL_ENTRY: &str = r#"
 @compute @workgroup_size(4, 4, 4)
 fn main_entry(

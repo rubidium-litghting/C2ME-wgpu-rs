@@ -257,6 +257,7 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
         let req = Box::new(BatchRequest {
             status: AtomicI32::new(STATUS_DONE),
             result: Mutex::new(Some(ResultBlob::new_empty())),
+            block: Mutex::new(Some(ResultBlob::new_empty())),
         });
         return Box::into_raw(req) as i64;
     }
@@ -268,6 +269,7 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
     let req = Arc::new(BatchRequest {
         status: AtomicI32::new(STATUS_PENDING),
         result: Mutex::new(None),
+        block: Mutex::new(None),
     });
     let req_bg = Arc::clone(&req);
     // Shape-dependent per-chunk cell count, computed before the move.
@@ -320,6 +322,13 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
                 ResultBlob::from_f32_data(&all_f32s, combined_offsets, chunk_idx)
             };
             *req_bg.result.lock().unwrap() = Some(result_blob);
+            // §20 block-state bytes as a separate blob (raw u32, no CRC needed
+            // by Java's reader — reuse ResultBlob only as a byte container).
+            if !executed.block_data.is_empty() {
+                let bytes: Vec<u8> = executed.block_data.iter()
+                    .flat_map(|v| v.to_le_bytes()).collect();
+                *req_bg.block.lock().unwrap() = Some(ResultBlob::from_bytes(bytes));
+            }
             req_bg.status.store(STATUS_DONE, Ordering::Release);
         }
         Err(_e) => {
@@ -374,6 +383,31 @@ pub unsafe extern "C" fn c2me_wgpu_take_result_blob(
     if !blob.verify_crc() {
         return 2;
     }
+    let (ptr, len) = blob.into_raw_parts();
+    unsafe {
+        ptr::write(out_ptr, ptr as *const u8);
+        ptr::write(out_len, len);
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// ⑤b Consume the §20 per-block state blob (u32 per block). Same lifetime
+//     rules as take_result_blob.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2me_wgpu_take_block_blob(
+    request_h: i64,
+    out_ptr: *mut *const u8,
+    out_len: *mut usize,
+) -> i32 {
+    if request_h == 0 { return STATUS_INVALID_HANDLE; }
+    if out_ptr.is_null() || out_len.is_null() { return STATUS_ERROR; }
+    // BORROW (do not Arc::from_raw): the handle is freed exactly once, by
+    // take_result_blob. Java must call take_block_blob FIRST, then
+    // take_result_blob. Two from_raw on one handle would free twice -> UAF.
+    let req: &BatchRequest = unsafe { &*(request_h as *const BatchRequest) };
+    if req.status.load(Ordering::Acquire) != STATUS_DONE { return STATUS_ERROR; }
+    let Some(blob) = req.block.lock().unwrap().take() else { return -1; };
     let (ptr, len) = blob.into_raw_parts();
     unsafe {
         ptr::write(out_ptr, ptr as *const u8);
@@ -485,4 +519,8 @@ fn decode_blob_f32s(blob: &ResultBlob) -> Vec<f32> {
 pub(crate) struct BatchRequest {
     pub status: AtomicI32,
     pub result: Mutex<Option<ResultBlob>>,
+    /// §20 per-block state bytes (u32 per block, chunk-major). Empty unless
+    /// the BlockOut shard is enabled. Separate from `result` so the density
+    /// blob layout is untouched.
+    pub block: Mutex<Option<ResultBlob>>,
 }

@@ -93,6 +93,17 @@ impl ResultBlob {
     /// Returns (data_ptr, data_len). Transfers ownership of the backing
     /// buffer to the caller, which MUST reclaim it via `free_raw_parts`
     /// (exposed to Java as `c2me_wgpu_free_result_blob`) or it leaks.
+    /// Wrap raw bytes as a blob (same 8-byte header layout, magic/version).
+    /// Used for the §20 per-block state blob, which Java reads as raw u32s.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        let mut v = Vec::<u8>::with_capacity(8 + bytes.len());
+        v.extend_from_slice(&MAGIC.to_le_bytes());
+        v.extend_from_slice(&VERSION.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // chunk_count placeholder
+        v.extend_from_slice(&bytes);
+        Self { data: v }
+    }
+
     pub fn into_raw_parts(self) -> (*mut u8, usize) {
         // into_boxed_slice shrinks capacity to len, so free_raw_parts can
         // rebuild an exact Box<[u8]> without tracking capacity separately.

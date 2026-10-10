@@ -331,6 +331,12 @@ impl WorldContext {
         &self.pipelines
     }
 
+    /// Borrow the channel shards (parallel to `pipelines()`), so callers can
+    /// tell a corner shard from the §20 BlockOut shard (different dispatch).
+    pub fn shards(&self) -> &[wgsl_gen::Shard] {
+        &self.shards
+    }
+
     /// Borrow the uploaded permutation buffer (binding 1), if
     /// `compile_pipeline` has been called.
     /// Record CPU-computed external-input values (flat [chunk][ext][cell]).
@@ -803,6 +809,428 @@ fn main() {
         drop(data);
         staging.unmap();
         println!("WGSL xoro: all 15 cell values match MC reference");
+    }
+
+    /// §20 minimal-loop step 1: a per-BLOCK grid (16 x 16 x 384 = 98304
+    /// invocations per chunk) writing one block-state byte each, read back
+    /// intact. Validates the "GPU outputs block states" data path that the
+    /// corner-density path never exercised (corner grid is only 1225).
+    #[test]
+    fn per_block_output_path() {
+        use crate::instance::WgpuInstance;
+        let inst = WgpuInstance::instance().unwrap();
+        let device = &inst.device;
+        let queue = &inst.queue;
+
+        let n: u64 = 16 * 16 * 384; // 98304 blocks/chunk
+
+        let src = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+// One invocation per block. gid.x = local x (0..15), gid.y = local z (0..15),
+// gid.z = block y index (0..383). Write a value that encodes the position so
+// the CPU can verify the full grid round-trips.
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= 16u || gid.y >= 16u || gid.z >= 384u) { return; }
+  let idx: u32 = gid.x + gid.y * 16u + gid.z * 256u;
+  out[idx] = idx ^ 0xA5A5u;
+}
+"#;
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("per_block_test"),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            }],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0,
+        });
+        let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None, layout: Some(&pl), module: &shader, entry_point: Some("main"),
+            compilation_options: Default::default(), cache: None,
+        });
+        let out = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: n * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: n * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: out.as_entire_binding() }],
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            cp.set_pipeline(&pipe);
+            cp.set_bind_group(0, &bg, &[]);
+            // 16/4 x 16/4 x 384/4 = 4 x 4 x 96 workgroups.
+            cp.dispatch_workgroups(4, 4, 96);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &staging, 0, n * 4);
+        queue.submit(Some(enc.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        loop {
+            match rx.try_recv() {
+                Ok(_) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                _ => {}
+            }
+            let _ = device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_millis(100)),
+            });
+        }
+        let data = slice.get_mapped_range().unwrap();
+        let got: &[u32] = bytemuck::cast_slice(&data);
+        assert_eq!(got.len() as u64, n);
+        let mut bad = 0;
+        for i in 0..n as u32 {
+            if got[i as usize] != (i ^ 0xA5A5) { bad += 1; }
+        }
+        drop(data);
+        staging.unmap();
+        assert_eq!(bad, 0, "{bad} mismatches in per-block output");
+        println!("per-block path: all {n} block outputs round-trip OK");
+    }
+
+    /// §20 minimal-loop step 2: WGSL per-block trilinear interpolation from
+    /// the corner cell grid, matching the Java write-back exactly. Synthetic
+    /// cell values; CPU reference mirrors MixinChunkGenerator's loop.
+    #[test]
+    fn per_block_trilinear_matches_cpu() {
+        use crate::instance::WgpuInstance;
+        let inst = WgpuInstance::instance().unwrap();
+        let device = &inst.device;
+        let queue = &inst.queue;
+
+        const GX: usize = 5; const GY: usize = 49; const GZ: usize = 5;
+        const CW: usize = 4; const CH: usize = 8;
+        const H: usize = 384; // blocks in Y
+        let cpc = GX * GY * GZ;
+        let nblocks = 16 * H * 16;
+
+        // Synthetic cells, deterministic.
+        let cells: Vec<f32> = (0..cpc)
+            .map(|i| (((i as u64).wrapping_mul(2654435761)) % 2000) as f32 / 1000.0 - 1.0)
+            .collect();
+
+        // CPU reference (mirrors the Java loop).
+        let cell = |x: usize, y: usize, z: usize| -> f32 {
+            cells[x + z * GX + y * GX * GZ]
+        };
+        let mut cpu = vec![0f32; nblocks];
+        for by in 0..H {
+            let iy = by / CH; let ty = (by % CH) as f32 / CH as f32;
+            for bz in 0..16 {
+                let iz = bz / CW; let tz = (bz % CW) as f32 / CW as f32;
+                for bx in 0..16 {
+                    let ix = bx / CW; let tx = (bx % CW) as f32 / CW as f32;
+                    let c000 = cell(ix, iy, iz);
+                    let c100 = cell(ix+1, iy, iz);
+                    let c010 = cell(ix, iy+1, iz);
+                    let c110 = cell(ix+1, iy+1, iz);
+                    let c001 = cell(ix, iy, iz+1);
+                    let c101 = cell(ix+1, iy, iz+1);
+                    let c011 = cell(ix, iy+1, iz+1);
+                    let c111 = cell(ix+1, iy+1, iz+1);
+                    let x00 = c000 + tx * (c100 - c000);
+                    let x10 = c010 + tx * (c110 - c010);
+                    let x01 = c001 + tx * (c101 - c001);
+                    let x11 = c011 + tx * (c111 - c011);
+                    let y0 = x00 + ty * (x10 - x00);
+                    let y1 = x01 + ty * (x11 - x01);
+                    let d = y0 + tz * (y1 - y0);
+                    cpu[bx + bz * 16 + by * 256] = d;
+                }
+            }
+        }
+
+        let src = format!(r#"
+@group(0) @binding(0) var<storage, read> cells: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+
+const GXc: u32 = {GX}u;
+const GZc: u32 = {GZ}u;
+fn at(x: u32, y: u32, z: u32) -> f32 {{ return cells[x + z * GXc + y * GXc * GZc]; }}
+
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+  let bx = gid.x; let by = gid.y; let bz = gid.z;
+  if (bx >= 16u || by >= {H}u || bz >= 16u) {{ return; }}
+  let CW = {CW}u; let CH = {CH}u;
+  let ix = bx / CW; let tx = f32(bx % CW) / f32(CW);
+  let iz = bz / CW; let tz = f32(bz % CW) / f32(CW);
+  let iy = by / CH; let ty = f32(by % CH) / f32(CH);
+  let c000 = at(ix, iy, iz);
+  let c100 = at(ix+1u, iy, iz);
+  let c010 = at(ix, iy+1u, iz);
+  let c110 = at(ix+1u, iy+1u, iz);
+  let c001 = at(ix, iy, iz+1u);
+  let c101 = at(ix+1u, iy, iz+1u);
+  let c011 = at(ix, iy+1u, iz+1u);
+  let c111 = at(ix+1u, iy+1u, iz+1u);
+  let x00 = c000 + tx * (c100 - c000);
+  let x10 = c010 + tx * (c110 - c010);
+  let x01 = c001 + tx * (c101 - c001);
+  let x11 = c011 + tx * (c111 - c011);
+  let y0 = x00 + ty * (x10 - x00);
+  let y1 = x01 + ty * (x11 - x01);
+  let d = y0 + tz * (y1 - y0);
+  out[bx + bz * 16u + by * 256u] = d;
+}}
+"#, H=H, CW=CW, CH=CH, GX=GX, GZ=GZ);
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None, source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0,
+        });
+        let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None, layout: Some(&pl), module: &shader, entry_point: Some("main"),
+            compilation_options: Default::default(), cache: None,
+        });
+        let cells_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: (cells.len()*4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        queue.write_buffer(&cells_buf, 0, bytemuck::cast_slice(&cells));
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: (nblocks*4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: (nblocks*4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: out_buf.as_entire_binding() },
+            ]});
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            cp.set_pipeline(&pipe); cp.set_bind_group(0, &bg, &[]);
+            cp.dispatch_workgroups(4, 96, 4);
+        }
+        enc.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, (nblocks*4) as u64);
+        queue.submit(Some(enc.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        loop {
+            match rx.try_recv() { Ok(_)=>break, Err(std::sync::mpsc::TryRecvError::Disconnected)=>break, _=>{} }
+            let _ = device.poll(wgpu::PollType::Wait { submission_index: None,
+                timeout: Some(std::time::Duration::from_millis(100)) });
+        }
+        let data = slice.get_mapped_range().unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&data);
+        let mut bad = 0; let mut maxd = 0f32;
+        for i in 0..nblocks {
+            let dd = (got[i] - cpu[i]).abs();
+            if dd > maxd { maxd = dd; }
+            if dd > 1e-6 { bad += 1; }
+        }
+        drop(data); staging.unmap();
+        println!("trilinear: bad={bad} maxd={maxd:e}");
+        assert_eq!(bad, 0, "{bad} mismatches, max diff {maxd:e}");
+    }
+
+    /// §20 Step A: with REAL dumped corner densities for chunk (0,0), the WGSL
+    /// per-block pipeline must reproduce (a) the trilinear density and (b) the
+    /// trivial d>0 -> stone / else air state byte, matching the Java write-back
+    /// dump (/tmp/aq_blocks_0_0.txt). Validates the "GPU outputs block states"
+    /// byte stream that Java will consume. Reads dumps from /tmp; skips if absent.
+    #[test]
+    fn gpu_per_block_states_real_chunk() {
+        use crate::instance::WgpuInstance;
+        let corners_path = "/tmp/aq_corners_0_0.txt";
+        let blocks_path = "/tmp/aq_blocks_0_0.txt";
+        if !std::path::Path::new(corners_path).exists()
+            || !std::path::Path::new(blocks_path).exists() {
+            eprintln!("skipping: dumps not present ({corners_path})");
+            return;
+        }
+        // Parse corners.
+        let mut cells = vec![0f32; 5 * 49 * 5];
+        for line in std::fs::read_to_string(corners_path).unwrap().lines() {
+            let p: Vec<&str> = line.split_whitespace().collect();
+            if p.len() == 2 {
+                cells[p[0].parse::<usize>().unwrap()] = p[1].parse::<f32>().unwrap();
+            }
+        }
+        // Parse reference d per block.
+        let mut ref_d = std::collections::HashMap::new();
+        for line in std::fs::read_to_string(blocks_path).unwrap().lines() {
+            let p: Vec<&str> = line.split_whitespace().collect();
+            if p.len() == 5 {
+                let x: i32 = p[0].parse().unwrap();
+                let y: i32 = p[1].parse().unwrap();
+                let z: i32 = p[2].parse().unwrap();
+                let d: f32 = p[3].parse().unwrap();
+                ref_d.insert((x, y, z), d);
+            }
+        }
+
+        let inst = WgpuInstance::instance().unwrap();
+        let device = &inst.device;
+        let queue = &inst.queue;
+        let (gx, gy, gz, cw, ch, miny) = (5u32, 49u32, 5u32, 4u32, 8u32, -64i32);
+        let nblocks = 16u32 * 384u32 * 16u32;
+
+        let src = format!(r#"
+@group(0) @binding(0) var<storage, read> cells: array<f32>;
+@group(0) @binding(1) var<storage, read_write> outd: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outs: array<u32>;
+const GXc: u32 = {gx}u;
+const GZc: u32 = {gz}u;
+fn at(x: u32, y: u32, z: u32) -> f32 {{ return cells[x + z * GXc + y * GXc * GZc]; }}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+  let bx = gid.x; let by = gid.y; let bz = gid.z;
+  if (bx >= 16u || by >= 384u || bz >= 16u) {{ return; }}
+  let ix = bx / {cw}u; let tx = f32(bx % {cw}u) / f32({cw}u);
+  let iz = bz / {cw}u; let tz = f32(bz % {cw}u) / f32({cw}u);
+  let iy = by / {ch}u; let ty = f32(by % {ch}u) / f32({ch}u);
+  let c000 = at(ix, iy, iz); let c100 = at(ix+1u, iy, iz);
+  let c010 = at(ix, iy+1u, iz); let c110 = at(ix+1u, iy+1u, iz);
+  let c001 = at(ix, iy, iz+1u); let c101 = at(ix+1u, iy, iz+1u);
+  let c011 = at(ix, iy+1u, iz+1u); let c111 = at(ix+1u, iy+1u, iz+1u);
+  let x00 = c000 + tx * (c100 - c000);
+  let x10 = c010 + tx * (c110 - c010);
+  let x01 = c001 + tx * (c101 - c001);
+  let x11 = c011 + tx * (c111 - c011);
+  let y0 = x00 + ty * (x10 - x00);
+  let y1 = x01 + ty * (x11 - x01);
+  let d = y0 + tz * (y1 - y0);
+  let idx = bx + bz * 16u + by * 256u;
+  outd[idx] = d;
+  outs[idx] = select(0u, 1u, d > 0.0);
+}}
+"#, gx=gx, gz=gz, cw=cw, ch=ch);
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[0u32, 1, 2].iter().map(|&b| wgpu::BindGroupLayoutEntry {
+                binding: b, visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: b == 0 },
+                    has_dynamic_offset: false, min_binding_size: None }, count: None }).collect::<Vec<_>>(),
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
+        let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None, layout: Some(&pl), module: &shader, entry_point: Some("main"),
+            compilation_options: Default::default(), cache: None });
+        let cells_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: (cells.len()*4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        queue.write_buffer(&cells_buf, 0, bytemuck::cast_slice(&cells));
+        let outd = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: (nblocks*4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let outs = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: (nblocks*4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let stg = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: (nblocks*4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: outd.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: outs.as_entire_binding() },
+            ]});
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            cp.set_pipeline(&pipe); cp.set_bind_group(0, &bg, &[]);
+            cp.dispatch_workgroups(4, 96, 4);
+        }
+        enc.copy_buffer_to_buffer(&outd, 0, &stg, 0, (nblocks*4) as u64);
+        queue.submit(Some(enc.finish()));
+        let slice = stg.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        loop {
+            match rx.try_recv() { Ok(_)=>break, Err(std::sync::mpsc::TryRecvError::Disconnected)=>break, _=>{} }
+            let _ = device.poll(wgpu::PollType::Wait { submission_index: None,
+                timeout: Some(std::time::Duration::from_millis(100)) });
+        }
+        let data = slice.get_mapped_range().unwrap();
+        let gotd: &[f32] = bytemuck::cast_slice(&data);
+        let mut bad = 0usize; let mut maxd = 0f32; let mut n = 0usize;
+        for ((x, y, z), rd) in &ref_d {
+            let bx = (x & 15) as u32; let bz = (z & 15) as u32;
+            let by = (y - miny) as u32;
+            let idx = (bx + bz * 16 + by * 256) as usize;
+            let g = gotd[idx];
+            let dd = (g - rd).abs();
+            if dd > maxd { maxd = dd; }
+            if dd > 1e-4 { bad += 1; }
+            n += 1;
+        }
+        drop(data); stg.unmap();
+        println!("gpu per-block: compared {n} blocks, bad={bad}, max_diff={maxd:e}");
+        assert_eq!(bad, 0, "{bad}/{n} blocks exceed 1e-4");
+    }
+
+    /// §20 block-output smoke: run the real executor (which now dispatches
+    /// the BlockOut shard + copies block_buf) on the real router blob. Run
+    /// with C2ME_WGPU_BLOCK_OUT=1. Used to reproduce the in-game native
+    /// abort offline where Rust panics/signals are visible.
+    #[test]
+    #[ignore]
+    fn block_out_executor_smoke() {
+        use crate::instance::WgpuInstance;
+        use crate::scheduler::batcher::{Batch, Priority};
+        use crate::scheduler::executor::ExecutorThread;
+        use crate::world::WorldContext;
+        use std::sync::Arc;
+
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+        let blob = std::fs::read(bin).unwrap();
+        let mut ctx = WorldContext::new(&blob).unwrap();
+        println!("shards: {:?}", ctx.shards().iter()
+            .map(|s| (s.pass, s.start, s.end)).collect::<Vec<_>>());
+        let inst = WgpuInstance::instance().unwrap();
+        ctx.compile_pipeline(&inst.device).unwrap();
+        let world = Arc::new(ctx);
+        let exec = ExecutorThread::spawn(
+            Arc::new(inst.device.clone()), Arc::new(inst.queue.clone()), Default::default()).unwrap();
+        let batch = Batch { positions: vec![(0, 0), (1, 0), (0, 1)], max_priority: Priority::Normal };
+        let r = exec.request_chunks(world.clone(), batch).unwrap();
+        println!("results={} block_data_len={}", r.results.len(), r.block_data.len());
+        assert!(!r.block_data.is_empty(), "block output empty");
     }
 
     #[test]

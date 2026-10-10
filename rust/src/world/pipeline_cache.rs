@@ -72,6 +72,7 @@ fn pass_id(pass: Pass) -> u8 {
         Pass::A => 1,
         Pass::B => 2,
         Pass::C => 3,
+        Pass::BlockOut => 4,
     }
 }
 

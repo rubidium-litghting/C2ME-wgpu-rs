@@ -69,9 +69,14 @@ public final class WgpuBatchCoordinator {
     public static final class GpuChunk {
         public final MemorySegment seg;
         public final int batchIndex;
-        GpuChunk(MemorySegment seg, int batchIndex) {
+        /** §20 per-block state bytes (u32/block, chunk-major) for the whole
+         *  batch, or null when the block-output shard is disabled. The caller
+         *  slices its chunk via batchIndex. */
+        public final MemorySegment blockSeg;
+        GpuChunk(MemorySegment seg, int batchIndex, MemorySegment blockSeg) {
             this.seg = seg;
             this.batchIndex = batchIndex;
+            this.blockSeg = blockSeg;
         }
     }
 
@@ -310,6 +315,16 @@ public final class WgpuBatchCoordinator {
             return;
         }
 
+        // §20: take the BLOCK blob FIRST — it borrows the handle, and
+        // takeResultBlob below frees it. (Reversed order = use-after-free.)
+        MemorySegment blockSeg = null;
+        try {
+            blockSeg = WgpuThinBinding.takeBlockBlob(req);
+            if (blockSeg != null && blockSeg.byteSize() == 0) blockSeg = null;
+        } catch (Throwable t) {
+            blockSeg = null;
+        }
+
         MemorySegment seg;
         try {
             seg = WgpuThinBinding.takeResultBlob(req);
@@ -320,7 +335,7 @@ public final class WgpuBatchCoordinator {
 
         int n = ib.batch.size();
         for (int i = 0; i < n; i++) {
-            ib.batch.get(i).future.complete(new GpuChunk(seg, i));
+            ib.batch.get(i).future.complete(new GpuChunk(seg, i, blockSeg));
         }
         recordStats(n, System.nanoTime() - t0);
     }

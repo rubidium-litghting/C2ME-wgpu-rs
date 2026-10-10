@@ -2305,3 +2305,69 @@ heightmap"，把关键路径上 CPU 的部分压到最小：
    过大时会**设备丢失**，且编译成本对规模**超线性**（§5.15.2）。§20 会显著
    增加 shader 体积，务必保持每片在安全区（§5.15.5 实测 ~2100 行 / 编译
    ~1.6s 稳；shard B 3083 行已到 9.6–10.2s，属危险边缘）。
+
+---
+
+## §21 §20 最小闭环进度（2026-10-11，交接）
+
+### 21.1 目标与当前状态
+
+目标（§20 最小闭环）：**GPU 直接输出 per-block 方块状态字节，CPU 只做
+palette 写入**，跳过 CPU 的三线性插值 + aquifer。这是"GPU 输出方块状态"
+架构的第一步。
+
+**当前状态：功能跑通，不崩，但 CPS 收益待测/可能为负。**
+
+### 21.2 已完成（本会话）
+
+1. **per-block 输出通路验证**（离线）：98304 blocks/chunk 的 per-block 网格
+   写 u32、回读全部正确（`per_block_output_path` 测试）。
+2. **WGSL 三线性插值**（离线）：与 Java 写回逐块一致
+   （`per_block_trilinear_matches_cpu`，maxd=0）。
+3. **真实数据离线验证**：用 dump 的 ch11 角点跑 GPU per-block，与
+   `aq_blocks` 逐块一致（`gpu_per_block_states_real_chunk`，bad=0）。
+4. **端到端接线**（Rust + Java）：
+   - Rust：新 `Pass::BlockOut` shard（`wgsl_gen.rs` 的 `BLOCK_OUT_ENTRY`）、
+     binding 7（`block_buf`）、executor 回读 `ExecutedBatch.block_data`、
+     C API `c2me_wgpu_take_block_blob`、`ResultBlob::from_bytes`。
+   - Java：`WgpuThinBinding.takeBlockBlob`、`WgpuBatchCoordinator` 的
+     `GpuChunk.blockSeg`、`MixinChunkGenerator.writeBlocksFromGpu`
+     （`blockSeg != null` 时走它、跳过密度写回）。
+   - 开关：`C2ME_WGPU_BLOCK_OUT=1`（默认关）。
+5. **修了一个真 bug（use-after-free）**：`take_result_blob` 与
+   `take_block_blob` 都对同一 handle 调 `Arc::from_raw` → 双重释放 →
+   游戏 native 崩。修法：`take_block_blob` 改为**借用**（`&*(...)`），
+   Java 侧**先 takeBlockBlob 再 takeResultBlob**。离线测试不走 C API，
+   所以当时测不出。
+
+### 21.3 本轮文件改动清单（未提交）
+
+Rust：`rust/src/codegen/wgsl_gen.rs`（BlockOut/Pass/plan_shards/
+BLOCK_OUT_ENTRY/block_out_enabled）、`rust/src/scheduler/executor.rs`
+（block_buf、dispatch 分流、block 回读）、`rust/src/c_api.rs`
+（block blob 打包/取/修 UAF）、`rust/src/result/format.rs`（from_bytes）、
+`rust/src/world/world.rs`（shards()、若干离线测试）、
+`rust/src/world/bind_group.rs`（binding 7）。
+Java：`WgpuThinBinding.java`、`WgpuBatchCoordinator.java`、
+`MixinChunkGenerator.java`（writeBlocksFromGpu、各处 dump）、
+`AquiferImplAccessor.java`、`ChunkNoiseSamplerAccessor.java`。
+配置：`~/1.21.1moddev.sh` 里 `C2ME_WGPU_BLOCK_OUT=1`（本机测试用）。
+
+### 21.4 下一步（接手第一件事）
+
+1. **看 CPS**：跑一轮，看 `c2me-wgpu-batch` 的 CPS 与 MIN_STAGE（11s）比。
+   预期：**minimal 闭环不省 CPU**（它只把平凡判定搬 GPU、还多了 98KB/chunk
+   回读），真正收益要等**真 aquifer**（Step B）。若 CPS 明显差于现有，
+   说明 per-block 回读代价大于收益 —— 这会决定 §20 方向是否终止。
+2. **若 CPS 可接受**：Step B = 把 `writeBlocksFromGpu` 里的平凡判定换成
+   **真 aquifer**（§17 的硬骨头：per-block barrier + 13 邻居扫描 +
+   `estimateSurfaceHeight` 跨 chunk）。官方用 4×4 方阵 + Stage1Cache 绕过。
+3. **提交**：本轮改动全部未提交（在 main 工作区）。先提交再接 Step B。
+
+### 21.5 关键提醒
+
+- `C2ME_WGPU_BLOCK_OUT=1` 时，`writeDensityToChunk` 提前返回，
+  `aq_blocks`/`aq_corners` dump **不产出**（正常）。
+- 海洋变陆地是 minimal 闭环的**预期**（没跑 aquifer），不是 bug。
+- **端到端指标才是判据**（§19 教训）：Chunky 总时间，不看内部 batch 吞吐。
+- 大量 dump 开关（`C2ME_DUMP_*`）记得测完关掉，否则拖慢生成。
