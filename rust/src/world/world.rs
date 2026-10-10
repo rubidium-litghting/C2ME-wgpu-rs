@@ -608,6 +608,203 @@ mod tests {
         }
     }
 
+    /// §20: same u32-pair Xoroshiro/hash3/split/nextInt, but in WGSL on the
+    /// GPU, computing the aquifer cell positions. Must match the same MC
+    /// reference values as the Rust test.
+    #[test]
+    fn xoro_u32pair_wgsl_matches_mc_reference() {
+        use crate::instance::WgpuInstance;
+        let inst = WgpuInstance::instance().unwrap();
+        let device = &inst.device;
+        let queue = &inst.queue;
+
+        // 5 cells: [cx,cy,cz] each.
+        let cells: [i32; 15] = [0,0,0, 1,2,3, -5,4,7, 10,-3,-8, 0,1,0];
+        let n = 5u64;
+
+        let src = r#"
+@group(0) @binding(0) var<storage, read> cells: array<i32, 15>;
+@group(0) @binding(1) var<storage, read_write> out: array<i32>;
+
+fn add64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+  let lo = a.x + b.x;
+  let c = select(0u, 1u, lo < a.x);
+  return vec2<u32>(lo, a.y + b.y + c);
+}
+fn xor64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> { return vec2<u32>(a.x ^ b.x, a.y ^ b.y); }
+fn shl64(a: vec2<u32>, s: u32) -> vec2<u32> {
+  if (s == 0u) { return a; }
+  if (s >= 32u) { return vec2<u32>(0u, a.x << (s - 32u)); }
+  return vec2<u32>(a.x << s, (a.y << s) | (a.x >> (32u - s)));
+}
+fn shr64(a: vec2<u32>, s: u32) -> vec2<u32> {
+  if (s == 0u) { return a; }
+  if (s >= 32u) { return vec2<u32>(a.y >> (s - 32u), 0u); }
+  return vec2<u32>((a.x >> s) | (a.y << (32u - s)), a.y >> s);
+}
+fn rotl64(a: vec2<u32>, s: u32) -> vec2<u32> {
+  let l = shl64(a, s);
+  let r = shr64(a, 64u - s);
+  return vec2<u32>(l.x | r.x, l.y | r.y);
+}
+// 32x32 -> (lo,hi), pure u32
+fn mul32x32(a: u32, b: u32) -> vec2<u32> {
+  let al = a & 0xFFFFu; let ah = a >> 16u;
+  let bl = b & 0xFFFFu; let bh = b >> 16u;
+  let ll = al * bl; let lh = al * bh; let hl = ah * bl; let hh = ah * bh;
+  let cross = (ll >> 16u) + (lh & 0xFFFFu) + (hl & 0xFFFFu);
+  return vec2<u32>((ll & 0xFFFFu) | (cross << 16u), hh + (lh >> 16u) + (hl >> 16u) + (cross >> 16u));
+}
+// (a.x,a.y)*(b.x,b.y) mod 2^64
+fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+  let p00 = mul32x32(a.x, b.x);
+  let p01 = mul32x32(a.x, b.y);
+  let p10 = mul32x32(a.y, b.x);
+  let mid = add64(p01, p10);
+  return add64(p00, vec2<u32>(0u, mid.x));
+}
+fn sgn(v: i32) -> vec2<u32> {
+  let u = bitcast<u32>(v);
+  if (v < 0) { return vec2<u32>(u, 0xFFFFFFFFu); }
+  return vec2<u32>(u, 0u);
+}
+fn hash3(x: i32, y: i32, z: i32) -> vec2<u32> {
+  let a = sgn(x * 3129871);
+  let bz = mul64(sgn(z), sgn(116129781));
+  let l = xor64(xor64(a, bz), sgn(y));
+  let l2 = add64(mul64(mul64(l, l), sgn(42317861)), mul64(l, sgn(11)));
+  let r = shr64(l2, 16u);
+  if ((l2.y & 0x80000000u) != 0u) { return vec2<u32>(r.x, r.y | 0xFFFF0000u); }
+  return r;
+}
+
+struct X { lo: vec2<u32>, hi: vec2<u32> }
+fn x_next(s: ptr<function, X>) -> vec2<u32> {
+  let s0 = (*s).lo; let s1 = (*s).hi;
+  let res = add64(rotl64(add64(s0, s1), 17u), s0);
+  let s1n = xor64(s1, s0);
+  (*s).lo = xor64(xor64(rotl64(s0, 49u), s1n), shl64(s1n, 21u));
+  (*s).hi = rotl64(s1n, 28u);
+  return res;
+}
+fn x_next_int(s: ptr<function, X>, bound: i32) -> i32 {
+  let b = u32(bound);
+  var r = vec2<u32>(x_next(s).x, 0u);           // u32 value zero-extended
+  var m = mul64(r, vec2<u32>(b, 0u));
+  var mlo = m.x;
+  if (mlo < b) {
+    let thr = (0u - b) % b;
+    while (mlo < thr) {
+      r = vec2<u32>(x_next(s).x, 0u);
+      m = mul64(r, vec2<u32>(b, 0u));
+      mlo = m.x;
+    }
+  }
+  return bitcast<i32>(m.y);
+}
+
+@compute @workgroup_size(1)
+fn main() {
+  // nextSplitter consumes two next() calls.
+  var sp: X;
+  sp.lo = vec2<u32>(12345u, 0u);
+  sp.hi = vec2<u32>(67890u, 0u);
+  let slo = x_next(&sp);
+  let shi = x_next(&sp);
+  for (var i = 0u; i < 5u; i = i + 1u) {
+    let cx = cells[i*3u]; let cy = cells[i*3u+1u]; let cz = cells[i*3u+2u];
+    var rr: X;
+    rr.lo = xor64(hash3(cx, cy, cz), slo);
+    rr.hi = shi;
+    out[i*3u+0u] = x_next_int(&rr, 10);
+    out[i*3u+1u] = x_next_int(&rr, 9);
+    out[i*3u+2u] = x_next_int(&rr, 10);
+  }
+}
+"#;
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("xoro_wgsl_test"),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0,
+        });
+        let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None, layout: Some(&pl), module: &shader, entry_point: Some("main"),
+            compilation_options: Default::default(), cache: None,
+        });
+
+        let cells_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: (cells.len()*4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&cells_buf, 0, bytemuck::cast_slice(&cells));
+        let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: n*3*4, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None, size: n*3*4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: cells_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: out_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+            cp.set_pipeline(&pipe);
+            cp.set_bind_group(0, &bg, &[]);
+            cp.dispatch_workgroups(1, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, n*3*4);
+        queue.submit(Some(enc.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        loop {
+            match rx.try_recv() {
+                Ok(_) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                _ => {}
+            }
+            let _ = device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_millis(100)),
+            });
+        }
+        let data = slice.get_mapped_range().unwrap();
+        let got: &[i32] = bytemuck::cast_slice(&data);
+
+        let expect: [i32; 15] = [7,3,0, 8,8,9, 5,3,9, 9,0,5, 7,1,2];
+        for i in 0..15 {
+            assert_eq!(got[i], expect[i],
+                "WGSL cell out[{i}] = {} expected {}", got[i], expect[i]);
+        }
+        drop(data);
+        staging.unmap();
+        println!("WGSL xoro: all 15 cell values match MC reference");
+    }
+
     #[test]
     fn gpu_end_to_end_test() {
         use crate::instance::WgpuInstance;
