@@ -51,6 +51,9 @@ public interface AquiferImplAccessor {
     @Accessor("randomDeriver")
     net.minecraft.util.math.random.RandomSplitter getRandomDeriver();
 
+    @org.spongepowered.asm.mixin.gen.Invoker("getWaterLevel")
+    net.minecraft.world.gen.chunk.AquiferSampler.FluidLevel invokeGetWaterLevel(long pos);
+
     @Accessor("startX") int getStartX();
     @Accessor("startY") int getStartY();
     @Accessor("startZ") int getStartZ();

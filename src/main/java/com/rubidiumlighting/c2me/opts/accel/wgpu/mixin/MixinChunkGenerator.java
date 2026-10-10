@@ -798,6 +798,35 @@ public abstract class MixinChunkGenerator {
                 a.getRandomDeriver().addDebugInfo(dbg);
                 sb.append("SEED ").append(dbg).append('\n');
             }
+            // §22: 预热所有 cell 的 waterLevels 表。MC 惰性填充（apply 访问到
+            // 才填），GPU 需要完整表。用 seedLo/seedHi 算每 cell 的
+            // blockPosition，再调 getWaterLevel 触发 getFluidLevel。
+            {
+                var dbg2 = new StringBuilder();
+                a.getRandomDeriver().addDebugInfo(dbg2);
+                String ds2 = dbg2.toString();
+                long sLo = Long.parseLong(ds2.split("seedLo: ")[1].split(",")[0].trim());
+                long sHi = Long.parseLong(ds2.split("seedHi: ")[1].trim());
+                long t0 = System.nanoTime();
+                int warmed = 0;
+                for (int idx = 0; idx < wl.length; idx++) {
+                    int ci = idx % sizeX;
+                    int ck = (idx / sizeX) % sizeZ;
+                    int cj = idx / (sizeX * sizeZ);
+                    int cx = startX + ci, cy = startY + cj, cz = startZ + ck;
+                    long h = net.minecraft.util.math.MathHelper.hashCode(cx, cy, cz);
+                    var rr = new net.minecraft.util.math.random.Xoroshiro128PlusPlusRandom(
+                            h ^ sLo, sHi);
+                    int bx = cx * 16 + rr.nextInt(10);
+                    int by = cy * 12 + rr.nextInt(9);
+                    int bz = cz * 16 + rr.nextInt(10);
+                    long pos = net.minecraft.util.math.BlockPos.asLong(bx, by, bz);
+                    a.invokeGetWaterLevel(pos);
+                    warmed++;
+                }
+                long dt = (System.nanoTime() - t0) / 1_000_000;
+                LOGGER.info("[c2me-wgpu] aquifer warmup: {} cells in {} ms", warmed, dt);
+            }
             for (int i = 0; i < wl.length; i++) {
                 long packed = bp[i];
                 boolean none = (packed == Long.MAX_VALUE);
