@@ -99,6 +99,12 @@ pub fn get_or_compile(
     device: &wgpu::Device,
     pipeline_layout: &wgpu::PipelineLayout,
 ) -> Result<wgpu::ComputePipeline> {
+    // §22 B-3: the bind-group layout gained binding 8/9 (aquifer). Any
+    // pipeline cached under the old layout is invalid, so perturb the key
+    // (and the on-disk cache path) with a layout version. Bump on any
+    // binding change.
+    const LAYOUT_VERSION: u32 = 2;
+    let fingerprint = fingerprint ^ LAYOUT_VERSION.wrapping_mul(0x9E37_79B9);
     let key = (fingerprint, pass_id(pass));
     let entry_point = pass.entry_point();
 

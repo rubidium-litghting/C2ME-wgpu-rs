@@ -250,6 +250,10 @@ impl WorldContext {
         let bg_layout = bind_group::create_layout(device)?;
         crate::wgpu_debug!("[c2me-wgpu][compile] bind group layout ok, creating pipeline layout...");
         let pipeline_layout = bind_group::create_pipeline_layout(device, &bg_layout)?;
+        // §22: BlockOut uses its own (smaller) layout — 6 storage buffers,
+        // under the 8-per-stage limit.
+        let bo_bg_layout = bind_group::create_block_out_layout(device)?;
+        let bo_pipeline_layout = bind_group::create_pipeline_layout(device, &bo_bg_layout)?;
         crate::wgpu_debug!("[c2me-wgpu][compile] pipeline layout ok, compiling pipeline...");
 
         let mut pipelines: Vec<wgpu::ComputePipeline> =
@@ -259,12 +263,17 @@ impl WorldContext {
                 "[c2me-wgpu][compile] compiling shard {:?} [{}..{})...",
                 shard.pass, shard.start, shard.end
             );
+            let layout = if shard.pass == crate::codegen::wgsl_gen::Pass::BlockOut {
+                &bo_pipeline_layout
+            } else {
+                &pipeline_layout
+            };
             let pipeline = pipeline_cache::get_or_compile(
                 self.fingerprint,
                 shard.pass,
                 &self.shader_srcs[i],
                 device,
-                &pipeline_layout,
+                layout,
             )?;
             pipelines.push(pipeline);
         }

@@ -126,8 +126,14 @@ pub struct SingleBatchExecutor {
     block_buf: wgpu::Buffer,
     /// External-input values (binding 6), lazily (re)created to fit the batch.
     external_buf: Option<wgpu::Buffer>,
+    /// §22 B-2: aquifer cell positions + lvl_y (vec4<i32>/cell), binding 8.
+    aquifer_p_buf: wgpu::Buffer,
+    /// §22 B-2: aquifer cell fluid state (u32/cell), binding 9.
+    aquifer_s_buf: wgpu::Buffer,
     #[allow(dead_code)]
     bind_group_layout: wgpu::BindGroupLayout,
+    /// §22: separate layout for the BlockOut shard (6 storage buffers).
+    block_out_bg_layout: wgpu::BindGroupLayout,
     #[allow(dead_code)]
     pipeline_layout: wgpu::PipelineLayout,
     #[allow(dead_code)]
@@ -187,8 +193,27 @@ impl SingleBatchExecutor {
             mapped_at_creation: false,
         });
 
+        // §22 B-2: aquifer cell tables. Max cells/chunk ≈ 3*131*3 = 1179 for
+        // height=512, cell_height=4; round to 1200. vec4<i32>/cell + u32/cell.
+        const MAX_AQ_CELLS: usize = 1200;
+        let aq_stride = MAX_AQ_CELLS * config.max_batch_size.max(1);
+        let aquifer_p_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("c2me_wgpu_aquifer_p"),
+            size: (aq_stride * 16) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let aquifer_s_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("c2me_wgpu_aquifer_s"),
+            size: (aq_stride * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let bind_group_layout = bind_group::create_layout(&device)
             .map_err(|e| format!("bind group layout: {e}"))?;
+        let block_out_bg_layout = bind_group::create_block_out_layout(&device)
+            .map_err(|e| format!("block-out bind group layout: {e}"))?;
         let pipeline_layout = bind_group::create_pipeline_layout(&device, &bind_group_layout)
             .map_err(|e| format!("pipeline layout: {e}"))?;
 
@@ -201,7 +226,10 @@ impl SingleBatchExecutor {
             output_buf,
             block_buf,
             external_buf: None,
+            aquifer_p_buf,
+            aquifer_s_buf,
             bind_group_layout,
+            block_out_bg_layout,
             pipeline_layout,
             config,
         })
@@ -322,6 +350,35 @@ impl SingleBatchExecutor {
         // Update the persistent positions buffer (binding 4).
         self.queue.write_buffer(&self.positions_buf, 0, bytemuck::cast_slice(&packed_positions));
 
+        // §22 B-2: expand per-chunk aquifer tables (batch order) and upload
+        // to binding 8/9. Aquifer cells are 16-block wide → sizeX/sizeZ = 3
+        // for a 16-wide chunk; sizeY follows the 12-block vertical stride.
+        {
+            let mut aq_p: Vec<[i32; 4]> = Vec::new();
+            let mut aq_s: Vec<u32> = Vec::new();
+            if let Ok(tables) = world.aquifer_tables.lock() {
+                let min_y = shape.min_y;
+                let height = shape.height;
+                let start_y = min_y.div_euclid(12) - 1;
+                let size_y = (min_y + height).div_euclid(12)
+                    - min_y.div_euclid(12) + 3;
+                for &(cx, cz) in &batch.positions {
+                    if let Some(bytes) = tables.get(&(cx, cz)) {
+                        if let Some(t) = crate::world::aquifer::AquiferTable::parse(
+                                bytes, 3, size_y, 3, cx - 1, start_y, cz - 1) {
+                            t.pack_for_gpu(&mut aq_p, &mut aq_s);
+                        }
+                    }
+                }
+            }
+            if !aq_p.is_empty() {
+                self.queue.write_buffer(&self.aquifer_p_buf, 0,
+                    bytemuck::cast_slice(&aq_p));
+                self.queue.write_buffer(&self.aquifer_s_buf, 0,
+                    bytemuck::cast_slice(&aq_s));
+            }
+        }
+
         // Get or create perm buffer (binding 1)
         let perm_buf = world.perm_buffer()
             .ok_or_else(|| "perm buffer not uploaded".to_string())?;
@@ -379,6 +436,20 @@ impl SingleBatchExecutor {
             ],
         });
 
+        // §22: BlockOut shard gets its own bind group (6 buffers).
+        let block_out_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("c2me_wgpu_block_out_bg"),
+            layout: &self.block_out_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.output_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.positions_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: self.block_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: self.aquifer_p_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: self.aquifer_s_buf.as_entire_binding() },
+            ],
+        });
+
         let prof = crate::profile_enabled();
         let t_encode0 = std::time::Instant::now();
 
@@ -421,8 +492,10 @@ impl SingleBatchExecutor {
             for (i, pipeline) in pipelines.iter().enumerate() {
                 cpass.set_pipeline(pipeline);
                 if shards[i].pass == crate::codegen::wgsl_gen::Pass::BlockOut {
+                    cpass.set_bind_group(0, &block_out_bg, &[]);
                     cpass.dispatch_workgroups(bw_x, bw_y, bw_z);
                 } else {
+                    cpass.set_bind_group(0, &bind_group, &[]);
                     cpass.dispatch_workgroups(wg_x, wg_y, wg_z);
                 }
             }

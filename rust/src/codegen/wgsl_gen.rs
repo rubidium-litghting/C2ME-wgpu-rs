@@ -391,7 +391,7 @@ pub fn emit_shader_for_shard(root: &AstNode, shard: Shard) -> Result<String> {
     if shard.pass == Pass::BlockOut {
         // Standalone shader: no AST emitters, just bindings + the block entry.
         let mut out = String::with_capacity(4096);
-        out.push_str(BINDINGS_HEADER);
+        out.push_str(BLOCK_OUT_HEADER);
         out.push_str(BLOCK_OUT_ENTRY);
         return Ok(out);
     }
@@ -486,7 +486,11 @@ pub fn emit_shader(root: &AstNode) -> Result<String> {
 /// This is the "GPU outputs block states" path; Java only writes the palette.
 /// (Aquifer/vein/beard are NOT applied here yet — this is the minimal loop.)
 const BLOCK_OUT_ENTRY: &str = r#"
-@group(0) @binding(7) var<storage, read_write> block_buf: array<u32>;
+fn aq_fdiv(a: i32, b: i32) -> i32 {
+  let q = a / b; let r = a % b;
+  if (r != 0 && ((r < 0) != (b < 0))) { return q - 1; }
+  return q;
+}
 
 @compute @workgroup_size(4, 4, 4)
 fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -534,7 +538,49 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let per_chunk: u32 = u32(16 * height_i * 16);
   let bidx: u32 = u32(chunk_index) * per_chunk + u32(cx_i32 + bz * 16 + cy_i32 * 256);
-  block_buf[bidx] = select(0u, 1u, d > 0.0);
+
+  // d > 0 → solid stone (vanilla aquifer returns null).
+  if (d > 0.0) { block_buf[bidx] = 1u; return; }
+
+  // §22 aquifer (12-cell scan + FluidLevel). Global block coords:
+  let chunk_cx = positions[chunk_index * 2];
+  let chunk_cz = positions[chunk_index * 2 + 1];
+  let wx: i32 = chunk_cx * 16 + cx_i32;
+  let wz: i32 = chunk_cz * 16 + bz;
+  let wy: i32 = i32(params.min_y_f) + cy_i32;
+
+  // FluidLevelSampler: y < min(-54, seaLevel) → LAVA.
+  if (wy < -54) { block_buf[bidx] = 3u; return; }
+
+  let min_y_i = i32(params.min_y_f);
+  let start_y_i = aq_fdiv(min_y_i, 12) - 1;
+  let aq_sy = aq_fdiv(min_y_i + height_i, 12) - aq_fdiv(min_y_i, 12) + 3;
+  let aq_base = chunk_index * aq_sy * 9; // AQ_SX(3) * AQ_SY * AQ_SZ(3)
+
+  let l = aq_fdiv(wx - 5, 16);
+  let m = aq_fdiv(wy + 1, 12);
+  let n = aq_fdiv(wz - 5, 16);
+
+  var o: i32 = 2147483647; var p: i32 = 2147483647; var ri: i32 = -1;
+  for (var u: i32 = 0; u <= 1; u = u + 1) {
+    for (var v: i32 = -1; v <= 1; v = v + 1) {
+      for (var w: i32 = 0; w <= 1; w = w + 1) {
+        let i = (l + u) - chunk_cx + 1;
+        let j = (m + v) - start_y_i;
+        let k = (n + w) - chunk_cz + 1;
+        if (i < 0 || i >= 3 || k < 0 || k >= 3 || j < 0 || j >= aq_sy) { continue; }
+        let idx = aq_base + (j * 3 + k) * 3 + i;
+        let cp = aq_p[idx];
+        let ad = cp.x - wx; let ae = cp.y - wy; let af = cp.z - wz;
+        let ag = ad * ad + ae * ae + af * af;
+        if (o >= ag) { ri = idx; p = o; o = ag; }
+        else if (p >= ag) { p = ag; }
+      }
+    }
+  }
+  if (ri < 0) { block_buf[bidx] = 1u; return; }
+  let rcly = aq_p[ri].w;
+  block_buf[bidx] = select(0u, aq_s[ri], wy < rcly);
 }
 "#;
 
@@ -583,6 +629,31 @@ struct WorldgenParams {
 @group(0) @binding(4) var<storage, read>        positions:    array<i32>;
 @group(0) @binding(5) var<storage, read>        simplex_perm: array<u32>;
 @group(0) @binding(6) var<storage, read>        external_inputs: array<f32>;
+"#;
+
+/// Bindings for the standalone BlockOut shard (§22). Deliberately separate
+/// from `BINDINGS_HEADER`: this shard uses only params/out_buf/positions/
+/// block_buf/aq_p/aq_s (6 storage buffers), so it gets its own bind group
+/// layout that stays under `max_storage_buffers_per_shader_stage` (8).
+const BLOCK_OUT_HEADER: &str = r#"
+struct WorldgenParams {
+  batch_origin_x: i32,
+  batch_origin_z: i32,
+  cell_width:     f32,
+  cell_height:    f32,
+  min_y_f:        f32,
+  height_f:       f32,
+  batch_count_x:  i32,
+  batch_count_z:  i32,
+  _pad:           array<u32, 8>,
+};
+
+@group(0) @binding(0) var<storage, read>        params:    WorldgenParams;
+@group(0) @binding(2) var<storage, read_write>  out_buf:   array<f32>;
+@group(0) @binding(4) var<storage, read>        positions: array<i32>;
+@group(0) @binding(7) var<storage, read_write>  block_buf: array<u32>;
+@group(0) @binding(8) var<storage, read>        aq_p:      array<vec4<i32>>;
+@group(0) @binding(9) var<storage, read>        aq_s:      array<u32>;
 "#;
 
 /// `main_entry` opening (single-pass mode) — sets up `cell_x / cell_y /
