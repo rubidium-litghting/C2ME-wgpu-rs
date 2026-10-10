@@ -7,13 +7,15 @@ A companion mod for [C2ME](https://modrinth.com/mod/c2me-fabric)
 that offloads the heavy noise / density-function pipeline of chunk generation
 onto the GPU.
 
-> ⚠️ **Experimental — read before installing.** Strict A/B testing shows that
-> on **strong-CPU / weak-GPU** machines (integrated graphics, most phones and
-> laptops) GPU offload can be **slower than plain C2ME on the CPU** — on a
-> Kirin 980, ~16.6 vs 23.2 chunks/s under Chunky. The GPU ends up waiting on
-> the renderer; the noise compute itself is not the bottleneck. Likely wins
-> only when the GPU is otherwise idle or you have a discrete GPU. Benchmark
-> on your own hardware before relying on it.
+> ⚠️ **Experimental — read before installing.** The mod now offloads the
+> whole density pipeline (noise, aquifer, structure shaping) to the GPU and
+> emits block states directly; the CPU only writes the chunk palette. On a
+> desktop AMD iGPU (RADV), an end-to-end Chunky run (r=500, 4225 chunks)
+> finishes in ~15 s vs ~23 s for plain C2ME on the CPU. Behaviour on
+> **weak/mobile GPUs has not been re-benchmarked** under this new
+> architecture — the older "strong-CPU / weak-GPU can be slower" caveat
+> applied to the previous CPU-write-back design. Benchmark on your own
+> hardware before relying on it.
 
 > **Compatibility-first.** This mod is deliberately built on **fp32** so it can
 > run on the *widest possible range of GPUs* — including integrated graphics
@@ -92,9 +94,10 @@ will not suggest it there.
    (and cached on disk).
 4. **Dispatch** — the GPU evaluates the density field for a whole batch of
    chunks in one dispatch.
-5. **Write back** — density values are read back and turned into blocks,
-   reusing Minecraft's own `AquiferSampler`, `StructureWeightSampler`
-   (Beardifier) and ore-vein samplers so the result matches vanilla.
+5. **Block states** — the GPU classifies every block (air / stone / water /
+   lava) itself, applying the aquifer and the Beardifier (structure shaping)
+   on the GPU. Java only writes the resulting per-block state bytes into the
+   chunk's palette.
 
 ---
 
@@ -125,10 +128,9 @@ it would exclude most mobile GPUs.
   the same corner grid and fed to the GPU as an "external input". The rest of
   the tree still runs on the GPU, so modded worldgen keeps working — only the
   unsupported subtree pays a CPU cost.
-- **May be a net slowdown on weak GPUs**: ~90% of GPU-path time is spent
-  queued behind the renderer (`poll`), not computing. On integrated/mobile GPUs that
-  are already busy rendering, this can make chunk generation slower than pure
-  CPU. See the note at the top.
+- **Weak/mobile GPUs not yet re-benchmarked** under the block-state
+  architecture. The old "queued behind the renderer" caveat applied to the
+  previous CPU-write-back design; whether it still holds is unverified.
 
 ---
 
@@ -160,6 +162,9 @@ Set these only when troubleshooting. All of them are read once at startup.
 | `C2ME_DUMP_DENSITY` | `1` | Dump the GPU density values of the chunk at (0, 0). |
 | `C2ME_DUMP_BLOCKS` | `1` | Dump the block states of the chunk at (0, 0), for offline comparison against vanilla. |
 | `C2ME_DUMP_BLOB` | file path | Dump the serialized NoiseRouter blob to the given path. |
+| `C2ME_WGPU_BLOCK_OUT` | `1` | GPU emits per-block block states (core path; on by default in the dev setup). |
+| `C2ME_WGPU_AQUIFER` | `1` | GPU aquifer (water / lava / stone classification). |
+| `C2ME_WGPU_BEARD` | `1` | GPU Beardifier (structure terrain shaping). |
 | `C2ME_WGPU_MAPPED_AT_CREATION` | `0` / `1` | Override how init-time buffers are uploaded. Default is `1` on desktop (fast mapped upload) and `0` on Android (Mali-G610 drivers reject the mapped path). Set `0` to force `queue.write_buffer`, `1` to force the mapped upload. |
 
 The blob dump can also be set with the JVM property `-Dc2me.dumpBlob=<path>`;
