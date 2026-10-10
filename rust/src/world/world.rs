@@ -503,6 +503,111 @@ mod tests {
         assert!(wgsl.contains("out_buf"));
         println!("✅ 集成测试通过：反序列化、优化、WGSL生成成功！");
     }
+    /// §20 aquifer ground-work: verify a PURE u32-pair implementation of
+    /// MC's Xoroshiro128++ + MathHelper.hashCode + split + nextInt(bound),
+    /// against values dumped from MC's own classes (Ref.java, seed 12345/
+    /// 67890). Every op here is u32-expressible, so WGSL can reproduce it
+    /// verbatim. This is the foundation for computing aquifer cell positions
+    /// on the GPU.
+    #[test]
+    fn xoro_u32pair_matches_mc_reference() {
+        type P = (u32, u32); // (lo, hi)
+
+        fn add(a: P, b: P) -> P {
+            let l = a.0 as u64 + b.0 as u64;
+            (l as u32, a.1.wrapping_add(b.1).wrapping_add((l >> 32) as u32))
+        }
+        fn xor(a: P, b: P) -> P { (a.0 ^ b.0, a.1 ^ b.1) }
+        fn shl(a: P, s: u32) -> P {
+            if s == 0 { return a; } if s >= 64 { return (0, 0); }
+            if s >= 32 { (0, a.0 << (s - 32)) }
+            else { (a.0 << s, (a.1 << s) | (a.0 >> (32 - s))) }
+        }
+        fn shr(a: P, s: u32) -> P {
+            if s == 0 { return a; } if s >= 64 { return (0, 0); }
+            if s >= 32 { (a.1 >> (s - 32), 0) }
+            else { ((a.0 >> s) | (a.1 << (32 - s)), a.1 >> s) }
+        }
+        fn rotl(a: P, s: u32) -> P {
+            let s = s % 64; if s == 0 { return a; }
+            let (l, r) = (shl(a, s), shr(a, 64 - s));
+            (l.0 | r.0, l.1 | r.1)
+        }
+        fn mul32(a: u32, b: u32) -> P {
+            let (al, ah) = (a & 0xFFFF, a >> 16);
+            let (bl, bh) = (b & 0xFFFF, b >> 16);
+            let (ll, lh, hl, hh) = (al * bl, al * bh, ah * bl, ah * bh);
+            let cross = (ll >> 16) + (lh & 0xFFFF) + (hl & 0xFFFF);
+            ((ll & 0xFFFF) | (cross << 16), hh + (lh >> 16) + (hl >> 16) + (cross >> 16))
+        }
+        fn mul(a: P, b: P) -> P {
+            let p00 = mul32(a.0, b.0);
+            let p01 = mul32(a.0, b.1);
+            let p10 = mul32(a.1, b.0);
+            add(p00, (0, add(p01, p10).0))
+        }
+        fn sgn(v: i64) -> P { ((v as u64) as u32, (v as u64 >> 32) as u32) }
+        fn hash3(x: i32, y: i32, z: i32) -> P {
+            let a = sgn((x.wrapping_mul(3129871)) as i64);
+            let bz = sgn((z as i64).wrapping_mul(116129781));
+            let l = xor(xor(a, bz), sgn(y as i64));
+            let l2 = add(mul(mul(l, l), sgn(42317861)), mul(l, sgn(11)));
+            let r = shr(l2, 16);
+            if l2.1 & 0x8000_0000 != 0 { (r.0, r.1 | 0xFFFF_0000) } else { r }
+        }
+        struct X { lo: P, hi: P }
+        impl X {
+            fn next(&mut self) -> P {
+                let (s0, s1) = (self.lo, self.hi);
+                let res = add(rotl(add(s0, s1), 17), s0);
+                let s1n = xor(s1, s0);
+                self.lo = xor(xor(rotl(s0, 49), s1n), shl(s1n, 21));
+                self.hi = rotl(s1n, 28);
+                res
+            }
+            fn next_i32(&mut self) -> u32 { self.next().0 }
+            fn next_int(&mut self, bound: i32) -> i32 {
+                let b = bound as u64;
+                let mut r = self.next_i32() as u64;
+                let mut m = r.wrapping_mul(b);
+                let mut mlo = m & 0xFFFF_FFFF;
+                if mlo < b {
+                    let thr = ((-bound) as u32 % bound as u32) as u64;
+                    while mlo < thr {
+                        r = self.next_i32() as u64;
+                        m = r.wrapping_mul(b);
+                        mlo = m & 0xFFFF_FFFF;
+                    }
+                }
+                (m >> 32) as i32
+            }
+        }
+        fn hex(n: P) -> String { format!("{:x}{:08x}", n.1, n.0) }
+
+        // RAW stream (seed 12345 / 67890)
+        let mut r = X { lo: (12345, 0), hi: (67890, 0) };
+        let got: Vec<String> = (0..4).map(|_| hex(r.next())).collect();
+        assert_eq!(got,
+            vec!["272d63039", "87e1a2e99377f9ef", "8aa1cc21ea593723", "5b767e353956a85a"]);
+
+        // Cell positions: [cx,cy,cz,dx,dy,dz] dumped from MC.
+        let cases: &[(i32, i32, i32, i32, i32, i32)] = &[
+            (0, 0, 0, 7, 3, 0),
+            (1, 2, 3, 8, 8, 9),
+            (-5, 4, 7, 5, 3, 9),
+            (10, -3, -8, 9, 0, 5),
+            (0, 1, 0, 7, 1, 2),
+        ];
+        let mut r = X { lo: (12345, 0), hi: (67890, 0) };
+        let (slo, shi) = (r.next(), r.next()); // nextSplitter
+        for &(cx, cy, cz, dx, dy, dz) in cases {
+            let mut rr = X { lo: xor(hash3(cx, cy, cz), slo), hi: shi };
+            assert_eq!(rr.next_int(10), dx, "cell ({cx},{cy},{cz}) dx");
+            assert_eq!(rr.next_int(9), dy, "cell ({cx},{cy},{cz}) dy");
+            assert_eq!(rr.next_int(10), dz, "cell ({cx},{cy},{cz}) dz");
+        }
+    }
+
     #[test]
     fn gpu_end_to_end_test() {
         use crate::instance::WgpuInstance;
