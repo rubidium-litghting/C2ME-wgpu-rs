@@ -48,6 +48,9 @@ public interface AquiferImplAccessor {
     @Accessor("fluidLevelSampler")
     net.minecraft.world.gen.chunk.AquiferSampler.FluidLevelSampler getFluidLevelSampler();
 
+    @Accessor("randomDeriver")
+    net.minecraft.util.math.random.RandomSplitter getRandomDeriver();
+
     @Accessor("startX") int getStartX();
     @Accessor("startY") int getStartY();
     @Accessor("startZ") int getStartZ();

@@ -791,6 +791,13 @@ public abstract class MixinChunkGenerator {
             sb.append("AQ ").append(startX).append(' ').append(startY).append(' ')
               .append(startZ).append(' ').append(sizeX).append(' ').append(sizeZ)
               .append('\n');
+            // §22: dump the aquifer RNG seed (seedLo/seedHi) so the Rust/WGSL
+            // generator can reproduce blockPositions[] from scratch.
+            {
+                var dbg = new StringBuilder();
+                a.getRandomDeriver().addDebugInfo(dbg);
+                sb.append("SEED ").append(dbg).append('\n');
+            }
             for (int i = 0; i < wl.length; i++) {
                 long packed = bp[i];
                 boolean none = (packed == Long.MAX_VALUE);
