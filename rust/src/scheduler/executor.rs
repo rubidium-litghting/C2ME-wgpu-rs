@@ -356,16 +356,17 @@ impl SingleBatchExecutor {
         {
             let mut aq_p: Vec<[i32; 4]> = Vec::new();
             let mut aq_s: Vec<u32> = Vec::new();
-            if let Ok(tables) = world.aquifer_tables.lock() {
+            if let Ok(mut tables) = world.aquifer_tables.lock() {
                 let min_y = shape.min_y;
                 let height = shape.height;
                 let start_y = min_y.div_euclid(12) - 1;
                 let size_y = (min_y + height).div_euclid(12)
                     - min_y.div_euclid(12) + 3;
                 for &(cx, cz) in &batch.positions {
-                    if let Some(bytes) = tables.get(&(cx, cz)) {
+                    // Consume: remove so the map does not grow unboundedly.
+                    if let Some(bytes) = tables.remove(&(cx, cz)) {
                         if let Some(t) = crate::world::aquifer::AquiferTable::parse(
-                                bytes, 3, size_y, 3, cx - 1, start_y, cz - 1) {
+                                &bytes, 3, size_y, 3, cx - 1, start_y, cz - 1) {
                             t.pack_for_gpu(&mut aq_p, &mut aq_s);
                         }
                     }

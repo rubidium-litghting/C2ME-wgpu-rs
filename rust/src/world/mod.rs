@@ -29,5 +29,6 @@ pub mod pipeline_cache;
 pub mod bind_group;
 pub mod constants;
 pub mod aquifer;
+pub mod beard;
 
 pub use world::WorldContext;

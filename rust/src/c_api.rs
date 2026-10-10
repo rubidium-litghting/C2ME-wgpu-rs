@@ -223,13 +223,6 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
         unsafe { std::slice::from_raw_parts(positions_ptr, n) }
     };
 
-    // §22 B-1: report how many aquifer tables were staged for this request.
-    {
-        let n_tables = world_arc.aquifer_tables.lock().map(|m| m.len()).unwrap_or(0);
-        crate::wgpu_debug!("[c2me-wgpu] request_chunks: {} positions, {} aquifer tables staged",
-            position_count, n_tables);
-    }
-
     // 1. Push each chunk into the pending queue.
     let queue = get_pending_queue();
     let batch = {

@@ -99,6 +99,17 @@ public abstract class MixinChunkGenerator {
      *  C2ME's worker pool. This is the only GPU path. Set C2ME_WGPU_ASYNC_SCHED=0
      *  to disable it entirely (GPU off for this run, plain C2ME CPU generation),
      *  useful as an A/B baseline. */
+    /** §23: dump Beardifier pieces/junctions + per-block beard reference. */
+    private static final boolean DUMP_BEARD =
+            "1".equals(System.getenv("C2ME_DUMP_BEARD"));
+    /** §23: dump only the FIRST structure-bearing chunk encountered. */
+    private static final java.util.concurrent.atomic.AtomicBoolean BEARD_DUMPED =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** §22 Step B: stage the per-chunk aquifer table for the GPU. */
+    private static final boolean AQ_GPU =
+            "1".equals(System.getenv("C2ME_WGPU_AQUIFER"));
+
     private static final boolean ASYNC_SCHED =
             !"0".equals(System.getenv("C2ME_WGPU_ASYNC_SCHED"));
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
@@ -168,6 +179,31 @@ public abstract class MixinChunkGenerator {
                             ((NoiseChunkGeneratorInvoker) (Object) gen)
                                     .callCreateChunkNoiseSampler(cs, fSa, fBlender, fNc));
             final net.minecraft.world.gen.chunk.AquiferSampler aquifer = sampler.getAquiferSampler();
+            if (AQ_GPU) {
+                try {
+                    stageAquiferForGpu(ds, chunk, aquifer);
+                } catch (Throwable t) {
+                    LOGGER.warn("[c2me-wgpu] aquifer stage failed", t);
+                }
+            }
+            if (DUMP_BEARD && BEARD_DUMPED.compareAndSet(false, true)) {
+                try {
+                    boolean hasStruct = !structureAccessor
+                            .getStructureStarts(chunk.getPos(),
+                                    s2 -> s2.getTerrainAdaptation()
+                                            != net.minecraft.world.gen.StructureTerrainAdaptation.NONE)
+                            .isEmpty();
+                    if (hasStruct) {
+                        dumpBeard(chunk, net.minecraft.world.gen.StructureWeightSampler
+                                .createStructureWeightSampler(structureAccessor, chunk.getPos()));
+                    } else {
+                        BEARD_DUMPED.set(false); // keep looking
+                    }
+                } catch (Throwable t) {
+                    LOGGER.warn("[c2me-wgpu] beard dump failed", t);
+                    BEARD_DUMPED.set(false);
+                }
+            }
             net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler fullBss =
                     ((ChunkNoiseSamplerAccessor) (Object) sampler).getBlockStateSampler();
             net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler veinOnly =
@@ -406,6 +442,9 @@ public abstract class MixinChunkGenerator {
         final int minY = ds.minY;
         BlockState stone = ds.defaultBlock;
         BlockState air = Blocks.AIR.getDefaultState();
+        // §22 GPU state codes: 0=air, 1=stone, 2=water, 3=lava.
+        BlockState water = Blocks.WATER.getDefaultState();
+        BlockState lava = Blocks.LAVA.getDefaultState();
         Heightmap oceanFloorWg = chunk.getHeightmap(Heightmap.Type.OCEAN_FLOOR_WG);
         Heightmap worldSurfaceWg = chunk.getHeightmap(Heightmap.Type.WORLD_SURFACE_WG);
         java.nio.ByteBuffer bb = blockSeg.asByteBuffer();
@@ -426,9 +465,12 @@ public abstract class MixinChunkGenerator {
                     int idx = bx + bz * 16 + by * 256;
                     int v = bb.getInt((int) (base + (long) idx * 4));
                     if (v == 0) continue;           // air
-                    sec.setBlockState(bx, ly, bz, stone);
-                    oceanFloorWg.trackUpdate(bx, globalY, bz, stone);
-                    worldSurfaceWg.trackUpdate(bx, globalY, bz, stone);
+                    BlockState bs = (v == 2) ? water
+                                  : (v == 3) ? lava
+                                  : stone;
+                    sec.setBlockState(bx, ly, bz, bs);
+                    oceanFloorWg.trackUpdate(bx, globalY, bz, bs);
+                    worldSurfaceWg.trackUpdate(bx, globalY, bz, bs);
                 }
             }
         }
@@ -518,7 +560,6 @@ public abstract class MixinChunkGenerator {
                 ? StructureWeightSampler.createStructureWeightSampler(
                         structureAccessor, chunk.getPos())
                 : null;
-
 
         float dmin = Float.POSITIVE_INFINITY, dmax = Float.NEGATIVE_INFINITY;
         int stoneCells = 0, airCells = 0;
@@ -772,6 +813,122 @@ public abstract class MixinChunkGenerator {
      *    AQ startX startY startZ sizeX sizeZ
      *    CELL index blockX blockY blockZ y state
      *  blockPositions is a packed long = BlockPos.asLong(blockX,blockY,blockZ). */
+    /**
+     * §22 Step B: warm up the aquifer's lazy waterLevels table, then serialize
+     * the compact table (seed + per-cell lvl_y/state) and stage it to Rust.
+     * blockPositions are recomputed on the Rust side from the seed.
+     */
+    /** §23: dump the Beardifier's per-chunk pieces/junctions and per-block
+     *  beard values, for offline validation of the Rust/WGSL reproduction. */
+    private static void dumpBeard(Chunk chunk,
+            net.minecraft.world.gen.StructureWeightSampler sw) {
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append("CHUNK ").append(chunk.getPos().x).append(' ')
+              .append(chunk.getPos().z).append('\n');
+            // pieces
+            var pit = sw.pieceIterator;
+            int np = 0;
+            StringBuilder pb = new StringBuilder();
+            while (pit.hasNext()) {
+                var pc = pit.next();
+                var box = pc.box();
+                String ad = pc.terrainAdjustment().name();
+                pb.append(box.getMinX()).append(' ').append(box.getMinY()).append(' ')
+                  .append(box.getMinZ()).append(' ').append(box.getMaxX()).append(' ')
+                  .append(box.getMaxY()).append(' ').append(box.getMaxZ()).append(' ')
+                  .append(ad).append(' ').append(pc.groundLevelDelta()).append('\n');
+                np++;
+            }
+            pit.back(Integer.MAX_VALUE);
+            sb.append("PIECE ").append(np).append('\n').append(pb);
+            // junctions
+            var jit = sw.junctionIterator;
+            int nj = 0;
+            StringBuilder jb = new StringBuilder();
+            while (jit.hasNext()) {
+                var jn = jit.next();
+                jb.append(jn.getSourceX()).append(' ').append(jn.getSourceGroundY())
+                  .append(' ').append(jn.getSourceZ()).append('\n');
+                nj++;
+            }
+            jit.back(Integer.MAX_VALUE);
+            sb.append("JUNC ").append(nj).append('\n').append(jb);
+            // per-block beard (full chunk)
+            int minY = -64, height = 384;
+            var npos = new com.rubidiumlighting.c2me.opts.accel.wgpu.MutableNoisePos();
+            sb.append("BLOCK ").append(16 * height * 16).append('\n');
+            int sx = chunk.getPos().getStartX();
+            int sz = chunk.getPos().getStartZ();
+            for (int by = 0; by < height; by++) {
+                int gy = minY + by;
+                for (int bz = 0; bz < 16; bz++) {
+                    for (int bx = 0; bx < 16; bx++) {
+                        double bd = sw.sample(npos.set(sx + bx, gy, sz + bz));
+                        sb.append(bx).append(' ').append(gy).append(' ').append(bz)
+                          .append(' ').append(bd).append('\n');
+                    }
+                }
+            }
+            java.nio.file.Files.writeString(
+                    java.nio.file.Path.of("/tmp/beard_" + chunk.getPos().x + "_"
+                            + chunk.getPos().z + ".txt"), sb.toString());
+            LOGGER.info("[c2me-wgpu] dumped beard ref ({} pieces, {} junc)", np, nj);
+        } catch (Throwable t) {
+            LOGGER.warn("[c2me-wgpu] beard dump failed", t);
+        }
+    }
+
+    private static void stageAquiferForGpu(DimState ds, Chunk chunk,
+            net.minecraft.world.gen.chunk.AquiferSampler aquifer) {
+        if (!(aquifer instanceof net.minecraft.world.gen.chunk.AquiferSampler.Impl impl)) {
+            return;
+        }
+        AquiferImplAccessor a = (AquiferImplAccessor) (Object) impl;
+        int startX = a.getStartX(), startY = a.getStartY(), startZ = a.getStartZ();
+        int sizeX = a.getSizeX(), sizeZ = a.getSizeZ();
+        net.minecraft.world.gen.chunk.AquiferSampler.FluidLevel[] wl = a.getWaterLevels();
+
+        var dbg = new StringBuilder();
+        a.getRandomDeriver().addDebugInfo(dbg);
+        String dss = dbg.toString();
+        long sLo = Long.parseLong(dss.split("seedLo: ")[1].split(",")[0].trim());
+        long sHi = Long.parseLong(dss.split("seedHi: ")[1].trim());
+
+        // Warm up every cell (MC fills waterLevels lazily on first apply).
+        for (int idx = 0; idx < wl.length; idx++) {
+            int ci = idx % sizeX;
+            int ck = (idx / sizeX) % sizeZ;
+            int cj = idx / (sizeX * sizeZ);
+            int cx = startX + ci, cy = startY + cj, cz = startZ + ck;
+            long h = net.minecraft.util.math.MathHelper.hashCode(cx, cy, cz);
+            var rr = new net.minecraft.util.math.random.Xoroshiro128PlusPlusRandom(h ^ sLo, sHi);
+            int bx = cx * 16 + rr.nextInt(10);
+            int by = cy * 12 + rr.nextInt(9);
+            int bz = cz * 16 + rr.nextInt(10);
+            a.invokeGetWaterLevel(net.minecraft.util.math.BlockPos.asLong(bx, by, bz));
+        }
+
+        java.nio.ByteBuffer tb = java.nio.ByteBuffer.allocate(24 + wl.length * 8)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        tb.putInt(0x41515541); // "AQUA"
+        tb.putInt(wl.length);
+        tb.putLong(sLo); tb.putLong(sHi);
+        for (int i = 0; i < wl.length; i++) {
+            var lvl = wl[i];
+            int ly = (lvl == null) ? Integer.MIN_VALUE : lvl.y;
+            int sc = 0;
+            if (lvl != null) {
+                var blk = lvl.state.getBlock();
+                if (blk == net.minecraft.block.Blocks.WATER) sc = 2;
+                else if (blk == net.minecraft.block.Blocks.LAVA) sc = 3;
+            }
+            tb.putInt(ly); tb.putInt(sc);
+        }
+        WgpuThinBinding.setAquiferTable(ds.worldHandle,
+                chunk.getPos().x, chunk.getPos().z, tb.array());
+    }
+
     private static void dumpAquifer(Chunk chunk, long worldHandle,
             net.minecraft.world.gen.chunk.AquiferSampler aquifer,
             NoiseRouter router) {

@@ -47,3 +47,7 @@ accessible field net/minecraft/world/gen/chunk/AquiferSampler$FluidLevel state L
 # §18.6b: reach StructureAccessor.world -> ServerWorld -> chunkLoadingManager
 # -> IVanillaChunkManager.c2me$getSchedulingManager().
 accessible field net/minecraft/world/gen/StructureAccessor world Lnet/minecraft/world/WorldAccess;
+
+# §23: Beardifier piece/junction iterators, read for the offline beard dump.
+accessible field net/minecraft/world/gen/StructureWeightSampler pieceIterator Lit/unimi/dsi/fastutil/objects/ObjectListIterator;
+accessible field net/minecraft/world/gen/StructureWeightSampler junctionIterator Lit/unimi/dsi/fastutil/objects/ObjectListIterator;
