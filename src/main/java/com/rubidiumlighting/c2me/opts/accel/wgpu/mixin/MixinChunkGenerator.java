@@ -827,6 +827,38 @@ public abstract class MixinChunkGenerator {
                 long dt = (System.nanoTime() - t0) / 1_000_000;
                 LOGGER.info("[c2me-wgpu] aquifer warmup: {} cells in {} ms", warmed, dt);
             }
+            // §22 Step B: serialize the compact per-chunk aquifer table.
+            // Layout: magic(4) n(4) seedLo(8) seedHi(8) then n * (lvl_y i32 +
+            // state u32). blockPositions[] is NOT included — Rust recomputes
+            // it from the seed (verified bit-exact in aquifer_positions.rs).
+            {
+                var dbg3 = new StringBuilder();
+                a.getRandomDeriver().addDebugInfo(dbg3);
+                String ds3 = dbg3.toString();
+                long sLo3 = Long.parseLong(ds3.split("seedLo: ")[1].split(",")[0].trim());
+                long sHi3 = Long.parseLong(ds3.split("seedHi: ")[1].trim());
+                java.nio.ByteBuffer tb = java.nio.ByteBuffer.allocate(24 + wl.length * 8)
+                        .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                tb.putInt(0x41515541); // "AQUA"
+                tb.putInt(wl.length);
+                tb.putLong(sLo3); tb.putLong(sHi3);
+                for (int i = 0; i < wl.length; i++) {
+                    var lvl = wl[i];
+                    int ly = (lvl == null) ? Integer.MIN_VALUE : lvl.y;
+                    int sc = 0;
+                    if (lvl != null) {
+                        var blk = lvl.state.getBlock();
+                        if (blk == net.minecraft.block.Blocks.WATER) sc = 2;
+                        else if (blk == net.minecraft.block.Blocks.LAVA) sc = 3;
+                    }
+                    tb.putInt(ly); tb.putInt(sc);
+                }
+                byte[] arr = tb.array();
+                java.nio.file.Files.write(java.nio.file.Path.of("/tmp/aquifer_table_"
+                        + chunk.getPos().x + "_" + chunk.getPos().z + ".bin"), arr);
+                LOGGER.info("[c2me-wgpu] aquifer table serialized: {} cells, {} bytes",
+                        wl.length, arr.length);
+            }
             for (int i = 0; i < wl.length; i++) {
                 long packed = bp[i];
                 boolean none = (packed == Long.MAX_VALUE);
