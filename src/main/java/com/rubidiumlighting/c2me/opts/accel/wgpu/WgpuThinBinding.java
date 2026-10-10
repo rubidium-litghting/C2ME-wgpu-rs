@@ -55,6 +55,7 @@ public class WgpuThinBinding {
     private static MethodHandle MH_get_gpu_name;
     private static MethodHandle MH_free_result_blob;
     private static MethodHandle MH_set_external_inputs;
+    private static MethodHandle MH_set_aquifer_table;
     private static MethodHandle MH_set_log_path;
 
     private static long instanceHandle;
@@ -149,6 +150,18 @@ public class WgpuThinBinding {
                             ValueLayout.JAVA_INT,        // count: i32
                             ValueLayout.ADDRESS,         // data_ptr: *const f32
                             ValueLayout.JAVA_LONG        // data_len: usize
+                    )
+            );
+
+            MH_set_aquifer_table = NativeLoader.linker.downcallHandle(
+                    NativeLoader.lookup.find("c2me_wgpu_set_aquifer_table").orElseThrow(),
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,        // -> i32 status
+                            ValueLayout.JAVA_LONG,       // world_h: i64
+                            ValueLayout.JAVA_INT,        // cx: i32
+                            ValueLayout.JAVA_INT,        // cz: i32
+                            ValueLayout.ADDRESS,         // table_ptr: *const u8
+                            ValueLayout.JAVA_LONG        // table_len: usize
                     )
             );
 
@@ -296,6 +309,20 @@ public class WgpuThinBinding {
      * @param count  number of external subtrees
      * @param data   flat [chunk][ext][cell] f32 values
      */
+    /**
+     * §22 Step B: stage a per-chunk aquifer table for the next request.
+     * `table` is the compact Java-serialized layout (magic + n + seed + cells).
+     */
+    public static void setAquiferTable(long worldH, int cx, int cz, byte[] table) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment seg = arena.allocateFrom(ValueLayout.JAVA_BYTE, table);
+            int st = (int) MH_set_aquifer_table.invokeExact(worldH, cx, cz, seg, (long) table.length);
+            if (st != 0) throw new RuntimeException("set_aquifer_table status=" + st);
+        } catch (Throwable t) {
+            throw new RuntimeException("[c2me-wgpu] set_aquifer_table failed", t);
+        }
+    }
+
     public static void setExternalInputs(long worldH, int count, float[] data) {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment dataSeg = (data != null && data.length > 0)

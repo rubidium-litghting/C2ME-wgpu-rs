@@ -84,6 +84,10 @@ pub struct WorldContext {
     /// CPU-computed values for those subtrees, laid out
     /// [chunk][ext][cell]. Uploaded to binding 6 before each dispatch.
     pub(crate) external_data: std::sync::Mutex<Vec<f32>>,
+    /// §22 Step B: per-chunk aquifer tables, keyed by (cx, cz). Each value is
+    /// the compact Java-serialized table (magic + n + seedLo/Hi + per-cell
+    /// lvl_y/state). Set via `c2me_wgpu_set_aquifer_table` before a request.
+    pub(crate) aquifer_tables: std::sync::Mutex<std::collections::HashMap<(i32, i32), Vec<u8>>>,
 }
 
 /// Create a GPU buffer pre-filled with `contents`.
@@ -217,6 +221,7 @@ impl WorldContext {
             origin_buffer: None,
             external_count: std::sync::atomic::AtomicUsize::new(0),
             external_data: std::sync::Mutex::new(Vec::new()),
+            aquifer_tables: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 

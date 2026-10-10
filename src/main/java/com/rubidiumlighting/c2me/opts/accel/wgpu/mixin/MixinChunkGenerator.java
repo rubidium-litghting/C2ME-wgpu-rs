@@ -762,7 +762,7 @@ public abstract class MixinChunkGenerator {
         if (DUMP_AQUIFER
                 && chunk.getPos().x >= DUMP_CHUNK[0] && chunk.getPos().x <= DUMP_CHUNK[2]
                 && chunk.getPos().z >= DUMP_CHUNK[1] && chunk.getPos().z <= DUMP_CHUNK[3]) {
-            dumpAquifer(chunk, aquifer, ds.rawRouter);
+            dumpAquifer(chunk, ds.worldHandle, aquifer, ds.rawRouter);
         }
 
     }
@@ -772,7 +772,7 @@ public abstract class MixinChunkGenerator {
      *    AQ startX startY startZ sizeX sizeZ
      *    CELL index blockX blockY blockZ y state
      *  blockPositions is a packed long = BlockPos.asLong(blockX,blockY,blockZ). */
-    private static void dumpAquifer(Chunk chunk,
+    private static void dumpAquifer(Chunk chunk, long worldHandle,
             net.minecraft.world.gen.chunk.AquiferSampler aquifer,
             NoiseRouter router) {
         try {
@@ -825,7 +825,6 @@ public abstract class MixinChunkGenerator {
                     warmed++;
                 }
                 long dt = (System.nanoTime() - t0) / 1_000_000;
-                LOGGER.info("[c2me-wgpu] aquifer warmup: {} cells in {} ms", warmed, dt);
             }
             // §22 Step B: serialize the compact per-chunk aquifer table.
             // Layout: magic(4) n(4) seedLo(8) seedHi(8) then n * (lvl_y i32 +
@@ -856,8 +855,10 @@ public abstract class MixinChunkGenerator {
                 byte[] arr = tb.array();
                 java.nio.file.Files.write(java.nio.file.Path.of("/tmp/aquifer_table_"
                         + chunk.getPos().x + "_" + chunk.getPos().z + ".bin"), arr);
-                LOGGER.info("[c2me-wgpu] aquifer table serialized: {} cells, {} bytes",
-                        wl.length, arr.length);
+                if (worldHandle != 0L) {
+                    WgpuThinBinding.setAquiferTable(worldHandle,
+                            chunk.getPos().x, chunk.getPos().z, arr);
+                }
             }
             for (int i = 0; i < wl.length; i++) {
                 long packed = bp[i];

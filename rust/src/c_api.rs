@@ -223,6 +223,13 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
         unsafe { std::slice::from_raw_parts(positions_ptr, n) }
     };
 
+    // §22 B-1: report how many aquifer tables were staged for this request.
+    {
+        let n_tables = world_arc.aquifer_tables.lock().map(|m| m.len()).unwrap_or(0);
+        crate::wgpu_debug!("[c2me-wgpu] request_chunks: {} positions, {} aquifer tables staged",
+            position_count, n_tables);
+    }
+
     // 1. Push each chunk into the pending queue.
     let queue = get_pending_queue();
     let batch = {
@@ -458,8 +465,45 @@ pub unsafe extern "C" fn c2me_wgpu_set_external_inputs(
     0
 }
 
+// ⑧ Set a per-chunk aquifer table (called by Java before a request).
+//
+/// `table_ptr` points to `table_len` bytes of the Java-serialized compact
+/// table (magic + n + seedLo/Hi + per-cell lvl_y/state). Copied into the
+/// WorldContext's map, keyed by (cx, cz), consumed at the next dispatch.
+//
+/// # Safety
+/// `table_ptr` must point to `table_len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2me_wgpu_set_aquifer_table(
+    world_h: i64,
+    cx: i32,
+    cz: i32,
+    table_ptr: *const u8,
+    table_len: usize,
+) -> i32 {
+    if world_h == 0 {
+        return STATUS_INVALID_HANDLE;
+    }
+    let world_arc = {
+        let table = get_handle_table().lock().unwrap();
+        match table.get(&world_h) {
+            Some(arc) => arc.clone(),
+            None => return STATUS_INVALID_HANDLE,
+        }
+    };
+    let bytes: Vec<u8> = if table_ptr.is_null() {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(table_ptr, table_len) }.to_vec()
+    };
+    if let Ok(mut m) = world_arc.aquifer_tables.lock() {
+        m.insert((cx, cz), bytes);
+    }
+    0
+}
+
 // ---------------------------------------------------------------------------
-// ⑧ Set the Rust-side log file path (called by Java at startup).
+// ⑨ Set the Rust-side log file path (called by Java at startup).
 //
 /// # Safety
 /// `ptr` must point to `len` UTF-8 bytes (or be null with len 0).
