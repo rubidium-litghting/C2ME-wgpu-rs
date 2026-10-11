@@ -93,6 +93,25 @@ pub struct WorldContext {
     /// §23: per-chunk Beardifier pieces/junctions, same stage pattern as
     /// aquifer. Empty for structure-free chunks (beard contributes 0).
     pub(crate) beard_tables: std::sync::Mutex<std::collections::HashMap<(i32, i32), Vec<u8>>>,
+    /// §22 fix: per-dimension aquifer mode. Dimensions without aquifers
+    /// (Nether/End) skip the 12-cell scan and use sea-level semantics.
+    pub(crate) aquifer_mode: std::sync::Mutex<AquiferMode>,
+}
+
+/// Aquifer behaviour for one dimension.
+#[derive(Clone, Copy)]
+pub struct AquiferMode {
+    pub has_aquifers: bool,
+    pub sea_level: i32,
+    /// Fluid state code above sea level: 2=water, 3=lava, 0=air.
+    pub default_fluid: u32,
+    /// y below this is always lava.
+    pub lava_level: i32,
+}
+impl Default for AquiferMode {
+    fn default() -> Self {
+        AquiferMode { has_aquifers: true, sea_level: 63, default_fluid: 2, lava_level: -54 }
+    }
 }
 
 /// Create a GPU buffer pre-filled with `contents`.
@@ -229,6 +248,7 @@ impl WorldContext {
             external_data: std::sync::Mutex::new(Vec::new()),
             aquifer_tables: std::sync::Mutex::new(std::collections::HashMap::new()),
             beard_tables: std::sync::Mutex::new(std::collections::HashMap::new()),
+            aquifer_mode: std::sync::Mutex::new(AquiferMode::default()),
         })
     }
 
@@ -430,6 +450,14 @@ impl WorldContext {
     }
 
     /// Borrow the simplex table buffer (binding 5), if uploaded.
+    /// §22: set the per-dimension aquifer mode (called after world_new).
+    pub fn set_aquifer_mode(&self, mode: AquiferMode) {
+        if let Ok(mut m) = self.aquifer_mode.lock() { *m = mode; }
+    }
+    pub fn aquifer_mode(&self) -> AquiferMode {
+        self.aquifer_mode.lock().map(|m| *m).unwrap_or_default()
+    }
+
     pub fn beard_weight_buffer(&self) -> Option<&wgpu::Buffer> {
         self.beard_weight_buffer.as_ref()
     }

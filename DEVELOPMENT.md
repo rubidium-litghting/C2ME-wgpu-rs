@@ -50,7 +50,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
 **GPU 架构**
 13. **多 pass 是硬约束**：每类 shard 用独立 bind group layout，只含它实际用的 binding（≤8 storage buffer）。
-14. **bind group 缓存陷阱**：pipeline 磁盘缓存键不含 layout 版本，改 binding 必须 bump `LAYOUT_VERSION`。
+14. **pipeline 缓存键不含代码生成**：磁盘缓存键 = AST 哈希 + pass，**既不含 layout 版本，也不含 WGSL 生成逻辑**。改 binding **或任何会改变 WGSL 输出的代码**（哪怕只动函数体）都必须 bump `LAYOUT_VERSION`，否则旧 pipeline 被复用 → `ComputePipeline invalid`。
 15. **shader 编译成本超线性**：拆小是唯一可靠解法（安全区 ~2100 行，Mali 单 shader 过大会设备丢失）。
 16. **惰性缓存可预计算**：MC 的惰性表（aquifer waterLevels）在 GPU 上必须整表预计算（Java warmup ~0ms）。
 17. **内存泄漏**：共享 map 要 remove-on-consume，不能只 insert。

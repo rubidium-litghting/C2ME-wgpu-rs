@@ -607,6 +607,19 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (bcount > 0u) { dd = dd + beard_sample(bbase, wx, wy, wz); }
   }
 
+  // §22: per-dimension aquifer mode from params._pad[1..5].
+  let has_aq = params._pad[1];
+  if (has_aq == 0u) {
+    // No aquifers (Nether/End): sea-level semantics, no 12-cell scan.
+    if (dd > 0.0) { block_buf[bidx] = 1u; return; }
+    let sea = i32(params._pad[2]);
+    let dfl = params._pad[3];
+    let lava_y = i32(params._pad[4]);
+    if (wy < min(lava_y, sea)) { block_buf[bidx] = 3u; return; }
+    if (wy < sea) { block_buf[bidx] = dfl; return; }
+    block_buf[bidx] = 0u; return;
+  }
+
   // d > 0 → solid stone (vanilla aquifer returns null).
   if (dd > 0.0) { block_buf[bidx] = 1u; return; }
 

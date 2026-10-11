@@ -518,8 +518,32 @@ pub unsafe extern "C" fn c2me_wgpu_set_beard_table(
     0
 }
 
+// ⑩ Set per-dimension aquifer mode (called by Java after world_new).
+/// `has_aquifers`: 0/1. `default_fluid`: 0=air / 2=water / 3=lava.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2me_wgpu_set_aquifer_mode(
+    world_h: i64,
+    has_aquifers: i32,
+    sea_level: i32,
+    default_fluid: i32,
+    lava_level: i32,
+) -> i32 {
+    if world_h == 0 { return STATUS_INVALID_HANDLE; }
+    let world_arc = {
+        let table = get_handle_table().lock().unwrap();
+        match table.get(&world_h) { Some(a) => a.clone(), None => return STATUS_INVALID_HANDLE }
+    };
+    world_arc.set_aquifer_mode(crate::world::world::AquiferMode {
+        has_aquifers: has_aquifers != 0,
+        sea_level,
+        default_fluid: default_fluid.max(0) as u32,
+        lava_level,
+    });
+    0
+}
+
 // ---------------------------------------------------------------------------
-// ⑩ Set the Rust-side log file path (called by Java at startup).
+// ⑪ Set the Rust-side log file path (called by Java at startup).
 //
 /// # Safety
 /// `ptr` must point to `len` UTF-8 bytes (or be null with len 0).

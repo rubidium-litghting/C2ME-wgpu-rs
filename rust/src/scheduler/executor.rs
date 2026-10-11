@@ -348,6 +348,14 @@ impl SingleBatchExecutor {
         // Update the persistent params buffer (binding 0).
         let mut params = params;
         params._pad[0] = ext_count as u32;
+        // §22: per-dimension aquifer mode in _pad[1..5].
+        {
+            let am = world.aquifer_mode();
+            params._pad[1] = if am.has_aquifers { 1 } else { 0 };
+            params._pad[2] = am.sea_level as u32;
+            params._pad[3] = am.default_fluid;
+            params._pad[4] = am.lava_level as u32;
+        }
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
         // Packed chunk positions [cx,cz,...] for the shader (binding 4).

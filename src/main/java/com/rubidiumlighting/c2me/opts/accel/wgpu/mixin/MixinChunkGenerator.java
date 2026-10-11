@@ -1246,6 +1246,16 @@ public abstract class MixinChunkGenerator {
                 return null;
             }
             LOGGER.info("[c2me-wgpu] Rust WorldContext created, handle={}", world);
+            // §22: per-dimension aquifer mode. Nether/End have no aquifers;
+            // their default fluid is lava (Nether) / none (End), sea level 32/0.
+            {
+                int dfl = 0;
+                var fb = settings.defaultFluid();
+                if (fb.isOf(net.minecraft.block.Blocks.WATER)) dfl = 2;
+                else if (fb.isOf(net.minecraft.block.Blocks.LAVA)) dfl = 3;
+                WgpuThinBinding.setAquiferMode(world, settings.hasAquifers(),
+                        settings.seaLevel(), dfl, -54);
+            }
             java.util.List<net.minecraft.world.gen.densityfunction.DensityFunction> extNodes =
                     new java.util.ArrayList<>(NoiseRouterBlobifier.EXTERNAL_NODES);
             if (!extNodes.isEmpty()) {
