@@ -68,7 +68,12 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 - **barrier 噪声分支**（aquifer 99.97%→100%）：只影响过渡带少数方块。
 - **矿脉全 GPU 化**：仍是角点粗筛 + MC 精算。
 - **pass B 拆分**：3084 行超安全线（编译 ~10 s，Mali 风险），纯工程优化。
-- **§14 Epic Terrain interpolated 边界 bug**：非线性外层在角点插值下错（已知未修，但与 Tectonic/Epic 实机测试通过）。
+- **§14 interpolated 边界 bug（Tectonic/Epic 触发）**：`squeeze` 等非线性节点包在
+  `interpolated` 外层时，MC 是"逐方块 外层(角点插值(内层))"，我们是"角点插值(整棵树)"，不等。
+  现象：浮空水、地表滴水石、怪地形。**vanilla 不触发，Tectonic/Epic 触发**。
+  修法（择日）：拦截 MC 的 `DensityInterpolator.fill()`，用 GPU 角点值填充 MC 缓冲，
+  让 MC 自己完成"插值 + 外层求值"。注意树里有 ~8 个 interpolator（含含水层噪声通道），
+  需枚举 + 建实例↔子树映射 + 改 blobify 协议。
 
 ### 环境变量速查
 
@@ -216,7 +221,7 @@ Rust 不认识的密度节点（地形 mod）在 CPU 按同一角点网格求值
 ### §13–§18 已证伪的实验（存档）
 
 - §13 手机"高 U 低显"负优化（旧架构 CPU 写回下成立，§20 后架构改变）。
-- §14 Epic Terrain interpolated 边界 bug（非线性外层角点插值错，未修）。
+- §14 interpolated 边界 bug（非线性外层角点插值错，Tectonic/Epic 触发，未修）。
 - §15 JFR 热点：写回瓶颈在 CPU 逐方块（aquifer/heightmap/vein）。
 - §16 GC 对负优化贡献：实测排除。
 - §17 aquifer 逐帧归因：~65% 写回，一半控制流一半噪声。
