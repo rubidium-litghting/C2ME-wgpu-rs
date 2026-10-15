@@ -163,6 +163,8 @@ pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
         AstNode::NoiseSampler { first, second, amplitude, xz_scale, y_scale, .. } => {
             emit_noise_sampler(ctx, first, second.as_ref(), *amplitude, *xz_scale, *y_scale)
         }
+        AstNode::InnerRef(_) => Err(anyhow::anyhow!(
+            "InnerRef emitted outside the BlockOut pass (should be substituted by outer-tree codegen)")),
         AstNode::Constant(_) => constant::emit(node, ctx),
         AstNode::InputX | AstNode::InputY | AstNode::InputZ => coordinate::emit(node, ctx),
         AstNode::Add(_, _)

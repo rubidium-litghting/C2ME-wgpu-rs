@@ -32,6 +32,7 @@
 
 use std::hash::{Hash, Hasher};
 
+pub mod split;
 pub mod deserialize;
 pub mod equality;
 pub mod opto;
@@ -256,6 +257,14 @@ pub enum AstNode {
     Cache2D(Box<AstNode>),
     CacheInterpolated(Box<AstNode>),
 
+    /// §14 fix: placeholder for the i-th extracted interpolated-boundary
+    /// subtree of finalDensity. The corner pass computes the 8 extracted
+    /// subtrees into out_buf slots 1..=8; the BlockOut pass trilinearly
+    /// interpolates them to block resolution and substitutes the result
+    /// here. Only appears inside the split outer tree; never evaluated by
+    /// the corner pass.
+    InnerRef(usize),
+
     // ── Surface / Aquifer ───────────────────────────────────────────────
     FindTopSurface {
         density: Box<AstNode>,
@@ -302,6 +311,8 @@ impl Hash for AstNode {
                 TAG_CONSTANT.hash(state);
                 f32_to_hash_bits(*v).hash(state);
             }
+
+            AstNode::InnerRef(i) => { 0xEDu8.hash(state); i.hash(state); }
 
             // ── Inputs ──────────────────────────────────────────────────────
             AstNode::InputX => TAG_INPUT_X.hash(state),

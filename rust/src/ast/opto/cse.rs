@@ -90,6 +90,7 @@ where
     match node {
         AstNode::NoiseSampler { .. } => node, // 或使用通配符
         AstNode::ExternalInput { .. } => node,
+        AstNode::InnerRef(_) => node,
         Shift { kind, offset } => Shift { kind, offset: map_box(offset, &mut f) },
         WeirdScaledSampler { mapper, input, noise } => WeirdScaledSampler {
             mapper,

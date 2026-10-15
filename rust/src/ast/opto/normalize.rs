@@ -49,7 +49,7 @@ fn rec(node: AstNode) -> AstNode {
     match node {
         AstNode::NoiseSampler { .. } => node, // 或使用通配符
         // Leaves ----------------------------------------------------------
-        Constant(_) | InputX | InputY | InputZ | ExternalInput { .. } => node,
+        Constant(_) | InputX | InputY | InputZ | ExternalInput { .. } | InnerRef(_) => node,
 
         // Commutative binaries: post-order, then hash-swap children -------
         Add(a, b) => order_commutative(*a, *b, Add, rec),

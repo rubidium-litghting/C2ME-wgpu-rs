@@ -222,6 +222,26 @@ Bug reports and pull requests are welcome.
 
 ---
 
+## Provenance
+
+This project is an independent, clean-room reimplementation. It was written
+against Minecraft's **runtime behaviour** (dumped noise data and sampled
+reference values), not against any third-party mod's source code.
+
+A code-origin review compared this mod's aquifer and Beardifier implementation
+against [C2ME](https://modrinth.com/mod/c2me-fabric)'s OpenCL accelerator:
+no shared identifiers, no copied functions, and a different architecture
+(C2ME mirrors Minecraft function-by-function; this mod uses a
+precomputed-table + GPU-scan design). Where the two look similar
+(e.g. `fastInverseSqrt`, `getStructureWeight`), the common source is
+Minecraft's own vanilla code, which both projects independently reproduce.
+
+Scope note: the review was at the feature/architecture level, not a
+character-by-character diff. Minecraft itself is not redistributed; only
+original code is shipped. See `LICENSE`.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

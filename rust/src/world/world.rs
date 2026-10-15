@@ -3346,6 +3346,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 AstNode::Aquifer { .. } => "Aquifer",
                 AstNode::BiomeTree { .. } => "BiomeTree",
                 AstNode::Root(_) => "Root",
+                AstNode::InnerRef(_) => "InnerRef",
             };
             *out.entry(name.to_string()).or_insert(0) += 1;
             // recurse
@@ -3673,6 +3674,152 @@ mod compile_time_scale {
             );
         }
         println!("TOTAL shader_module={total_sm:?}  compute_pipeline={total_cp:?}");
+    }
+
+
+    fn count_ci(node: &crate::ast::AstNode, depth: usize, out: &mut Vec<(usize, usize)>) -> usize {
+        use crate::ast::AstNode::*;
+        let mut nodes = 1usize;
+        let mut kids: Vec<&AstNode> = Vec::new();
+        match node {
+            Constant(_) | ExternalInput{..} | InputX | InputY | InputZ
+            | SimplexNoise2D{..} | SimplexNoise3D{..} | InterpNoiseSampler{..}
+            | EndIslands{..} | Beardifier{..} | YClampedGradient{..}
+            | BiomeTree{..} | NoiseSampler{..} | InnerRef(_) => {}
+            Add(a,b)|Sub(a,b)|Mul(a,b)|Div(a,b)|Min(a,b)|Max(a,b)|FloorDiv(a,b) => { kids.push(a); kids.push(b); }
+            Abs(a)|Square(a)|Cube(a)|Sqrt(a)|Squeeze(a)|CacheFlat(a)|Cache2D(a) => kids.push(a),
+            CacheInterpolated(a) => { out.push((out.len(), depth)); kids.push(a); }
+            InterpolatedNoiseSampler{child} => { out.push((out.len()+1000, depth)); kids.push(child); }
+            Shift{offset,..} => kids.push(offset),
+            WeirdScaledSampler{input,noise,..} => { kids.push(input); kids.push(noise); }
+            ShiftedNoise{shift_x,shift_y,shift_z,noise,..} => { kids.push(shift_x); kids.push(shift_y); kids.push(shift_z); kids.push(noise); }
+            Spline{location,values,..} => { kids.push(location); for v in values { kids.push(v); } }
+            RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}
+            | IntervalSelect{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi} => {
+                kids.push(input); kids.push(min); kids.push(max); kids.push(in_bounds); kids.push(out_of_bounds_lo); kids.push(out_of_bounds_hi); }
+            FindTopSurface{density,initial,..} => { kids.push(density); kids.push(initial); }
+            Aquifer{density,fluid_level} => { kids.push(density); kids.push(fluid_level); }
+            Root(v) => { for c in v { kids.push(c); } }
+        }
+        for k in kids { nodes += count_ci(k, depth+1, out); }
+        nodes
+    }
+
+    #[test]
+    #[ignore]
+    fn count_interpolated_nodes() {
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+        let blob = std::fs::read(bin).unwrap();
+        let ctx = crate::world::WorldContext::new(&blob).unwrap();
+        let root = &ctx.ast_root;
+        let mut ci = Vec::new();
+        let total = count_ci(root, 0, &mut ci);
+        println!("total nodes={total}, CacheInterpolated count={}", ci.len());
+        for (i, d) in &ci { println!("  CI[{i}] at depth {d}"); }
+        if let crate::ast::AstNode::Root(ch) = root {
+            // finalDensity = ch[11]; measure inner subtree sizes.
+            let mut inner_sizes: Vec<usize> = Vec::new();
+            fn collect_inner(node: &crate::ast::AstNode, out: &mut Vec<usize>) {
+                use crate::ast::AstNode::*;
+                let mut kids: Vec<&AstNode> = Vec::new();
+                match node {
+                    InterpolatedNoiseSampler{child} => {
+                        let mut v = Vec::new();
+                        let n = count_ci(child, 0, &mut v);
+                        out.push(n);
+                        return;
+                    }
+                    Constant(_)|ExternalInput{..}|InputX|InputY|InputZ
+                    |SimplexNoise2D{..}|SimplexNoise3D{..}|InterpNoiseSampler{..}
+                    |EndIslands{..}|Beardifier{..}|YClampedGradient{..}
+                    |BiomeTree{..}|NoiseSampler{..}|InnerRef(_) => {}
+                    Add(a,b)|Sub(a,b)|Mul(a,b)|Div(a,b)|Min(a,b)|Max(a,b)|FloorDiv(a,b) => { kids.push(a); kids.push(b); }
+                    Abs(a)|Square(a)|Cube(a)|Sqrt(a)|Squeeze(a)|CacheFlat(a)|Cache2D(a)|CacheInterpolated(a) => kids.push(a),
+                    Shift{offset,..} => kids.push(offset),
+                    WeirdScaledSampler{input,noise,..} => { kids.push(input); kids.push(noise); }
+                    ShiftedNoise{shift_x,shift_y,shift_z,noise,..} => { kids.push(shift_x); kids.push(shift_y); kids.push(shift_z); kids.push(noise); }
+                    Spline{location,values,..} => { kids.push(location); for v in values { kids.push(v); } }
+                    RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}
+                    | IntervalSelect{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi} => {
+                        kids.push(input); kids.push(min); kids.push(max); kids.push(in_bounds); kids.push(out_of_bounds_lo); kids.push(out_of_bounds_hi); }
+                    FindTopSurface{density,initial,..} => { kids.push(density); kids.push(initial); }
+                    Aquifer{density,fluid_level} => { kids.push(density); kids.push(fluid_level); }
+                    Root(v) => { for c in v { kids.push(c); } }
+                }
+                for k in kids { collect_inner(k, out); }
+            }
+            collect_inner(&ch[11], &mut inner_sizes);
+            let total_fd = count_ci(&ch[11], 0, &mut Vec::new());
+            let sum_inner: usize = inner_sizes.iter().sum();
+            println!("finalDensity total={total_fd}, boundaries={}, inner_sum={sum_inner}, OUTER≈{}", inner_sizes.len(), total_fd - sum_inner);
+            println!("  inner subtree sizes: {:?}", inner_sizes);
+            // Dump outer structure (skip inner).
+            fn dump_outer(node: &crate::ast::AstNode, depth: usize, ind: &str) {
+                use crate::ast::AstNode::*;
+                let tag = match node {
+                    Add(..)=>"Add", Sub(..)=>"Sub", Mul(..)=>"Mul", Div(..)=>"Div",
+                    Min(..)=>"Min", Max(..)=>"Max", Abs(..)=>"Abs", Square(..)=>"Sq",
+                    Cube(..)=>"Cube", Sqrt(..)=>"Sqrt", Squeeze(..)=>"Squeeze",
+                    Constant(_)=>"Const", RangeChoice{..}=>"RangeChoice",
+                    IntervalSelect{..}=>"IntervalSelect", YClampedGradient{..}=>"YClamp",
+                    InterpolatedNoiseSampler{..}=>"[INNER]",
+                    CacheFlat(..)=>"CacheFlat", Cache2D(..)=>"Cache2D", CacheInterpolated(..)=>"CacheInterp",
+                    _=>"other",
+                };
+                println!("{ind}{tag}");
+                if matches!(node, InterpolatedNoiseSampler{..}) { return; }
+                let mut kids: Vec<&AstNode> = Vec::new();
+                match node {
+                    Add(a,b)|Sub(a,b)|Mul(a,b)|Div(a,b)|Min(a,b)|Max(a,b)|FloorDiv(a,b) => { kids.push(a); kids.push(b); }
+                    Abs(a)|Square(a)|Cube(a)|Sqrt(a)|Squeeze(a)|CacheFlat(a)|Cache2D(a)|CacheInterpolated(a) => kids.push(a),
+                    RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}
+                    | IntervalSelect{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi} => {
+                        kids.push(input); kids.push(min); kids.push(max); kids.push(in_bounds); kids.push(out_of_bounds_lo); kids.push(out_of_bounds_hi); }
+                    ShiftedNoise{shift_x,shift_y,shift_z,noise,..} => { kids.push(shift_x); kids.push(shift_y); kids.push(shift_z); kids.push(noise); }
+                    WeirdScaledSampler{input,noise,..} => { kids.push(input); kids.push(noise); }
+                    _=>{}
+                }
+                for k in kids { dump_outer(k, depth+1, &format!("{ind}  ")); }
+            }
+            println!("--- OUTER tree ---");
+            dump_outer(&ch[11], 0, "  ");
+        }
+    }
+
+
+    #[test]
+    #[ignore]
+    fn split_final_density_extracts_inners() {
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+        let blob = std::fs::read(bin).unwrap();
+        let ctx = crate::world::WorldContext::new(&blob).unwrap();
+        let ch = match &ctx.ast_root { crate::ast::AstNode::Root(c) => c, _ => panic!() };
+        let fd = &ch[11];
+        let mut inners = Vec::new();
+        let outer = crate::ast::split::split(fd, &mut inners);
+        println!("inners extracted = {}", inners.len());
+        assert_eq!(inners.len(), 8, "expected 8 interpolated boundaries");
+        // outer must contain exactly 8 InnerRef nodes (0..8), each once.
+        fn count_refs(n: &crate::ast::AstNode, seen: &mut std::collections::HashSet<usize>) {
+            use crate::ast::AstNode::*;
+            let mut kids: Vec<&AstNode> = Vec::new();
+            match n {
+                InnerRef(i) => { seen.insert(*i); }
+                Add(a,b)|Sub(a,b)|Mul(a,b)|Div(a,b)|Min(a,b)|Max(a,b)|FloorDiv(a,b) => { kids.push(a); kids.push(b); }
+                Abs(a)|Square(a)|Cube(a)|Sqrt(a)|Squeeze(a)|CacheFlat(a)|Cache2D(a)|CacheInterpolated(a) => kids.push(a),
+                RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}
+                | IntervalSelect{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi} => {
+                    kids.push(input); kids.push(min); kids.push(max); kids.push(in_bounds); kids.push(out_of_bounds_lo); kids.push(out_of_bounds_hi); }
+                _=>{}
+            }
+            for k in kids { count_refs(k, seen); }
+        }
+        let mut seen = std::collections::HashSet::new();
+        count_refs(&outer, &mut seen);
+        println!("refs in outer = {:?}", seen);
+        assert_eq!(seen.len(), 8, "outer must reference all 8 inners");
+        for i in 0..8 { assert!(seen.contains(&i), "missing InnerRef({i})"); }
+        println!("split OK: 8 inners, outer has all 8 refs");
     }
 
     use crate::ast::AstNode;
