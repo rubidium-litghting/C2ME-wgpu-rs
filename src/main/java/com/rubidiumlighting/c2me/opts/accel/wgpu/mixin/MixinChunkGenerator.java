@@ -185,6 +185,19 @@ public abstract class MixinChunkGenerator {
             } catch (Throwable t) {
                 LOGGER.warn("[c2me-wgpu] aquifer stage failed", t);
             }
+            if (DUMP_AQUIFER) {
+                LOGGER.info("[c2me-wgpu] stageAquiferForGpu called for chunk: {}, DUMP_CHUNK: {},{}", chunk.getPos(), DUMP_CHUNK[0], DUMP_CHUNK[1]);
+            }
+            // §22 diagnostic: dump this chunk's aquifer table if requested.
+            if (DUMP_AQUIFER
+                    && chunk.getPos().x >= DUMP_CHUNK[0] && chunk.getPos().x <= DUMP_CHUNK[2]
+                    && chunk.getPos().z >= DUMP_CHUNK[1] && chunk.getPos().z <= DUMP_CHUNK[3]) {
+                try {
+                    dumpAquifer(chunk, ds.worldHandle, aquifer, ds.rawRouter);
+                } catch (Throwable t) {
+                    LOGGER.warn("[c2me-wgpu] aquifer dump failed", t);
+                }
+            }
             try { maybeDumpChunkRef(chunk, ds, ds.rawRouter, noiseConfig); }
             catch (Throwable t) { LOGGER.warn("[c2me-wgpu] chunk-ref dump failed", t); }
             // Beardifier table is mandatory: structures shape the terrain
@@ -321,7 +334,7 @@ public abstract class MixinChunkGenerator {
 
     private static int[] parseDumpChunk() {
         String v = System.getenv("C2ME_DUMP_CHUNK");
-        if (v == null || v.isBlank()) return new int[]{0, 0, 0, 0};
+        if (v == null || v.isBlank()) return new int[]{98, -47, 98, -47}; // FORCED
         try {
             String[] p = v.split(",");
             if (p.length == 2) {
@@ -725,7 +738,7 @@ public abstract class MixinChunkGenerator {
             net.minecraft.world.gen.chunk.AquiferSampler aquifer,
             NoiseRouter router) {
         try {
-            if (!(aquifer instanceof net.minecraft.world.gen.chunk.AquiferSampler.Impl impl)) {
+                        if (!(aquifer instanceof net.minecraft.world.gen.chunk.AquiferSampler.Impl impl)) {
                 LOGGER.warn("[c2me-wgpu] aquifer dump: not Impl, skipping");
                 return;
             }

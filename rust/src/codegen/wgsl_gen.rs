@@ -400,6 +400,7 @@ pub fn emit_shader_for_shard(
     shard: Shard,
     inners: &[AstNode],
     outer: Option<&AstNode>,
+    barrier_noise: Option<&AstNode>,
 ) -> Result<String> {
     if shard.pass == Pass::Inner {
         let mut ctx = GenCtx::new(Pass::Inner);
@@ -436,11 +437,16 @@ pub fn emit_shader_for_shard(
     if shard.pass == Pass::BlockOut {
         let mut ctx = GenCtx::new(Pass::BlockOut);
         
-        let d_expr = if let Some(_out_tree) = outer {
-            // DIAGNOSTIC 2: read the first inner directly to see if data is present.
-            "tri_at(cbase + 16u * cpc, ix, iy, iz, ccx, s, tx, ty, tz)".to_string()
+        let d_expr = if let Some(out_tree) = outer {
+            super::emitters::emit_node(out_tree, &mut ctx)?
         } else {
             "d".to_string()
+        };
+        
+        let b_expr = if let Some(b_tree) = barrier_noise {
+            super::emitters::emit_node(b_tree, &mut ctx)?
+        } else {
+            "0.0".to_string()
         };
         
         let mut injected = String::with_capacity(4096);
@@ -458,6 +464,7 @@ pub fn emit_shader_for_shard(
             injected.push('\n');
         }
         injected.push_str(&format!("  let d_final: f32 = {};\n", d_expr));
+        injected.push_str(&format!("  let barrier_val: f32 = {};\n", b_expr));
         
         let mut usage = String::with_capacity(8192);
         usage.push_str(BLOCK_OUT_HEADER);
@@ -629,6 +636,41 @@ fn aq_fdiv(a: i32, b: i32) -> i32 {
   return q;
 }
 
+fn max_dist(i: i32, a: i32) -> f32 {
+  let d = 25.0;
+  return 1.0 - abs(f32(a - i)) / 25.0;
+}
+
+fn calc_density(
+    wy: i32,
+    lvl_y1: i32, st1: u32,
+    lvl_y2: i32, st2: u32,
+    barrier_val: f32,
+) -> f32 {
+    let is_lava1 = st1 == 3u; let is_water1 = st1 == 2u;
+    let is_lava2 = st2 == 3u; let is_water2 = st2 == 2u;
+    if (is_lava1 && is_water2) || (is_water1 && is_lava2) { return 2.0; }
+    let j = abs(lvl_y1 - lvl_y2);
+    if (j == 0) { return 0.0; }
+    let d = 0.5 * f32(lvl_y1 + lvl_y2);
+    let e = f32(wy) + 0.5 - d;
+    let f = f32(j) / 2.0;
+    let o = f - abs(e);
+    var q: f32 = 0.0;
+    if (e > 0.0) {
+        let p = o;
+        if (p > 0.0) { q = p / 1.5; } else { q = p / 2.5; }
+    } else {
+        let p = 3.0 + o;
+        if (p > 0.0) { q = p / 3.0; } else { q = p / 10.0; }
+    }
+    var r = 0.0;
+    if (q >= -2.0 && q <= 2.0) {
+        r = barrier_val;
+    }
+    return 2.0 * (r + q);
+}
+
 // ── Ore veins (§24) ─────────────────────────────────────────────────
 // Mirrors net.minecraft.world.gen.OreVeinSampler. Runs on blocks the aquifer
 // already classified as solid (density > 0), optionally replacing them with a
@@ -705,7 +747,7 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ccy: i32 = height_i / cell_h + 1;
   let s: i32 = ccx * ccz;
   let cpc: u32 = u32(ccx * ccy * ccz);
-  let cbase: u32 = u32(chunk_index) * params._pad[11] * cpc;
+  let cbase: u32 = u32(chunk_index) * 144u * cpc;
   let ch11_base: u32 = cbase + 11u * cpc;
 
   let ix: i32 = cx_i32 / cell_w;
@@ -791,7 +833,8 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
   let m = aq_fdiv(wy + 1, 12);
   let n = aq_fdiv(wz - 5, 16);
 
-  var o: i32 = 2147483647; var p: i32 = 2147483647; var ri: i32 = -1;
+  var o: i32 = 2147483647; var p: i32 = 2147483647; var q: i32 = 2147483647;
+  var ri: i32 = -1; var si: i32 = -1; var ti: i32 = -1;
   for (var u: i32 = 0; u <= 1; u = u + 1) {
     for (var v: i32 = -1; v <= 1; v = v + 1) {
       for (var w: i32 = 0; w <= 1; w = w + 1) {
@@ -803,14 +846,59 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
         let cp = aquifer_buf[u32(idx)];
         let ad = cp.x - wx; let ae = cp.y - wy; let af = cp.z - wz;
         let ag = ad * ad + ae * ae + af * af;
-        if (o >= ag) { ri = idx; p = o; o = ag; }
-        else if (p >= ag) { p = ag; }
+        if (o >= ag) {
+          q = p; p = o; o = ag;
+          ti = si; si = ri; ri = idx;
+        } else if (p >= ag) {
+          q = p; p = ag;
+          ti = si; si = idx;
+        } else if (q >= ag) {
+          q = ag; ti = idx;
+        }
       }
     }
   }
   if (ri < 0) { block_buf[bidx] = 1u; return; }
-  let rcly = aquifer_buf[u32(ri)].w;
-  block_buf[bidx] = select(0u, u32(aquifer_buf[aq_half + u32(ri)].x), wy < rcly);
+  
+  let r_lvl = aquifer_buf[u32(ri)].w;
+  let r_st = u32(aquifer_buf[aq_half + u32(ri)].x);
+  
+  let dist_op = max_dist(o, p);
+  if (dist_op <= 0.0) { block_buf[bidx] = select(0u, r_st, wy < r_lvl); return; }
+  
+  if (r_st == 2u && wy - 1 < aquifer_buf[u32(ri)].w) {
+      block_buf[bidx] = select(0u, r_st, wy < r_lvl); return;
+  }
+  
+  var s_lvl: i32 = r_lvl;
+  var s_st: u32 = r_st;
+  if (si >= 0) {
+    s_lvl = aquifer_buf[u32(si)].w;
+    s_st = u32(aquifer_buf[aq_half + u32(si)].x);
+  }
+  var t_lvl: i32 = r_lvl;
+  var t_st: u32 = r_st;
+  if (ti >= 0) {
+    t_lvl = aquifer_buf[u32(ti)].w;
+    t_st = u32(aquifer_buf[aq_half + u32(ti)].x);
+  }
+  
+  let e_val = dist_op * calc_density(wy, r_lvl, r_st, s_lvl, s_st, barrier_val);
+  if (dd + e_val > 0.0) { block_buf[bidx] = 1u; return; }
+  
+  let dist_oq = max_dist(o, q);
+  if (dist_oq > 0.0) {
+      let g_val = dist_op * dist_oq * calc_density(wy, r_lvl, r_st, t_lvl, t_st, barrier_val);
+      if (dd + g_val > 0.0) { block_buf[bidx] = 1u; return; }
+  }
+  
+  let dist_pq = max_dist(p, q);
+  if (dist_pq > 0.0) {
+      let h_val = dist_op * dist_pq * calc_density(wy, s_lvl, s_st, t_lvl, t_st, barrier_val);
+      if (dd + h_val > 0.0) { block_buf[bidx] = 1u; return; }
+  }
+  
+  block_buf[bidx] = select(0u, r_st, wy < r_lvl);
 }
 "#;
 
@@ -945,7 +1033,7 @@ fn main_entry(
                          + cy_i32 * cell_count_x * cell_count_z);
   // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
   // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
-  let chunk_cell_base: u32 = u32(chunk_index) * params._pad[11] * cells_per_chunk;
+  let chunk_cell_base: u32 = u32(chunk_index) * 144u * cells_per_chunk;
 
   // ── 铁律①: i32 world coords via origin subtraction ──────────────────
   let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
@@ -999,7 +1087,7 @@ fn main_pass_a(
                          + cy_i32 * cell_count_x * cell_count_z);
   // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
   // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
-  let chunk_cell_base: u32 = u32(chunk_index) * params._pad[11] * cells_per_chunk;
+  let chunk_cell_base: u32 = u32(chunk_index) * 144u * cells_per_chunk;
   let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
   let world_z_i32: i32 = origin_z + cz_local * i32(params.cell_width);
   let world_y_i32: i32 = i32(params.min_y_f) + cy_i32 * i32(params.cell_height);
@@ -1047,7 +1135,7 @@ fn main_pass_b(
                          + cy_i32 * cell_count_x * cell_count_z);
   // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
   // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
-  let chunk_cell_base: u32 = u32(chunk_index) * params._pad[11] * cells_per_chunk;
+  let chunk_cell_base: u32 = u32(chunk_index) * 144u * cells_per_chunk;
   let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
   let world_z_i32: i32 = origin_z + cz_local * i32(params.cell_width);
   let world_y_i32: i32 = i32(params.min_y_f) + cy_i32 * i32(params.cell_height);
@@ -1093,7 +1181,7 @@ fn main_pass_c(
                          + cy_i32 * cell_count_x * cell_count_z);
   // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
   // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
-  let chunk_cell_base: u32 = u32(chunk_index) * params._pad[11] * cells_per_chunk;
+  let chunk_cell_base: u32 = u32(chunk_index) * 144u * cells_per_chunk;
   let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
   let world_z_i32: i32 = origin_z + cz_local * i32(params.cell_width);
   let world_y_i32: i32 = i32(params.min_y_f) + cy_i32 * i32(params.cell_height);

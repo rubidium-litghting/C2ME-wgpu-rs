@@ -101,6 +101,7 @@ pub struct WorldContext {
     /// needed (vanilla terrain has no non-linear wrapper outside an interp).
     pub(crate) density_inners: Vec<crate::ast::AstNode>,
     pub(crate) density_outer: Option<crate::ast::AstNode>,
+    pub(crate) barrier_noise: Option<crate::ast::AstNode>,
 
     /// Ore-vein RNG seed (seedLo, seedHi) from MC's `oreRandomDeriver`.
     /// Set once per world via `c2me_wgpu_set_ore_seed`; (0,0) means unset.
@@ -199,13 +200,14 @@ impl WorldContext {
         // §14 Pass E: pre-split finalDensity (ch11) into per-corner subtrees
         // (`inners`) and a per-block `outer` tree, so the GPU can evaluate
         // non-linear wrappers per block instead of per corner.
-        let (density_inners, density_outer) = match &ast_root {
+        let (density_inners, density_outer, barrier_noise) = match &ast_root {
             crate::ast::AstNode::Root(channels) if channels.len() > 11 => {
                 let mut inners = Vec::new();
                 let outer = crate::ast::split::split(&channels[11], &mut inners);
-                (inners, Some(outer))
+                let barrier = if !channels.is_empty() { Some(channels[0].clone()) } else { None };
+                (inners, Some(outer), barrier)
             }
-            _ => (Vec::new(), None),
+            _ => (Vec::new(), None, None),
         };
 
         // 3. Fingerprint = stable hash of optimized AST (Java ↔ Rust consistency)
@@ -230,7 +232,7 @@ impl WorldContext {
         };
         let mut shader_srcs: Vec<String> = Vec::with_capacity(shards.len());
         for shard in &shards {
-            let src = wgsl_gen::emit_shader_for_shard(&ast_root, *shard, &density_inners, density_outer.as_ref())?;
+            let src = wgsl_gen::emit_shader_for_shard(&ast_root, *shard, &density_inners, density_outer.as_ref(), barrier_noise.as_ref())?;
             crate::wgpu_debug!(
                 "[c2me-wgpu][codegen] shard {:?} [{}..{}) WGSL: {} lines, {} bytes",
                 shard.pass, shard.start, shard.end,
@@ -274,6 +276,7 @@ impl WorldContext {
             aquifer_mode: std::sync::Mutex::new(AquiferMode::default()),
             density_inners,
             density_outer,
+            barrier_noise,
             ore_seed: std::sync::Mutex::new((0, 0)),
             ore_veins: std::sync::atomic::AtomicBool::new(false),
         })
@@ -560,6 +563,41 @@ impl WorldContext {
     }
 
 mod tests {
+    #[test]
+    #[ignore]
+    fn validate_epic_blockout_size() {
+        let bin = "/tmp/tectonic_router.bin.-64_512_4_8";
+        if !std::path::Path::new(bin).exists() { return; }
+        let blob = std::fs::read(bin).unwrap();
+        let ctx = crate::world::WorldContext::new(&blob).unwrap();
+        for (shard, src) in ctx.shards.iter().zip(ctx.shader_srcs.iter()) {
+            if shard.pass == crate::codegen::wgsl_gen::Pass::BlockOut {
+                let lines = src.lines().count();
+                println!("Epic BlockOut WGSL: {} lines", lines);
+                match naga::front::wgsl::parse_str(src) {
+                    Ok(_) => println!("Epic BlockOut WGSL parsed successfully!"),
+                    Err(e) => panic!("Epic BlockOut WGSL parse error:\n{}", e.emit_to_string(src)),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn validate_blockout_wgsl() {
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+        let blob = std::fs::read(bin).unwrap();
+        let ctx = crate::world::WorldContext::new(&blob).unwrap();
+        for (shard, src) in ctx.shards.iter().zip(ctx.shader_srcs.iter()) {
+            if shard.pass == crate::codegen::wgsl_gen::Pass::BlockOut {
+                match naga::front::wgsl::parse_str(src) {
+                    Ok(_) => println!("BlockOut WGSL parsed successfully!"),
+                    Err(e) => panic!("BlockOut WGSL parse error:\n{}", e.emit_to_string(src)),
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore]
     fn dump_shard_sources() {
@@ -3567,9 +3605,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let t = interp.clamp(0.0,1.0);
         (lo/512.0 + t*(up/512.0 - lo/512.0))/128.0
     }
+    thread_local! {
+        pub static INNER_VALS: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+    }
+
     pub(crate) fn cpu_ast_eval(node: &crate::ast::AstNode, perm: &[i32], origins: &[f32], x: f32, y: f32, z: f32) -> f32 {
         use crate::ast::AstNode as A;
         match node {
+            A::InnerRef(i) => INNER_VALS.with(|v| v.borrow().get(*i).copied().unwrap_or(0.0)),
             A::Constant(v) => *v,
             A::InputX => x, A::InputY => y, A::InputZ => z,
             A::Add(a, b) => cpu_ast_eval(a, perm, origins, x, y, z) + cpu_ast_eval(b, perm, origins, x, y, z),
@@ -6089,6 +6132,162 @@ mod compile_time_scale {
         }).unwrap().join().unwrap();
     }
 
+
+    #[test]
+    #[ignore]
+    fn diagnose_epic_terrain_512() {
+        use super::tests::cpu_ast_eval;
+        let bin = "/tmp/tectonic_router.bin.-64_512_4_8";
+        if !std::path::Path::new(bin).exists() {
+            println!("File not found: {bin}");
+            return;
+        }
+        let blob = std::fs::read(bin).unwrap();
+        let ctx = crate::world::WorldContext::new(&blob).unwrap();
+        let perm = ctx.perm_table_set().buffer.clone();
+        let origins = ctx.perm_table_set().origins.clone();
+        
+        println!("inner_count = {}", ctx.density_inners.len());
+        
+        // 测试目标坐标：X:1657, Z:-729。遍历一些 Y 值。
+        let wx = 1657.0f32;
+        let wz = -729.0f32;
+        
+        for wy in [-64.0, -32.0, -20.0, -13.0, 0.0, 32.0, 64.0] {
+            println!("--- (wx,wy,wz) = ({}, {}, {}) ---", wx, wy, wz);
+            
+            // 1. 算所有 inner 的值
+            for (i, inner) in ctx.density_inners.iter().enumerate() {
+                let v = cpu_ast_eval(inner, &perm, &origins, wx, wy, wz);
+                // 只打印非零或异常的值
+                if v != 0.0 || v.is_nan() || v.is_infinite() {
+                    println!("  inner[{}] = {:.6}", i, v);
+                }
+            }
+            
+            // 2. 角点插值：在 8 个角点上算 inner 值，然后三线性插值
+            if let Some(outer) = &ctx.density_outer {
+                // 确定目标点所在的角点网格（以 chunk 为单位，cell_w=4, cell_h=8）
+                // 目标 chunk 的起始坐标（X=1657 -> cx=103, Z=-729 -> cz=-46）
+                // chunk 的角点网格 = (5, 65, 5)，每格 4x8x4
+                // 我们直接算 8 个角点
+                let cw = 4.0f32; let ch = 8.0f32;
+                let origin_x = (wx / 16.0).floor() * 16.0;
+                let origin_z = (wz / 16.0).floor() * 16.0;
+                let origin_y = -64.0f32;
+
+                let ix = ((wx - origin_x) / cw).floor() as i32;
+                let iy = ((wy - origin_y) / ch).floor() as i32;
+                let iz = ((wz - origin_z) / cw).floor() as i32;
+                let tx = ((wx - origin_x) - ix as f32 * cw) / cw;
+                let ty = ((wy - origin_y) - iy as f32 * ch) / ch;
+                let tz = ((wz - origin_z) - iz as f32 * cw) / cw;
+
+                let mut inner_vals = vec![0.0f32; ctx.density_inners.len()];
+                for (idx, inner) in ctx.density_inners.iter().enumerate() {
+                    let x0 = origin_x + ix as f32 * cw;
+                    let x1 = origin_x + (ix+1) as f32 * cw;
+                    let y0 = origin_y + iy as f32 * ch;
+                    let y1 = origin_y + (iy+1) as f32 * ch;
+                    let z0 = origin_z + iz as f32 * cw;
+                    let z1 = origin_z + (iz+1) as f32 * cw;
+
+                    let c000 = cpu_ast_eval(inner, &perm, &origins, x0, y0, z0);
+                    let c100 = cpu_ast_eval(inner, &perm, &origins, x1, y0, z0);
+                    let c010 = cpu_ast_eval(inner, &perm, &origins, x0, y1, z0);
+                    let c110 = cpu_ast_eval(inner, &perm, &origins, x1, y1, z0);
+                    let c001 = cpu_ast_eval(inner, &perm, &origins, x0, y0, z1);
+                    let c101 = cpu_ast_eval(inner, &perm, &origins, x1, y0, z1);
+                    let c011 = cpu_ast_eval(inner, &perm, &origins, x0, y1, z1);
+                    let c111 = cpu_ast_eval(inner, &perm, &origins, x1, y1, z1);
+
+                    let x00 = c000 + tx * (c100 - c000);
+                    let x10 = c010 + tx * (c110 - c010);
+                    let x01 = c001 + tx * (c101 - c001);
+                    let x11 = c011 + tx * (c111 - c011);
+                    let y0l = x00 + ty * (x10 - x00);
+                    let y1l = x01 + ty * (x11 - x01);
+                    inner_vals[idx] = y0l + tz * (y1l - y0l);
+                }
+
+                super::tests::INNER_VALS.with(|v| *v.borrow_mut() = inner_vals.clone());
+                let v = cpu_ast_eval(outer, &perm, &origins, wx, wy, wz);
+                println!("  outer(interp) = {:.6}", v);
+                super::tests::INNER_VALS.with(|v| v.borrow_mut().clear());
+            }
+            
+            // 3. 算完整 ch11 的值
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c) => c, _ => panic!() };
+            let full = cpu_ast_eval(&chans[11], &perm, &origins, wx, wy, wz);
+            println!("  full_ch11= {:.6}", full);
+            
+            // 4. 算 barrier_noise 的值
+            if let Some(barrier) = &ctx.barrier_noise {
+                let b_val = cpu_ast_eval(barrier, &perm, &origins, wx, wy, wz);
+                println!("  barrier  = {:.6}", b_val);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_epic_barrier_struct() {
+        let bin = "/tmp/tectonic_router.bin.-64_512_4_8";
+        if !std::path::Path::new(bin).exists() { return; }
+        let blob = std::fs::read(bin).unwrap();
+        let (raw, _, _) = crate::ast::deserialize::deserialize_full(&blob).unwrap();
+        let chans = match &raw { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+        
+        fn size(n:&crate::ast::AstNode)->usize{
+            use crate::ast::AstNode as A;
+            let mut kids:Vec<&A>=vec![];
+            match n {
+                A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)|A::FloorDiv(a,b)=>{kids.push(a);kids.push(b);}
+                A::Abs(a)|A::Square(a)|A::Cube(a)|A::Sqrt(a)|A::Squeeze(a)|A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{kids.push(a);}
+                A::RangeChoice{input,in_bounds,out_of_bounds_lo,out_of_bounds_hi,..}=>{kids.push(input);kids.push(in_bounds);kids.push(out_of_bounds_lo);kids.push(out_of_bounds_hi);}
+                A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{kids.push(shift_x);kids.push(shift_y);kids.push(shift_z);kids.push(noise);}
+                A::Shift{offset,..}=>{kids.push(offset);}
+                A::WeirdScaledSampler{input,noise,..}=>{kids.push(input);kids.push(noise);}
+                A::Spline{location,values,..}=>{kids.push(location);for v in values{kids.push(v);}}
+                _=>{}
+            }
+            1 + kids.iter().map(|k| size(k)).sum::<usize>()
+        }
+        fn tag(n:&crate::ast::AstNode)->&'static str{
+            use crate::ast::AstNode as A;
+            match n {
+                A::NoiseSampler{..}=>"Noise",A::Spline{..}=>"Spline",A::ShiftedNoise{..}=>"ShiftedNoise",
+                A::Add(_,_)=>"Add",A::Mul(_,_)=>"Mul",A::Sub(_,_)=>"Sub",A::Min(_,_)=>"Min",A::Max(_,_)=>"Max",
+                A::Abs(_)=>"Abs",A::Squeeze(_)=>"Squeeze",A::YClampedGradient{..}=>"YClamp",
+                A::Constant(_)=>"Const",A::InputX=>"X",A::InputY=>"Y",A::InputZ=>"Z",
+                A::RangeChoice{..}=>"RangeChoice",A::CacheFlat(_)=>"CacheFlat",A::Cache2D(_)=>"Cache2D",
+                A::Shift{..}=>"Shift",A::InterpolatedNoiseSampler{..}=>"InterpNoise",
+                A::CacheInterpolated(_)=>"CacheInterp",
+                _=>"?",
+            }
+        }
+        let n = &chans[0];
+        println!("ch0 barrier size={} top={}", size(n), tag(n));
+        fn walk(n:&crate::ast::AstNode, ind:usize){
+            use crate::ast::AstNode as A;
+            let pad="  ".repeat(ind.min(10));
+            println!("{}{} (size={})", pad, tag(n), size(n));
+            if ind>5 {return;}
+            let mut kids:Vec<&A>=vec![];
+            match n {
+                A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)|A::FloorDiv(a,b)=>{kids.push(a);kids.push(b);}
+                A::Abs(a)|A::Square(a)|A::Cube(a)|A::Sqrt(a)|A::Squeeze(a)|A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{kids.push(a);}
+                A::RangeChoice{input,in_bounds,out_of_bounds_lo,out_of_bounds_hi,..}=>{kids.push(input);kids.push(in_bounds);kids.push(out_of_bounds_lo);kids.push(out_of_bounds_hi);}
+                A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{kids.push(shift_x);kids.push(shift_y);kids.push(shift_z);kids.push(noise);}
+                A::Shift{offset,..}=>{kids.push(offset);}
+                A::WeirdScaledSampler{input,noise,..}=>{kids.push(input);kids.push(noise);}
+                A::Spline{location,values,..}=>{kids.push(location);for v in values{kids.push(v);}}
+                _=>{}
+            }
+            for k in kids { walk(k, ind+1); }
+        }
+        walk(n, 0);
+    }
 
     #[test]
     #[ignore]

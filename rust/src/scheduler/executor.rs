@@ -379,9 +379,9 @@ impl SingleBatchExecutor {
             params._pad[7] = hi as u32;
             params._pad[8] = (hi as u64 >> 32) as u32;
             params._pad[9] = if world.ore_veins.load(std::sync::atomic::Ordering::Relaxed) { 1 } else { 0 };
+        }
         // _pad[11] is the total channel count, used by WGSL chunk strides.
         params._pad[11] = (16 + MAX_INNER_COUNT) as u32;
-        }
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
         // Packed chunk positions [cx,cz,...] for the shader (binding 4).
@@ -446,7 +446,6 @@ impl SingleBatchExecutor {
                 // the pre-allocated buffer: only the first `n` vec4 entries
                 // were written, so aq_s starts at index `n`.
                 params._pad[10] = n as u32;
-                params._pad[11] = (16 + MAX_INNER_COUNT) as u32;
                 self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
             }
         }
@@ -612,8 +611,7 @@ impl SingleBatchExecutor {
         let cpc = cells_per_chunk;
         for ci in 0..num_chunks as usize {
             for (k, &ch) in readback.iter().enumerate() {
-                let total_channels = 16 + MAX_INNER_COUNT;
-                let src_off = ((ci * total_channels + ch) * cpc) as u64 * 4;
+                let src_off = ((ci * (16 + MAX_INNER_COUNT) + ch) * cpc) as u64 * 4;
                 let dst_off = ((ci * out_channels + k) * cpc) as u64 * 4;
                 let len = cpc as u64 * 4;
                 encoder.copy_buffer_to_buffer(
