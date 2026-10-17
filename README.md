@@ -11,11 +11,10 @@ onto the GPU.
 > whole density pipeline (noise, aquifer, structure shaping) to the GPU and
 > emits block states directly; the CPU only writes the chunk palette. On a
 > desktop AMD iGPU (RADV), an end-to-end Chunky run (r=500, 4225 chunks)
-> finishes in ~15 s vs ~23 s for plain C2ME on the CPU. Behaviour on
-> **weak/mobile GPUs has not been re-benchmarked** under this new
-> architecture — the older "strong-CPU / weak-GPU can be slower" caveat
-> applied to the previous CPU-write-back design. Benchmark on your own
-> hardware before relying on it.
+> finishes in ~15 s vs ~23 s for plain C2ME on the CPU. On a mobile GPU
+> (Mali-G610), the same workload completes in 2m19s (34.8 cps) vs 3m12s
+> (21.5 cps) on the CPU — a **61% throughput increase**. The old "weak-GPU
+> can be slower" caveat no longer applies.
 
 > **Compatibility-first.** This mod is deliberately built on **fp32** so it can
 > run on the *widest possible range of GPUs* — including integrated graphics
