@@ -1,7 +1,7 @@
 # C2ME WGPU 加速模块 — 开发文档
 
 > 最后更新：2026-10-17
-> 状态：**aquifer + Beardifier 全 GPU 完成（§22）**，含 **Spline n==1 单点节点修复** 与 **shard B 瘦身**。
+> 状态：**Pass E 架构、矿脉、含水层完全对齐原版**。史诗地形（Epic Terrain）与 Tectonic 完美兼容！
 > 桌面端到端反超纯 CPU（Chunky r=500：15 s vs 23 s）。GPU 直接输出 per-block 方块状态，CPU 只写 palette。
 > 历史细节见文末「附录：开发历程」。
 
