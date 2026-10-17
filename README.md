@@ -73,7 +73,7 @@ exactly as usual.
 | Platform | Status |
 |---|---|
 | Linux x86_64 | ✅ tested |
-| Android aarch64 (custom JVM) | ✅ tested (Kirin 980) |
+| Android aarch64 (custom JVM) | ✅ tested (Mali-G610 / Dimensity) |
 | Windows x86_64 | ✅ tested (AMD, mingw DLL) |
 | macOS (Metal) | ⚠️ wgpu backend available, not officially tested |
 
@@ -92,11 +92,14 @@ will not suggest it there.
    generates a WGSL compute shader, which is compiled to a GPU pipeline
    (and cached on disk).
 4. **Dispatch** — the GPU evaluates the density field for a whole batch of
-   chunks in one dispatch.
+   chunks. To correctly handle modded non-linear density functions (e.g.,
+   `squeeze`), the final density tree is split (the "Pass E" architecture):
+   interpolated subtrees are evaluated at cell corners, while non-linear wrappers
+   are applied per-block during the final classification.
 5. **Block states** — the GPU classifies every block (air / stone / water /
-   lava) itself, applying the aquifer and the Beardifier (structure shaping)
-   on the GPU. Java only writes the resulting per-block state bytes into the
-   chunk's palette.
+   lava) itself, applying the aquifer, the Beardifier (structure shaping), and
+   the **Ore Vein sampler** (using a native GPU Xoroshiro RNG) on the GPU.
+   Java only writes the resulting per-block state bytes into the chunk's palette.
 
 ---
 
@@ -124,9 +127,6 @@ it would exclude most mobile GPUs.
   the same corner grid and fed to the GPU as an "external input". The rest of
   the tree still runs on the GPU, so modded worldgen keeps working — only the
   unsupported subtree pays a CPU cost.
-- **Weak/mobile GPUs not yet re-benchmarked** under the block-state
-  architecture. The old "queued behind the renderer" caveat applied to the
-  previous CPU-write-back design; whether it still holds is unverified.
 
 ---
 
