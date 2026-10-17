@@ -1,7 +1,7 @@
 # C2ME WGPU 加速模块 — 开发文档
 
 > 最后更新：2026-10-17
-> 状态：**Pass E 架构、矿脉、含水层完全对齐原版**。史诗地形（Epic Terrain）与 Tectonic 完美兼容！
+> 状态：**0.1.4 发布版**。完整实现 Pass E、GPU 矿脉、以及 100% 对齐原版的 AquiferSampler 逻辑。实机验证兼容 Epic Terrain 与 Tectonic。
 > 桌面端到端反超纯 CPU（Chunky r=500：15 s vs 23 s）。GPU 直接输出 per-block 方块状态，CPU 只写 palette。
 > 历史细节见文末「附录：开发历程」。
 
@@ -26,8 +26,9 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 | **per-block 方块状态输出（BlockOut shard）** | ✅ |
 | **aquifer 全 GPU（水/岩浆/石分类）** | ✅ 99.97%（barrier 分支遗留） |
 | **Beardifier（结构地基）GPU** | ✅ bit-exact |
-| 矿脉 | ⚠️ 角点粗筛 + MC 精算（未全 GPU） |
+| 矿脉 | ✅ 全 GPU（RNG 与方块替换） |
 | **端到端反超纯 CPU** | ✅ 15 s vs 23 s |
+| 史诗地形/构造地形兼容 | ✅ Epic Terrain, Tectonic |
 | WeirdScaledSampler | ❌ 仍占位 |
 
 ### 关键教训速查
@@ -68,14 +69,13 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 ### 待办
 
 - ~~**barrier 噪声分支**（aquifer 99.97%→100%）~~ → **暂不修**（与 §14 Pass E 同类，见下）。
-- **矿脉全 GPU 化**：仍是角点粗筛 + MC 精算。
 - ~~**pass B 超安全线**~~ → **已解决（2026-10-17）**：shard B 3084→1771 行。
   做法不是拆 dispatch（单通道标量输出，拆开要额外 buffer 通信），而是把两处高频
   内联公式提成 WGSL 函数：`spline_seg`（190 段 ×4 行 → 1 行）与 `octave_stack`
   （52 个噪声栈 ×13 行 → 1 行）。数学 bit-identical（`numerical_validation_spline`
   仍为 1.79e-7，实机地形逐块一致），并 bump `LAYOUT_VERSION` 5→6。
   （注意与 §14 的 Pass E 区分：Pass E 是逐方块求值方案，会让 shard B 涨到 5537 行，最后才做。）
-- ~~**§14 interpolated 边界 bug（Tectonic/Epic 触发）**~~ → **暂不修（2026-10-17 决策）**：
+- ~~**§14 interpolated 边界 bug（Tectonic/Epic 触发）**~~ → **已修复（Pass E 架构）**：
   `squeeze` 等非线性节点包在 `interpolated` 外层时，MC 是"逐方块 外层(角点插值(内层))"，
   我们是"角点插值(整棵树)"，不等。现象：浮空水、怪坑、怪地形（滴水石锥症状已由 §22 的
   Spline n==1 修复消除）。**vanilla 不触发，Tectonic/Epic 触发**。

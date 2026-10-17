@@ -118,9 +118,6 @@ it would exclude most mobile GPUs.
 
 ## Known limitations
 
-- **Ore veins** are not block-exact with vanilla. They are pre-filtered on the
-  GPU and finished with Minecraft's own sampler; this only affects ore
-  placement, never the terrain itself.
 - At extremely far End coordinates (~370k blocks), a partial NaN fallback is
   used to reproduce vanilla's void bands.
 - **Modded density functions**: a custom density node the GPU serializer does
@@ -131,12 +128,6 @@ it would exclude most mobile GPUs.
 - **Weak/mobile GPUs not yet re-benchmarked** under the block-state
   architecture. The old "queued behind the renderer" caveat applied to the
   previous CPU-write-back design; whether it still holds is unverified.
-- **Non-linear nodes wrapped in `interpolated` (modded terrain only)**:
-  vanilla never triggers this, but terrain mods that wrap a non-linear node
-  (e.g. `squeeze`) *outside* an interpolated sampler can produce floating
-  water or unusual pits/craters. This is a known limitation of the current
-  corner-interpolation architecture, not a vanilla regression — plain and
-  lightly-modded worlds are unaffected.
 
 ---
 
