@@ -18,9 +18,9 @@ onto the GPU.
 
 > **Compatibility-first.** This mod is deliberately built on **fp32** so it can
 > run on the *widest possible range of GPUs* — including integrated graphics
-> and mobile SoCs. The official C2ME accelerator targets `fp64` via OpenCL;
-> this mod complements it by covering devices that fp64 (and `shader-f64`)
-> cannot reach.
+> and mobile SoCs. Higher precision is only ever obtained through fp32-internal
+> compensation; `f64` is intentionally never used, because it would exclude most
+> mobile GPUs.
 
 ---
 
@@ -152,16 +152,31 @@ Set these only when troubleshooting. All of them are read once at startup.
 
 | Variable | Value | Effect |
 |---|---|---|
-| `C2ME_WGPU_DEBUG` | any non-empty value | Enables verbose logging: shader-compile timings, pipeline-cache hits/misses, and periodic chunk-per-second (`CPS=`) throughput stats. Written to `<gameDir>/logs/c2me-wgpu.log`. Silent by default. |
-| `C2ME_WGPU_PROFILE` | any non-empty value | Emits per-stage GPU batch timing (encode / submit / readback / decode), aggregated as one averaged line every 64 batches. Written to `<gameDir>/logs/c2me-wgpu.log`. Independent of `C2ME_WGPU_DEBUG`. |
-| `C2ME_VANILLA_REF` | `1` | Skip the GPU entirely, let vanilla generate the chunk, then dump its blocks for offline comparison against GPU output. |
-| `C2ME_DUMP_BLOCKS` | `1` | Dump the block states of the chunk at (0, 0), for offline comparison against vanilla. |
+| `C2ME_WGPU_DEBUG` | `1` | Enables verbose logging and periodic chunk-per-second (`CPS=`) stats. Also prints CPS to the chat HUD. Written to `<gameDir>/logs/c2me-wgpu.log`. |
+| `C2ME_WGPU_PROFILE` | `1` | Emits per-stage GPU batch timing (encode / submit / readback / decode) to the log. |
+| `C2ME_WGPU_ASYNC_SCHED` | `0` | Disables async write-back on C2ME's worker pool. Useful for A/B benchmarking. |
+| `C2ME_WGPU_MAPPED_AT_CREATION` | `0` / `1` | Override buffer upload method. Default `1` on desktop, `0` on Android (Mali rejects mapped path). |
+| `C2ME_VANILLA_REF` | `1` | Skip GPU entirely, let vanilla generate, then dump blocks for offline comparison. |
+| `C2ME_DUMP_BLOCKS` | `1` | Dump block states for the target chunk for offline comparison. |
 | `C2ME_DUMP_BLOB` | file path | Dump the serialized NoiseRouter blob to the given path. |
-| `C2ME_DUMP_DIR` | directory | Where the dumps above are written. Defaults to the platform temp dir (`/tmp` on Linux, but Android has none). |
-| `C2ME_WGPU_MAPPED_AT_CREATION` | `0` / `1` | Override how init-time buffers are uploaded. Default is `1` on desktop (fast mapped upload) and `0` on Android (Mali-G610 drivers reject the mapped path). Set `0` to force `queue.write_buffer`, `1` to force the mapped upload. |
+| `C2ME_DUMP_DIR` | directory | Where dump files are written. Defaults to platform temp dir. |
+| `C2ME_DUMP_CHUNK` | `x,z` or `x1,z1,x2,z2` | Target chunk(s) for the `C2ME_DUMP_*` diagnostics. |
+| `C2ME_DUMP_AQUIFER` | `1` | Dump the aquifer cell table. |
+| `C2ME_DUMP_AQ_BLOCKS` | `1` | Dump per-block aquifer reference data. |
+| `C2ME_DUMP_DENSITY` | `1` | Dump GPU density values. |
+| `C2ME_DUMP_BEARD` | `1` | Dump Beardifier structure shaping data. |
+| `C2ME_WGPU_FORCE_SINGLE` | `1` | Development only: forces a single-shard all-channel shader for debugging. |
+| `C2ME_WGPU_MINIMAL_SHADER` | `1` | Development only: uses a minimal stub shader for bring-up testing. |
+| `C2ME_WGPU_MAX_CHANNELS` | integer | Development only: caps the number of emitted channels. |
+| `C2ME_WGPU_FAKE_GPU_MS` | integer | Development only: simulates a slower GPU by injecting delay. |
+| `C2ME_WGPU_NO_PIPELINE_CACHE` | `1` | Development only: bypasses the on-disk shader pipeline cache. |
 
 The blob dump can also be set with the JVM property `-Dc2me.dumpBlob=<path>`;
 the environment variable is only a fallback when the property is unset.
+
+> **Note:** variables prefixed with `C2ME_DUMP_` and those marked "Development
+> only" are strictly for troubleshooting and do not need to be set during
+> normal gameplay.
 
 > **Rust-side log file:** the native library writes its diagnostics to
 > `<gameDir>/logs/c2me-wgpu.log` (the path is passed from Java at startup).
