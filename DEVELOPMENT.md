@@ -2,6 +2,7 @@
 
 > 最后更新：2026-10-17
 > 状态：**0.1.4 发布版**。完整实现 Pass E、GPU 矿脉、以及 100% 对齐原版的 AquiferSampler 逻辑。实机验证兼容 Epic Terrain 与 Tectonic。
+> 移动端实测：Chunky A/B 测试在 Mali-G610 平板（4225 区块）上从 21.5 cps 提升至 34.8 cps。
 > 桌面端到端反超纯 CPU（Chunky r=500：15 s vs 23 s）。GPU 直接输出 per-block 方块状态，CPU 只写 palette。
 > 历史细节见文末「附录：开发历程」。
 
@@ -27,7 +28,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 | **aquifer 全 GPU（水/岩浆/石分类）** | ✅ 99.97%（barrier 分支遗留） |
 | **Beardifier（结构地基）GPU** | ✅ bit-exact |
 | 矿脉 | ✅ 全 GPU（RNG 与方块替换） |
-| **端到端反超纯 CPU** | ✅ 15 s vs 23 s |
+| **端到端反超纯 CPU** | ✅ 15 s vs 23 s (桌面) |
+| **移动端端到端提速** | ✅ 34.8 cps vs 21.5 cps (+61%) |
 | 史诗地形/构造地形兼容 | ✅ Epic Terrain, Tectonic |
 | WeirdScaledSampler | ❌ 仍占位 |
 
