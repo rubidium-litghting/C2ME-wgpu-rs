@@ -114,6 +114,10 @@ public abstract class MixinChunkGenerator {
     private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,
                                  StructureAccessor structureAccessor, Chunk chunk,
                                  CallbackInfoReturnable<CompletableFuture<Chunk>> cir) {
+        // 检测当前维度的世界种子是否发生变化（例如玩家切换了存档）。
+        // 每个维度（通过 settings 区分）独立记录种子，多玩家在不同维度并发时不会互相干扰。
+        long currentSeed = noiseConfig.getOreRandomDeriver().split(0L).nextLong();
+
         // GPU availability: use ModuleEntryPoint (which captures init failure
         // safely). WgpuThinBinding.isAvailable() would itself trigger the
         // class <clinit>; though now failure-safe, ModuleEntryPoint is the
@@ -134,6 +138,18 @@ public abstract class MixinChunkGenerator {
             NoiseChunkGenerator selfGen = (NoiseChunkGenerator) (Object) this;
             ChunkGeneratorSettings settings = selfGen.getSettings().value();
             DimState ds = DIM_STATES.get(settings);
+            if (ds != null && ds.seed != currentSeed) {
+                // 发现该维度的缓存属于旧世界，移除并延迟销毁它。
+                DIM_STATES.remove(settings);
+                long oldHandle = ds.worldHandle;
+                if (oldHandle != 0L) {
+                    java.util.concurrent.CompletableFuture.delayedExecutor(5, java.util.concurrent.TimeUnit.SECONDS)
+                        .execute(() -> {
+                            try { WgpuThinBinding.worldDestroy(oldHandle); } catch (Throwable ignored) {}
+                        });
+                }
+                ds = null;
+            }
             if (ds == null) {
                 // This dimension already failed to initialise: stay on CPU.
                 if (FAILED_DIMS.contains(settings)) {
@@ -149,7 +165,7 @@ public abstract class MixinChunkGenerator {
                         if (FAILED_DIMS.contains(settings)) {
                             return;
                         }
-                        ds = initDimState(settings, noiseConfig, chunk);
+                        ds = initDimState(settings, noiseConfig, chunk, currentSeed);
                         if (ds != null) {
                             DIM_STATES.put(settings, ds);
                         } else {
@@ -929,6 +945,7 @@ public abstract class MixinChunkGenerator {
      *  node can be single-shot sampled for diagnostics. */
     /** Per-dimension GPU state: world handle, batch coordinator, grid dims. */
     private static final class DimState {
+        final long seed;
         final long worldHandle;
         final WgpuBatchCoordinator coordinator;
         final int gridX, gridY, gridZ;   // corner counts per axis
@@ -940,10 +957,11 @@ public abstract class MixinChunkGenerator {
          *  fill with THIS, not a hard-coded stone — otherwise the Nether got
          *  filled with stone. */
         final net.minecraft.block.BlockState defaultBlock;
-        DimState(long worldHandle, WgpuBatchCoordinator coordinator,
+        DimState(long seed, long worldHandle, WgpuBatchCoordinator coordinator,
                  int gridX, int gridY, int gridZ, int cellW, int cellH,
                  int minY, int height, NoiseRouter rawRouter,
                  net.minecraft.block.BlockState defaultBlock) {
+            this.seed = seed;
             this.worldHandle = worldHandle;
             this.coordinator = coordinator;
             this.gridX = gridX; this.gridY = gridY; this.gridZ = gridZ;
@@ -957,7 +975,7 @@ public abstract class MixinChunkGenerator {
     /** Build a WorldContext for one dimension's noise settings. Returns null
      *  on any failure so the caller can fall back to the vanilla CPU path. */
     private static DimState initDimState(ChunkGeneratorSettings settings,
-                                         NoiseConfig noiseConfig, Chunk chunk) {
+                                         NoiseConfig noiseConfig, Chunk chunk, long seed) {
         try {
             NoiseRouter router = decompileRouter(noiseConfig.getNoiseRouter());
             if (router == null) {
@@ -1029,7 +1047,7 @@ public abstract class MixinChunkGenerator {
             }
             WgpuBatchCoordinator coord = new WgpuBatchCoordinator(world, extNodes,
                     gx, gy, gz, hc, vc, minY);
-            return new DimState(world, coord, gx, gy, gz, hc, vc, minY, height, router,
+            return new DimState(seed, world, coord, gx, gy, gz, hc, vc, minY, height, router,
                     settings.defaultBlock());
         } catch (Throwable t) {
             LOGGER.error("[c2me-wgpu] world init failed; staying on CPU path", t);

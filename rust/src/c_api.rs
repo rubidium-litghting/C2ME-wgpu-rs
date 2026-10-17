@@ -127,6 +127,14 @@ pub unsafe extern "C" fn c2me_wgpu_create_instance(
 /// (or both null/0 for empty blob in this skeleton).
 /// `err_buf` must be null or valid mutable buffer of `err_buf_len` bytes.
 #[unsafe(no_mangle)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2me_wgpu_world_destroy(world_h: i64) -> i32 {
+    if world_h == 0 { return STATUS_INVALID_HANDLE; }
+    let mut table = get_handle_table().lock().unwrap();
+    if table.remove(&world_h).is_some() { 0 } else { STATUS_INVALID_HANDLE }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_world_new(
     instance_h: i64,
     config_blob_ptr: *const u8,

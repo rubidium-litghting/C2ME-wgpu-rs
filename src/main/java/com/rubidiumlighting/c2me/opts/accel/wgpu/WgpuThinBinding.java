@@ -48,6 +48,7 @@ public class WgpuThinBinding {
 
     private static MethodHandle MH_create_instance;
     private static MethodHandle MH_world_new;
+    private static MethodHandle MH_world_destroy;
     private static MethodHandle MH_request_chunks;
     private static MethodHandle MH_poll_status;
     private static MethodHandle MH_take_result_blob;
@@ -83,6 +84,13 @@ public class WgpuThinBinding {
                     )
             );
 
+            MH_world_destroy = NativeLoader.linker.downcallHandle(
+                    NativeLoader.lookup.find("c2me_wgpu_world_destroy").orElseThrow(),
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_LONG
+                    )
+            );
             MH_world_new = NativeLoader.linker.downcallHandle(
                     NativeLoader.lookup.find("c2me_wgpu_world_new").orElseThrow(),
                     FunctionDescriptor.of(
@@ -298,6 +306,16 @@ public class WgpuThinBinding {
      * @param blob      serialized NoiseRouter blob (from NoiseRouterBlobifier)
      * @return world handle (non-zero)
      */
+    public static void worldDestroy(long worldH) {
+        if (worldH == 0L) return;
+        try {
+            int st = (int) MH_world_destroy.invokeExact(worldH);
+            if (st != 0) throw new RuntimeException("world_destroy status=" + st);
+        } catch (Throwable e) {
+            throw new RuntimeException("[c2me-wgpu] world_destroy failed", e);
+        }
+    }
+
     public static long worldNew(long instanceH, ByteBuffer blob) {
         if (!blob.isDirect()) {
             ByteBuffer direct = ByteBuffer.allocateDirect(blob.remaining());
