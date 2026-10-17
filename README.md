@@ -1,255 +1,194 @@
 # C2ME-wgpu-rs
 
-GPU-accelerated world generation for Minecraft, powered by
-[wgpu](https://wgpu.rs/) (Vulkan / Metal / DX12 / WebGPU).
+为 Minecraft 提供由 [wgpu](https://wgpu.rs/) (Vulkan / Metal / DX12 / WebGPU) 驱动的 GPU 加速世界生成。
 
-A companion mod for [C2ME](https://modrinth.com/mod/c2me-fabric)
-that offloads the heavy noise / density-function pipeline of chunk generation
-onto the GPU.
+这是一个 [C2ME](https://modrinth.com/mod/c2me-fabric) 的伴生模组，将区块生成中繁重的噪声 / 密度函数管线卸载至 GPU 计算。
 
-> ⚠️ **Experimental — read before installing.** The mod now offloads the
-> whole density pipeline (noise, aquifer, structure shaping) to the GPU and
-> emits block states directly; the CPU only writes the chunk palette. On a
-> desktop AMD iGPU (RADV), an end-to-end Chunky run (r=500, 4225 chunks)
-> finishes in ~15 s vs ~23 s for plain C2ME on the CPU. On a mobile GPU
-> (Mali-G610), the same workload completes in 2m19s (34.8 cps) vs 3m12s
-> (21.5 cps) on the CPU — a **61% throughput increase**. The old "weak-GPU
-> can be slower" caveat no longer applies.
+> [English](README_en.md) | **简体中文**
 
-> **Compatibility-first.** This mod is deliberately built on **fp32** so it can
-> run on the *widest possible range of GPUs* — including integrated graphics
-> and mobile SoCs. Higher precision is only ever obtained through fp32-internal
-> compensation; `f64` is intentionally never used, because it would exclude most
-> mobile GPUs.
+> ⚠️ **实验性功能 — 安装前请阅读。** 
+> 本模组现已将整个密度管线（噪声、含水层、结构地基）卸载至 GPU 并直接输出方块状态；CPU 仅负责写入区块调色板。
+> 在桌面端 AMD 核显 (RADV) 上，Chunky 端到端测试 (r=500, 4225 区块) 耗时约 15 秒，而纯 CPU 跑 C2ME 约需 23 秒。
+> 在移动端 GPU (Mali-G610) 上，同样的测试耗时 2 分 19 秒，而纯 CPU 需 3 分 12 秒（**端到端提速 61%**）。
+> 分析 Chunky 的连续生成速率显示，纯地形生成吞吐量提升了 **+30.3%**（30.65 CPS vs 23.52 CPS）。
+> 旧版“弱 GPU 可能更慢”的警告已不再适用。
+
+> **兼容性优先。** 
+> 本模组刻意基于 **fp32** 构建，以兼容*尽可能广泛的 GPU*——包括核显和移动端 SoC。
+> 官方的 C2ME OpenCL 加速模块基于 `fp64`（仅在较新的 Minecraft 版本中可用）；本模组通过覆盖 1.21.1 以及 `fp64`（和 `shader-f64`）无法触及的设备来作为补充。
+> 这里的高精度仅通过 fp32 内部补偿来实现；刻意绝不使用 `f64`，因为那会将大多数移动端 GPU 拒之门外。
 
 ---
 
-## Requirements
+## 环境要求
 
 | | |
 |---|---|
 | Minecraft | 1.21.1 (Fabric) |
 | Fabric Loader | >= 0.17.2 |
-| **C2ME** | **required** (this is a companion module, not standalone) |
-| Java | 25+ (the mod is built against Java 25 and uses the Panama FFM API) |
-| GPU | Any GPU with a working wgpu backend |
+| **C2ME** | **必需** (本模组为伴生模块，不能独立运行) |
+| Java | 25+ (本模组基于 Java 25 构建，并使用 Panama FFM API) |
+| GPU | 任何支持 wgpu 后端的 GPU |
 
-Java 25 or newer is required: the mod is compiled for Java 25 (and talks to
-its Rust core through the Panama FFM API, which is stable from Java 24).
+需要 Java 25 或更高版本：模组针对 Java 25 编译（并通过 Panama FFM API 与其 Rust 核心通信，该 API 从 Java 24 起稳定）。
 
-> **Why still named "C2ME-wgpu-rs"?** This mod ships its own access widener
-> and does **not** link against C2ME at build time: the C2ME members it calls
-> (`SchedulingManager`) are declared by a small **compile-only stub**
-> (`src/stub`, `compileOnly` — not packaged into the jar), so no C2ME jar is
-> needed to build and no C2ME version is pinned. It depends on C2ME at
-> **runtime**: for the
-> multi-threaded chunk generation that keeps the GPU batch pipeline fed (with
-> C2ME, desktop throughput reaches ~144 chunks/s; without it, the GPU starves
-> and collapses to ~13, roughly phone level), and — when `C2ME_WGPU_ASYNC_SCHED`
-> is on (default) — to run the CPU write-back on C2ME's worker pool, so chunk
-> requests never block a worker (see "How it works"). If the C2ME scheduling
-> API is unavailable, GPU acceleration is simply left off for that run and
-> plain C2ME generates terrain on the CPU (there is no synchronous GPU
-> fallback). So it remains a **C2ME companion module** — C2ME supplies the
-> parallelism, this mod supplies the GPU compute — and keeps the name.
+> **为什么依然叫 "C2ME-wgpu-rs"？** 
+> 本模组自带 access widener，并且需要 C2ME。
+> 
+> **在构建期**，Java 代码直接引用了 C2ME 的类（如 `SchedulingManager`）。为了避免拉取整个 C2ME 源码，我们提供了一个小巧的 **仅编译期 stub**（`src/stub`, `compileOnly` — 不会打包进 jar）。这意味着编译不需要 C2ME 的 jar，也不会锁定任何特定的 C2ME 版本。
+> 
+> **在运行期**，它强依赖 C2ME 做两件事：
+> 1. 多线程区块生成，以保持 GPU 批处理管线满载（有 C2ME 时，桌面端吞吐量可达 ~144 区块/秒；没有它，GPU 会因吃不满而效能骤降至 ~13）。
+> 2. 异步写回架构严重依赖 C2ME 的 `SchedulingManager.positionedExecutor()` 在其 worker 池上执行 CPU 任务。如果该 API 不可用，该次运行的 GPU 加速将被完全禁用，退回纯 C2ME 的 CPU 生成（不存在同步 GPU 回退机制）。
+> 
+> 因此，它依然是一个 **C2ME 伴生模块** —— C2ME 提供并行度和调度器，本模组提供 GPU 算力 —— 名字得以保留。
 
 ---
 
-## Installation
+## 安装
 
-1. Install Fabric Loader for Minecraft 1.21.1.
-2. Put **C2ME** and **C2ME-wgpu-rs** into your `mods/` folder.
-3. Launch the game.
+1. 为 Minecraft 1.21.1 安装 Fabric Loader。
+2. 将 **C2ME** 和 **C2ME-wgpu-rs** 放入 `mods/` 文件夹。
+3. 启动游戏。
 
-No configuration is needed. If a compatible GPU is found **and** C2ME's
-scheduling API is available, terrain generation is offloaded automatically;
-otherwise the mod stays silent and plain C2ME generates terrain on the CPU,
-exactly as usual.
+无需任何配置。如果找到了兼容的 GPU **且** C2ME 的调度 API 可用，地形生成会自动卸载至 GPU；否则，模组保持静默，由纯 C2ME 在 CPU 上生成地形，与往常无异。
 
 ---
 
-## Platform support
+## 平台支持
 
-| Platform | Status |
+| 平台 | 状态 |
 |---|---|
-| Linux x86_64 | ✅ tested |
-| Android aarch64 (custom JVM) | ✅ tested (Mali-G610 / Dimensity) |
-| Windows x86_64 | ✅ tested (AMD, mingw DLL) |
-| macOS (Metal) | ⚠️ wgpu backend available, not officially tested |
+| Linux x86_64 | ✅ 已测试 |
+| Android aarch64 (自定义 JVM) | ✅ 已测试 (Mali-G610 / 天玑) |
+| Windows x86_64 | ✅ 已测试 (AMD, mingw DLL) |
+| macOS (Metal) | ⚠️ 有 wgpu 后端，未官方测试 |
 
-On Android, `-XX:+UseZGC` is **not** supported by the custom JVM and the mod
-will not suggest it there.
-
----
-
-## How it works
-
-1. **Serialize** — the vanilla `NoiseRouter` (the density-function tree that
-   drives terrain) is serialized into a compact binary blob on the Java side.
-2. **Hand off** — the blob is passed to a Rust `cdylib` through the Panama FFM
-   API (no callbacks, a simple poll model).
-3. **Compile** — Rust deserializes the tree, runs optimization passes, and
-   generates a WGSL compute shader, which is compiled to a GPU pipeline
-   (and cached on disk).
-4. **Dispatch** — the GPU evaluates the density field for a whole batch of
-   chunks. To correctly handle modded non-linear density functions (e.g.,
-   `squeeze`), the final density tree is split (the "Pass E" architecture):
-   interpolated subtrees are evaluated at cell corners, while non-linear wrappers
-   are applied per-block during the final classification.
-5. **Block states** — the GPU classifies every block (air / stone / water /
-   lava) itself, applying the aquifer, the Beardifier (structure shaping), and
-   the **Ore Vein sampler** (using a native GPU Xoroshiro RNG) on the GPU.
-   Java only writes the resulting per-block state bytes into the chunk's palette.
+在 Android 上，自定义 JVM **不支持** `-XX:+UseZGC`，模组也不会在那里给出该建议。
 
 ---
 
-## Accuracy
+## 工作原理
 
-The mod computes in **fp32**. Compared to Minecraft's `double` reference:
-
-- shallow expressions agree to about **1e-6**;
-- deep expressions (thousands of noise samples) can drift up to about **1e-2**.
-
-This is the **inherent limit of fp32**, not a bug. Terrain thresholds are not
-sensitive to differences of this magnitude, and the generated terrain is
-visually indistinguishable from vanilla. Higher precision is only ever obtained
-through fp32-internal compensation — `f64` is intentionally never used, because
-it would exclude most mobile GPUs.
+1. **序列化** — 原版的 `NoiseRouter`（驱动地形的密度函数树）在 Java 侧被序列化为紧凑的二进制 blob。
+2. **交接** — 该 blob 通过 Panama FFM API 传给 Rust `cdylib`（无回调，简单的轮询模型）。
+3. **编译** — Rust 反序列化该树，运行优化 pass，并生成 WGSL 计算着色器，随后编译为 GPU 管线（并缓存在磁盘上）。
+4. **分发** — GPU 一次 dispatch 即可计算整批区块的密度场。为了正确处理模组中非线性的密度函数（例如 `squeeze`），最终的密度树会被拆分（即 "Pass E" 架构）：插值子树在角点求值，而非线性外层在最后的方块分类时逐方块应用。
+5. **方块状态** — GPU 自行对每个方块进行分类（空气 / 石头 / 水 / 岩浆），在 GPU 上应用含水层、结构地基（Beardifier）以及**矿脉采样器**（使用原生的 GPU Xoroshiro 随机数生成器）。Java 仅将得到的逐方块状态字节写入区块调色板。
 
 ---
 
-## Known limitations
+## 精度
 
-- At extremely far End coordinates (~370k blocks), a partial NaN fallback is
-  used to reproduce vanilla's void bands.
-- **Modded density functions**: a custom density node the GPU serializer does
-  not natively understand (e.g. from a terrain mod) is evaluated on the CPU at
-  the same corner grid and fed to the GPU as an "external input". The rest of
-  the tree still runs on the GPU, so modded worldgen keeps working — only the
-  unsupported subtree pays a CPU cost.
+模组使用 **fp32** 进行计算。与 Minecraft 的 `double` 参考值相比：
+
+- 浅层表达式一致度约为 **1e-6**；
+- 深层表达式（数千次噪声采样）最多可漂移约 **1e-2**。
+
+这是 **fp32 的固有极限**，并非 bug。地形阈值对此量级的差异不敏感，且生成的地形与原版在视觉上无法区分。
 
 ---
 
-## Environment variables
+## 已知限制
 
-### GPU selection (standard wgpu variables)
+- 在末地极远坐标（约 37 万格）处，使用部分 NaN 回退机制来复现原版的虚空带。
+- **模组密度函数**：GPU 序列化器无法原生理解的定制密度节点（例如来自地形模组的节点）会在 CPU 上以相同的角点网格计算，并作为“外部输入”喂给 GPU。树的其他部分依然在 GPU 上运行，因此模组世界生成保持工作 —— 只有不受支持的子树会承担 CPU 开销。
 
-The mod honours wgpu's own environment variables, so they behave the same as
-in any other wgpu application:
+---
 
-| Variable | Values | Effect |
+## 环境变量
+
+### GPU 选择（标准 wgpu 变量）
+
+模组遵循 wgpu 自身的环境变量，因此它们的行为与任何其他 wgpu 应用程序一致：
+
+| 变量 | 值 | 效果 |
 |---|---|---|
-| `WGPU_BACKEND` | `vulkan`, `dx12`, `metal`, `gl`, `webgpu` (comma-separated) | Restrict the graphics backends tried. Useful when one backend is broken (e.g. `WGPU_BACKEND=gl`). |
-| `WGPU_ADAPTER_NAME` | substring (case-insensitive) | Force a specific GPU by name, e.g. `WGPU_ADAPTER_NAME=radeon`. If nothing matches, the mod logs a warning and falls back to its default choice. |
+| `WGPU_BACKEND` | `vulkan`, `dx12`, `metal`, `gl`, `webgpu` (逗号分隔) | 限制尝试的图形后端。在某个后端损坏时很有用。注意：`gl` 后端需要 OpenGL 4.3+ 才能支持通用计算 (Compute Shader)。 |
+| `WGPU_ADAPTER_NAME` | 子串 (不区分大小写) | 按名称强制指定特定的 GPU，例如 `WGPU_ADAPTER_NAME=radeon`。如果没有匹配项，模组会记录一条警告并回退到其默认选择。 |
 
-Without any of these, the mod uses Vulkan / Metal / DX12 (whichever the OS
-provides) and prefers the **integrated GPU**, so the discrete GPU stays free
-for rendering.
+如果不使用这些变量，模组会使用 Vulkan / Metal / DX12（取决于操作系统提供的），并优先选择**集成显卡**，从而让独立显卡空闲以用于渲染。
 
-### Diagnostics and debug exports
+### 诊断与调试导出
 
-Set these only when troubleshooting. All of them are read once at startup.
+仅在排查故障时设置这些变量。它们都在启动时读取一次。
 
-| Variable | Value | Effect |
+| 变量 | 值 | 效果 |
 |---|---|---|
-| `C2ME_WGPU_DEBUG` | `1` | Enables verbose logging and periodic chunk-per-second (`CPS=`) stats. Also prints CPS to the chat HUD. Written to `<gameDir>/logs/c2me-wgpu.log`. |
-| `C2ME_WGPU_PROFILE` | `1` | Emits per-stage GPU batch timing (encode / submit / readback / decode) to the log. |
-| `C2ME_WGPU_ASYNC_SCHED` | `0` | Disables async write-back on C2ME's worker pool. Useful for A/B benchmarking. |
-| `C2ME_WGPU_MAPPED_AT_CREATION` | `0` / `1` | Override buffer upload method. Default `1` on desktop, `0` on Android (Mali rejects mapped path). |
-| `C2ME_VANILLA_REF` | `1` | Skip GPU entirely, let vanilla generate, then dump blocks for offline comparison. |
-| `C2ME_DUMP_BLOCKS` | `1` | Dump block states for the target chunk for offline comparison. |
-| `C2ME_DUMP_BLOB` | file path | Dump the serialized NoiseRouter blob to the given path. |
-| `C2ME_DUMP_DIR` | directory | Where dump files are written. Defaults to platform temp dir. |
-| `C2ME_DUMP_CHUNK` | `x,z` or `x1,z1,x2,z2` | Target chunk(s) for the `C2ME_DUMP_*` diagnostics. |
-| `C2ME_DUMP_AQUIFER` | `1` | Dump the aquifer cell table. |
-| `C2ME_DUMP_AQ_BLOCKS` | `1` | Dump per-block aquifer reference data. |
-| `C2ME_DUMP_DENSITY` | `1` | Dump GPU density values. |
-| `C2ME_DUMP_BEARD` | `1` | Dump Beardifier structure shaping data. |
-| `C2ME_WGPU_FORCE_SINGLE` | `1` | Development only: forces a single-shard all-channel shader for debugging. |
-| `C2ME_WGPU_MINIMAL_SHADER` | `1` | Development only: uses a minimal stub shader for bring-up testing. |
-| `C2ME_WGPU_MAX_CHANNELS` | integer | Development only: caps the number of emitted channels. |
-| `C2ME_WGPU_FAKE_GPU_MS` | integer | Development only: simulates a slower GPU by injecting delay. |
-| `C2ME_WGPU_NO_PIPELINE_CACHE` | `1` | Development only: bypasses the on-disk shader pipeline cache. |
+| `C2ME_WGPU_DEBUG` | `1` | 启用详细日志和定期的每秒区块数（`CPS=`）统计。同时将 CPS 打印到聊天 HUD。写入 `<gameDir>/logs/c2me-wgpu.log`。 |
+| `C2ME_WGPU_PROFILE` | `1` | 将分阶段的 GPU 批处理计时（encode / submit / readback / decode）写入日志。 |
+| `C2ME_WGPU_ASYNC_SCHED` | `0` | 禁用 C2ME worker 池上的异步写回。便于 A/B 基准测试。 |
+| `C2ME_WGPU_MAPPED_AT_CREATION` | `0` / `1` | 覆盖缓冲区上传方法。桌面端默认 `1`，Android 端默认 `0`（Mali 驱动拒绝映射路径）。 |
+| `C2ME_VANILLA_REF` | `1` | 完全跳过 GPU，让原版生成，然后 dump 方块以供离线对比。 |
+| `C2ME_DUMP_BLOCKS` | `1` | 为目标区块 dump 方块状态以供离线对比。 |
+| `C2ME_DUMP_BLOB` | 文件路径 | 将序列化的 NoiseRouter blob dump 到指定路径。 |
+| `C2ME_DUMP_DIR` | 目录 | dump 文件写入的目录。默认为平台临时目录。 |
+| `C2ME_DUMP_CHUNK` | `x,z` 或 `x1,z1,x2,z2` | `C2ME_DUMP_*` 诊断的目标区块。 |
+| `C2ME_DUMP_AQUIFER` | `1` | dump 含水层 cell 表。 |
+| `C2ME_DUMP_AQ_BLOCKS` | `1` | dump 逐方块含水层参考数据。 |
+| `C2ME_DUMP_DENSITY` | `1` | dump GPU 密度值。 |
+| `C2ME_DUMP_BEARD` | `1` | dump Beardifier 结构地基数据。 |
+| `C2ME_WGPU_FORCE_SINGLE` | `1` | 仅开发用：强制使用单 shard 全通道着色器进行调试。 |
+| `C2ME_WGPU_MINIMAL_SHADER` | `1` | 仅开发用：使用最小占位着色器进行启动测试。 |
+| `C2ME_WGPU_MAX_CHANNELS` | 整数 | 仅开发用：限制发出的通道数量。 |
+| `C2ME_WGPU_FAKE_GPU_MS` | 整数 | 仅开发用：通过注入延迟来模拟较慢的 GPU。 |
+| `C2ME_WGPU_NO_PIPELINE_CACHE` | `1` | 仅开发用：绕过磁盘上的着色器管线缓存。 |
 
-The blob dump can also be set with the JVM property `-Dc2me.dumpBlob=<path>`;
-the environment variable is only a fallback when the property is unset.
+blob dump 也可以通过 JVM 属性 `-Dc2me.dumpBlob=<path>` 设置；当该属性未设置时，环境变量仅作为回退。
 
-> **Note:** variables prefixed with `C2ME_DUMP_` and those marked "Development
-> only" are strictly for troubleshooting and do not need to be set during
-> normal gameplay.
+> **注意：** 以 `C2ME_DUMP_` 为前缀的变量以及标记为“仅开发用”的变量严格用于故障排查，正常游玩时无需设置。
 
-> **Rust-side log file:** the native library writes its diagnostics to
-> `<gameDir>/logs/c2me-wgpu.log` (the path is passed from Java at startup).
-> This is separate from Minecraft's own `logs/latest.log`, which only captures
-> Java logging.
+> **Rust 侧日志文件：** 原生库将其诊断信息写入 `<gameDir>/logs/c2me-wgpu.log`（路径由 Java 在启动时传入）。这独立于 Minecraft 自身的 `logs/latest.log`，后者仅捕获 Java 日志。
 
-### Cache location
+### 缓存位置
 
-| Variable | Effect |
+| 变量 | 效果 |
 |---|---|
-| `XDG_CACHE_HOME` | Base directory for the on-disk shader pipeline cache (`$XDG_CACHE_HOME/c2me/wgpu_pipelines/`). |
-| `HOME` | Fallback when `XDG_CACHE_HOME` is unset (`$HOME/.cache`). |
+| `XDG_CACHE_HOME` | 磁盘着色器管线缓存的基础目录（`$XDG_CACHE_HOME/c2me/wgpu_pipelines/`）。 |
+| `HOME` | 当 `XDG_CACHE_HOME` 未设置时的回退（`$HOME/.cache`）。 |
 
-> **Note:** the cache path follows the XDG convention, which is native to Linux
-> only. On Windows and macOS these variables are usually unset or non-standard,
-> so the on-disk pipeline cache is effectively disabled there. This costs a
-> one-off shader recompile per launch and does not affect correctness.
+> **注意：** 缓存路径遵循 XDG 约定，这是 Linux 原生特有的。在 Windows 和 macOS 上，这些变量通常未设置或非标准，因此那里的磁盘管线缓存实际上被禁用了。这会导致每次启动都需要一次性的着色器重新编译，但不影响正确性。
 
-### Build-time only
+### 仅构建期使用
 
-| Variable | Effect |
+| 变量 | 效果 |
 |---|---|
-| `ANDROID_NDK_HOME` | When present, the build **automatically** cross-compiles the native library for Android (aarch64) and stages it into the jar under `natives/android-aarch64/`. Unset it (or pass `-PskipAndroid`) to skip. |
+| `ANDROID_NDK_HOME` | 存在时，构建**会自动**为 Android (aarch64) 交叉编译原生库，并将其暂存到 jar 内的 `natives/android-aarch64/` 下。取消设置它（或传入 `-PskipAndroid`）以跳过。 |
 
 ---
 
-## Building from source
+## 从源码构建
 
 ```bash
 ./gradlew build
 ```
 
-The built mod jar is written to `build/libs/`.
+构建出的模组 jar 会写入 `build/libs/`。
 
-Building requires:
-- JDK 25 (for the Java toolchain) and JDK 21 (for the Gradle JVM);
-- a Rust toolchain (the native library is compiled as part of the build);
-- **`cargo-ndk`** *only if* you build for Android
-  (`cargo install cargo-ndk`, plus an Android NDK; the Android build is
-  skipped automatically when `ANDROID_NDK_HOME` is not set,
-  or forced off with `-PskipAndroid`).
+构建需要：
+- JDK 25（用于 Java 工具链）和 JDK 21（用于 Gradle JVM）；
+- Rust 工具链（原生库作为构建的一部分进行编译）；
+- **`cargo-ndk`** *仅当*您为 Android 构建时
+  （`cargo install cargo-ndk`，外加一个 Android NDK；当 `ANDROID_NDK_HOME` 未设置时，Android 构建会自动跳过，或通过 `-PskipAndroid` 强制关闭）。
 
 ---
 
-## Development note
+## 开发说明
 
-This mod was developed with heavy **AI assistance** — the code, documentation
-and tests were largely AI-generated under maintainer review. Treat it
-accordingly: verify behaviour on your own hardware before relying on it.
-Bug reports and pull requests are welcome.
+本模组是在**大量 AI 辅助**下开发的 —— 代码、文档和测试大部分是在维护者审查下由 AI 生成的。请对此保持警惕：在依赖它之前，请务必在您自己的硬件上验证行为。欢迎提交 Bug 报告和 Pull Request。
 
 ---
 
-## Provenance
+## 来源说明
 
-This project is an independent, clean-room reimplementation. It was written
-against Minecraft's **runtime behaviour** (dumped noise data and sampled
-reference values), not against any third-party mod's source code.
+本项目是一个独立的、净室（clean-room）重新实现。它是针对 Minecraft 的**运行时行为**（导出的噪声数据和采样的参考值）编写的，而不是针对任何第三方模组的源代码。
 
-A code-origin review compared this mod's aquifer and Beardifier implementation
-against [C2ME](https://modrinth.com/mod/c2me-fabric)'s OpenCL accelerator:
-no shared identifiers, no copied functions, and a different architecture
-(C2ME mirrors Minecraft function-by-function; this mod uses a
-precomputed-table + GPU-scan design). Where the two look similar
-(e.g. `fastInverseSqrt`, `getStructureWeight`), the common source is
-Minecraft's own vanilla code, which both projects independently reproduce.
+一次代码来源审查将本模组的含水层和 Beardifier 实现与 [C2ME](https://modrinth.com/mod/c2me-fabric) 的 OpenCL 加速器进行了比较：没有共享标识符，没有复制的函数，且架构不同（C2ME 逐函数镜像 Minecraft；本模组使用预计算表 + GPU 扫描设计）。在两者看起来相似的地方（例如 `fastInverseSqrt`, `getStructureWeight`），共同的来源是 Minecraft 自己的原版代码，这两个项目都是独立复现的。
 
-Scope note: the review was at the feature/architecture level, not a
-character-by-character diff. Minecraft itself is not redistributed; only
-original code is shipped. See `LICENSE`.
+范围说明：审查是在特性/架构层面进行的，而不是逐字符差异对比。Minecraft 本身不被重新分发；仅提供原创代码。参见 `LICENSE`。
 
 ---
 
-## License
+## 许可证
 
-MIT — see [LICENSE](LICENSE).
+MIT — 参见 [LICENSE](LICENSE)。

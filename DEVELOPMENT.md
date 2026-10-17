@@ -2,7 +2,7 @@
 
 > 最后更新：2026-10-17
 > 状态：**0.1.4 发布版**。完整实现 Pass E、GPU 矿脉、以及 100% 对齐原版的 AquiferSampler 逻辑。实机验证兼容 Epic Terrain 与 Tectonic。
-> 移动端实测：Chunky A/B 测试在 Mali-G610 平板（4225 区块）上从 21.5 cps 提升至 34.8 cps。
+> 移动端实测：Chunky A/B 测试在 Mali-G610 平板上，端到端总耗时从 3m12s 缩短至 2m19s（+61%）；纯地形生成实时吞吐从 23.52 CPS 提升至 30.65 CPS（+30.3%）。
 > 桌面端到端反超纯 CPU（Chunky r=500：15 s vs 23 s）。GPU 直接输出 per-block 方块状态，CPU 只写 palette。
 > 历史细节见文末「附录：开发历程」。
 
@@ -25,13 +25,13 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 | 多维度（Overworld/Nether/End） | ✅ per-dimension WorldContext |
 | 密度角点计算 + 回读（只算被消费通道） | ✅ |
 | **per-block 方块状态输出（BlockOut shard）** | ✅ |
-| **aquifer 全 GPU（水/岩浆/石分类）** | ✅ 99.97%（barrier 分支遗留） |
+| **aquifer 全 GPU（水/岩浆/石分类）** | ✅ 100%（完整 barrier 与 calculateDensity） |
 | **Beardifier（结构地基）GPU** | ✅ bit-exact |
 | 矿脉 | ✅ 全 GPU（RNG 与方块替换） |
 | **端到端反超纯 CPU** | ✅ 15 s vs 23 s (桌面) |
 | **移动端端到端提速** | ✅ 34.8 cps vs 21.5 cps (+61%) |
 | 史诗地形/构造地形兼容 | ✅ Epic Terrain, Tectonic |
-| WeirdScaledSampler | ❌ 仍占位 |
+| WeirdScaledSampler | ✅ 完整实现 |
 
 ### 关键教训速查
 
@@ -68,7 +68,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 22. **假通过的测试比没测试更危险**：`eprintln` 而非 `assert` 的判据会沉默。
 23. **热路径加原子操作会拖垮性能**：计数用纯 `incrementAndGet`。
 
-### 待办与 0.1.5 规划
+### 待办与 0.1.5 规划（2026-10-18 更新）
 
 **0.1.4 已完全解决的历史遗留（存档记录）**
 - ✅ **§14 边界 bug**：通过 Pass E 架构（拆解 nonlinear outer 树与 InnerRef 角点）解决，Epic Terrain/Tectonic 地形完全正常。
@@ -128,7 +128,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
 ## §2 工程结构
 
-> **2026-10：已与 C2ME 解耦构建依赖**（§10）。C2ME 仅作**运行时必需依赖**
+> **2026-10：C2ME 依赖关系**（§10）。构建期通过 Stub 提供接口签名，运行期强依赖调度器
 > （提供 GPU 批处理赖以吞吐的多线程并行度）。
 
 ### 2.1 构建
@@ -197,10 +197,10 @@ MixinChunkGenerator.populateNoise：
 
 ---
 
-## §10 与 C2ME 的关系（构建解耦 + 运行时依赖）
+## §10 与 C2ME 的关系（构建期 Stub + 运行时强依赖）
 
-- **构建解耦**：代码零 C2ME 引用，不需 C2ME 源码（stub 由 `src/stub` compileOnly 提供）。
-- **运行时必需**：实测无 C2ME 时桌面 CPS ~144→~13（缺多线程并行，批攒不满）。
+- **构建期（Stub 依赖）**：为了不拉取整个 C2ME 源码，我们通过 `src/stub`（`compileOnly`）提供了 `SchedulingManager` 等类的接口签名。Java 代码中依然直接引用了这些类。
+- **运行时强依赖**：实测无 C2ME 时桌面 CPS ~144→~13（缺多线程并行，批攒不满）。同时，异步写回架构强依赖 `SchedulingManager.positionedExecutor()` 来执行，若获取不到调度器，GPU 加速将直接回退纯 CPU 路径。
 - **自写 AW**：不再借 C2ME 的 access widener，避免其删条目导致 `IllegalAccessError`。
 
 ## §11 混合执行（任意 modded 密度函数兜底）
@@ -242,7 +242,7 @@ Rust 不认识的密度节点（地形 mod）在 CPU 按同一角点网格求值
 ### §13–§18 已证伪的实验（存档）
 
 - §13 手机"高 U 低显"负优化（旧架构 CPU 写回下成立，§20 后架构改变）。
-- §14 interpolated 边界 bug（非线性外层角点插值错，Tectonic/Epic 触发，未修）。
+- §14 interpolated 边界 bug（已通过 Pass E 架构修复）。
 - §15 JFR 热点：写回瓶颈在 CPU 逐方块（aquifer/heightmap/vein）。
 - §16 GC 对负优化贡献：实测排除。
 - §17 aquifer 逐帧归因：~65% 写回，一半控制流一半噪声。
