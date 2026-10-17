@@ -68,28 +68,29 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 22. **假通过的测试比没测试更危险**：`eprintln` 而非 `assert` 的判据会沉默。
 23. **热路径加原子操作会拖垮性能**：计数用纯 `incrementAndGet`。
 
-### 待办
+### 待办与 0.1.5 规划
 
-- ~~**barrier 噪声分支**（aquifer 99.97%→100%）~~ → **暂不修**（与 §14 Pass E 同类，见下）。
-- ~~**pass B 超安全线**~~ → **已解决（2026-10-17）**：shard B 3084→1771 行。
-  做法不是拆 dispatch（单通道标量输出，拆开要额外 buffer 通信），而是把两处高频
-  内联公式提成 WGSL 函数：`spline_seg`（190 段 ×4 行 → 1 行）与 `octave_stack`
-  （52 个噪声栈 ×13 行 → 1 行）。数学 bit-identical（`numerical_validation_spline`
-  仍为 1.79e-7，实机地形逐块一致），并 bump `LAYOUT_VERSION` 5→6。
-  （注意与 §14 的 Pass E 区分：Pass E 是逐方块求值方案，会让 shard B 涨到 5537 行，最后才做。）
-- ~~**§14 interpolated 边界 bug（Tectonic/Epic 触发）**~~ → **已修复（Pass E 架构）**：
-  `squeeze` 等非线性节点包在 `interpolated` 外层时，MC 是"逐方块 外层(角点插值(内层))"，
-  我们是"角点插值(整棵树)"，不等。现象：浮空水、怪坑、怪地形（滴水石锥症状已由 §22 的
-  Spline n==1 修复消除）。**vanilla 不触发，Tectonic/Epic 触发**。
-  修法（Pass E，**与边界问题一并最后修**）：拦截 MC 的 `DensityInterpolator.fill()`，用 GPU 角点值填充 MC 缓冲，
-  让 MC 自己完成"插值 + 外层求值"。注意树里有 ~8 个 interpolator（含含水层噪声通道），
-  需枚举 + 建实例↔子树映射 + 改 blobify 协议。
-  **不修的原因**：Pass E 实测把 CPS 封顶在 ~150（每 chunk 多一次 98k 逐方块 dispatch，
-  shard B 3084→5537 行，Mali 设备丢失风险），地形收益被性能成本抵消。
-- **aquifer barrier 分支（99.97%→100%）暂不修（2026-10-17 决策）**：与 Pass E 同类。
-  MC 的 `calculateDensity` 需 per-block 采样 barrierNoise（ch0），Tectonic 的 ch0 是
-  90 行结构；BlockOut binding 已满 8/8（铁律 13），加 perm/origins 需重构且 shader
-  逼近 Mali 安全区。收益仅过渡带 0.03% 方块，与 Pass E 一并搁置。
+**0.1.4 已完全解决的历史遗留（存档记录）**
+- ✅ **§14 边界 bug**：通过 Pass E 架构（拆解 nonlinear outer 树与 InnerRef 角点）解决，Epic Terrain/Tectonic 地形完全正常。
+- ✅ **Barrier 噪声与含水层对齐**：完整移植原版 `calculateDensity`（含高度过滤和全局流体判定），彻底告别全水浮岛。
+- ✅ **矿脉全 GPU 化**：完整的 RNG 与矿脉方块替换已实装，无需 CPU 回退。
+- ✅ **Shard B 瘦身**：高频内联公式函数化，从 3084 行降到 1771 行。
+
+**0.1.5 目标：代码整理与用户友好化（进入等 Issue 阶段）**
+- [ ] **代码清洁**：
+  - 清理排查期间留下的历史冗余代码、无用 `#[allow(dead_code)]`。
+  - 审查并移除重复的 `c2me_wgpu.log` 日志写入逻辑（如果有）。
+  - 修复项目内大量的 cargo `unused` 警告。
+- [ ] **用户友好化（UX）**：
+  - 集成 ModMenu（或提供一个配置界面），让用户能可视化开关功能（如矿脉、结构地基等），而不是只能通过环境变量。
+  - 优化聊天栏提示：初次进入世界时友好提示“GPU 加速已启用/回退原因”，避免玩家在不知情的情况下吃 CPU 帧数。
+  - 在模组图标或配置里展示当前运行的 GPU 名称和硬件状态。
+  - 如果可能，提供对 F3 调试屏幕的自定义扩展，显示当前 GPU 生成的 CPS。
+- [ ] **健壮性**：
+  - 增加更多边缘平台（如未测试的 macOS Metal）的预防性回退逻辑。
+  - 统一处理未捕获的 GPU DeviceLost，确保游戏不会因为驱动崩溃而卡死。
+- [ ] **文档梳理**：
+  - 整理目前的 Debug 环境变量说明，把不再使用的变量（如 `MIN_STAGE`）彻底从文档中删除。
 
 ### 环境变量速查
 
