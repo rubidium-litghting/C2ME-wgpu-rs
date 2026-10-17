@@ -131,6 +131,12 @@ it would exclude most mobile GPUs.
 - **Weak/mobile GPUs not yet re-benchmarked** under the block-state
   architecture. The old "queued behind the renderer" caveat applied to the
   previous CPU-write-back design; whether it still holds is unverified.
+- **Non-linear nodes wrapped in `interpolated` (modded terrain only)**:
+  vanilla never triggers this, but terrain mods that wrap a non-linear node
+  (e.g. `squeeze`) *outside* an interpolated sampler can produce floating
+  water or unusual pits/craters. This is a known limitation of the current
+  corner-interpolation architecture, not a vanilla regression — plain and
+  lightly-modded worlds are unaffected.
 
 ---
 
@@ -159,12 +165,9 @@ Set these only when troubleshooting. All of them are read once at startup.
 | `C2ME_WGPU_DEBUG` | any non-empty value | Enables verbose logging: shader-compile timings, pipeline-cache hits/misses, and periodic chunk-per-second (`CPS=`) throughput stats. Written to `<gameDir>/logs/c2me-wgpu.log`. Silent by default. |
 | `C2ME_WGPU_PROFILE` | any non-empty value | Emits per-stage GPU batch timing (encode / submit / readback / decode), aggregated as one averaged line every 64 batches. Written to `<gameDir>/logs/c2me-wgpu.log`. Independent of `C2ME_WGPU_DEBUG`. |
 | `C2ME_VANILLA_REF` | `1` | Skip the GPU entirely, let vanilla generate the chunk, then dump its blocks for offline comparison against GPU output. |
-| `C2ME_DUMP_DENSITY` | `1` | Dump the GPU density values of the chunk at (0, 0). |
 | `C2ME_DUMP_BLOCKS` | `1` | Dump the block states of the chunk at (0, 0), for offline comparison against vanilla. |
 | `C2ME_DUMP_BLOB` | file path | Dump the serialized NoiseRouter blob to the given path. |
-| `C2ME_WGPU_BLOCK_OUT` | `1` | GPU emits per-block block states (core path; on by default in the dev setup). |
-| `C2ME_WGPU_AQUIFER` | `1` | GPU aquifer (water / lava / stone classification). |
-| `C2ME_WGPU_BEARD` | `1` | GPU Beardifier (structure terrain shaping). |
+| `C2ME_DUMP_DIR` | directory | Where the dumps above are written. Defaults to the platform temp dir (`/tmp` on Linux, but Android has none). |
 | `C2ME_WGPU_MAPPED_AT_CREATION` | `0` / `1` | Override how init-time buffers are uploaded. Default is `1` on desktop (fast mapped upload) and `0` on Android (Mali-G610 drivers reject the mapped path). Set `0` to force `queue.write_buffer`, `1` to force the mapped upload. |
 
 The blob dump can also be set with the JVM property `-Dc2me.dumpBlob=<path>`;

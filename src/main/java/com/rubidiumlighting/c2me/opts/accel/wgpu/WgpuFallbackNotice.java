@@ -55,4 +55,23 @@ public final class WgpuFallbackNotice {
     public static String poll() {
         return PENDING.poll();
     }
+
+    /**
+     * Latest periodic CPS line. Kept separate from {@link #PENDING} because
+     * throughput stats repeat: de-duplicating them would swallow every sample
+     * after the first. Only the newest one is retained, so a session with no
+     * chat HUD (or a paused client) never accumulates a backlog.
+     */
+    private static final java.util.concurrent.atomic.AtomicReference<String> LATEST_STATS =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
+    /** Publish the newest stats line for the client to print (if it can). */
+    public static void reportStats(String message) {
+        LATEST_STATS.set(message);
+    }
+
+    /** Return and clear the newest stats line, or {@code null} if none. */
+    public static String pollStats() {
+        return LATEST_STATS.getAndSet(null);
+    }
 }

@@ -99,9 +99,6 @@ public abstract class MixinChunkGenerator {
      *  C2ME's worker pool. This is the only GPU path. Set C2ME_WGPU_ASYNC_SCHED=0
      *  to disable it entirely (GPU off for this run, plain C2ME CPU generation),
      *  useful as an A/B baseline. */
-    /** §23: stage the per-chunk Beardifier table for the GPU. */
-    private static final boolean BEARD_GPU =
-            "1".equals(System.getenv("C2ME_WGPU_BEARD"));
 
     /** §23: dump Beardifier pieces/junctions + per-block beard reference. */
     private static final boolean DUMP_BEARD =
@@ -110,9 +107,6 @@ public abstract class MixinChunkGenerator {
     private static final java.util.concurrent.atomic.AtomicBoolean BEARD_DUMPED =
             new java.util.concurrent.atomic.AtomicBoolean(false);
 
-    /** §22 Step B: stage the per-chunk aquifer table for the GPU. */
-    private static final boolean AQ_GPU =
-            "1".equals(System.getenv("C2ME_WGPU_AQUIFER"));
 
     private static final boolean ASYNC_SCHED =
             !"0".equals(System.getenv("C2ME_WGPU_ASYNC_SCHED"));
@@ -183,14 +177,19 @@ public abstract class MixinChunkGenerator {
                             ((NoiseChunkGeneratorInvoker) (Object) gen)
                                     .callCreateChunkNoiseSampler(cs, fSa, fBlender, fNc));
             final net.minecraft.world.gen.chunk.AquiferSampler aquifer = sampler.getAquiferSampler();
-            if (AQ_GPU) {
-                try {
-                    stageAquiferForGpu(ds, chunk, aquifer);
-                } catch (Throwable t) {
-                    LOGGER.warn("[c2me-wgpu] aquifer stage failed", t);
-                }
+            // Aquifer table is mandatory: the BlockOut shader classifies
+            // water/lava/stone from these cells. Without it every block below
+            // sea level falls through to the "no cell found -> stone" branch.
+            try {
+                stageAquiferForGpu(ds, chunk, aquifer);
+            } catch (Throwable t) {
+                LOGGER.warn("[c2me-wgpu] aquifer stage failed", t);
             }
-            if (BEARD_GPU) {
+            try { maybeDumpChunkRef(chunk, ds, ds.rawRouter, noiseConfig); }
+            catch (Throwable t) { LOGGER.warn("[c2me-wgpu] chunk-ref dump failed", t); }
+            // Beardifier table is mandatory: structures shape the terrain
+            // through it; without it buildings float / sink.
+            {
                 try {
                     stageBeardForGpu(ds, chunk, structureAccessor);
                 } catch (Throwable t) {
@@ -215,12 +214,11 @@ public abstract class MixinChunkGenerator {
                     BEARD_DUMPED.set(false);
                 }
             }
-            net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler fullBss =
-                    ((ChunkNoiseSamplerAccessor) (Object) sampler).getBlockStateSampler();
-            net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler veinOnly =
-                    extractOreVeinSampler(fullBss);
-            final net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler oreVein =
-                    (veinOnly != null) ? veinOnly : fullBss;
+            // NOTE: the CPU ore-vein sampler used to be pulled out here for the
+            // removed density write-back path. `sampler.getBlockStateSampler()`
+            // re-runs the aquifer with raw density (a side effect) and is now
+            // pure overhead, so it is gone. `extractOreVeinSampler` is kept for
+            // the upcoming GPU vein work.
 
             // ── async scheduling path (§18.6b) ───────────────────
             // If enabled and we can reach C2ME's SchedulingManager, submit the
@@ -247,8 +245,8 @@ public abstract class MixinChunkGenerator {
                             // ScheduledTask until `result` completes (§18.6b).
                             sched.positionedExecutor(pos).execute(() -> {
                                 try {
-                                    writeDensityToChunk(fChunk, gpu.seg, gpu.blockSeg,
-                                            aquifer, oreVein, gpu.batchIndex, fSa, fDs);
+                                    writeDensityToChunk(fChunk, gpu.blockSeg,
+                                            gpu.batchIndex, fDs);
                                     if (DUMP_BLOCKS) {
                                         maybeDumpBlocks(fChunk, "gpu");
                                     }
@@ -296,6 +294,30 @@ public abstract class MixinChunkGenerator {
     /** Target chunk(s) for block dumping. Default (0,0). Override with
      *  C2ME_DUMP_CHUNK=x,z (or x1,z1,x2,z2 for a rectangle, inclusive). */
     private static final int[] DUMP_CHUNK = parseDumpChunk();
+
+    /** True only when the user explicitly asked for a chunk dump. All the
+     *  diagnostic writers below are gated on this (or on their own DUMP_*
+     *  flag), so a normal session never touches the filesystem. */
+    private static final boolean DUMP_ENABLED = parseDumpEnabled();
+
+    private static boolean parseDumpEnabled() {
+        String v = System.getenv("C2ME_DUMP_CHUNK");
+        return v != null && !v.isBlank();
+    }
+
+    /** Directory for diagnostic dumps. `/tmp` does not exist on Android, so
+     *  default to the platform temp dir; `C2ME_DUMP_DIR` overrides. */
+    private static String dumpDir() {
+        String d = System.getenv("C2ME_DUMP_DIR");
+        if (d != null && !d.isBlank()) return d;
+        String t = System.getProperty("java.io.tmpdir");
+        if (t == null || t.isBlank()) t = ".";
+        // Trailing separators would double up in the concatenations below.
+        while (t.length() > 1 && (t.endsWith("/") || t.endsWith("\\"))) {
+            t = t.substring(0, t.length() - 1);
+        }
+        return t;
+    }
 
     private static int[] parseDumpChunk() {
         String v = System.getenv("C2ME_DUMP_CHUNK");
@@ -429,7 +451,7 @@ public abstract class MixinChunkGenerator {
                     }
                 }
             }
-            String path = "/tmp/chunk_blocks_" + mode
+            String path = dumpDir() + "/chunk_blocks_" + mode
                     + "_" + cx + "_" + cz + ".txt";
             java.nio.file.Files.writeString(java.nio.file.Path.of(path), sb.toString());
             LOGGER.info("[c2me-wgpu] dumped {} block states ({} blocks) to {}",
@@ -453,9 +475,19 @@ public abstract class MixinChunkGenerator {
         final int minY = ds.minY;
         BlockState stone = ds.defaultBlock;
         BlockState air = Blocks.AIR.getDefaultState();
-        // §22 GPU state codes: 0=air, 1=stone, 2=water, 3=lava.
+        // GPU state codes:
+        //   0=air 1=stone 2=water 3=lava
+        //   4=granite 5=tuff 6=copper_ore 7=raw_copper_block
+        //   8=deepslate_iron_ore 9=raw_iron_block
+        // 4..9 are ore-vein outputs (OreVeinSampler.VeinType).
         BlockState water = Blocks.WATER.getDefaultState();
         BlockState lava = Blocks.LAVA.getDefaultState();
+        BlockState granite = Blocks.GRANITE.getDefaultState();
+        BlockState tuff = Blocks.TUFF.getDefaultState();
+        BlockState copperOre = Blocks.COPPER_ORE.getDefaultState();
+        BlockState rawCopper = Blocks.RAW_COPPER_BLOCK.getDefaultState();
+        BlockState ironOre = Blocks.DEEPSLATE_IRON_ORE.getDefaultState();
+        BlockState rawIron = Blocks.RAW_IRON_BLOCK.getDefaultState();
         Heightmap oceanFloorWg = chunk.getHeightmap(Heightmap.Type.OCEAN_FLOOR_WG);
         Heightmap worldSurfaceWg = chunk.getHeightmap(Heightmap.Type.WORLD_SURFACE_WG);
         java.nio.ByteBuffer bb = blockSeg.asByteBuffer();
@@ -476,9 +508,17 @@ public abstract class MixinChunkGenerator {
                     int idx = bx + bz * 16 + by * 256;
                     int v = bb.getInt((int) (base + (long) idx * 4));
                     if (v == 0) continue;           // air
-                    BlockState bs = (v == 2) ? water
-                                  : (v == 3) ? lava
-                                  : stone;
+                    BlockState bs = switch (v) {
+                        case 2 -> water;
+                        case 3 -> lava;
+                        case 4 -> granite;
+                        case 5 -> tuff;
+                        case 6 -> copperOre;
+                        case 7 -> rawCopper;
+                        case 8 -> ironOre;
+                        case 9 -> rawIron;
+                        default -> stone;
+                    };
                     sec.setBlockState(bx, ly, bz, bs);
                     oceanFloorWg.trackUpdate(bx, globalY, bz, bs);
                     worldSurfaceWg.trackUpdate(bx, globalY, bz, bs);
@@ -487,336 +527,28 @@ public abstract class MixinChunkGenerator {
         }
     }
 
-    private static void writeDensityToChunk(Chunk chunk, java.lang.foreign.MemorySegment seg,
+    /** §20: the ONLY GPU write-back path. The GPU emits one block-state
+     *  byte (0=air,1=stone,2=water,3=lava) per block; this copies them into
+     *  the chunk palette and keeps the two WG heightmaps in sync.
+     *
+     *  The former "GPU density only, MC trilinear + aquifer + vein on the
+     *  CPU" path was removed: §20 measured it as a net loss (CPU write-back
+     *  pinned CPS at ~150 on desktop, ~6 on mobile). Ore veins are not yet
+     *  emitted by the GPU — see the GPU-vein TODO.
+     *
+     *  `blockSeg` is null only if the BlockOut shard produced no blob (should
+     *  not happen now that it is on by default); we log and leave the chunk
+     *  empty rather than crashing the world. */
+    private static void writeDensityToChunk(Chunk chunk,
                                             java.lang.foreign.MemorySegment blockSeg,
-                                            net.minecraft.world.gen.chunk.AquiferSampler aquifer,
-                                            net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler oreVein,
-                                            int batchIndex,
-                                            StructureAccessor structureAccessor,
-                                            DimState ds) {
-        // §20 minimal loop: if the GPU produced per-block state bytes, write
-        // those directly (the GPU already did the d>0 decision). This skips
-        // the CPU trilinear interp + aquifer entirely.
-        if (blockSeg != null) {
-            writeBlocksFromGpu(chunk, blockSeg, batchIndex, ds);
+                                            int batchIndex, DimState ds) {
+        if (blockSeg == null) {
+            LOGGER.error("[c2me-wgpu] BlockOut produced no block blob for chunk {} {} "
+                    + "— chunk left empty (block_out shard missing?)",
+                    chunk.getPos().x, chunk.getPos().z);
             return;
         }
-        // Rust now copies out only the two consumed channels
-        // (finalDensity -> slot 0, veinToggle -> slot 1); the other 14 are
-        // never read back. See executor.rs OUT_CHANNELS.
-        final int CHANNEL = 0;                  // finalDensity
-        final int CELLS_X = ds.gridX;
-        final int CELLS_Y = ds.gridY;
-        final int CELLS_Z = ds.gridZ;
-        final int CELLS_PER_CHANNEL = CELLS_X * CELLS_Y * CELLS_Z;
-        final int PAYLOAD_BASE = 0x88;
-        final int CELL_W = ds.cellW;
-        final int CELL_H = ds.cellH;
-        final int MIN_Y = ds.minY;
-        final int OUT_CHANNELS = 2;
-
-        // Blob layout (multi-chunk): payload = chunk0[2 channels][CPC],
-        // chunk1[2 channels][CPC], ... The header channel_offsets only
-        // describe chunk 0, so chunk i's channel c lives at
-        //   PAYLOAD_BASE + i * 2 * CPC * 4 + c * CPC * 4
-        long chunkStride = (long) OUT_CHANNELS * CELLS_PER_CHANNEL * 4;
-        long need = PAYLOAD_BASE + (long) batchIndex * chunkStride
-                + (long) (CHANNEL + 1) * CELLS_PER_CHANNEL * 4;
-        if (seg.byteSize() < need) {
-            return;
-        }
-
-        java.nio.ByteBuffer bb = seg.asByteBuffer();
-        bb.order(java.nio.ByteOrder.LITTLE_ENDIAN);
-        int base = (int) (PAYLOAD_BASE + (long) batchIndex * chunkStride
-                + CHANNEL * CELLS_PER_CHANNEL * 4);
-
-        final long tWriteStart = PROFILE ? System.nanoTime() : 0L;
-        final int startX = chunk.getPos().getStartX();
-        final int startZ = chunk.getPos().getStartZ();
-
-        BlockState stone = ds.defaultBlock;   // dim-specific solid (stone/netherrack/end_stone)
-        BlockState air = Blocks.AIR.getDefaultState();
-        Heightmap oceanFloorWg = chunk.getHeightmap(Heightmap.Type.OCEAN_FLOOR_WG);
-        Heightmap worldSurfaceWg = chunk.getHeightmap(Heightmap.Type.WORLD_SURFACE_WG);
-
-        StringBuilder densityDump = null;
-        StringBuilder aqBlocksDump = null;
-        if (DUMP_AQ_BLOCKS
-                && chunk.getPos().x >= DUMP_CHUNK[0] && chunk.getPos().x <= DUMP_CHUNK[2]
-                && chunk.getPos().z >= DUMP_CHUNK[1] && chunk.getPos().z <= DUMP_CHUNK[3]) {
-            aqBlocksDump = new StringBuilder();
-        }
-        if (DUMP_DENSITY
-                && chunk.getPos().x >= DUMP_CHUNK[0] && chunk.getPos().x <= DUMP_CHUNK[2]
-                && chunk.getPos().z >= DUMP_CHUNK[1] && chunk.getPos().z <= DUMP_CHUNK[3]) {
-            densityDump = new StringBuilder();
-        }
-
-        // MC's real "Beardifier": shapes terrain around structures (flattens
-        // / buries under villages so houses sit in the ground). The GPU
-        // density lacks it, so structures floated/sank. Reuse MC's own
-        // Only build the (expensive) structure-weight sampler when this chunk
-        // actually contains a structure whose terrain adaptation is not NONE.
-        // Vanilla's own predicate is `s.getTerrainAdaptation() != NONE` (see
-        // StructureWeightSampler.method_42696); matching it exactly is what lets
-        // us skip ~98k sample() calls on structure-free chunks. Using `s -> true`
-        // here pulled in NONE-adaptation structures and effectively never skipped.
-        boolean chunkHasStructure = !structureAccessor
-                .getStructureStarts(chunk.getPos(),
-                        s -> s.getTerrainAdaptation()
-                                != net.minecraft.world.gen.StructureTerrainAdaptation.NONE)
-                .isEmpty();
-        StructureWeightSampler structureWeight = chunkHasStructure
-                ? StructureWeightSampler.createStructureWeightSampler(
-                        structureAccessor, chunk.getPos())
-                : null;
-
-        float dmin = Float.POSITIVE_INFINITY, dmax = Float.NEGATIVE_INFINITY;
-        int stoneCells = 0, airCells = 0;
-        int aqCalls = 0;
-        // Sample every 16th aquifer call to estimate its cost without
-        // wrecking JIT inlining of the hot block loop.
-        int aqProbeCounter = 0;
-        long aqProbeNanos = 0L;
-        int aqProbeCalls = 0;
-
-        // Precompute all cell values so we can trilinearly interpolate.
-        float[] cells = new float[CELLS_PER_CHANNEL];
-        for (int i = 0; i < CELLS_PER_CHANNEL; i++) {
-            float d = bb.getFloat(base + i * 4);
-            cells[i] = d;
-            if (d < dmin) dmin = d;
-            if (d > dmax) dmax = d;
-            if (d > 0.0f) stoneCells++; else airCells++;
-        }
-        // veinToggle (ch12) corner cells — used only as a cheap coarse filter
-        // for ore veins (the real vein logic is per-block + randomised).
-        final int CHANNEL_VT = 1;
-        int vtBase = (int) (PAYLOAD_BASE + (long) batchIndex * chunkStride
-                + CHANNEL_VT * CELLS_PER_CHANNEL * 4);
-        float[] vtCells = new float[CELLS_PER_CHANNEL];
-        for (int i = 0; i < CELLS_PER_CHANNEL; i++) vtCells[i] = bb.getFloat(vtBase + i * 4);
-        // Block-level trilinear interpolation.
-        //
-        // MC's ChunkNoiseSampler evaluates the density at every BLOCK via
-        // trilinear interpolation of cell-corner samples. We only have one
-        // value per cell (4x4x4 blocks), so we approximate: treat each
-        // cell's value as its center sample and interpolate per block
-        // between the two neighbouring cells in each axis. Without this,
-        // an entire 4x4x4 cell flips between stone/air at once, which
-        // fills the top few blocks of every ocean cell with stone.
-        // Reusable noise position — one allocation per chunk instead of one
-        // per block (~131k/chunk). See MutableNoisePos.
-        final com.rubidiumlighting.c2me.opts.accel.wgpu.MutableNoisePos mutablePos =
-                new com.rubidiumlighting.c2me.opts.accel.wgpu.MutableNoisePos();
-
-        for (int by = 0; by < ds.height; by++) {
-            int globalY = MIN_Y + by;
-            int secIdx = chunk.getSectionIndex(globalY);
-            if (secIdx < 0 || secIdx >= chunk.getSectionArray().length) continue;
-            ChunkSection sec = chunk.getSection(secIdx);
-
-            // Cell values are CENTER samples: cell (i,j,k) covers blocks
-            // [4i, 4i+4) etc, centre at block 4i+2. A block bx in cell units
-            // (centre at integer) sits at `bx/4 - 0.5`; floor gives the
-            // lower cell, fraction the weight toward the upper one.
-            // Cell values are CORNER samples: cell i covers blocks
-            // [4i, 4i+4); its value is the density at block 4i. Interpolate
-            // between corner[i] and corner[i+1] with weight (b%4)/4.
-            int iy = by / CELL_H;
-            int cy0 = iy, cy1 = iy + 1;
-            float ty = (by % CELL_H) / (float) CELL_H;
-
-            for (int bz = 0; bz < 16; bz++) {
-                int iz = bz / CELL_W;
-                int cz0 = iz, cz1 = iz + 1;
-                float tz = (bz % CELL_W) / (float) CELL_W;
-
-                for (int bx = 0; bx < 16; bx++) {
-                    int ix = bx / CELL_W;
-                    int cx0 = ix, cx1 = ix + 1;
-                    float tx = (bx % CELL_W) / (float) CELL_W;
-
-                    // cellAt() linearly extrapolates past the grid edge, so
-                    // the last cell of a chunk is NOT flat — that flat strip
-                    // was the visible chunk-boundary seam.
-                    float c000 = cells[cx0 + cz0 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
-                    float c100 = cells[cx1 + cz0 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
-                    float c010 = cells[cx0 + cz0 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
-                    float c110 = cells[cx1 + cz0 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
-                    float c001 = cells[cx0 + cz1 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
-                    float c101 = cells[cx1 + cz1 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
-                    float c011 = cells[cx0 + cz1 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
-                    float c111 = cells[cx1 + cz1 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
-
-                    float x00 = c000 + tx * (c100 - c000);
-                    float x10 = c010 + tx * (c110 - c010);
-                    float x01 = c001 + tx * (c101 - c001);
-                    float x11 = c011 + tx * (c111 - c011);
-                    float y0 = x00 + ty * (x10 - x00);
-                    float y1 = x01 + ty * (x11 - x01);
-                    float d = y0 + tz * (y1 - y0);
-
-                    // Let MC's aquifer decide: null = solid (stone),
-                    // otherwise water / lava / air per local fluid level.
-                    com.rubidiumlighting.c2me.opts.accel.wgpu.MutableNoisePos npos =
-                            mutablePos.set(startX + bx, globalY, startZ + bz);
-                    // Beard is applied PER BLOCK (not at cell corners):
-                    // MC's mapAll swaps Beardifier for StructureWeightSampler
-                    // as a direct density node, so it is NOT trilinearly
-                    // interpolated. Doing so flattened the structure
-                    // foundations and made buildings float again.
-                    double beard = (structureWeight != null)
-                            ? structureWeight.sample(npos) : 0.0;
-                    BlockState bs;
-                    if (PROFILE && (aqProbeCounter & 15) == 0) {
-                        long tAq = System.nanoTime();
-                        bs = aquifer.apply(npos, (double) d + beard);
-                        aqProbeNanos += System.nanoTime() - tAq;
-                        aqProbeCalls++;
-                    } else {
-                        bs = aquifer.apply(npos, (double) d + beard);
-                    }
-                    aqProbeCounter++;
-                    if (PROFILE) aqCalls++;
-                    if (bs == null) {
-                        // Solid. Ore veins are per-block + randomised, so they
-                        // cannot live on the corner grid. Only compute the
-                        // veinToggle filter for solid blocks inside the vein Y
-                        // band (copper 0..48, iron -60..-8 -> use -64..56);
-                        // everything else skips the interpolation entirely.
-                        BlockState vein = null;
-                        if (oreVein != null && globalY >= -64 && globalY <= 56) {
-                            float v000 = vtCells[cx0 + cz0 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
-                            float v100 = vtCells[cx1 + cz0 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
-                            float v010 = vtCells[cx0 + cz0 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
-                            float v110 = vtCells[cx1 + cz0 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
-                            float v001 = vtCells[cx0 + cz1 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
-                            float v101 = vtCells[cx1 + cz1 * CELLS_X + cy0 * CELLS_X * CELLS_Z];
-                            float v011 = vtCells[cx0 + cz1 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
-                            float v111 = vtCells[cx1 + cz1 * CELLS_X + cy1 * CELLS_X * CELLS_Z];
-                            float vx00 = v000 + tx * (v100 - v000);
-                            float vx10 = v010 + tx * (v110 - v010);
-                            float vx01 = v001 + tx * (v101 - v001);
-                            float vx11 = v011 + tx * (v111 - v011);
-                            float vy0 = vx00 + ty * (vx10 - vx00);
-                            float vy1 = vx01 + ty * (vx11 - vx01);
-                            float vt = vy0 + tz * (vy1 - vy0);
-                            // MC's real gate is |veinToggle| + yClamp < 0.4
-                            // -> skip. Interpolated vt is smoothed, so use a
-                            // matching 0.4 threshold; this keeps oreCalls low.
-                            if (Math.abs(vt) >= 0.4f) {
-                                vein = oreVein.sample(npos);
-                                // Guard: if extraction fell back to the
-                                // chained source, its aquifer stage can return
-                                // air/water (re-evaluated with raw density).
-                                // OreVeinSampler never returns those.
-                                if (vein != null && (vein.isAir()
-                                        || vein.isOf(Blocks.WATER)
-                                        || vein.isOf(Blocks.LAVA))) {
-                                    vein = null;
-                                }
-                            }
-                        }
-                        bs = (vein != null) ? vein : stone;
-                    }
-                    if (densityDump != null) {
-                        int lx0 = bx & 15, lz0 = bz & 15;
-                        densityDump.append(lx0).append(' ').append(globalY).append(' ')
-                          .append(lz0).append(' ').append((double) d + beard)
-                          .append(' ')
-                          .append(bs == air ? "air"
-                              : net.minecraft.registry.Registries.BLOCK
-                                  .getId(bs.getBlock()).toString())
-                          .append('\n');
-                    }
-        if (aqBlocksDump != null) {
-                        aqBlocksDump.append(startX + bx).append(' ')
-                          .append(globalY).append(' ')
-                          .append(startZ + bz).append(' ')
-                          .append((double) d + beard).append(' ')
-                          .append(bs == air ? "air"
-                              : net.minecraft.registry.Registries.BLOCK
-                                  .getId(bs.getBlock()).toString())
-                          .append('\n');
-                    }
-                    if (bs == air) continue;
-                    int lx = bx & 15;
-                    int ly = globalY & 15;
-                    int lz = bz & 15;
-                    sec.setBlockState(lx, ly, lz, bs);
-                    // Vanilla tracks both WG heightmaps right after writing.
-                    // Skipping this left structure placement (villages!) with
-                    // a stale surface height, so buildings floated.
-                    oceanFloorWg.trackUpdate(lx, globalY, lz, bs);
-                    worldSurfaceWg.trackUpdate(lx, globalY, lz, bs);
-                }
-            }
-        }
-
-
-
-        if (PROFILE) {
-            long totalUs = (System.nanoTime() - tWriteStart) / 1_000L;
-            profileCpuAccumulate(totalUs);
-        }
-
-        if (densityDump != null) {
-            try {
-                java.nio.file.Files.writeString(
-                        java.nio.file.Path.of("/tmp/chunk_density_gpu_"
-                                + chunk.getPos().x + "_" + chunk.getPos().z + ".txt"),
-                        densityDump.toString());
-                LOGGER.info("[c2me-wgpu] dumped GPU density ({} blocks)",
-                        densityDump.length());
-            } catch (Throwable t) {
-                LOGGER.warn("[c2me-wgpu] density dump failed", t);
-            }
-        }
-
-        if (DUMP_AQ_BLOCKS
-                && chunk.getPos().x >= DUMP_CHUNK[0] && chunk.getPos().x <= DUMP_CHUNK[2]
-                && chunk.getPos().z >= DUMP_CHUNK[1] && chunk.getPos().z <= DUMP_CHUNK[3]) {
-            try {
-                StringBuilder cb = new StringBuilder();
-                cb.append("CHUNK ").append(chunk.getPos().x).append(' ')
-                  .append(chunk.getPos().z).append('\n');
-                cb.append("GRID ").append(CELLS_X).append(' ').append(CELLS_Y)
-                  .append(' ').append(CELLS_Z).append(' ').append(CELL_W)
-                  .append(' ').append(CELL_H).append(' ').append(MIN_Y).append('\n');
-                for (int i = 0; i < CELLS_PER_CHANNEL; i++) {
-                    cb.append(i).append(' ').append(cells[i]).append('\n');
-                }
-                java.nio.file.Files.writeString(
-                        java.nio.file.Path.of("/tmp/aq_corners_"
-                                + chunk.getPos().x + "_" + chunk.getPos().z + ".txt"),
-                        cb.toString());
-                LOGGER.info("[c2me-wgpu] dumped ch11 corners ({} cells)", CELLS_PER_CHANNEL);
-            } catch (Throwable t) {
-                LOGGER.warn("[c2me-wgpu] corner dump failed", t);
-            }
-        }
-
-        if (aqBlocksDump != null) {
-            try {
-                java.nio.file.Files.writeString(
-                        java.nio.file.Path.of("/tmp/aq_blocks_"
-                                + chunk.getPos().x + "_" + chunk.getPos().z + ".txt"),
-                        aqBlocksDump.toString());
-                LOGGER.info("[c2me-wgpu] dumped per-block aquifer ref ({} blocks)",
-                        aqBlocksDump.length());
-            } catch (Throwable t) {
-                LOGGER.warn("[c2me-wgpu] aq block dump failed", t);
-            }
-        }
-
-        if (DUMP_AQUIFER
-                && chunk.getPos().x >= DUMP_CHUNK[0] && chunk.getPos().x <= DUMP_CHUNK[2]
-                && chunk.getPos().z >= DUMP_CHUNK[1] && chunk.getPos().z <= DUMP_CHUNK[3]) {
-            dumpAquifer(chunk, ds.worldHandle, aquifer, ds.rawRouter);
-        }
-
+        writeBlocksFromGpu(chunk, blockSeg, batchIndex, ds);
     }
 
     /** §20 reference: dump the aquifer per-cell table so the GPU reimplementation
@@ -931,7 +663,7 @@ public abstract class MixinChunkGenerator {
                 }
             }
             java.nio.file.Files.writeString(
-                    java.nio.file.Path.of("/tmp/beard_" + chunk.getPos().x + "_"
+                    java.nio.file.Path.of(dumpDir() + "/beard_" + chunk.getPos().x + "_"
                             + chunk.getPos().z + ".txt"), sb.toString());
             LOGGER.info("[c2me-wgpu] dumped beard ref ({} pieces, {} junc)", np, nj);
         } catch (Throwable t) {
@@ -1070,7 +802,7 @@ public abstract class MixinChunkGenerator {
                     tb.putInt(ly); tb.putInt(sc);
                 }
                 byte[] arr = tb.array();
-                java.nio.file.Files.write(java.nio.file.Path.of("/tmp/aquifer_table_"
+                java.nio.file.Files.write(java.nio.file.Path.of(dumpDir() + "/aquifer_table_"
                         + chunk.getPos().x + "_" + chunk.getPos().z + ".bin"), arr);
                 if (worldHandle != 0L) {
                     WgpuThinBinding.setAquiferTable(worldHandle,
@@ -1092,7 +824,7 @@ public abstract class MixinChunkGenerator {
                   .append(none ? "none" : (bx + " " + by + " " + bz)).append(' ')
                   .append(y).append(' ').append(state).append('\n');
             }
-            String path = "/tmp/aquifer_" + chunk.getPos().x + "_" + chunk.getPos().z + ".txt";
+            String path = dumpDir() + "/aquifer_" + chunk.getPos().x + "_" + chunk.getPos().z + ".txt";
             java.nio.file.Files.writeString(java.nio.file.Path.of(path), sb.toString());
             LOGGER.info("[c2me-wgpu] dumped aquifer table ({} cells) to {}", wl.length, path);
 
@@ -1149,7 +881,7 @@ public abstract class MixinChunkGenerator {
                         : net.minecraft.registry.Registries.BLOCK.getId(lvl.state.getBlock()).toString())
                   .append('\n');
             }
-            String nbPath = "/tmp/aquifer_noise_" + chunk.getPos().x + "_" + chunk.getPos().z + ".txt";
+            String nbPath = dumpDir() + "/aquifer_noise_" + chunk.getPos().x + "_" + chunk.getPos().z + ".txt";
             java.nio.file.Files.writeString(java.nio.file.Path.of(nbPath), nb.toString());
             LOGGER.info("[c2me-wgpu] dumped aquifer noise inputs to {}", nbPath);
 
@@ -1168,7 +900,7 @@ public abstract class MixinChunkGenerator {
                 sh.append(cx).append(' ').append(cz).append(' ')
                   .append(e.getIntValue()).append('\n');
             }
-            String shPath = "/tmp/aquifer_surfaces_" + chunk.getPos().x + "_" + chunk.getPos().z + ".txt";
+            String shPath = dumpDir() + "/aquifer_surfaces_" + chunk.getPos().x + "_" + chunk.getPos().z + ".txt";
             java.nio.file.Files.writeString(java.nio.file.Path.of(shPath), sh.toString());
             LOGGER.info("[c2me-wgpu] dumped surface-height cache ({} columns) to {}",
                     shCache.size(), shPath);
@@ -1256,6 +988,26 @@ public abstract class MixinChunkGenerator {
                 WgpuThinBinding.setAquiferMode(world, settings.hasAquifers(),
                         settings.seaLevel(), dfl, -54);
             }
+            // Ore-vein RNG seed: RandomSplitter exposes it through the public
+            // addDebugInfo() hook (no reflection on obfuscated fields).
+            if (settings.oreVeins()) {
+                try {
+                    StringBuilder sb = new StringBuilder();
+                    noiseConfig.getOreRandomDeriver().addDebugInfo(sb);
+                    java.util.regex.Matcher m = java.util.regex.Pattern
+                            .compile("seedLo: (-?\\d+), seedHi: (-?\\d+)")
+                            .matcher(sb);
+                    if (m.find()) {
+                        WgpuThinBinding.setOreSeed(world,
+                                Long.parseLong(m.group(1)), Long.parseLong(m.group(2)));
+                        LOGGER.info("[c2me-wgpu] ore-vein seed staged");
+                    } else {
+                        LOGGER.warn("[c2me-wgpu] could not parse ore seed from '{}'", sb);
+                    }
+                } catch (Throwable t) {
+                    LOGGER.warn("[c2me-wgpu] ore seed staging failed", t);
+                }
+            }
             java.util.List<net.minecraft.world.gen.densityfunction.DensityFunction> extNodes =
                     new java.util.ArrayList<>(NoiseRouterBlobifier.EXTERNAL_NODES);
             if (!extNodes.isEmpty()) {
@@ -1280,6 +1032,218 @@ public abstract class MixinChunkGenerator {
     /** Optional diagnostic: dump the router blob and a per-channel corner
      *  reference grid when a dump marker / system property is set. No-op
      *  otherwise (this is the source of src/test/resources/real_router.bin). */
+    private static final java.util.concurrent.atomic.AtomicBoolean CHUNK_REF_DUMPED =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** Dump the corner reference for the first chunk inside C2ME_DUMP_CHUNK,
+     *  using the SAME decompiled tree as the blob (the `router` argument). */
+    private static void maybeDumpChunkRef(Chunk chunk, DimState ds, NoiseRouter router,
+                                          NoiseConfig noiseConfig) {
+        if (!DUMP_ENABLED) return;
+        int cx = chunk.getPos().x, cz = chunk.getPos().z;
+        if (cx < DUMP_CHUNK[0] || cx > DUMP_CHUNK[2]
+                || cz < DUMP_CHUNK[1] || cz > DUMP_CHUNK[3]) return;
+        if (!CHUNK_REF_DUMPED.compareAndSet(false, true)) return;
+        try {
+            java.util.LinkedHashMap<String, net.minecraft.world.gen.densityfunction.DensityFunction> chans =
+                    new java.util.LinkedHashMap<>();
+            chans.put("barrierNoise", router.barrierNoise());
+            chans.put("fluidLevelFloodednessNoise", router.fluidLevelFloodednessNoise());
+            chans.put("fluidLevelSpreadNoise", router.fluidLevelSpreadNoise());
+            chans.put("lavaNoise", router.lavaNoise());
+            chans.put("temperature", router.temperature());
+            chans.put("vegetation", router.vegetation());
+            chans.put("continents", router.continents());
+            chans.put("erosion", router.erosion());
+            chans.put("depth", router.depth());
+            chans.put("ridges", router.ridges());
+            chans.put("initialDensityWithoutJaggedness", router.initialDensityWithoutJaggedness());
+            chans.put("finalDensity", router.finalDensity());
+            chans.put("veinToggle", router.veinToggle());
+            chans.put("veinRidged", router.veinRidged());
+            chans.put("veinGap", router.veinGap());
+            StringBuilder sb = new StringBuilder();
+            sb.append("# cx cz startX startZ\n");
+            sb.append("CHUNK ").append(cx).append(' ').append(cz).append('\n');
+            sb.append("DIMS ").append(ds.gridX).append(' ').append(ds.gridY).append(' ').append(ds.gridZ).append('\n');
+            sb.append("CELL_W ").append(ds.cellW).append('\n');
+            sb.append("MIN_Y ").append(ds.minY).append('\n');
+            int sx = chunk.getPos().getStartX();
+            int sz = chunk.getPos().getStartZ();
+            for (var e : chans.entrySet()) {
+                sb.append("CHANNEL ").append(e.getKey()).append('\n');
+                net.minecraft.world.gen.densityfunction.DensityFunction fd = e.getValue();
+                for (int guard = 0; guard < 32; guard++) {
+                    if (fd instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.RegistryEntryHolder h) {
+                        fd = h.function().value();
+                    } else if (fd instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Wrapper w) {
+                        fd = w.wrapped();
+                    } else { break; }
+                }
+                for (int j = 0; j < ds.gridY; j++) {
+                    int wy = ds.minY + j * ds.cellH;
+                    for (int k = 0; k < ds.gridZ; k++) {
+                        int wz = sz + k * ds.cellW;
+                        for (int i = 0; i < ds.gridX; i++) {
+                            int wx = sx + i * ds.cellW;
+                            double v = fd.sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(wx, wy, wz));
+                            sb.append(i).append(' ').append(j).append(' ').append(k).append(' ').append((float) v).append('\n');
+                        }
+                    }
+                }
+            }
+            String rp = dumpDir() + "/ref_chunk_" + cx + "_" + cz + ".txt";
+            java.nio.file.Files.writeString(java.nio.file.Path.of(rp), sb.toString());
+            LOGGER.info("[c2me-wgpu] dumped per-chunk ref (decompiled tree) to {}", rp);
+            // §14 diag: also dump the COMPILED tree's depth, to compare against decompiled.
+            try {
+                NoiseRouter comp = noiseConfig.getNoiseRouter();
+                StringBuilder cb = new StringBuilder();
+                cb.append("CHANNEL depth\n");
+                net.minecraft.world.gen.densityfunction.DensityFunction cfd = comp.depth();
+                for (int guard=0; guard<32; guard++) {
+                    if (cfd instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.RegistryEntryHolder h) cfd=h.function().value();
+                    else if (cfd instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Wrapper w) cfd=w.wrapped();
+                    else break;
+                }
+                for (int j=0;j<ds.gridY;j++){int wy=ds.minY+j*ds.cellH;
+                  for (int k=0;k<ds.gridZ;k++){int wz=sz+k*ds.cellW;
+                    for (int i=0;i<ds.gridX;i++){int wx=sx+i*ds.cellW;
+                      double v=cfd.sample(new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(wx,wy,wz));
+                      cb.append(i).append(' ').append(j).append(' ').append(k).append(' ').append((float)v).append('\n');}}}
+                java.nio.file.Files.writeString(java.nio.file.Path.of(dumpDir() + "/ref_chunk_"+cx+"_"+cz+"_compiled.txt"), cb.toString());
+                LOGGER.info("[c2me-wgpu] dumped COMPILED-tree depth ref to {}/ref_chunk_{}_{}_compiled.txt", dumpDir(), cx, cz);
+            } catch (Throwable t2) { LOGGER.warn("[c2me-wgpu] compiled ref dump failed", t2); }
+            // §14 diag: dump every Spline's locations/derivatives from MC's
+            // decompiled depth tree, to diff against our Rust deserialization.
+            try {
+                final java.util.List<String> sp = new java.util.ArrayList<>();
+                ds.rawRouter.depth().apply(new net.minecraft.world.gen.densityfunction.DensityFunction.DensityFunctionVisitor() {
+                    @Override
+                    public net.minecraft.world.gen.densityfunction.DensityFunction apply(
+                            net.minecraft.world.gen.densityfunction.DensityFunction d) {
+                        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Spline spl) {
+                            try {
+                                Object inner = spl.spline();
+                                if (inner instanceof net.minecraft.util.math.Spline.Implementation<?,?> impl) {
+                                    sp.add(java.util.Arrays.toString(impl.locations())
+                                         + " | " + java.util.Arrays.toString(impl.derivatives()));
+                                } else if (inner instanceof net.minecraft.util.math.Spline.FixedFloatFunction<?,?> f) {
+                                    sp.add("FIXED " + f.value());
+                                }
+                            } catch (Throwable ignore) {}
+                        }
+                        return d;
+                    }
+                });
+                java.nio.file.Files.writeString(java.nio.file.Path.of(dumpDir() + "/mc_depth_splines.txt"),
+                        String.join("\n", sp));
+                LOGGER.info("[c2me-wgpu] dumped {} MC splines to {}/mc_depth_splines.txt", sp.size(), dumpDir());
+            } catch (Throwable t3) { LOGGER.warn("[c2me-wgpu] MC spline dump failed", t3); }
+            // §14 diag: value trace of every depth node at the failing point.
+            try {
+                StringBuilder tb = new StringBuilder();
+                var pos = new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(
+                        sx + 0, ds.minY + 24 * ds.cellH, sz + 0); // cell(0,24,0) world(800,128,800)
+                int[] counter = {0};
+                valueTrace(ds.rawRouter.depth(), pos, tb, 0, counter);
+                java.nio.file.Files.writeString(java.nio.file.Path.of(dumpDir() + "/mc_depth_values.txt"), tb.toString());
+                LOGGER.info("[c2me-wgpu] dumped MC depth value trace ({} lines) to {}/mc_depth_values.txt", counter[0], dumpDir());
+            } catch (Throwable t4) { LOGGER.warn("[c2me-wgpu] MC value trace failed", t4); }
+        } catch (Throwable t) {
+            LOGGER.warn("[c2me-wgpu] per-chunk ref dump failed", t);
+        }
+    }
+
+    private static String resolveType(net.minecraft.world.gen.densityfunction.DensityFunction d) {
+        var T = net.minecraft.world.gen.densityfunction.DensityFunctionTypes.class;
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Constant) return "Const";
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.RangeChoice) return "RangeChoice";
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Spline) return "Spline";
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.YClampedGradient) return "YClamp";
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Noise) return "Noise";
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.ShiftedNoise) return "ShiftedNoise";
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.ShiftA) return "ShiftA";
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.ShiftB) return "ShiftB";
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Shift) return "Shift";
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.UnaryOperation u) {
+            return switch (u.type()) {
+                case ABS -> "Abs"; case SQUARE -> "Square"; case CUBE -> "Cube";
+                case SQUEEZE -> "Squeeze";
+                case HALF_NEGATIVE -> "HalfNeg"; case QUARTER_NEGATIVE -> "QuarterNeg";
+            };
+        }
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Wrapper w) {
+            return switch (w.type()) { case FLAT_CACHE -> "CacheFlat"; case CACHE2D -> "Cache2D";
+                case CACHE_ONCE -> "CacheOnce"; case CACHE_ALL_IN_CELL -> "CacheCell"; case INTERPOLATED -> "Interp"; };
+        }
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.RegistryEntryHolder h) {
+            return "Holder(" + resolveType(h.function().value()) + ")";
+        }
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.LinearOperation lo) {
+            return lo.specificType() == net.minecraft.world.gen.densityfunction.DensityFunctionTypes.LinearOperation.SpecificType.ADD ? "Add" : "Mul";
+        }
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.BinaryOperation bo) {
+            return switch (bo.type()) { case ADD -> "Add"; case MUL -> "Mul"; case MIN -> "Min"; case MAX -> "Max"; };
+        }
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Clamp) return "Clamp";
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.WeirdScaledSampler) return "Weird";
+        return d.getClass().getSimpleName();
+    }
+
+    private static void valueTrace(
+            net.minecraft.world.gen.densityfunction.DensityFunction d,
+            net.minecraft.world.gen.densityfunction.DensityFunction.NoisePos pos,
+            StringBuilder sb, int ind, int[] counter) {
+        // Transparent wrappers our AST does NOT represent (serialized as passthrough).
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.RegistryEntryHolder h) {
+            valueTrace(h.function().value(), pos, sb, ind, counter); return;
+        }
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Wrapper w
+                && (w.type() == net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Wrapping.Type.CACHE_ONCE
+                 || w.type() == net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Wrapping.Type.CACHE_ALL_IN_CELL)) {
+            valueTrace(w.wrapped(), pos, sb, ind, counter); return;
+        }
+        String pad = "  ".repeat(Math.min(ind, 40));
+        double v = d.sample(pos);
+        String tag = resolveType(d);
+        sb.append(pad).append(tag).append(" = ").append(String.format("%.6f", v)).append('\n');
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Spline sp) {
+            try {
+                Object inner = sp.spline();
+                if (inner instanceof net.minecraft.util.math.Spline.Implementation<?,?> impl) {
+                    float[] L = impl.locations();
+                    if (L.length > 0 && Math.abs(L[0] - (-0.45f)) < 1e-4) {
+                        sb.append(pad).append("  [SPLINE-STRUCT] ").append(impl.getDebugString()).append('\n');
+                    }
+                }
+            } catch (Throwable ignore) {}
+        }
+        counter[0]++;
+        if (ind > 300) return;
+        if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.BinaryOperationLike b) {
+            valueTrace(b.argument1(), pos, sb, ind+1, counter);
+            valueTrace(b.argument2(), pos, sb, ind+1, counter);
+        } else if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Unary u) {
+            valueTrace(u.input(), pos, sb, ind+1, counter);
+        } else if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.Wrapper w) {
+            valueTrace(w.wrapped(), pos, sb, ind+1, counter);
+        } else if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.RangeChoice r) {
+            valueTrace(r.input(), pos, sb, ind+1, counter);
+        } else if (d instanceof net.minecraft.world.gen.densityfunction.DensityFunctionTypes.ShiftedNoise sn) {
+            valueTrace(sn.shiftX(), pos, sb, ind+1, counter);
+            valueTrace(sn.shiftY(), pos, sb, ind+1, counter);
+            valueTrace(sn.shiftZ(), pos, sb, ind+1, counter);
+            // noise child (not a DensityFunction; our AST stores it as NoiseSampler)
+            double dx = pos.blockX() * sn.xzScale() + sn.shiftX().sample(pos);
+            double dy = pos.blockY() * sn.yScale() + sn.shiftY().sample(pos);
+            double dz = pos.blockZ() * sn.xzScale() + sn.shiftZ().sample(pos);
+            sb.append("  ".repeat(Math.min(ind+1, 40))).append("Noise = ")
+              .append(String.format("%.6f", sn.noise().sample(dx, dy, dz))).append('\n');
+            counter[0]++;
+        }
+    }
+
     private static void maybeDumpBlobAndRef(NoiseRouter router, NoiseConfig noiseConfig,
                                             Chunk chunk, ByteBuffer blob,
                                             int minY, int height, int cellW, int cellH,
@@ -1311,7 +1275,7 @@ public abstract class MixinChunkGenerator {
               .append(chunk.getPos().z).append('\n');
             sb.append("DIMS ").append(gx).append(" ").append(gy).append(" ").append(gz).append("\n");
             sb.append("CELL_W ").append(cellW).append("\nMIN_Y ").append(minY).append("\n");
-            NoiseRouter CR = noiseConfig.getNoiseRouter();
+            NoiseRouter CR = router;  // §5.8: must match the blob's tree (decompiled), not the compiled router
             java.util.LinkedHashMap<String, net.minecraft.world.gen.densityfunction.DensityFunction> chans =
                     new java.util.LinkedHashMap<>();
             chans.put("barrierNoise", CR.barrierNoise());

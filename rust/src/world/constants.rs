@@ -60,8 +60,10 @@ pub struct WorldgenParams {
     pub batch_count_x: i32,
     pub batch_count_z: i32,
 
-    /// Reserved padding to 64-byte multiple for alignment paranoia.
-    pub _pad: [u32; 8],
+    /// Reserved slots. [0]=external count, [1..5]=aquifer mode,
+    /// [5..9]=ore-vein RNG seed (seedLo.lo, seedLo.hi, seedHi.lo, seedHi.hi).
+    /// Padded to a 64-byte multiple.
+    pub _pad: [u32; 12],
 }
 
 // Three-way offset assertion (called once at startup from Instance creation).
@@ -73,7 +75,9 @@ const _ASSERT_OFFSETS: () = {
     assert!(offset_of!(WorldgenParams, batch_origin_z) == 4);
     assert!(offset_of!(WorldgenParams, cell_width) == 8);
     assert!(offset_of!(WorldgenParams, cell_height) == 12);
-    assert!(std::mem::size_of::<WorldgenParams>() % 64 == 0);
+    // WGSL requires 16-byte alignment for structs containing arrays; 64 was
+    // over-strict and is no longer a multiple once _pad grew to 12.
+    assert!(std::mem::size_of::<WorldgenParams>() % 16 == 0);
 };
 
 // ============================================================================

@@ -65,7 +65,20 @@ pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
     let result = ctx.fresh_var("spline");
 
     if n == 1 {
-        ctx.emit(format!("let {result}: f32 = {};", vs[0]));
+        // MC `Spline$Implementation.apply`: for n==1, k is -1 (t<l0) or
+        // n-1==0 (t>=l0), both route to `outside()`. With derivative d0 that
+        // extrapolates v0 + d0*(t-l0); with d0==0 it is the constant v0.
+        let l0 = locations[0];
+        let d0 = derivatives[0];
+        if d0 == 0.0 {
+            ctx.emit(format!("let {result}: f32 = {};", vs[0]));
+        } else {
+            // Reuse `t` already emitted above (line 57): result = v0 + d0*(t-l0).
+            ctx.emit(format!(
+                "let {result}: f32 = {vs0} + ({d0:.9e}) * ({t} - {l0:.9e});",
+                vs0 = vs[0]
+            ));
+        }
         return Ok(result);
     }
 
@@ -102,10 +115,6 @@ pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
         let vk1 = &vs[k + 1];
         let width = lk1 - lk;
 
-        let p = ctx.fresh_var("sp");
-        let a = ctx.fresh_var("sa");
-        let b = ctx.fresh_var("sb");
-
         if k == 0 {
             ctx.emit(format!("  if ({t} < {lk1:.9e}) {{"));
         } else if k == n - 2 {
@@ -113,11 +122,10 @@ pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
         } else {
             ctx.emit(format!("  else if ({t} < {lk1:.9e}) {{"));
         }
-        ctx.emit(format!("    let {p}: f32 = ({t} - {lk:.9e}) / {width:.9e};"));
-        ctx.emit(format!("    let {a}: f32 = {dk:.9e} * {width:.9e} - ({vk1} - {vk});"));
-        ctx.emit(format!("    let {b}: f32 = ({dk1:.9e}) * -1.0 * {width:.9e} + ({vk1} - {vk});"));
+        // One call instead of four inline lines; spline_seg is bit-identical
+        // to the previous expansion (see math_lib.wgsl).
         ctx.emit(format!(
-            "    {result} = {vk} + {p} * ({vk1} - {vk}) + {p} * (1.0 - {p}) * ({a} + {p} * ({b} - {a}));"
+            "    {result} = spline_seg({t}, {lk:.9e}, {width:.9e}, {dk:.9e}, {dk1:.9e}, {vk}, {vk1});"
         ));
         ctx.emit("  }".to_string());
     }

@@ -108,7 +108,9 @@ pub fn plan_shards(channel_count: usize) -> Vec<Shard> {
     // so ch11 / ch12 still land at their original offsets.
     const FD: usize = 11;  // finalDensity
     const VT: usize = 12;  // veinToggle
-    const VT_END: usize = 13;
+    // Shard C now emits all three ore-vein channels (12/13/14); BlockOut
+    // interpolates their corners to decide vein placement.
+    const VT_END: usize = 15;
     // Small diagnostic / unit-test blobs carry fewer channels than
     // finalDensity's index (11). They cannot use the sharded layout, so
     // fall back to a single all-channel shader — the emitters they
@@ -389,8 +391,15 @@ pub fn emit_shader_for_pass(root: &AstNode, pass: Pass) -> Result<String> {
 /// Emit the shader module for one channel `shard` (see [`Shard`]).
 pub fn emit_shader_for_shard(root: &AstNode, shard: Shard) -> Result<String> {
     if shard.pass == Pass::BlockOut {
-        // Standalone shader: no AST emitters, just bindings + the block entry.
-        let mut out = String::with_capacity(4096);
+        // Standalone shader: no AST emitters. It still gets the pruned math
+        // library, because the ore-vein step needs the Xoroshiro RNG and
+        // (stage 2) per-block noise evaluation.
+        let mut usage = String::with_capacity(8192);
+        usage.push_str(BLOCK_OUT_HEADER);
+        usage.push_str(BLOCK_OUT_ENTRY);
+        let math_lib = emit_pruned_math_lib(&usage);
+        let mut out = String::with_capacity(math_lib.len() + usage.len() + 1024);
+        out.push_str(&math_lib);
         out.push_str(BLOCK_OUT_HEADER);
         out.push_str(BLOCK_OUT_ENTRY);
         return Ok(out);
@@ -491,6 +500,7 @@ const BLOCK_OUT_ENTRY: &str = r#"
 //   [2..2+7*pc] pieces (7 i32: minX,minY,minZ,maxX,maxY,maxZ,adapt,delta),
 //   junctions follow (3 i32 each).
 const BEARD_STRIDE: u32 = 4096u;
+const BEARD_W_OFF: u32 = 13824u; // 24*24*24, beard_w section length
 const ADAPT_BURY: i32 = 1; const ADAPT_THIN: i32 = 2;
 const ADAPT_BOX: i32 = 3; const ADAPT_ENCAP: i32 = 4;
 
@@ -502,22 +512,22 @@ fn beard_gsw(x: i32, y: i32, z: i32, yy: i32) -> f32 {
   // MC uses a double fastInverseSqrt; f32 with exact inverseSqrt is within
   // ~1e-7 relative, negligible for structure shaping.
   let f = -d * inverseSqrt(e / 2.0) / 2.0;
-  return f * beard_w[u32(k * 576 + i * 24 + j)];
+  return f * bitcast<f32>(beard_buf[u32(k * 576 + i * 24 + j)]);
 }
 fn beard_mag(x: f32, y: f32, z: f32) -> f32 {
   let d = sqrt(x * x + y * y + z * z);
   return 1.0 - clamp(d / 6.0, 0.0, 1.0);
 }
 fn beard_sample(base: u32, bx: i32, by: i32, bz: i32) -> f32 {
-  let pc = i32(beard_pj[base]);
-  let jc = i32(beard_pj[base + 1u]);
+  let pc = i32(beard_buf[BEARD_W_OFF + base]);
+  let jc = i32(beard_buf[BEARD_W_OFF + base + 1u]);
   var d = 0.0;
   var o = base + 2u;
   for (var n: i32 = 0; n < pc; n = n + 1) {
-    let minx = i32(beard_pj[o]); let miny = i32(beard_pj[o+1u]);
-    let minz = i32(beard_pj[o+2u]); let maxx = i32(beard_pj[o+3u]);
-    let maxy = i32(beard_pj[o+4u]); let maxz = i32(beard_pj[o+5u]);
-    let ad = i32(beard_pj[o+6u]); let gld = i32(beard_pj[o+7u]);
+    let minx = i32(beard_buf[BEARD_W_OFF + o]); let miny = i32(beard_buf[BEARD_W_OFF + o+1u]);
+    let minz = i32(beard_buf[BEARD_W_OFF + o+2u]); let maxx = i32(beard_buf[BEARD_W_OFF + o+3u]);
+    let maxy = i32(beard_buf[BEARD_W_OFF + o+4u]); let maxz = i32(beard_buf[BEARD_W_OFF + o+5u]);
+    let ad = i32(beard_buf[BEARD_W_OFF + o+6u]); let gld = i32(beard_buf[BEARD_W_OFF + o+7u]);
     o = o + 8u;
     let m = max(0, max(minx - bx, bx - maxx));
     let nn = max(0, max(minz - bz, bz - maxz));
@@ -531,7 +541,7 @@ fn beard_sample(base: u32, bx: i32, by: i32, bz: i32) -> f32 {
     else if (ad == ADAPT_ENCAP) { d = d + beard_mag(f32(m) * 0.5, f32(q) * 0.5, f32(nn) * 0.5) * 0.8; }
   }
   for (var n: i32 = 0; n < jc; n = n + 1) {
-    let sx = i32(beard_pj[o]); let sy = i32(beard_pj[o+1u]); let sz = i32(beard_pj[o+2u]);
+    let sx = i32(beard_buf[BEARD_W_OFF + o]); let sy = i32(beard_buf[BEARD_W_OFF + o+1u]); let sz = i32(beard_buf[BEARD_W_OFF + o+2u]);
     o = o + 3u;
     let r = bx - sx; let l = by - sy; let mm = bz - sz;
     d = d + beard_gsw(r, l, mm, l) * 0.4;
@@ -543,6 +553,64 @@ fn aq_fdiv(a: i32, b: i32) -> i32 {
   let q = a / b; let r = a % b;
   if (r != 0 && ((r < 0) != (b < 0))) { return q - 1; }
   return q;
+}
+
+// ── Ore veins (§24) ─────────────────────────────────────────────────
+// Mirrors net.minecraft.world.gen.OreVeinSampler. Runs on blocks the aquifer
+// already classified as solid (density > 0), optionally replacing them with a
+// vein ore / raw-ore / stone variant.
+
+fn vein_clamped_map(v: f32, from_lo: f32, from_hi: f32, to_lo: f32, to_hi: f32) -> f32 {
+  let t = clamp((v - from_lo) / (from_hi - from_lo), 0.0, 1.0);
+  return t * (to_hi - to_lo) + to_lo;
+}
+
+// Trilinearly interpolate channel at `base` for the current block.
+fn tri_at(base: u32, ix: i32, iy: i32, iz: i32, ccx: i32, s: i32,
+          tx: f32, ty: f32, tz: f32) -> f32 {
+  let c000 = out_buf[base + u32(ix + iz * ccx + iy * s)];
+  let c100 = out_buf[base + u32(ix + 1 + iz * ccx + iy * s)];
+  let c010 = out_buf[base + u32(ix + iz * ccx + (iy + 1) * s)];
+  let c110 = out_buf[base + u32(ix + 1 + iz * ccx + (iy + 1) * s)];
+  let c001 = out_buf[base + u32(ix + (iz + 1) * ccx + iy * s)];
+  let c101 = out_buf[base + u32(ix + 1 + (iz + 1) * ccx + iy * s)];
+  let c011 = out_buf[base + u32(ix + (iz + 1) * ccx + (iy + 1) * s)];
+  let c111 = out_buf[base + u32(ix + 1 + (iz + 1) * ccx + (iy + 1) * s)];
+  let x00 = c000 + tx * (c100 - c000);
+  let x10 = c010 + tx * (c110 - c010);
+  let x01 = c001 + tx * (c101 - c001);
+  let x11 = c011 + tx * (c111 - c011);
+  let y0 = x00 + ty * (x10 - x00);
+  let y1 = x01 + ty * (x11 - x01);
+  return y0 + tz * (y1 - y0);
+}
+
+// 0 = not a vein block (leave as stone); otherwise a block-state code 4..9.
+fn vein_state(wx: i32, wy: i32, wz: i32, vt: f32, vr: f32, vg: f32) -> u32 {
+  let is_copper = vt > 0.0;
+  let min_y: i32 = select(-60, 0, is_copper);
+  let max_y: i32 = select(-8, 50, is_copper);
+  let e = abs(vt);
+  let j = max_y - wy;
+  let k = wy - min_y;
+  if (k < 0 || j < 0) { return 0u; }
+  let l = min(j, k);
+  let f = vein_clamped_map(f32(l), 0.0, 20.0, -0.2, 0.0);
+  if (e + f < 0.4) { return 0u; }
+  // randomDeriver.split(wx, wy, wz): Xoroshiro(hashCode ^ seedLo, seedHi).
+  let h = java_hash3(wx, wy, wz);
+  let m = vec2<u32>(h.x ^ params._pad[5], h.y ^ params._pad[6]);
+  var st: vec4<u32> = vec4<u32>(m.x, m.y, params._pad[7], params._pad[8]);
+  if (xoro_next_float(&st) > 0.7) { return 0u; }
+  if (vr >= 0.0) { return 0u; }
+  let g = vein_clamped_map(e, 0.4, 0.6, 0.1, 0.3);
+  if (xoro_next_float(&st) < g && vg > -0.3) {
+    if (xoro_next_float(&st) < 0.02) {
+      return select(9u, 7u, is_copper);   // raw iron : raw copper
+    }
+    return select(8u, 6u, is_copper);     // deepslate iron : copper ore
+  }
+  return select(5u, 4u, is_copper);       // tuff : granite
 }
 
 @compute @workgroup_size(4, 4, 4)
@@ -603,7 +671,7 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
   var dd = d;
   {
     let bbase = u32(chunk_index) * BEARD_STRIDE;
-    let bcount = beard_pj[bbase];
+    let bcount = beard_buf[BEARD_W_OFF + bbase];
     if (bcount > 0u) { dd = dd + beard_sample(bbase, wx, wy, wz); }
   }
 
@@ -620,8 +688,20 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
     block_buf[bidx] = 0u; return;
   }
 
-  // d > 0 → solid stone (vanilla aquifer returns null).
-  if (dd > 0.0) { block_buf[bidx] = 1u; return; }
+  // d > 0 → solid. MC then lets OreVeinSampler replace solid blocks.
+  if (dd > 0.0) {
+    var st: u32 = 1u;
+    if (params._pad[9] == 1u) {
+      let cbase = u32(chunk_index) * 16u * cpc;
+      let vt = tri_at(cbase + 12u * cpc, ix, iy, iz, ccx, s, tx, ty, tz);
+      let vr = tri_at(cbase + 13u * cpc, ix, iy, iz, ccx, s, tx, ty, tz);
+      let vg = tri_at(cbase + 14u * cpc, ix, iy, iz, ccx, s, tx, ty, tz);
+      let vs = vein_state(wx, wy, wz, vt, vr, vg);
+      if (vs != 0u) { st = vs; }
+    }
+    block_buf[bidx] = st;
+    return;
+  }
 
   // FluidLevelSampler: y < min(-54, seaLevel) → LAVA.
   if (wy < -54) { block_buf[bidx] = 3u; return; }
@@ -630,6 +710,8 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
   let start_y_i = aq_fdiv(min_y_i, 12) - 1;
   let aq_sy = aq_fdiv(min_y_i + height_i, 12) - aq_fdiv(min_y_i, 12) + 3;
   let aq_base = chunk_index * aq_sy * 9; // AQ_SX(3) * AQ_SY * AQ_SZ(3)
+  // aquifer_buf holds aq_p in [0, half) and aq_s in [half, 2*half).
+  let aq_half: u32 = params._pad[10];
 
   let l = aq_fdiv(wx - 5, 16);
   let m = aq_fdiv(wy + 1, 12);
@@ -644,7 +726,7 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
         let k = (n + w) - chunk_cz + 1;
         if (i < 0 || i >= 3 || k < 0 || k >= 3 || j < 0 || j >= aq_sy) { continue; }
         let idx = aq_base + (j * 3 + k) * 3 + i;
-        let cp = aq_p[idx];
+        let cp = aquifer_buf[u32(idx)];
         let ad = cp.x - wx; let ae = cp.y - wy; let af = cp.z - wz;
         let ag = ad * ad + ae * ae + af * af;
         if (o >= ag) { ri = idx; p = o; o = ag; }
@@ -653,18 +735,17 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
   if (ri < 0) { block_buf[bidx] = 1u; return; }
-  let rcly = aq_p[ri].w;
-  block_buf[bidx] = select(0u, aq_s[ri], wy < rcly);
+  let rcly = aquifer_buf[u32(ri)].w;
+  block_buf[bidx] = select(0u, u32(aquifer_buf[aq_half + u32(ri)].x), wy < rcly);
 }
 "#;
 
 /// `C2ME_WGPU_BLOCK_OUT=1` enables the block-output shard (§20 minimal loop).
+/// BlockOut is the only GPU write-back path (the CPU density path was
+/// removed as a measured net loss, §20). It is no longer switchable: a
+/// session without it would write empty chunks.
 pub fn block_out_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("C2ME_WGPU_BLOCK_OUT")
-            .map(|v| !v.is_empty() && v != "0").unwrap_or(false)
-    })
+    true
 }
 
 const MINIMAL_ENTRY: &str = r#"
@@ -693,7 +774,7 @@ struct WorldgenParams {
   height_f:       f32,
   batch_count_x:  i32,
   batch_count_z:  i32,
-  _pad:           array<u32, 8>,
+  _pad:           array<u32, 12>,
 };
 
 @group(0) @binding(0) var<storage, read>        params:       WorldgenParams;
@@ -719,17 +800,21 @@ struct WorldgenParams {
   height_f:       f32,
   batch_count_x:  i32,
   batch_count_z:  i32,
-  _pad:           array<u32, 8>,
+  _pad:           array<u32, 12>,
 };
 
 @group(0) @binding(0) var<storage, read>        params:    WorldgenParams;
 @group(0) @binding(2) var<storage, read_write>  out_buf:   array<f32>;
 @group(0) @binding(4) var<storage, read>        positions: array<i32>;
 @group(0) @binding(7) var<storage, read_write>  block_buf: array<u32>;
-@group(0) @binding(8) var<storage, read>        aq_p:      array<vec4<i32>>;
-@group(0) @binding(9) var<storage, read>        aq_s:      array<u32>;
-@group(0) @binding(10) var<storage, read>       beard_w:   array<f32>;
-@group(0) @binding(11) var<storage, read>       beard_pj:  array<u32>;
+// Bindings are merged to stay within 8 storage buffers:
+//   aquifer_buf = [ aq_p (N x vec4) | aq_s (N x vec4, only .x used) ]
+//   beard_buf   = [ beard_w (13824 u32, bitcast f32) | beard_pj (stride 4096/chunk) ]
+// perm / perm_origin are the same buffers the corner shards use.
+@group(0) @binding(8) var<storage, read>        aquifer_buf: array<vec4<i32>>;
+@group(0) @binding(9) var<storage, read>        beard_buf:   array<u32>;
+@group(0) @binding(10) var<storage, read>       perm:        array<u32>;
+@group(0) @binding(11) var<storage, read>       perm_origin: array<f32>;
 "#;
 
 /// `main_entry` opening (single-pass mode) — sets up `cell_x / cell_y /
@@ -955,10 +1040,13 @@ mod tests {
     fn plan_shards_only_emits_consumed_channels() {
         // Only ch11 (finalDensity) and ch12 (veinToggle) are read back
         // by Java; everything else is dropped to save shader compile time.
+        // BlockOut is on by default, so it always trails the corner shards.
         let shards = plan_shards(16);
-        assert_eq!(shards.len(), 2);
-        assert_eq!((shards[0].pass, shards[0].start, shards[0].end), (Pass::B, 11, 12));
-        assert_eq!((shards[1].pass, shards[1].start, shards[1].end), (Pass::C, 12, 13));
+        let corner: Vec<_> = shards.iter().filter(|s| s.pass != Pass::BlockOut).collect();
+        assert_eq!(corner.len(), 2);
+        assert_eq!((corner[0].pass, corner[0].start, corner[0].end), (Pass::B, 11, 12));
+        assert_eq!((corner[1].pass, corner[1].start, corner[1].end), (Pass::C, 12, 15));
+        assert_eq!(shards.last().unwrap().pass, Pass::BlockOut);
     }
 
     #[test]
@@ -971,16 +1059,20 @@ mod tests {
             assert_eq!(shards.len(), 1, "n={n}");
             assert_eq!((shards[0].pass, shards[0].start, shards[0].end), (Pass::Single, 0, n), "n={n}");
         }
-        // 12 channels: ch11 present, ch12 absent -> shard B only.
-        let twelve = plan_shards(12);
+        // 12 channels: ch11 present, ch12 absent -> shard B only (+ BlockOut).
+        let twelve: Vec<_> = plan_shards(12).into_iter()
+            .filter(|s| s.pass != Pass::BlockOut).collect();
         assert_eq!(twelve.len(), 1);
         assert_eq!((twelve[0].pass, twelve[0].start, twelve[0].end), (Pass::B, 11, 12));
-        // 13+ channels: both ch11 and ch12 -> shards B and C.
+        // 13+ channels: both ch11 and ch12 -> shards B and C (+ BlockOut).
         for n in [13usize, 14, 15, 16] {
-            let shards = plan_shards(n);
+            let shards: Vec<_> = plan_shards(n).into_iter()
+                .filter(|s| s.pass != Pass::BlockOut).collect();
             assert_eq!(shards.len(), 2, "n={n}");
             assert_eq!((shards[0].pass, shards[0].start, shards[0].end), (Pass::B, 11, 12), "n={n}");
-            assert_eq!((shards[1].pass, shards[1].start, shards[1].end), (Pass::C, 12, 13), "n={n}");
+            // Shard C covers all three vein channels, clipped to what exists.
+            assert_eq!((shards[1].pass, shards[1].start, shards[1].end),
+                       (Pass::C, 12, 15.min(n)), "n={n}");
         }
     }
 

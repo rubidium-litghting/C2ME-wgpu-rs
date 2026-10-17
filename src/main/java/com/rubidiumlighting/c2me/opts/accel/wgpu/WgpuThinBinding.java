@@ -58,7 +58,13 @@ public class WgpuThinBinding {
     private static MethodHandle MH_set_aquifer_table;
     private static MethodHandle MH_set_beard_table;
     private static MethodHandle MH_set_aquifer_mode;
+    private static MethodHandle MH_set_ore_seed;
     private static MethodHandle MH_set_log_path;
+
+    /** Non-null when the FFM downcall linking failed (e.g. a symbol is
+     *  missing from the native library). Lets callers report the real cause
+     *  instead of blaming the GPU adapter. */
+    private static String linkError = null;
 
     private static long instanceHandle;
     /** True only if the native lib linked AND a wgpu instance was created. */
@@ -162,6 +168,12 @@ public class WgpuThinBinding {
                             ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT,
                             ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
                             ValueLayout.JAVA_INT));
+            MH_set_ore_seed = NativeLoader.linker.downcallHandle(
+                    NativeLoader.lookup.find("c2me_wgpu_set_ore_seed").orElseThrow(),
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,
+                            ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,
+                            ValueLayout.JAVA_LONG));
             MH_set_beard_table = NativeLoader.linker.downcallHandle(
                     NativeLoader.lookup.find("c2me_wgpu_set_beard_table").orElseThrow(),
                     FunctionDescriptor.of(
@@ -189,6 +201,7 @@ public class WgpuThinBinding {
             );
         } catch (Throwable t) {
             System.err.println("[c2me-wgpu] FFM link failed: " + t);
+            linkError = String.valueOf(t);
             linked = false;
         }
 
@@ -273,6 +286,11 @@ public class WgpuThinBinding {
         return available;
     }
 
+    /** @return the FFM linking failure detail, or {@code null} if linking was fine. */
+    public static String getLinkError() {
+        return linkError;
+    }
+
     /**
      * Create a new WorldContext from a serialized NoiseRouter blob.
      *
@@ -338,6 +356,17 @@ public class WgpuThinBinding {
         } catch (Throwable t) {
             if (t instanceof RuntimeException re) throw re;
             throw new RuntimeException("[c2me-wgpu] set_aquifer_mode failed", t);
+        }
+    }
+
+    /** Set the ore-vein RNG seed (seedLo, seedHi) from MC's oreRandomDeriver. */
+    public static void setOreSeed(long worldH, long seedLo, long seedHi) {
+        try {
+            int st = (int) MH_set_ore_seed.invokeExact(worldH, seedLo, seedHi);
+            if (st != 0) throw new RuntimeException("set_ore_seed status=" + st);
+        } catch (Throwable t) {
+            if (t instanceof RuntimeException re) throw re;
+            throw new RuntimeException("[c2me-wgpu] set_ore_seed failed", t);
         }
     }
 

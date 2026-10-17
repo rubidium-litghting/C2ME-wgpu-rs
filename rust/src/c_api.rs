@@ -519,6 +519,26 @@ pub unsafe extern "C" fn c2me_wgpu_set_beard_table(
 }
 
 // ⑩ Set per-dimension aquifer mode (called by Java after world_new).
+// ---------------------------------------------------------------------------
+// ⑩c Set the ore-vein RNG seed (called once per world from Java).
+//
+/// # Safety
+/// `world_h` must be a live handle from `c2me_wgpu_world_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2me_wgpu_set_ore_seed(
+    world_h: i64,
+    seed_lo: i64,
+    seed_hi: i64,
+) -> i32 {
+    if world_h == 0 { return STATUS_INVALID_HANDLE; }
+    let world_arc = {
+        let table = get_handle_table().lock().unwrap();
+        match table.get(&world_h) { Some(a) => a.clone(), None => return STATUS_INVALID_HANDLE }
+    };
+    world_arc.set_ore_seed(seed_lo, seed_hi);
+    0
+}
+
 /// `has_aquifers`: 0/1. `default_fluid`: 0=air / 2=water / 3=lava.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_set_aquifer_mode(

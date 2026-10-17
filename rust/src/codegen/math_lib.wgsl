@@ -17,6 +17,51 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 
 fn clamp01(x: f32) -> f32 { return clamp(x, 0.0, 1.0); }
 
+// One cubic-Hermite segment of MC's Spline. Extracted verbatim from the
+// per-segment inline expansion so each segment costs one call instead of
+// four lines (Spline-heavy routers emit ~190 segments per shard). The
+// arithmetic order matches the inline form exactly — bit-identical.
+//   p = (t - lk) / width
+//   a = dk*width - (vk1 - vk)
+//   b = -dk1*width + (vk1 - vk)
+//   r = vk + p*(vk1-vk) + p*(1-p)*(a + p*(b-a))
+// One OctavePerlinNoiseSampler stack, Kahan-summed. Extracted from the
+// per-stack inline expansion (routers emit ~50 stacks per shard). `amps`
+// is zero-padded to 16; only the first `n` entries are read, so padding
+// cannot change the result. Arithmetic order matches the inline form.
+fn octave_stack(
+    cx: f32, cy: f32, cz: f32,
+    base: i32, n: u32,
+    amps: array<f32, 16>,
+    freq0: f32, ac0: f32,
+    sxz: f32, sy: f32,
+) -> f32 {
+    var fx: f32 = cx * sxz;
+    var fy: f32 = cy * sy;
+    var fz: f32 = cz * sxz;
+    var freq: f32 = freq0;
+    var ac: f32 = ac0;
+    var acc: KahanSum = kahan_zero();
+    for (var i: u32 = 0u; i < n; i++) {
+        let a_i = amps[i];
+        if (a_i != 0.0) {
+            let v: f32 = noise_perlin3d_origin(
+                base + i32(i) * 256i, fx * freq, fy * freq, fz * freq) * a_i * ac;
+            kahan_add(&acc, v);
+        }
+        freq *= 2.0;
+        ac *= 0.5;
+    }
+    return kahan_result(acc);
+}
+
+fn spline_seg(t: f32, lk: f32, width: f32, dk: f32, dk1: f32, vk: f32, vk1: f32) -> f32 {
+    let p = (t - lk) / width;
+    let a = dk * width - (vk1 - vk);
+    let b = dk1 * -1.0 * width + (vk1 - vk);
+    return vk + p * (vk1 - vk) + p * (1.0 - p) * (a + p * (b - a));
+}
+
 // Trilinear interpolation across the 8 corners of a unit cube.
 fn trilinear_lerp(
     c000: f32, c100: f32, c010: f32, c110: f32,
@@ -326,6 +371,113 @@ fn noise_perlin2d(perm_offset: i32, x: f32, y: f32) -> f32 {
 // ----------------------------------------------------------------------------
 // § Simplex noise (标准实现，非原版)
 // ----------------------------------------------------------------------------
+
+// ----------------------------------------------------------------------------
+// § 64-bit integer emulation + Xoroshiro128++ (ore-vein RNG)
+// ----------------------------------------------------------------------------
+// WGSL has no u64, so a 64-bit value is a (lo, hi) pair of u32. All 32-bit
+// multiplies go through 16-bit limbs, so nothing relies on WGSL's undefined
+// overflow behaviour.
+
+fn u64_add(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let lo = a.x + b.x;
+    let carry = select(0u, 1u, lo < a.x);
+    return vec2<u32>(lo, a.y + b.y + carry);
+}
+
+fn u64_shl(a: vec2<u32>, s: u32) -> vec2<u32> {
+    if (s == 0u) { return a; }
+    if (s >= 64u) { return vec2<u32>(0u, 0u); }
+    if (s >= 32u) { return vec2<u32>(0u, a.x << (s - 32u)); }
+    return vec2<u32>(a.x << s, (a.y << s) | (a.x >> (32u - s)));
+}
+
+fn u64_shr(a: vec2<u32>, s: u32) -> vec2<u32> {
+    if (s == 0u) { return a; }
+    if (s >= 64u) { return vec2<u32>(0u, 0u); }
+    if (s >= 32u) { return vec2<u32>(a.y >> (s - 32u), 0u); }
+    return vec2<u32>((a.x >> s) | (a.y << (32u - s)), a.y >> s);
+}
+
+fn u64_rotl(a: vec2<u32>, s: u32) -> vec2<u32> {
+    let r = s % 64u;
+    if (r == 0u) { return a; }
+    return u64_shl(a, r) | u64_shr(a, 64u - r);
+}
+
+// 32x32 -> 64 unsigned multiply via 16-bit limbs (no overflow).
+fn mul32_wide(a: u32, b: u32) -> vec2<u32> {
+    let al = a & 0xFFFFu; let ah = a >> 16u;
+    let bl = b & 0xFFFFu; let bh = b >> 16u;
+    let ll = al * bl;
+    let lh = al * bh;
+    let hl = ah * bl;
+    let hh = ah * bh;
+    let cross = (ll >> 16u) + (lh & 0xFFFFu) + (hl & 0xFFFFu);
+    return vec2<u32>((ll & 0xFFFFu) | (cross << 16u),
+                     hh + (lh >> 16u) + (hl >> 16u) + (cross >> 16u));
+}
+
+fn u64_mul(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let p00 = mul32_wide(a.x, b.x);
+    let p01 = mul32_wide(a.x, b.y);
+    let p10 = mul32_wide(a.y, b.x);
+    return u64_add(p00, vec2<u32>(0u, p01.x + p10.x));
+}
+
+// Sign-extend an i32 to the (lo, hi) 64-bit pair.
+fn sign_extend_i64(v: i32) -> vec2<u32> {
+    let lo = bitcast<u32>(v);
+    return vec2<u32>(lo, select(0u, 0xFFFFFFFFu, (lo & 0x80000000u) != 0u));
+}
+
+// i32 * i32 evaluated as wrapping 32-bit, then sign-extended to 64 bits —
+// matches Java's `(long)(x * const)`.
+fn i32_mul_extend(a: i32, b: i32) -> vec2<u32> {
+    let m = mul32_wide(bitcast<u32>(a), bitcast<u32>(b));
+    let sign = select(0u, 0xFFFFFFFFu, (m.x & 0x80000000u) != 0u);
+    return vec2<u32>(m.x, sign);
+}
+
+// MathHelper.hashCode(x, y, z) — same function aquifer.rs uses for cell seeds.
+//   long l = x*3129871 ^ z*116129781L ^ y;
+//   l = l*l*42317861L + l*11L;
+//   return l >> 16;   (arithmetic)
+fn java_hash3(x: i32, y: i32, z: i32) -> vec2<u32> {
+    let a = i32_mul_extend(x, 3129871);
+    let b = u64_mul(sign_extend_i64(z), vec2<u32>(116129781u, 0u));
+    let c = sign_extend_i64(y);
+    let l = a ^ b ^ c;
+    let l2 = u64_add(
+        u64_mul(u64_mul(l, l), vec2<u32>(42317861u, 0u)),
+        u64_mul(l, vec2<u32>(11u, 0u)));
+    let r = u64_shr(l2, 16u);
+    let neg = (l2.y & 0x80000000u) != 0u;
+    return vec2<u32>(r.x, select(r.y, r.y | 0xFFFF0000u, neg));
+}
+
+// Xoroshiro128++ state is (seedLo, seedHi) as a vec4: [lo.x, lo.y, hi.x, hi.y].
+fn xoro_init(seed_lo: vec2<u32>, seed_hi: vec2<u32>) -> vec4<u32> {
+    return vec4<u32>(seed_lo.x, seed_lo.y, seed_hi.x, seed_hi.y);
+}
+
+fn xoro_next(st: ptr<function, vec4<u32>>) -> vec2<u32> {
+    let s0 = vec2<u32>((*st).x, (*st).y);
+    let s1 = vec2<u32>((*st).z, (*st).w);
+    let res = u64_add(u64_rotl(u64_add(s0, s1), 17u), s0);
+    let s1n = s0 ^ s1;
+    let new_lo = u64_rotl(s0, 49u) ^ s1n ^ u64_shl(s1n, 21u);
+    let new_hi = u64_rotl(s1n, 28u);
+    *st = vec4<u32>(new_lo.x, new_lo.y, new_hi.x, new_hi.y);
+    return res;
+}
+
+// Java: (float)(next() >>> 40) * 2^-24
+fn xoro_next_float(st: ptr<function, vec4<u32>>) -> f32 {
+    let r = xoro_next(st);
+    let bits = (r.y >> 8u) & 0xFFFFFFu;
+    return f32(bits) * 5.9604645e-8;
+}
 
 fn hash3_perm(a: i32, b: i32, c: i32) -> u32 {
     let idx = i32(perm[(i32(perm[(i32(perm[(a & 255)]) + b) & 255]) + c) & 255]);

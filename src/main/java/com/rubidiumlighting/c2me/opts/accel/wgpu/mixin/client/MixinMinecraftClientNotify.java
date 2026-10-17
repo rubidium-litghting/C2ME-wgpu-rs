@@ -56,6 +56,12 @@ public class MixinMinecraftClientNotify {
         while ((m = WgpuFallbackNotice.poll()) != null) {
             chat.addMessage(Text.literal(m).formatted(Formatting.YELLOW));
         }
+
+        // Throughput stats. These are only produced when C2ME_WGPU_DEBUG is
+        // set, so the "spam" is confined to debug sessions; no throttle here.
+        while ((m = WgpuFallbackNotice.pollStats()) != null) {
+            chat.addMessage(Text.literal(m).formatted(Formatting.GRAY));
+        }
     }
 
     @Inject(method = "joinWorld", at = @At("RETURN"))

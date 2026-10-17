@@ -52,10 +52,17 @@ public class ModuleEntryPoint {
                 dt = "native library not available for this platform";
                 LOGGER.warn("[c2me-wgpu] {}, falling back to CPU", dt);
             } else if (!WgpuThinBinding.isAvailable()) {
-                // Library loaded but no usable adapter (driver missing/blocked,
-                // unsupported GPU, etc.). WgpuThinBinding logs the reason.
                 st = Status.INIT_FAILED;
-                dt = "no suitable wgpu adapter (driver missing or unsupported GPU)";
+                String linkErr = WgpuThinBinding.getLinkError();
+                if (linkErr != null) {
+                    // The native library loaded but a downcall symbol is
+                    // missing — that is a packaging/version mismatch, NOT a
+                    // GPU problem. Say so, otherwise this looks like a
+                    // driver issue and sends debugging in the wrong direction.
+                    dt = "native library symbol mismatch (" + linkErr + ")";
+                } else {
+                    dt = "no suitable wgpu adapter (driver missing or unsupported GPU)";
+                }
                 LOGGER.warn("[c2me-wgpu] {}, falling back to CPU", dt);
             } else {
                 dt = WgpuThinBinding.getGpuName();

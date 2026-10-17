@@ -96,6 +96,11 @@ pub struct WorldContext {
     /// §22 fix: per-dimension aquifer mode. Dimensions without aquifers
     /// (Nether/End) skip the 12-cell scan and use sea-level semantics.
     pub(crate) aquifer_mode: std::sync::Mutex<AquiferMode>,
+    /// Ore-vein RNG seed (seedLo, seedHi) from MC's `oreRandomDeriver`.
+    /// Set once per world via `c2me_wgpu_set_ore_seed`; (0,0) means unset.
+    pub(crate) ore_seed: std::sync::Mutex<(i64, i64)>,
+    /// True once the ore-vein seed has been staged (settings.oreVeins()).
+    pub(crate) ore_veins: std::sync::atomic::AtomicBool,
 }
 
 /// Aquifer behaviour for one dimension.
@@ -249,6 +254,8 @@ impl WorldContext {
             aquifer_tables: std::sync::Mutex::new(std::collections::HashMap::new()),
             beard_tables: std::sync::Mutex::new(std::collections::HashMap::new()),
             aquifer_mode: std::sync::Mutex::new(AquiferMode::default()),
+            ore_seed: std::sync::Mutex::new((0, 0)),
+            ore_veins: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -458,6 +465,16 @@ impl WorldContext {
         self.aquifer_mode.lock().map(|m| *m).unwrap_or_default()
     }
 
+    /// Set the ore-vein RNG seed (from `NoiseConfig.getOreRandomDeriver()`).
+    pub fn set_ore_seed(&self, lo: i64, hi: i64) {
+        *self.ore_seed.lock().unwrap() = (lo, hi);
+        self.ore_veins.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn ore_seed(&self) -> (i64, i64) {
+        *self.ore_seed.lock().unwrap()
+    }
+
     pub fn beard_weight_buffer(&self) -> Option<&wgpu::Buffer> {
         self.beard_weight_buffer.as_ref()
     }
@@ -489,6 +506,35 @@ impl WorldContext {
 // Tests
 // ======================================================================
 #[cfg(test)]
+
+    pub(crate) fn dbg_mp(v: f64) -> f64 { v - (v/33554432.0+0.5).floor()*33554432.0 }
+    pub(crate) fn dbg_perlin(perm:&[i32],p:i32,x:f64,y:f64,z:f64)->f64{
+        let ix=x.floor() as i32; let iy=y.floor() as i32; let iz=z.floor() as i32;
+        let fx=x-ix as f64; let fy=y-iy as f64; let fz=z-iz as f64;
+        let xi=ix&255; let yi=iy&255; let zi=iz&255;
+        let idx=|i:i32|(p+i) as usize;
+        let a=perm[idx(xi)]; let b=perm[idx((xi+1)&255)];
+        let aa=perm[idx((a+yi)&255)]; let ab=perm[idx((a+yi+1)&255)];
+        let ba=perm[idx((b+yi)&255)]; let bb=perm[idx((b+yi+1)&255)];
+        let aaa=perm[idx((aa+zi)&255)]; let aab=perm[idx((aa+zi+1)&255)];
+        let aba=perm[idx((ab+zi)&255)]; let abb=perm[idx((ab+zi+1)&255)];
+        let baa=perm[idx((ba+zi)&255)]; let bab=perm[idx((ba+zi+1)&255)];
+        let bba=perm[idx((bb+zi)&255)]; let bbb=perm[idx((bb+zi+1)&255)];
+        let gr=|h:i32,xx:f64,yy:f64,zz:f64|->f64{let (gx,gy,gz)=match h&15{
+            0=>(1.0,1.0,0.0),1=>(-1.0,1.0,0.0),2=>(1.0,-1.0,0.0),3=>(-1.0,-1.0,0.0),
+            4=>(1.0,0.0,1.0),5=>(-1.0,0.0,1.0),6=>(1.0,0.0,-1.0),7=>(-1.0,0.0,-1.0),
+            8=>(0.0,1.0,1.0),9=>(0.0,-1.0,1.0),10=>(0.0,1.0,-1.0),11=>(0.0,-1.0,-1.0),
+            12=>(1.0,1.0,0.0),13=>(0.0,-1.0,1.0),14=>(-1.0,1.0,0.0),_=>(0.0,-1.0,-1.0)};gx*xx+gy*yy+gz*zz};
+        let fd=|t:f64|t*t*t*(t*(t*6.0-15.0)+10.0); let lp=|a:f64,b:f64,t:f64|a+t*(b-a);
+        let u=fd(fx);let v=fd(fy);let w=fd(fz);
+        let x1=lp(gr(aaa,fx,fy,fz),gr(baa,fx-1.0,fy,fz),u);
+        let x2=lp(gr(aba,fx,fy-1.0,fz),gr(bba,fx-1.0,fy-1.0,fz),u);
+        let y1=lp(x1,x2,v);
+        let x3=lp(gr(aab,fx,fy,fz-1.0),gr(bab,fx-1.0,fy,fz-1.0),u);
+        let x4=lp(gr(abb,fx,fy-1.0,fz-1.0),gr(bbb,fx-1.0,fy-1.0,fz-1.0),u);
+        let y2=lp(x3,x4,v); lp(y1,y2,w)
+    }
+
 mod tests {
     #[test]
     #[ignore]
@@ -3114,6 +3160,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
         let instance = WgpuInstance::instance().unwrap();
         ctx.compile_pipeline(&instance.device).unwrap();
+        // Read-back layout is compact: [chunk][readback_index][cells].
+        // Capture the channel->index map before moving ctx into the Arc.
+        let readback = ctx.readback_channels();
         let world_arc = Arc::new(ctx);
         let executor = ExecutorThread::spawn(
             Arc::new(instance.device.clone()), Arc::new(instance.queue.clone()), Default::default()).unwrap();
@@ -3125,7 +3174,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         for &(name, ch) in chan_map {
             let cv = &cpu_vals[&ch];
             let rv = &ref_data[&ch];
-            let base = ch * cpc * 4;
+            let Some(ri) = readback.iter().position(|&c| c == ch) else {
+                println!("ch{} {}: NOT in readback (skipped); readback={:?}", ch, name, readback);
+                continue;
+            };
+            let base = ri * cpc * 4;
             let (mut rc, mut rg, mut cg, mut mx_cg, mut mx_rc) = (0.0f64, 0.0f64, 0.0f64, 0.0f32, 0.0f32);
             for idx in 0..cpc {
                 let gpu = f32::from_le_bytes(payload[base+idx*4..base+idx*4+4].try_into().unwrap());
@@ -3490,7 +3543,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let t = interp.clamp(0.0,1.0);
         (lo/512.0 + t*(up/512.0 - lo/512.0))/128.0
     }
-    fn cpu_ast_eval(node: &crate::ast::AstNode, perm: &[i32], origins: &[f32], x: f32, y: f32, z: f32) -> f32 {
+    pub(crate) fn cpu_ast_eval(node: &crate::ast::AstNode, perm: &[i32], origins: &[f32], x: f32, y: f32, z: f32) -> f32 {
         use crate::ast::AstNode as A;
         match node {
             A::Constant(v) => *v,
@@ -3517,7 +3570,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
                 let n = locations.len();
                 let vs: Vec<f32> = values.iter().map(|v| cpu_ast_eval(v, perm, origins, x, y, z)).collect();
                 if n == 0 { return 0.0; }
-                if n == 1 { return vs[0]; }
+                if n == 1 {
+                    let d0 = derivatives[0];
+                    return if d0 == 0.0 { vs[0] } else { vs[0] + d0 * (t - locations[0]) };
+                }
                 if t < locations[0] {
                     let d0 = derivatives[0];
                     return if d0 == 0.0 { vs[0] } else { vs[0] + d0 * (t - locations[0]) };
@@ -3820,6 +3876,2379 @@ mod compile_time_scale {
         assert_eq!(seen.len(), 8, "outer must reference all 8 inners");
         for i in 0..8 { assert!(seen.contains(&i), "missing InnerRef({i})"); }
         println!("split OK: 8 inners, outer has all 8 refs");
+    }
+
+
+    #[test]
+    #[ignore]
+    fn depth_error_pattern() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(768*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth = &chans[8];
+            let txt = std::fs::read_to_string("/tmp/ref_chunk_50_50.txt").unwrap();
+            let (mut dx,mut dy,mut dz)=(5usize,49usize,5usize); let (mut cxx,mut czz)=(0i32,0i32);
+            let mut cur=false; let mut vals=vec![];
+            for l in txt.lines() {
+                if let Some(r)=l.strip_prefix("DIMS "){let v:Vec<usize>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();dx=v[0];dy=v[1];dz=v[2];}
+                if let Some(r)=l.strip_prefix("CHUNK "){let v:Vec<i32>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();cxx=v[0];czz=v[1];}
+                if l.starts_with("CHANNEL depth"){cur=true;vals=vec![0f32;dx*dy*dz];continue;}
+                if l.starts_with("CHANNEL "){cur=false;continue;}
+                if cur { let t:Vec<&str>=l.split_whitespace().collect(); if t.len()==4 {
+                    let i:usize=t[0].parse().unwrap();let j:usize=t[1].parse().unwrap();let k:usize=t[2].parse().unwrap();
+                    vals[i+k*dx+j*dx*dz]=t[3].parse().unwrap(); } }
+            }
+            let sx=cxx*16; let sz=czz*16;
+            println!("x,z grid at j=24 (y=128): diff = cpu - ref");
+            for k in 0..dz {
+                let mut row=String::new();
+                for i in 0..dx {
+                    let wx=(sx+i as i32*4) as f32; let wy=128.0f32; let wz=(sz+k as i32*4) as f32;
+                    let c=cpu_ast_eval(depth,&perm,&origins,wx,wy,wz);
+                    let r=vals[i+k*dx+24*dx*dz];
+                    row += &format!("{:+6.3} ", c-r);
+                }
+                println!("  z={k}: {row}");
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn depth_f64_full() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(768*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins: Vec<f32> = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth = &chans[8];
+            fn mp(v:f64)->f64 { v - (v/33554432.0+0.5).floor()*33554432.0 }
+            fn fade(t:f64)->f64{t*t*t*(t*(t*6.0-15.0)+10.0)}
+            fn lerp(a:f64,b:f64,t:f64)->f64{a+t*(b-a)}
+            fn perlin3d_f64(perm:&[i32],p:i32,x:f64,y:f64,z:f64)->f64{
+                let ix=x.floor() as i32; let iy=y.floor() as i32; let iz=z.floor() as i32;
+                let fx=x-ix as f64; let fy=y-iy as f64; let fz=z-iz as f64;
+                let xi=ix&255; let yi=iy&255; let zi=iz&255;
+                let idx=|i:i32|(p+i) as usize;
+                let a=perm[idx(xi)]; let b=perm[idx((xi+1)&255)];
+                let aa=perm[idx((a+yi)&255)]; let ab=perm[idx((a+yi+1)&255)];
+                let ba=perm[idx((b+yi)&255)]; let bb=perm[idx((b+yi+1)&255)];
+                let aaa=perm[idx((aa+zi)&255)]; let aab=perm[idx((aa+zi+1)&255)];
+                let aba=perm[idx((ab+zi)&255)]; let abb=perm[idx((ab+zi+1)&255)];
+                let baa=perm[idx((ba+zi)&255)]; let bab=perm[idx((ba+zi+1)&255)];
+                let bba=perm[idx((bb+zi)&255)]; let bbb=perm[idx((bb+zi+1)&255)];
+                let grad=|h:i32,xx:f64,yy:f64,zz:f64|->f64{
+                    let (gx,gy,gz)=match h&15{
+                        0=>(1.0,1.0,0.0),1=>(-1.0,1.0,0.0),2=>(1.0,-1.0,0.0),3=>(-1.0,-1.0,0.0),
+                        4=>(1.0,0.0,1.0),5=>(-1.0,0.0,1.0),6=>(1.0,0.0,-1.0),7=>(-1.0,0.0,-1.0),
+                        8=>(0.0,1.0,1.0),9=>(0.0,-1.0,1.0),10=>(0.0,1.0,-1.0),11=>(0.0,-1.0,-1.0),
+                        12=>(1.0,1.0,0.0),13=>(0.0,-1.0,1.0),14=>(-1.0,1.0,0.0),_=>(0.0,-1.0,-1.0)};
+                    gx*xx+gy*yy+gz*zz
+                };
+                let u=fade(fx); let v=fade(fy); let w=fade(fz);
+                let x1=lerp(grad(aaa,fx,fy,fz),grad(baa,fx-1.0,fy,fz),u);
+                let x2=lerp(grad(aba,fx,fy-1.0,fz),grad(bba,fx-1.0,fy-1.0,fz),u);
+                let y1=lerp(x1,x2,v);
+                let x3=lerp(grad(aab,fx,fy,fz-1.0),grad(bab,fx-1.0,fy,fz-1.0),u);
+                let x4=lerp(grad(abb,fx,fy-1.0,fz-1.0),grad(bbb,fx-1.0,fy-1.0,fz-1.0),u);
+                let y2=lerp(x3,x4,v);
+                lerp(y1,y2,w)
+            }
+            fn perlin_origin_f64(perm:&[i32],orig:&[f32],po:i32,x:f64,y:f64,z:f64)->f64{
+                let e=po/256;
+                let px=mp(x)+orig[(e*3) as usize] as f64;
+                let py=mp(y)+orig[(e*3+1) as usize] as f64;
+                let pz=mp(z)+orig[(e*3+2) as usize] as f64;
+                perlin3d_f64(perm,po,px,py,pz)
+            }
+            fn oct_f64(perm:&[i32],orig:&[f32],oct:&crate::ast::OctaveSampler,cx:f32,cy:f32,cz:f32)->f64{
+                let mut freq=oct.initial_freq; let mut amp=oct.persistence; let mut acc=0f64;
+                for i in 0..oct.amplitudes.len(){
+                    if oct.amplitudes[i]!=0.0 {
+                        let s=perlin_origin_f64(perm,orig,oct.perm_offset+i as i32*256,
+                            (cx as f64)*(freq as f64),(cy as f64)*(freq as f64),(cz as f64)*(freq as f64));
+                        acc+=oct.amplitudes[i] as f64 * s * amp as f64;
+                    }
+                    freq*=2.0; amp*=0.5;
+                }
+                acc
+            }
+            fn ev(n:&crate::ast::AstNode,perm:&[i32],orig:&[f32],x:f32,y:f32,z:f32)->f32{
+                use crate::ast::AstNode as A;
+                match n {
+                    A::NoiseSampler{first,second,amplitude,xz_scale,y_scale,..}=>{
+                        const D:f32=1.0181268882175227;
+                        let vf=oct_f64(perm,orig,first,x*xz_scale,y*y_scale,z*xz_scale);
+                        let t=if let Some(s)=second{vf+oct_f64(perm,orig,s,x*xz_scale*D,y*y_scale*D,z*xz_scale*D)}else{vf};
+                        (t* (*amplitude as f64)) as f32
+                    }
+                    A::Min(a,b)=>ev(a,perm,orig,x,y,z).min(ev(b,perm,orig,x,y,z)),
+                    A::Max(a,b)=>ev(a,perm,orig,x,y,z).max(ev(b,perm,orig,x,y,z)),
+                    A::Add(a,b)=>ev(a,perm,orig,x,y,z)+ev(b,perm,orig,x,y,z),
+                    A::Sub(a,b)=>ev(a,perm,orig,x,y,z)-ev(b,perm,orig,x,y,z),
+                    A::Mul(a,b)=>ev(a,perm,orig,x,y,z)*ev(b,perm,orig,x,y,z),
+                    A::Div(a,b)=>ev(a,perm,orig,x,y,z)/ev(b,perm,orig,x,y,z),
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>ev(a,perm,orig,x,y,z),
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,..}=>{
+                        let iv=ev(input,perm,orig,x,y,z); let mn=ev(min,perm,orig,x,y,z); let mx=ev(max,perm,orig,x,y,z);
+                        if iv>=mn && iv<mx { ev(in_bounds,perm,orig,x,y,z) } else { ev(out_of_bounds_lo,perm,orig,x,y,z) }
+                    }
+                    A::Spline{locations,derivatives,location,values}=>{
+                        let t=ev(location,perm,orig,x,y,z); let nn=locations.len();
+                        let vs:Vec<f32>=values.iter().map(|v|ev(v,perm,orig,x,y,z)).collect();
+                        if nn==0{return 0.0;} if nn==1{return vs[0];}
+                        if t<locations[0]{let d0=derivatives[0]; return if d0==0.0{vs[0]}else{vs[0]+d0*(t-locations[0])};}
+                        if t>=locations[nn-1]{let dn=derivatives[nn-1]; return if dn==0.0{vs[nn-1]}else{vs[nn-1]+dn*(t-locations[nn-1])};}
+                        for k in 0..nn-1 { if t<locations[k+1] {
+                            let lk=locations[k];let lk1=locations[k+1];let dk=derivatives[k];let dk1=derivatives[k+1];
+                            let vk=vs[k];let vk1=vs[k+1];let w=lk1-lk;let pp=(t-lk)/w;
+                            let a=dk*w-(vk1-vk);let b=dk1*-1.0*w+(vk1-vk);
+                            return vk+pp*(vk1-vk)+pp*(1.0-pp)*(a+pp*(b-a));}}
+                        vs[nn-1]
+                    }
+                    A::YClampedGradient{from_y,to_y,from_value,to_value}=>{
+                        let t=((y-from_y)/(to_y-from_y)).clamp(0.0,1.0); from_value+t*(to_value-from_value)
+                    }
+                    A::Constant(v)=>*v, A::InputX=>x, A::InputY=>y, A::InputZ=>z,
+                    _=>cpu_ast_eval(n,perm,orig,x,y,z),
+                }
+            }
+            let txt=std::fs::read_to_string("/tmp/ref_chunk_50_50.txt").unwrap();
+            let (mut dx,mut dy,mut dz)=(5usize,49usize,5usize); let (mut cxx,mut czz)=(0i32,0i32);
+            let mut cur=false; let mut vals=vec![];
+            for l in txt.lines(){
+                if let Some(r)=l.strip_prefix("DIMS "){let v:Vec<usize>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();dx=v[0];dy=v[1];dz=v[2];}
+                if let Some(r)=l.strip_prefix("CHUNK "){let v:Vec<i32>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();cxx=v[0];czz=v[1];}
+                if l.starts_with("CHANNEL depth"){cur=true;vals=vec![0f32;dx*dy*dz];continue;}
+                if l.starts_with("CHANNEL "){cur=false;continue;}
+                if cur {let t:Vec<&str>=l.split_whitespace().collect(); if t.len()==4 {
+                    let i:usize=t[0].parse().unwrap();let j:usize=t[1].parse().unwrap();let k:usize=t[2].parse().unwrap();
+                    vals[i+k*dx+j*dx*dz]=t[3].parse().unwrap();}}
+            }
+            let sx=cxx*16;let sz=czz*16;
+            let mut bad=0;let mut maxd=0f32;
+            for j in 0..dy{for k in 0..dz{for i in 0..dx{
+                let wx=(sx+i as i32*4) as f32;let wy=(-64+j as i32*8) as f32;let wz=(sz+k as i32*4) as f32;
+                let c=ev(depth,&perm,&origins,wx,wy,wz);
+                let d=(c-vals[i+k*dx+j*dx*dz]).abs();if d>maxd{maxd=d;}if d>0.01{bad+=1;}
+            }}}
+            println!("depth f64-FULL: {bad}/{} bad, maxd={maxd:.5}", dx*dy*dz);
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn cache2d_frozen_y() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(768*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            fn ev(n:&crate::ast::AstNode,perm:&[i32],orig:&[f32],x:f32,y:f32,z:f32)->f32{
+                use crate::ast::AstNode as A;
+                match n {
+                    A::Cache2D(a)=>ev(a,perm,orig,x,-64.0,z),   // freeze to first-visited y
+                    A::CacheFlat(a)|A::CacheInterpolated(a)=>ev(a,perm,orig,x,y,z),
+                    A::Min(a,b)=>ev(a,perm,orig,x,y,z).min(ev(b,perm,orig,x,y,z)),
+                    A::Max(a,b)=>ev(a,perm,orig,x,y,z).max(ev(b,perm,orig,x,y,z)),
+                    A::Add(a,b)=>ev(a,perm,orig,x,y,z)+ev(b,perm,orig,x,y,z),
+                    A::Sub(a,b)=>ev(a,perm,orig,x,y,z)-ev(b,perm,orig,x,y,z),
+                    A::Mul(a,b)=>ev(a,perm,orig,x,y,z)*ev(b,perm,orig,x,y,z),
+                    A::Div(a,b)=>ev(a,perm,orig,x,y,z)/ev(b,perm,orig,x,y,z),
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,..}=>{
+                        let iv=ev(input,perm,orig,x,y,z);let mn=ev(min,perm,orig,x,y,z);let mx=ev(max,perm,orig,x,y,z);
+                        if iv>=mn&&iv<mx {ev(in_bounds,perm,orig,x,y,z)} else {ev(out_of_bounds_lo,perm,orig,x,y,z)}}
+                    A::Spline{locations,derivatives,location,values}=>{
+                        let t=ev(location,perm,orig,x,y,z);let nn=locations.len();
+                        let vs:Vec<f32>=values.iter().map(|v|ev(v,perm,orig,x,y,z)).collect();
+                        if nn==0{return 0.0;}if nn==1{return vs[0];}
+                        if t<locations[0]{let d0=derivatives[0];return if d0==0.0{vs[0]}else{vs[0]+d0*(t-locations[0])};}
+                        if t>=locations[nn-1]{let dn=derivatives[nn-1];return if dn==0.0{vs[nn-1]}else{vs[nn-1]+dn*(t-locations[nn-1])};}
+                        for k in 0..nn-1{if t<locations[k+1]{
+                            let lk=locations[k];let lk1=locations[k+1];let dk=derivatives[k];let dk1=derivatives[k+1];
+                            let vk=vs[k];let vk1=vs[k+1];let w=lk1-lk;let pp=(t-lk)/w;
+                            let a=dk*w-(vk1-vk);let b=dk1*-1.0*w+(vk1-vk);
+                            return vk+pp*(vk1-vk)+pp*(1.0-pp)*(a+pp*(b-a));}}
+                        vs[nn-1]}
+                    A::YClampedGradient{from_y,to_y,from_value,to_value}=>{let t=((y-from_y)/(to_y-from_y)).clamp(0.0,1.0);from_value+t*(to_value-from_value)}
+                    A::Constant(v)=>*v,A::InputX=>x,A::InputY=>y,A::InputZ=>z,
+                    _=>cpu_ast_eval(n,perm,orig,x,y,z),
+                }
+            }
+            let depth=&chans[8];
+            let txt=std::fs::read_to_string("/tmp/ref_chunk_50_50.txt").unwrap();
+            let (mut dx,mut dy,mut dz)=(5usize,49usize,5usize);let (mut cxx,mut czz)=(0i32,0i32);
+            let mut cur=false;let mut vals=vec![];
+            for l in txt.lines(){
+                if let Some(r)=l.strip_prefix("DIMS "){let v:Vec<usize>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();dx=v[0];dy=v[1];dz=v[2];}
+                if let Some(r)=l.strip_prefix("CHUNK "){let v:Vec<i32>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();cxx=v[0];czz=v[1];}
+                if l.starts_with("CHANNEL depth"){cur=true;vals=vec![0f32;dx*dy*dz];continue;}
+                if l.starts_with("CHANNEL "){cur=false;continue;}
+                if cur {let t:Vec<&str>=l.split_whitespace().collect();if t.len()==4{
+                    let i:usize=t[0].parse().unwrap();let j:usize=t[1].parse().unwrap();let k:usize=t[2].parse().unwrap();
+                    vals[i+k*dx+j*dx*dz]=t[3].parse().unwrap();}}}
+            let sx=cxx*16;let sz=czz*16;
+            let mut bad=0;let mut maxd=0f32;
+            for j in 0..dy{for k in 0..dz{for i in 0..dx{
+                let wx=(sx+i as i32*4) as f32;let wy=(-64+j as i32*8) as f32;let wz=(sz+k as i32*4) as f32;
+                let c=ev(depth,&perm,&origins,wx,wy,wz);
+                let d=(c-vals[i+k*dx+j*dx*dz]).abs();if d>maxd{maxd=d;}if d>0.01{bad+=1;}
+            }}}
+            println!("depth Cache2D-frozen@y=-64: {bad}/{} bad, maxd={maxd:.5}", dx*dy*dz);
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn depth_children() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth = &chans[8];
+            let (a,b) = match depth { crate::ast::AstNode::Min(x,y)=>(x.as_ref(),y.as_ref()), _=>{println!("not Min");return;} };
+            let txt = std::fs::read_to_string("/tmp/ref_chunk_50_50.txt").unwrap();
+            let (mut dx,mut dy,mut dz)=(5usize,49usize,5usize); let (mut cxx,mut czz)=(0i32,0i32);
+            let mut cur=false; let mut vals=vec![];
+            for l in txt.lines(){
+                if let Some(r)=l.strip_prefix("DIMS "){let v:Vec<usize>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();dx=v[0];dy=v[1];dz=v[2];}
+                if let Some(r)=l.strip_prefix("CHUNK "){let v:Vec<i32>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();cxx=v[0];czz=v[1];}
+                if l.starts_with("CHANNEL depth"){cur=true;vals=vec![0f32;dx*dy*dz];continue;}
+                if l.starts_with("CHANNEL "){cur=false;continue;}
+                if cur {let t:Vec<&str>=l.split_whitespace().collect();if t.len()==4{
+                    let i:usize=t[0].parse().unwrap();let j:usize=t[1].parse().unwrap();let k:usize=t[2].parse().unwrap();
+                    vals[i+k*dx+j*dx*dz]=t[3].parse().unwrap();}}
+            }
+            let sx=cxx*16;let sz=czz*16;
+            for (i,j,k) in [(0usize,24usize,0usize),(2,24,2),(4,24,4),(0,0,0),(4,48,4)] {
+                let wx=(sx+i as i32*4) as f32;let wy=(-64+j as i32*8) as f32;let wz=(sz+k as i32*4) as f32;
+                let va=cpu_ast_eval(a,&perm,&origins,wx,wy,wz);
+                let vb=cpu_ast_eval(b,&perm,&origins,wx,wy,wz);
+                let r=vals[i+k*dx+j*dx*dz];
+                println!("(i={i},j={j},k={k}) childA={va:.5} childB={vb:.5} min={:.5} REF={r:.5}", va.min(vb));
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn find_nonmonotonic_splines() {
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            fn walk(n:&crate::ast::AstNode, ch:usize, path:&str, cnt:&mut usize){
+                use crate::ast::AstNode as A;
+                if let A::Spline{locations,derivatives,values,..}=n {
+                    let mut sorted=true;
+                    for i in 1..locations.len() { if locations[i] <= locations[i-1] { sorted=false; } }
+                    *cnt+=1;
+                    if !sorted {
+                        println!("NON-MONO ch{ch} path={path}");
+                        println!("  locs={:?}", locations);
+                        println!("  ders={:?}", derivatives);
+                        println!("  nvals={} nloc={} nder={}", values.len(), locations.len(), derivatives.len());
+                    }
+                }
+                let mut k:Vec<(&crate::ast::AstNode,String)>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push((a,"L".into()));k.push((b,"R".into()));}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push((a,"C".into()));}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push((input,"in".into()));k.push((min,"mn".into()));k.push((max,"mx".into()));k.push((in_bounds,"ib".into()));k.push((out_of_bounds_lo,"lo".into()));k.push((out_of_bounds_hi,"hi".into()));}
+                    A::Spline{location,values,..}=>{k.push((location,"loc".into()));for (i,v) in values.iter().enumerate(){k.push((v,format!("v{i}")));}}
+                    A::Shift{offset,..}=>{k.push((offset,"off".into()));}
+                    A::WeirdScaledSampler{input,noise,..}=>{k.push((input,"in".into()));k.push((noise,"n".into()));}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push((shift_x,"sx".into()));k.push((shift_y,"sy".into()));k.push((shift_z,"sz".into()));k.push((noise,"n".into()));}
+                    _=>{}
+                }
+                for (c,p) in k { walk(c,ch,&format!("{path}/{p}"),cnt); }
+            }
+            let mut total=0;
+            walk(&chans[8],8,"", &mut total);
+            println!("depth spline count={total}");
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn spline_inputs_at_error() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            // childA of depth's Min = the CacheFlat_big + YClamp branch
+            let depth=&chans[8];
+            let childA = match depth { crate::ast::AstNode::Min(x,_)=>x.as_ref(), _=>{return;} };
+            fn walk(n:&crate::ast::AstNode,perm:&[i32],orig:&[f32],x:f32,y:f32,z:f32,path:&str){
+                use crate::ast::AstNode as A;
+                if let A::Spline{locations,location,..}=n {
+                    let t=cpu_ast_eval(location,perm,orig,x,y,z);
+                    // which segment?
+                    let mut seg=-1i32;
+                    for i in 0..locations.len() { if t>=locations[i] { seg=i as i32; } }
+                    let near = locations.iter().any(|&l| (t-l).abs()<1e-4);
+                    println!("{path} t={t:.6} seg={seg} nearBreak={near} locs0..={:.4} locsLast={:.4}",
+                        locations.first().copied().unwrap_or(0.0), locations.last().copied().unwrap_or(0.0));
+                }
+                let mut k:Vec<(&crate::ast::AstNode,String)>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push((a,"L".into()));k.push((b,"R".into()));}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push((a,"C".into()));}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push((input,"in".into()));k.push((min,"mn".into()));k.push((max,"mx".into()));k.push((in_bounds,"ib".into()));k.push((out_of_bounds_lo,"lo".into()));k.push((out_of_bounds_hi,"hi".into()));}
+                    A::Spline{location,values,..}=>{k.push((location,"loc".into()));for (i,v) in values.iter().enumerate(){k.push((v,format!("v{i}")));}}
+                    A::Shift{offset,..}=>{k.push((offset,"off".into()));}
+                    A::WeirdScaledSampler{input,noise,..}=>{k.push((input,"in".into()));k.push((noise,"n".into()));}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push((shift_x,"sx".into()));k.push((shift_y,"sy".into()));k.push((shift_z,"sz".into()));k.push((noise,"n".into()));}
+                    _=>{}
+                }
+                for (c,p) in k { walk(c,perm,orig,x,y,z,&format!("{path}/{p}")); }
+            }
+            println!("=== childA splines at (800,128,800) ===");
+            walk(childA,&perm,&origins,800.0,128.0,800.0,"A");
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn childA_y_independence() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            // childA = Min's first arg = Add(<big>, YClamp)
+            let childA = match depth { crate::ast::AstNode::Min(x,_)=>x.as_ref(), _=>{println!("not min");return;} };
+            // childA structure: Add(big, yclamp)? print discr
+            println!("childA = {:?}", std::mem::discriminant(childA));
+            if let crate::ast::AstNode::Add(x,y)=childA {
+                println!("  Add: L={:?} R={:?}", std::mem::discriminant(x.as_ref()), std::mem::discriminant(y.as_ref()));
+                for j in [0usize,8,16,24,32,40,48] {
+                    let wy=(-64+j as i32*8) as f32;
+                    let l=cpu_ast_eval(x,&perm,&origins,800.0,wy,800.0);
+                    let r=cpu_ast_eval(y,&perm,&origins,800.0,wy,800.0);
+                    println!("  y={wy}: L={l:.5} R={r:.5}");
+                }
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_L_tree() {
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let childA = match &chans[8] { crate::ast::AstNode::Min(x,_)=>x.as_ref(), _=>{return;} };
+            let l = match childA { crate::ast::AstNode::Add(x,_)=>x.as_ref(), _=>{println!("not Add");return;} };
+            fn d(n:&crate::ast::AstNode, ind:usize){
+                use crate::ast::AstNode as A;
+                let p="  ".repeat(ind.min(25));
+                let tag=match n{
+                    A::Min(_,_)=>"Min",A::Max(_,_)=>"Max",A::Add(_,_)=>"Add",A::Sub(_,_)=>"Sub",A::Mul(_,_)=>"Mul",A::Div(_,_)=>"Div",
+                    A::CacheFlat(_)=>"CacheFlat",A::Cache2D(_)=>"Cache2D",A::NoiseSampler{..}=>"Noise",A::Spline{..}=>"Spline",
+                    A::RangeChoice{..}=>"RangeChoice",A::YClampedGradient{..}=>"YClamp",A::Constant(_)=>"Const",
+                    A::Shift{..}=>"Shift",A::ShiftedNoise{..}=>"ShiftedNoise",A::WeirdScaledSampler{..}=>"Weird",
+                    _=>"other"};
+                print!("{p}{tag}");
+                if let A::Constant(v)=n {print!("({v})");}
+                if let A::NoiseSampler{xz_scale,y_scale,amplitude,..}=n {print!("(xz={xz_scale},y={y_scale},amp={amplitude})");}
+                println!();
+                let mut k:Vec<(&crate::ast::AstNode,String)>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push((a,"L".into()));k.push((b,"R".into()));}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push((a,"C".into()));}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push((input,"in".into()));k.push((min,"mn".into()));k.push((max,"mx".into()));k.push((in_bounds,"ib".into()));k.push((out_of_bounds_lo,"lo".into()));k.push((out_of_bounds_hi,"hi".into()));}
+                    A::Spline{location,values,..}=>{k.push((location,"loc".into()));for (i,v) in values.iter().enumerate(){k.push((v,format!("v{i}")));}}
+                    A::Shift{offset,..}=>{k.push((offset,"off".into()));}
+                    A::WeirdScaledSampler{input,noise,..}=>{k.push((input,"in".into()));k.push((noise,"n".into()));}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push((shift_x,"sx".into()));k.push((shift_y,"sy".into()));k.push((shift_z,"sz".into()));k.push((noise,"n".into()));}
+                    _=>{}
+                }
+                for (c,p) in k { print!("{p}:"); d(c,ind+1); }
+            }
+            println!("=== depth childA.L tree ===");
+            d(l,0);
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn spline_loc_types() {
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            fn tname(n:&crate::ast::AstNode)->String{
+                use crate::ast::AstNode as A;
+                match n {
+                    A::Constant(v)=>format!("Const({v})"),
+                    A::InputY=>"InputY".into(), A::InputX=>"InputX".into(), A::InputZ=>"InputZ".into(),
+                    A::NoiseSampler{xz_scale,y_scale,..}=>format!("Noise(xz={xz_scale},y={y_scale})"),
+                    A::CacheFlat(_)=>"CacheFlat".into(), A::Cache2D(_)=>"Cache2D".into(),
+                    A::Add(_,_)=>"Add".into(),A::Mul(_,_)=>"Mul".into(),A::Min(_,_)=>"Min".into(),A::Max(_,_)=>"Max".into(),A::Sub(_,_)=>"Sub".into(),
+                    A::Spline{..}=>"Spline".into(), A::YClampedGradient{..}=>"YClamp".into(),
+                    A::RangeChoice{..}=>"RangeChoice".into(), A::Shift{..}=>"Shift".into(),
+                    A::ShiftedNoise{..}=>"ShiftedNoise".into(), A::WeirdScaledSampler{..}=>"Weird".into(),
+                    _=>"other".into(),
+                }
+            }
+            fn walk(n:&crate::ast::AstNode, out:&mut std::collections::BTreeMap<String,usize>){
+                use crate::ast::AstNode as A;
+                if let A::Spline{location,..}=n { *out.entry(tname(location)).or_insert(0)+=1; }
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push(a);k.push(b);}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::WeirdScaledSampler{input,noise,..}=>{k.push(input);k.push(noise);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { walk(c,out); }
+            }
+            let mut m=std::collections::BTreeMap::new();
+            walk(&chans[8],&mut m);
+            println!("=== depth spline location function types ===");
+            for (k,v) in &m { println!("  {v:4} × {k}"); }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn opto_vs_raw_depth() {
+        use crate::ast::deserialize::deserialize_full_with_perm;
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(768*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let (raw, _shape, _biome, perm_entries, _simp) = deserialize_full_with_perm(&blob).unwrap();
+            let raw_depth = match &raw { crate::ast::AstNode::Root(c)=>c[8].clone(), _=>panic!() };
+            let opt = crate::ast::opto::run_pipeline(raw).unwrap();
+            let opt_depth = match &opt { crate::ast::AstNode::Root(c)=>c[8].clone(), _=>panic!() };
+            let perm: Vec<i32> = {
+                let pts = crate::world::world::PermutationTableSet::from_entries(&perm_entries);
+                pts.buffer.clone()
+            };
+            // origins need same source; use from_entries
+            let pts = crate::world::world::PermutationTableSet::from_entries(&perm_entries);
+            let origins = pts.origins.clone();
+            // ref
+            let txt = std::fs::read_to_string("/tmp/ref_chunk_50_50.txt").unwrap();
+            let (mut dx,mut dy,mut dz)=(5usize,49usize,5usize); let (mut cxx,mut czz)=(0i32,0i32);
+            let mut cur=false; let mut vals=vec![];
+            for l in txt.lines(){
+                if let Some(r)=l.strip_prefix("DIMS "){let v:Vec<usize>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();dx=v[0];dy=v[1];dz=v[2];}
+                if let Some(r)=l.strip_prefix("CHUNK "){let v:Vec<i32>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();cxx=v[0];czz=v[1];}
+                if l.starts_with("CHANNEL depth"){cur=true;vals=vec![0f32;dx*dy*dz];continue;}
+                if l.starts_with("CHANNEL "){cur=false;continue;}
+                if cur {let t:Vec<&str>=l.split_whitespace().collect();if t.len()==4{
+                    let i:usize=t[0].parse().unwrap();let j:usize=t[1].parse().unwrap();let k:usize=t[2].parse().unwrap();
+                    vals[i+k*dx+j*dx*dz]=t[3].parse().unwrap();}}
+            }
+            let sx=cxx*16;let sz=czz*16;
+            let (mut badr,mut badh,mut maxr,mut maxh)=(0,0,0f32,0f32);
+            for j in 0..dy{for k in 0..dz{for i in 0..dx{
+                let wx=(sx+i as i32*4) as f32;let wy=(-64+j as i32*8) as f32;let wz=(sz+k as i32*4) as f32;
+                let r=vals[i+k*dx+j*dx*dz];
+                let vr=cpu_ast_eval(&raw_depth,&perm,&origins,wx,wy,wz);
+                let vo=cpu_ast_eval(&opt_depth,&perm,&origins,wx,wy,wz);
+                let dr=(vr-r).abs(); let dh=(vo-r).abs();
+                if dr>0.01{badr+=1;} if dh>0.01{badh+=1;}
+                if dr>maxr{maxr=dr;} if dh>maxh{maxh=dh;}
+            }}}
+            println!("RAW (no opto): {badr}/{} bad maxd={maxr:.5}", dx*dy*dz);
+            println!("OPTO:          {badh}/{} bad maxd={maxh:.5}", dx*dy*dz);
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn perlin_f32_vs_f64_at_far() {
+        use crate::ast::deserialize::deserialize_full_with_perm;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let (raw, _s, _b, pts, _si) = deserialize_full_with_perm(&blob).unwrap();
+            let perm = crate::world::world::PermutationTableSet::from_entries(&pts).buffer.clone();
+            let origins = crate::world::world::PermutationTableSet::from_entries(&pts).origins.clone();
+            // find first NoiseSampler in depth
+            fn find(n:&crate::ast::AstNode)->Option<&crate::ast::AstNode>{
+                use crate::ast::AstNode as A;
+                if matches!(n, A::NoiseSampler{..}) { return Some(n); }
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push(a);k.push(b);}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    _=>{}
+                }
+                for c in k { if let Some(r)=find(c){return Some(r);} }
+                None
+            }
+            let d = match &raw { crate::ast::AstNode::Root(c)=>&c[8], _=>panic!() };
+            let noise = match find(d) { Some(n)=>n, None=>{println!("no noise");return;} };
+            // f32 path: cpu_ast_eval; f64 path: replicate octave with f64 coords
+            fn mp_f64(v:f64)->f64 { v - (v/33554432.0+0.5).floor()*33554432.0 }
+            for (label,x,z) in [("near",112.0f32,544.0f32),("far",800.0,800.0)] {
+                let v32 = super::tests::cpu_ast_eval(noise,&perm,&origins,x,0.0,z);
+                // emulate f64 octave with same perm
+                let (xz,ys,amp,first,second) = match noise {
+                    crate::ast::AstNode::NoiseSampler{xz_scale,y_scale,amplitude,first,second,..}=>(*xz_scale,*y_scale,*amplitude,first,second),
+                    _=>unreachable!(),
+                };
+                // just report f32 vs "f64-scaled coordinate then f32 perlin"
+                let mut diffs=vec![];
+                let mut freq=first.initial_freq as f64;
+                for i in 0..first.amplitudes.len() {
+                    let coord_f32 = (x*xz) * freq as f32;
+                    let coord_f64 = (x as f64)*(xz as f64)*freq;
+                    let wrapped_f32 = (coord_f32/33554432.0+0.5).floor()*33554432.0;
+                    let wrapped_f64 = (coord_f64/33554432.0+0.5).floor()*33554432.0;
+                    let mc_f32 = coord_f32 - wrapped_f32;
+                    let mc_f64 = (coord_f64 - wrapped_f64) as f32;
+                    if (mc_f32-mc_f64).abs() > 0.01 {
+                        diffs.push(format!("oct{i} freq={freq} cf32={coord_f32:.0} cf64={coord_f64:.0} wrapf32={mc_f32:.1} wrapf64={mc_f64:.1}"));
+                    }
+                    freq*=2.0;
+                }
+                println!("[{label}] x={x} f32_noise={v32:.6}  coord-wrap diffs={}", diffs.len());
+                for dd in diffs.iter().take(4) { println!("    {dd}"); }
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn depth_with_mc_cache_semantics() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(768*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth = &chans[8];
+            let txt = std::fs::read_to_string("/tmp/ref_chunk_50_50.txt").unwrap();
+            let (mut dx,mut dy,mut dz)=(5usize,49usize,5usize); let (mut cxx,mut czz)=(0i32,0i32);
+            let mut cur=false; let mut vals=vec![];
+            for l in txt.lines(){
+                if let Some(r)=l.strip_prefix("DIMS "){let v:Vec<usize>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();dx=v[0];dy=v[1];dz=v[2];}
+                if let Some(r)=l.strip_prefix("CHUNK "){let v:Vec<i32>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();cxx=v[0];czz=v[1];}
+                if l.starts_with("CHANNEL depth"){cur=true;vals=vec![0f32;dx*dy*dz];continue;}
+                if l.starts_with("CHANNEL "){cur=false;continue;}
+                if cur {let t:Vec<&str>=l.split_whitespace().collect();if t.len()==4{
+                    let i:usize=t[0].parse().unwrap();let j:usize=t[1].parse().unwrap();let k:usize=t[2].parse().unwrap();
+                    vals[i+k*dx+j*dx*dz]=t[3].parse().unwrap();}}
+            }
+            let sx=cxx*16;let sz=czz*16;
+            // variant: Cache2D/CacheFlat -> evaluate delegate at (x, 0, z) [MC FlatCache uses y=0; Cache2D first-visit is j=0 => y=minY? try both]
+            fn ev(n:&crate::ast::AstNode,perm:&[i32],orig:&[f32],x:f32,y:f32,z:f32)->f32{
+                use crate::ast::AstNode as A;
+                match n {
+                    A::Cache2D(a)|A::CacheFlat(a)=>ev(a,perm,orig,x,0.0,z),
+                    A::CacheInterpolated(a)=>ev(a,perm,orig,x,y,z),
+                    A::Min(a,b)=>ev(a,perm,orig,x,y,z).min(ev(b,perm,orig,x,y,z)),
+                    A::Max(a,b)=>ev(a,perm,orig,x,y,z).max(ev(b,perm,orig,x,y,z)),
+                    A::Add(a,b)=>ev(a,perm,orig,x,y,z)+ev(b,perm,orig,x,y,z),
+                    A::Sub(a,b)=>ev(a,perm,orig,x,y,z)-ev(b,perm,orig,x,y,z),
+                    A::Mul(a,b)=>ev(a,perm,orig,x,y,z)*ev(b,perm,orig,x,y,z),
+                    A::Div(a,b)=>ev(a,perm,orig,x,y,z)/ev(b,perm,orig,x,y,z),
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,..}=>{
+                        let iv=ev(input,perm,orig,x,y,z);let mn=ev(min,perm,orig,x,y,z);let mx=ev(max,perm,orig,x,y,z);
+                        if iv>=mn&&iv<mx {ev(in_bounds,perm,orig,x,y,z)} else {ev(out_of_bounds_lo,perm,orig,x,y,z)}}
+                    A::Spline{locations,derivatives,location,values}=>{
+                        let t=ev(location,perm,orig,x,y,z);let nn=locations.len();
+                        let vs:Vec<f32>=values.iter().map(|v|ev(v,perm,orig,x,y,z)).collect();
+                        if nn==0{return 0.0;}if nn==1{return vs[0];}
+                        if t<locations[0]{let d0=derivatives[0];return if d0==0.0{vs[0]}else{vs[0]+d0*(t-locations[0])};}
+                        if t>=locations[nn-1]{let dn=derivatives[nn-1];return if dn==0.0{vs[nn-1]}else{vs[nn-1]+dn*(t-locations[nn-1])};}
+                        for k in 0..nn-1{if t<locations[k+1]{
+                            let lk=locations[k];let lk1=locations[k+1];let dk=derivatives[k];let dk1=derivatives[k+1];
+                            let vk=vs[k];let vk1=vs[k+1];let w=lk1-lk;let pp=(t-lk)/w;
+                            let a=dk*w-(vk1-vk);let b=dk1*-1.0*w+(vk1-vk);
+                            return vk+pp*(vk1-vk)+pp*(1.0-pp)*(a+pp*(b-a));}}
+                        vs[nn-1]}
+                    A::YClampedGradient{from_y,to_y,from_value,to_value}=>{let t=((y-from_y)/(to_y-from_y)).clamp(0.0,1.0);from_value+t*(to_value-from_value)}
+                    A::Constant(v)=>*v,A::InputX=>x,A::InputY=>y,A::InputZ=>z,
+                    _=>cpu_ast_eval(n,perm,orig,x,y,z),
+                }
+            }
+            let mut bad=0;let mut maxd=0f32;
+            for j in 0..dy{for k in 0..dz{for i in 0..dx{
+                let wx=(sx+i as i32*4) as f32;let wy=(-64+j as i32*8) as f32;let wz=(sz+k as i32*4) as f32;
+                let c=ev(depth,&perm,&origins,wx,wy,wz);
+                let d=(c-vals[i+k*dx+j*dx*dz]).abs();if d>maxd{maxd=d;}if d>0.01{bad+=1;}
+            }}}
+            println!("depth with Cache(y=0) semantics: {bad}/{} bad, maxd={maxd:.5}", dx*dy*dz);
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn depth_other_nodes() {
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            fn nm(n:&crate::ast::AstNode)->String{
+                use crate::ast::AstNode as A;
+                match n {
+                    A::Constant(_)=>"Const".into(),A::InputX=>"InputX".into(),A::InputY=>"InputY".into(),A::InputZ=>"InputZ".into(),
+                    A::Add(_,_)=>"Add".into(),A::Sub(_,_)=>"Sub".into(),A::Mul(_,_)=>"Mul".into(),A::Div(_,_)=>"Div".into(),
+                    A::Min(_,_)=>"Min".into(),A::Max(_,_)=>"Max".into(),A::Abs(_)=>"Abs".into(),A::Square(_)=>"Square".into(),
+                    A::Cube(_)=>"Cube".into(),A::Sqrt(_)=>"Sqrt".into(),A::FloorDiv(_,_)=>"FloorDiv".into(),A::Squeeze(_)=>"Squeeze".into(),
+                    A::NoiseSampler{..}=>"Noise".into(),A::SimplexNoise2D{..}=>"Simplex2D".into(),A::SimplexNoise3D{..}=>"Simplex3D".into(),
+                    A::InterpolatedNoiseSampler{..}=>"InterpNS".into(),A::InterpNoiseSampler{..}=>"InterpNoise".into(),
+                    A::Shift{..}=>"Shift".into(),A::WeirdScaledSampler{..}=>"Weird".into(),A::ShiftedNoise{..}=>"ShiftedNoise".into(),
+                    A::EndIslands{..}=>"EndIslands".into(),A::Beardifier{..}=>"Beardifier".into(),A::Spline{..}=>"Spline".into(),
+                    A::RangeChoice{..}=>"RangeChoice".into(),A::IntervalSelect{..}=>"IntervalSelect".into(),
+                    A::YClampedGradient{..}=>"YClamp".into(),A::CacheFlat(_)=>"CacheFlat".into(),A::Cache2D(_)=>"Cache2D".into(),
+                    A::CacheInterpolated(_)=>"CacheInterp".into(),A::FindTopSurface{..}=>"FindTop".into(),A::Aquifer{..}=>"Aquifer".into(),
+                    A::BiomeTree{..}=>"BiomeTree".into(),A::Root(_)=>"Root".into(),
+                    A::ExternalInput{..}=>"ExternalInput".into(), A::InnerRef(_)=>"InnerRef".into(),
+                }
+            }
+            fn walk(n:&crate::ast::AstNode, m:&mut std::collections::BTreeMap<String,usize>){
+                use crate::ast::AstNode as A;
+                *m.entry(nm(n)).or_insert(0)+=1;
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)|A::FloorDiv(a,b)=>{k.push(a);k.push(b);}
+                    A::Abs(a)|A::Square(a)|A::Cube(a)|A::Sqrt(a)|A::Squeeze(a)|A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::IntervalSelect{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::WeirdScaledSampler{input,noise,..}=>{k.push(input);k.push(noise);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    A::InterpolatedNoiseSampler{child}=>{k.push(child);}
+                    A::FindTopSurface{density,initial,..}=>{k.push(density);k.push(initial);}
+                    A::Aquifer{density,fluid_level}=>{k.push(density);k.push(fluid_level);}
+                    _=>{}
+                }
+                for c in k { walk(c,m); }
+            }
+            let mut m=std::collections::BTreeMap::new();
+            walk(&chans[8],&mut m);
+            println!("=== depth node types ===");
+            for (k,v) in &m { println!("  {v:5} × {k}"); }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn ref50_channels() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(768*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let txt = std::fs::read_to_string("/tmp/ref_chunk_50_50.txt").unwrap();
+            let (mut dx,mut dy,mut dz)=(5usize,49usize,5usize); let (mut cxx,mut czz)=(0i32,0i32);
+            let mut cur:Option<String>=None; let mut data:std::collections::HashMap<String,Vec<f32>>=Default::default();
+            for l in txt.lines(){
+                if let Some(r)=l.strip_prefix("DIMS "){let v:Vec<usize>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();dx=v[0];dy=v[1];dz=v[2];}
+                if let Some(r)=l.strip_prefix("CHUNK "){let v:Vec<i32>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();cxx=v[0];czz=v[1];}
+                if let Some(n)=l.strip_prefix("CHANNEL "){cur=Some(n.trim().into());data.insert(n.trim().into(),vec![0f32;dx*dy*dz]);continue;}
+                if let Some(c)=&cur {let t:Vec<&str>=l.split_whitespace().collect();if t.len()==4{
+                    let i:usize=t[0].parse().unwrap();let j:usize=t[1].parse().unwrap();let k:usize=t[2].parse().unwrap();
+                    data.get_mut(c).unwrap()[i+k*dx+j*dx*dz]=t[3].parse().unwrap();}}
+            }
+            let order=["barrierNoise","fluidLevelFloodednessNoise","fluidLevelSpreadNoise","lavaNoise","temperature","vegetation","continents","erosion","depth","ridges","initialDensityWithoutJaggedness","finalDensity","veinToggle","veinRidged","veinGap"];
+            let sx=cxx*16;let sz=czz*16;
+            for (ci,name) in order.iter().enumerate(){
+                if ci>=chans.len(){break;}
+                if let Some(rv)=data.get(*name){
+                    let mut bad=0;let mut maxd=0f32;
+                    for j in 0..dy{for k in 0..dz{for i in 0..dx{
+                        let wx=(sx+i as i32*4) as f32;let wy=(-64+j as i32*8) as f32;let wz=(sz+k as i32*4) as f32;
+                        let c=cpu_ast_eval(&chans[ci],&perm,&origins,wx,wy,wz);
+                        let d=(c-rv[i+k*dx+j*dx*dz]).abs();if d>maxd{maxd=d;}if d>0.01{bad+=1;}
+                    }}}
+                    println!("ch{} {:34} bad={}/{} maxd={:.5}",ci,name,bad,dx*dy*dz,maxd);
+                }
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn ref51_channels() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(768*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let txt = std::fs::read_to_string("/tmp/ref_chunk_51_6.txt").unwrap();
+            let (mut dx,mut dy,mut dz)=(5usize,49usize,5usize); let (mut cxx,mut czz)=(0i32,0i32);
+            let mut cur:Option<String>=None; let mut data:std::collections::HashMap<String,Vec<f32>>=Default::default();
+            for l in txt.lines(){
+                if let Some(r)=l.strip_prefix("DIMS "){let v:Vec<usize>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();dx=v[0];dy=v[1];dz=v[2];}
+                if let Some(r)=l.strip_prefix("CHUNK "){let v:Vec<i32>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();cxx=v[0];czz=v[1];}
+                if let Some(n)=l.strip_prefix("CHANNEL "){cur=Some(n.trim().into());data.insert(n.trim().into(),vec![0f32;dx*dy*dz]);continue;}
+                if let Some(c)=&cur {let t:Vec<&str>=l.split_whitespace().collect();if t.len()==4{
+                    let i:usize=t[0].parse().unwrap();let j:usize=t[1].parse().unwrap();let k:usize=t[2].parse().unwrap();
+                    data.get_mut(c).unwrap()[i+k*dx+j*dx*dz]=t[3].parse().unwrap();}}
+            }
+            let order=["barrierNoise","fluidLevelFloodednessNoise","fluidLevelSpreadNoise","lavaNoise","temperature","vegetation","continents","erosion","depth","ridges","initialDensityWithoutJaggedness","finalDensity","veinToggle","veinRidged","veinGap"];
+            let sx=cxx*16;let sz=czz*16;
+            for (ci,name) in order.iter().enumerate(){
+                if ci>=chans.len(){break;}
+                if let Some(rv)=data.get(*name){
+                    let mut bad=0;let mut maxd=0f32;
+                    for j in 0..dy{for k in 0..dz{for i in 0..dx{
+                        let wx=(sx+i as i32*4) as f32;let wy=(-64+j as i32*8) as f32;let wz=(sz+k as i32*4) as f32;
+                        let c=cpu_ast_eval(&chans[ci],&perm,&origins,wx,wy,wz);
+                        let d=(c-rv[i+k*dx+j*dx*dz]).abs();if d>maxd{maxd=d;}if d>0.01{bad+=1;}
+                    }}}
+                    println!("ch{} {:34} bad={}/{} maxd={:.5}",ci,name,bad,dx*dy*dz,maxd);
+                }
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn ref7_channels() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(768*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let txt = std::fs::read_to_string("/tmp/ref_chunk_7_49.txt").unwrap();
+            let (mut dx,mut dy,mut dz)=(5usize,49usize,5usize); let (mut cxx,mut czz)=(0i32,0i32);
+            let mut cur:Option<String>=None; let mut data:std::collections::HashMap<String,Vec<f32>>=Default::default();
+            for l in txt.lines(){
+                if let Some(r)=l.strip_prefix("DIMS "){let v:Vec<usize>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();dx=v[0];dy=v[1];dz=v[2];}
+                if let Some(r)=l.strip_prefix("CHUNK "){let v:Vec<i32>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();cxx=v[0];czz=v[1];}
+                if let Some(n)=l.strip_prefix("CHANNEL "){cur=Some(n.trim().into());data.insert(n.trim().into(),vec![0f32;dx*dy*dz]);continue;}
+                if let Some(c)=&cur {let t:Vec<&str>=l.split_whitespace().collect();if t.len()==4{
+                    let i:usize=t[0].parse().unwrap();let j:usize=t[1].parse().unwrap();let k:usize=t[2].parse().unwrap();
+                    data.get_mut(c).unwrap()[i+k*dx+j*dx*dz]=t[3].parse().unwrap();}}
+            }
+            let order=["barrierNoise","fluidLevelFloodednessNoise","fluidLevelSpreadNoise","lavaNoise","temperature","vegetation","continents","erosion","depth","ridges","initialDensityWithoutJaggedness","finalDensity","veinToggle","veinRidged","veinGap"];
+            let sx=cxx*16;let sz=czz*16;
+            for (ci,name) in order.iter().enumerate(){
+                if ci>=chans.len(){break;}
+                if let Some(rv)=data.get(*name){
+                    let mut bad=0;let mut maxd=0f32;
+                    for j in 0..dy{for k in 0..dz{for i in 0..dx{
+                        let wx=(sx+i as i32*4) as f32;let wy=(-64+j as i32*8) as f32;let wz=(sz+k as i32*4) as f32;
+                        let c=cpu_ast_eval(&chans[ci],&perm,&origins,wx,wy,wz);
+                        let d=(c-rv[i+k*dx+j*dx*dz]).abs();if d>maxd{maxd=d;}if d>0.01{bad+=1;}
+                    }}}
+                    println!("ch{} {:34} bad={}/{} maxd={:.5}",ci,name,bad,dx*dy*dz,maxd);
+                }
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn f32_vs_f64_two_points() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(768*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins: Vec<f32> = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth = &chans[8];
+            fn mp(v:f64)->f64 { v - (v/33554432.0+0.5).floor()*33554432.0 }
+            fn fade(t:f64)->f64{t*t*t*(t*(t*6.0-15.0)+10.0)}
+            fn lerp(a:f64,b:f64,t:f64)->f64{a+t*(b-a)}
+            fn p3d(perm:&[i32],p:i32,x:f64,y:f64,z:f64)->f64{
+                let ix=x.floor() as i32; let iy=y.floor() as i32; let iz=z.floor() as i32;
+                let fx=x-ix as f64; let fy=y-iy as f64; let fz=z-iz as f64;
+                let xi=ix&255; let yi=iy&255; let zi=iz&255;
+                let idx=|i:i32|(p+i) as usize;
+                let a=perm[idx(xi)]; let b=perm[idx((xi+1)&255)];
+                let aa=perm[idx((a+yi)&255)]; let ab=perm[idx((a+yi+1)&255)];
+                let ba=perm[idx((b+yi)&255)]; let bb=perm[idx((b+yi+1)&255)];
+                let aaa=perm[idx((aa+zi)&255)]; let aab=perm[idx((aa+zi+1)&255)];
+                let aba=perm[idx((ab+zi)&255)]; let abb=perm[idx((ab+zi+1)&255)];
+                let baa=perm[idx((ba+zi)&255)]; let bab=perm[idx((ba+zi+1)&255)];
+                let bba=perm[idx((bb+zi)&255)]; let bbb=perm[idx((bb+zi+1)&255)];
+                let gr=|h:i32,xx:f64,yy:f64,zz:f64|->f64{let (gx,gy,gz)=match h&15{
+                    0=>(1.0,1.0,0.0),1=>(-1.0,1.0,0.0),2=>(1.0,-1.0,0.0),3=>(-1.0,-1.0,0.0),
+                    4=>(1.0,0.0,1.0),5=>(-1.0,0.0,1.0),6=>(1.0,0.0,-1.0),7=>(-1.0,0.0,-1.0),
+                    8=>(0.0,1.0,1.0),9=>(0.0,-1.0,1.0),10=>(0.0,1.0,-1.0),11=>(0.0,-1.0,-1.0),
+                    12=>(1.0,1.0,0.0),13=>(0.0,-1.0,1.0),14=>(-1.0,1.0,0.0),_=>(0.0,-1.0,-1.0)};gx*xx+gy*yy+gz*zz};
+                let u=fade(fx);let v=fade(fy);let w=fade(fz);
+                let x1=lerp(gr(aaa,fx,fy,fz),gr(baa,fx-1.0,fy,fz),u);
+                let x2=lerp(gr(aba,fx,fy-1.0,fz),gr(bba,fx-1.0,fy-1.0,fz),u);
+                let y1=lerp(x1,x2,v);
+                let x3=lerp(gr(aab,fx,fy,fz-1.0),gr(bab,fx-1.0,fy,fz-1.0),u);
+                let x4=lerp(gr(abb,fx,fy-1.0,fz-1.0),gr(bbb,fx-1.0,fy-1.0,fz-1.0),u);
+                let y2=lerp(x3,x4,v);
+                lerp(y1,y2,w)
+            }
+            fn po(perm:&[i32],orig:&[f32],p:i32,x:f64,y:f64,z:f64)->f64{
+                let e=p/256;
+                p3d(perm,p,mp(x)+orig[(e*3) as usize] as f64,mp(y)+orig[(e*3+1) as usize] as f64,mp(z)+orig[(e*3+2) as usize] as f64)
+            }
+            fn oct(perm:&[i32],orig:&[f32],o:&crate::ast::OctaveSampler,cx:f64,cy:f64,cz:f64)->f64{
+                let mut f=o.initial_freq as f64; let mut a=o.persistence as f64; let mut acc=0f64;
+                for i in 0..o.amplitudes.len(){ if o.amplitudes[i]!=0.0 {
+                    let s=po(perm,orig,o.perm_offset+i as i32*256, mp(cx*f), mp(cy*f), mp(cz*f));
+                    acc+=o.amplitudes[i] as f64*s*a; }
+                    f*=2.0; a*=0.5; }
+                acc
+            }
+            fn ev64(n:&crate::ast::AstNode,perm:&[i32],orig:&[f32],x:f64,y:f64,z:f64)->f64{
+                use crate::ast::AstNode as A;
+                match n {
+                    A::Constant(v)=>*v as f64, A::InputX=>x, A::InputY=>y, A::InputZ=>z,
+                    A::Add(a,b)=>ev64(a,perm,orig,x,y,z)+ev64(b,perm,orig,x,y,z),
+                    A::Sub(a,b)=>ev64(a,perm,orig,x,y,z)-ev64(b,perm,orig,x,y,z),
+                    A::Mul(a,b)=>ev64(a,perm,orig,x,y,z)*ev64(b,perm,orig,x,y,z),
+                    A::Div(a,b)=>ev64(a,perm,orig,x,y,z)/ev64(b,perm,orig,x,y,z),
+                    A::Min(a,b)=>ev64(a,perm,orig,x,y,z).min(ev64(b,perm,orig,x,y,z)),
+                    A::Max(a,b)=>ev64(a,perm,orig,x,y,z).max(ev64(b,perm,orig,x,y,z)),
+                    A::Abs(a)=>ev64(a,perm,orig,x,y,z).abs(),
+                    A::Square(a)=>{let v=ev64(a,perm,orig,x,y,z);v*v}
+                    A::Cube(a)=>{let v=ev64(a,perm,orig,x,y,z);v*v*v}
+                    A::Sqrt(a)=>ev64(a,perm,orig,x,y,z).sqrt(),
+                    A::Squeeze(a)=>{let v=ev64(a,perm,orig,x,y,z).clamp(-1.0,1.0);v*0.5-v*v*v/24.0}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>ev64(a,perm,orig,x,y,z),
+                    A::FloorDiv(a,b)=>(ev64(a,perm,orig,x,y,z)/ev64(b,perm,orig,x,y,z)).floor(),
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,..}=>{
+                        let iv=ev64(input,perm,orig,x,y,z);let mn=ev64(min,perm,orig,x,y,z);let mx=ev64(max,perm,orig,x,y,z);
+                        if iv>=mn&&iv<mx {ev64(in_bounds,perm,orig,x,y,z)} else {ev64(out_of_bounds_lo,perm,orig,x,y,z)}}
+                    A::NoiseSampler{first,second,amplitude,xz_scale,y_scale,..}=>{
+                        const D:f64=1.0181268882175227;
+                        let vf=oct(perm,orig,first,x*(*xz_scale as f64),y*(*y_scale as f64),z*(*xz_scale as f64));
+                        let t=if let Some(s)=second{vf+oct(perm,orig,s,x*(*xz_scale as f64)*D,y*(*y_scale as f64)*D,z*(*xz_scale as f64)*D)}else{vf};
+                        t*(*amplitude as f64)}
+                    A::Shift{kind,offset}=>{let (cx,cy,cz)=match kind{0=>(x*0.25,y*0.25,z*0.25),1=>(x*0.25,0.0,z*0.25),2=>(z*0.25,x*0.25,0.0),_=>(x,y,z)};
+                        ev64(offset,perm,orig,cx,cy,cz)*4.0}
+                    A::ShiftedNoise{xz_scale,y_scale,shift_x,shift_y,shift_z,noise}=>{
+                        let d=x*(*xz_scale as f64)+ev64(shift_x,perm,orig,x,y,z);
+                        let e=y*(*y_scale as f64)+ev64(shift_y,perm,orig,x,y,z);
+                        let f=z*(*xz_scale as f64)+ev64(shift_z,perm,orig,x,y,z);
+                        ev64(noise,perm,orig,d,e,f)}
+                    A::YClampedGradient{from_y,to_y,from_value,to_value}=>{let t=((y-*from_y as f64)/((*to_y-*from_y) as f64)).clamp(0.0,1.0);*from_value as f64+t*((*to_value-*from_value) as f64)}
+                    A::Spline{locations,derivatives,location,values}=>{
+                        let t=ev64(location,perm,orig,x,y,z); let nn=locations.len();
+                        let vs:Vec<f64>=values.iter().map(|v|ev64(v,perm,orig,x,y,z)).collect();
+                        if nn==0{return 0.0;} if nn==1{return vs[0];}
+                        if t<locations[0] as f64 {let d0=derivatives[0] as f64; return if d0==0.0{vs[0]}else{vs[0]+d0*(t-locations[0] as f64)};}
+                        if t>=locations[nn-1] as f64 {let dn=derivatives[nn-1] as f64; return if dn==0.0{vs[nn-1]}else{vs[nn-1]+dn*(t-locations[nn-1] as f64)};}
+                        for k in 0..nn-1{ if t<locations[k+1] as f64 {
+                            let lk=locations[k] as f64;let lk1=locations[k+1] as f64;let dk=derivatives[k] as f64;let dk1=derivatives[k+1] as f64;
+                            let vk=vs[k];let vk1=vs[k+1];let w=lk1-lk;let pp=(t-lk)/w;
+                            let a=dk*w-(vk1-vk);let b=dk1*-1.0*w+(vk1-vk);
+                            return vk+pp*(vk1-vk)+pp*(1.0-pp)*(a+pp*(b-a));}}
+                        vs[nn-1]}
+                    _=>cpu_ast_eval(n,perm,orig,x as f32,y as f32,z as f32) as f64,
+                }
+            }
+            for (label,x,z) in [("OK  (112,784)",112.0f32,784.0f32),("BAD (816,96)",816.0,96.0)] {
+                let f32v=cpu_ast_eval(depth,&perm,&origins,x,128.0,z);
+                let f64v=ev64(depth,&perm,&origins,x as f64,128.0,z as f64) as f32;
+                println!("[{label}] f32={f32v:.6} f64={f64v:.6} diff={:.6}", (f32v-f64v).abs());
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn depth_rangechoice_boundaries() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            fn walk(n:&crate::ast::AstNode,perm:&[i32],orig:&[f32],x:f32,y:f32,z:f32,idx:&mut usize){
+                use crate::ast::AstNode as A;
+                if let A::RangeChoice{input,min,max,..}=n {
+                    let iv=cpu_ast_eval(input,perm,orig,x,y,z);
+                    let mn=cpu_ast_eval(min,perm,orig,x,y,z);
+                    let mx=cpu_ast_eval(max,perm,orig,x,y,z);
+                    let inr = iv>=mn && iv<mx;
+                    let near = (iv-mn).abs()<0.01 || (iv-mx).abs()<0.01;
+                    println!("RC[{idx}] input={iv:.5} min={mn:.3} max={mx:.3} inRange={inr} NEAR_BOUND={near}");
+                    *idx+=1;
+                }
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push(a);k.push(b);}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { walk(c,perm,orig,x,y,z,idx); }
+            }
+            for (label,x,z) in [("OK (112,784)",112.0f32,784.0f32),("BAD(816,96)",816.0,96.0)] {
+                println!("=== {label} ===");
+                let mut idx=0; walk(depth,&perm,&origins,x,128.0,z,&mut idx);
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn rc0_input_f64() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins: Vec<f32> = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            // find first RangeChoice's input
+            fn find_rc(n:&crate::ast::AstNode)->Option<&crate::ast::AstNode>{
+                use crate::ast::AstNode as A;
+                if let A::RangeChoice{input,..}=n { return Some(input.as_ref()); }
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push(a);k.push(b);}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { if let Some(r)=find_rc(c){return Some(r);} }
+                None
+            }
+            let rc0 = match find_rc(depth) { Some(n)=>n, None=>{println!("no RC");return;} };
+            fn mp(v:f64)->f64 { v - (v/33554432.0+0.5).floor()*33554432.0 }
+            fn fade(t:f64)->f64{t*t*t*(t*(t*6.0-15.0)+10.0)}
+            fn lerp(a:f64,b:f64,t:f64)->f64{a+t*(b-a)}
+            fn p3d(perm:&[i32],p:i32,x:f64,y:f64,z:f64)->f64{
+                let ix=x.floor() as i32; let iy=y.floor() as i32; let iz=z.floor() as i32;
+                let fx=x-ix as f64; let fy=y-iy as f64; let fz=z-iz as f64;
+                let xi=ix&255; let yi=iy&255; let zi=iz&255;
+                let idx=|i:i32|(p+i) as usize;
+                let a=perm[idx(xi)]; let b=perm[idx((xi+1)&255)];
+                let aa=perm[idx((a+yi)&255)]; let ab=perm[idx((a+yi+1)&255)];
+                let ba=perm[idx((b+yi)&255)]; let bb=perm[idx((b+yi+1)&255)];
+                let aaa=perm[idx((aa+zi)&255)]; let aab=perm[idx((aa+zi+1)&255)];
+                let aba=perm[idx((ab+zi)&255)]; let abb=perm[idx((ab+zi+1)&255)];
+                let baa=perm[idx((ba+zi)&255)]; let bab=perm[idx((ba+zi+1)&255)];
+                let bba=perm[idx((bb+zi)&255)]; let bbb=perm[idx((bb+zi+1)&255)];
+                let gr=|h:i32,xx:f64,yy:f64,zz:f64|->f64{let (gx,gy,gz)=match h&15{
+                    0=>(1.0,1.0,0.0),1=>(-1.0,1.0,0.0),2=>(1.0,-1.0,0.0),3=>(-1.0,-1.0,0.0),
+                    4=>(1.0,0.0,1.0),5=>(-1.0,0.0,1.0),6=>(1.0,0.0,-1.0),7=>(-1.0,0.0,-1.0),
+                    8=>(0.0,1.0,1.0),9=>(0.0,-1.0,1.0),10=>(0.0,1.0,-1.0),11=>(0.0,-1.0,-1.0),
+                    12=>(1.0,1.0,0.0),13=>(0.0,-1.0,1.0),14=>(-1.0,1.0,0.0),_=>(0.0,-1.0,-1.0)};gx*xx+gy*yy+gz*zz};
+                let u=fade(fx);let v=fade(fy);let w=fade(fz);
+                let x1=lerp(gr(aaa,fx,fy,fz),gr(baa,fx-1.0,fy,fz),u);
+                let x2=lerp(gr(aba,fx,fy-1.0,fz),gr(bba,fx-1.0,fy-1.0,fz),u);
+                let y1=lerp(x1,x2,v);
+                let x3=lerp(gr(aab,fx,fy,fz-1.0),gr(bab,fx-1.0,fy,fz-1.0),u);
+                let x4=lerp(gr(abb,fx,fy-1.0,fz-1.0),gr(bbb,fx-1.0,fy-1.0,fz-1.0),u);
+                let y2=lerp(x3,x4,v);
+                lerp(y1,y2,w)
+            }
+            fn po(perm:&[i32],orig:&[f32],p:i32,x:f64,y:f64,z:f64)->f64{
+                let e=p/256;
+                p3d(perm,p,mp(x)+orig[(e*3) as usize] as f64,mp(y)+orig[(e*3+1) as usize] as f64,mp(z)+orig[(e*3+2) as usize] as f64)
+            }
+            fn oct(perm:&[i32],orig:&[f32],o:&crate::ast::OctaveSampler,cx:f64,cy:f64,cz:f64)->f64{
+                let mut f=o.initial_freq as f64; let mut a=o.persistence as f64; let mut acc=0f64;
+                for i in 0..o.amplitudes.len(){ if o.amplitudes[i]!=0.0 {
+                    let s=po(perm,orig,o.perm_offset+i as i32*256, mp(cx*f), mp(cy*f), mp(cz*f));
+                    acc+=o.amplitudes[i] as f64*s*a; }
+                    f*=2.0; a*=0.5; }
+                acc
+            }
+            fn ev64(n:&crate::ast::AstNode,perm:&[i32],orig:&[f32],x:f64,y:f64,z:f64)->f64{
+                use crate::ast::AstNode as A;
+                match n {
+                    A::Constant(v)=>*v as f64, A::InputX=>x, A::InputY=>y, A::InputZ=>z,
+                    A::Add(a,b)=>ev64(a,perm,orig,x,y,z)+ev64(b,perm,orig,x,y,z),
+                    A::Sub(a,b)=>ev64(a,perm,orig,x,y,z)-ev64(b,perm,orig,x,y,z),
+                    A::Mul(a,b)=>ev64(a,perm,orig,x,y,z)*ev64(b,perm,orig,x,y,z),
+                    A::Div(a,b)=>ev64(a,perm,orig,x,y,z)/ev64(b,perm,orig,x,y,z),
+                    A::Min(a,b)=>ev64(a,perm,orig,x,y,z).min(ev64(b,perm,orig,x,y,z)),
+                    A::Max(a,b)=>ev64(a,perm,orig,x,y,z).max(ev64(b,perm,orig,x,y,z)),
+                    A::Abs(a)=>ev64(a,perm,orig,x,y,z).abs(),
+                    A::Square(a)=>{let v=ev64(a,perm,orig,x,y,z);v*v}
+                    A::Cube(a)=>{let v=ev64(a,perm,orig,x,y,z);v*v*v}
+                    A::Sqrt(a)=>ev64(a,perm,orig,x,y,z).sqrt(),
+                    A::Squeeze(a)=>{let v=ev64(a,perm,orig,x,y,z).clamp(-1.0,1.0);v*0.5-v*v*v/24.0}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>ev64(a,perm,orig,x,y,z),
+                    A::FloorDiv(a,b)=>(ev64(a,perm,orig,x,y,z)/ev64(b,perm,orig,x,y,z)).floor(),
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,..}=>{
+                        let iv=ev64(input,perm,orig,x,y,z);let mn=ev64(min,perm,orig,x,y,z);let mx=ev64(max,perm,orig,x,y,z);
+                        if iv>=mn&&iv<mx {ev64(in_bounds,perm,orig,x,y,z)} else {ev64(out_of_bounds_lo,perm,orig,x,y,z)}}
+                    A::NoiseSampler{first,second,amplitude,xz_scale,y_scale,..}=>{
+                        const D:f64=1.0181268882175227;
+                        let vf=oct(perm,orig,first,x*(*xz_scale as f64),y*(*y_scale as f64),z*(*xz_scale as f64));
+                        let t=if let Some(s)=second{vf+oct(perm,orig,s,x*(*xz_scale as f64)*D,y*(*y_scale as f64)*D,z*(*xz_scale as f64)*D)}else{vf};
+                        t*(*amplitude as f64)}
+                    A::Shift{kind,offset}=>{let (cx,cy,cz)=match kind{0=>(x*0.25,y*0.25,z*0.25),1=>(x*0.25,0.0,z*0.25),2=>(z*0.25,x*0.25,0.0),_=>(x,y,z)};
+                        ev64(offset,perm,orig,cx,cy,cz)*4.0}
+                    A::ShiftedNoise{xz_scale,y_scale,shift_x,shift_y,shift_z,noise}=>{
+                        let d=x*(*xz_scale as f64)+ev64(shift_x,perm,orig,x,y,z);
+                        let e=y*(*y_scale as f64)+ev64(shift_y,perm,orig,x,y,z);
+                        let f=z*(*xz_scale as f64)+ev64(shift_z,perm,orig,x,y,z);
+                        ev64(noise,perm,orig,d,e,f)}
+                    A::YClampedGradient{from_y,to_y,from_value,to_value}=>{let t=((y-*from_y as f64)/((*to_y-*from_y) as f64)).clamp(0.0,1.0);*from_value as f64+t*((*to_value-*from_value) as f64)}
+                    A::Spline{locations,derivatives,location,values}=>{
+                        let t=ev64(location,perm,orig,x,y,z); let nn=locations.len();
+                        let vs:Vec<f64>=values.iter().map(|v|ev64(v,perm,orig,x,y,z)).collect();
+                        if nn==0{return 0.0;} if nn==1{return vs[0];}
+                        if t<locations[0] as f64 {let d0=derivatives[0] as f64; return if d0==0.0{vs[0]}else{vs[0]+d0*(t-locations[0] as f64)};}
+                        if t>=locations[nn-1] as f64 {let dn=derivatives[nn-1] as f64; return if dn==0.0{vs[nn-1]}else{vs[nn-1]+dn*(t-locations[nn-1] as f64)};}
+                        for k in 0..nn-1{ if t<locations[k+1] as f64 {
+                            let lk=locations[k] as f64;let lk1=locations[k+1] as f64;let dk=derivatives[k] as f64;let dk1=derivatives[k+1] as f64;
+                            let vk=vs[k];let vk1=vs[k+1];let w=lk1-lk;let pp=(t-lk)/w;
+                            let a=dk*w-(vk1-vk);let b=dk1*-1.0*w+(vk1-vk);
+                            return vk+pp*(vk1-vk)+pp*(1.0-pp)*(a+pp*(b-a));}}
+                        vs[nn-1]}
+                    _=>cpu_ast_eval(n,perm,orig,x as f32,y as f32,z as f32) as f64,
+                }
+            }
+            for (label,x,z) in [("OK (112,784)",112.0f64,784.0f64),("BAD(816,96)",816.0,96.0)] {
+                let f32v=cpu_ast_eval(rc0,&perm,&origins,x as f32,128.0,z as f32);
+                let f64v=ev64(rc0,&perm,&origins,x,128.0,z) as f32;
+                println!("[{label}] RC0.input: f32={f32v:.7} f64={f64v:.7} diff={:.7}  (boundary=0.0)", (f32v-f64v).abs());
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_rc0_input_tree() {
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            fn find_rc(n:&crate::ast::AstNode)->Option<&crate::ast::AstNode>{
+                use crate::ast::AstNode as A;
+                if let A::RangeChoice{input,..}=n { return Some(input.as_ref()); }
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push(a);k.push(b);}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { if let Some(r)=find_rc(c){return Some(r);} }
+                None
+            }
+            let rc0 = find_rc(depth).unwrap();
+            fn d(n:&crate::ast::AstNode, ind:usize){
+                use crate::ast::AstNode as A;
+                let p="  ".repeat(ind.min(25));
+                let tag=match n{
+                    A::Min(_,_)=>"Min",A::Max(_,_)=>"Max",A::Add(_,_)=>"Add",A::Sub(_,_)=>"Sub",A::Mul(_,_)=>"Mul",A::Div(_,_)=>"Div",
+                    A::CacheFlat(_)=>"CacheFlat",A::Cache2D(_)=>"Cache2D",A::NoiseSampler{..}=>"Noise",A::Spline{..}=>"Spline",
+                    A::RangeChoice{..}=>"RangeChoice",A::YClampedGradient{..}=>"YClamp",A::Constant(_)=>"Const",
+                    A::Shift{..}=>"Shift",A::ShiftedNoise{..}=>"ShiftedNoise",A::WeirdScaledSampler{..}=>"Weird",
+                    A::InputX=>"InputX",A::InputY=>"InputY",A::InputZ=>"InputZ",A::Abs(_)=>"Abs",
+                    _=>"other"};
+                print!("{p}{tag}");
+                if let A::Constant(v)=n {print!("({v})");}
+                if let A::YClampedGradient{from_y,to_y,from_value,to_value}=n {print!("(fy={from_y},ty={to_y},fv={from_value},tv={to_value})");}
+                if let A::NoiseSampler{xz_scale,y_scale,amplitude,..}=n {print!("(xz={xz_scale},y={y_scale},amp={amplitude})");}
+                if let A::Shift{kind,..}=n {print!("(kind={kind})");}
+                if let A::ShiftedNoise{xz_scale,y_scale,..}=n {print!("(xz={xz_scale},y={y_scale})");}
+                println!();
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)|A::FloorDiv(a,b)=>{k.push(a);k.push(b);}
+                    A::Abs(a)|A::Square(a)|A::Cube(a)|A::Sqrt(a)|A::Squeeze(a)|A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    A::WeirdScaledSampler{input,noise,..}=>{k.push(input);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { d(c,ind+1); }
+            }
+            println!("=== RC0.input tree ===");
+            d(rc0,0);
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn rc0_boundary_correlation() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            fn find_rc(n:&crate::ast::AstNode)->Option<(&crate::ast::AstNode,f32,f32)>{
+                use crate::ast::AstNode as A;
+                if let A::RangeChoice{input,min,max,..}=n {
+                    let mn=if let A::Constant(v)=min.as_ref(){*v}else{f32::NAN};
+                    let mx=if let A::Constant(v)=max.as_ref(){*v}else{f32::NAN};
+                    if !mn.is_nan(){return Some((input.as_ref(),mn,mx));}
+                }
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push(a);k.push(b);}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    _=>{}
+                }
+                for c in k { if let Some(r)=find_rc(c){return Some(r);} }
+                None
+            }
+            let (rc0_in,mn,_mx)=find_rc(depth).unwrap();
+            let txt=std::fs::read_to_string("/tmp/ref_chunk_50_50.txt").unwrap();
+            let (mut dx,mut dy,mut dz)=(5usize,49usize,5usize);let (mut cxx,mut czz)=(0i32,0i32);
+            let mut cur=false;let mut vals=vec![];
+            for l in txt.lines(){
+                if let Some(r)=l.strip_prefix("DIMS "){let v:Vec<usize>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();dx=v[0];dy=v[1];dz=v[2];}
+                if let Some(r)=l.strip_prefix("CHUNK "){let v:Vec<i32>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();cxx=v[0];czz=v[1];}
+                if l.starts_with("CHANNEL depth"){cur=true;vals=vec![0f32;dx*dy*dz];continue;}
+                if l.starts_with("CHANNEL "){cur=false;continue;}
+                if cur {let t:Vec<&str>=l.split_whitespace().collect();if t.len()==4{
+                    let i:usize=t[0].parse().unwrap();let j:usize=t[1].parse().unwrap();let k:usize=t[2].parse().unwrap();
+                    vals[i+k*dx+j*dx*dz]=t[3].parse().unwrap();}}
+            }
+            let sx=cxx*16;let sz=czz*16;
+            // 2x2 bucket: (isWrong, isNearBoundary)
+            let mut n_near_wrong=0; let mut n_near_ok=0; let mut n_far_wrong=0; let mut n_far_ok=0;
+            for j in 0..dy{for k in 0..dz{for i in 0..dx{
+                let wx=(sx+i as i32*4) as f32;let wy=(-64+j as i32*8) as f32;let wz=(sz+k as i32*4) as f32;
+                let c=cpu_ast_eval(depth,&perm,&origins,wx,wy,wz);
+                let wrong=(c-vals[i+k*dx+j*dx*dz]).abs()>0.01;
+                let rci=cpu_ast_eval(rc0_in,&perm,&origins,wx,wy,wz);
+                let near=(rci-mn).abs()<0.05;
+                match (near,wrong){(true,true)=>n_near_wrong+=1,(true,false)=>n_near_ok+=1,(false,true)=>n_far_wrong+=1,(false,false)=>n_far_ok+=1,_=>{}}
+            }}}
+            println!("RC0 near-boundary(<0.05 of min={mn:.3}):");
+            println!("  near & WRONG = {n_near_wrong}");
+            println!("  near & ok    = {n_near_ok}");
+            println!("  far  & WRONG = {n_far_wrong}");
+            println!("  far  & ok    = {n_far_ok}");
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn spline_loc_y_dep() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            // For each Spline wrapped (directly or transitively) under a CacheFlat,
+            // test if its location changes with y at a fixed (x,z).
+            fn has_y_dep(n:&crate::ast::AstNode, perm:&[i32], orig:&[f32], x:f32, z:f32)->bool{
+                let v1=cpu_ast_eval(n,perm,orig,x,-64.0,z);
+                let v2=cpu_ast_eval(n,perm,orig,x,128.0,z);
+                (v1-v2).abs()>1e-4
+            }
+            // walk: report CacheFlat whose inner IS y-dependent
+            fn walk(n:&crate::ast::AstNode, perm:&[i32], orig:&[f32], x:f32, z:f32, cnt:&mut usize){
+                use crate::ast::AstNode as A;
+                if let A::CacheFlat(inner)=n {
+                    if has_y_dep(inner,perm,orig,x,z) {
+                        *cnt+=1;
+                        if *cnt<=5 { println!("Y-DEP CacheFlat inner at (x={x},z={z})"); }
+                    }
+                }
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push(a);k.push(b);}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    A::WeirdScaledSampler{input,noise,..}=>{k.push(input);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { walk(c,perm,orig,x,z,cnt); }
+            }
+            for (x,z) in [(112.0f32,784.0f32),(816.0,96.0)] {
+                let mut cnt=0; walk(depth,&perm,&origins,x,z,&mut cnt);
+                println!("(x={x},z={z}): Y-dependent CacheFlat count = {cnt}");
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn L_children_at_bad() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            let childA = match depth { crate::ast::AstNode::Min(x,_)=>x.as_ref(), _=>{println!("??");return;} };
+            let l = match childA { crate::ast::AstNode::Add(x,_)=>x.as_ref(), _=>{println!("not add");return;} };
+            // L = CacheFlat(Cache2D(Add(...))). descend to the Add and print both halves.
+            fn peel(n:&crate::ast::AstNode)->&crate::ast::AstNode{
+                use crate::ast::AstNode as A;
+                match n { A::CacheFlat(a)|A::Cache2D(a)=>peel(a), _=>n }
+            }
+            let inner=peel(l);
+            println!("L inner = {:?}", std::mem::discriminant(inner));
+            if let crate::ast::AstNode::Add(a,b)=inner {
+                for (label,x,z) in [("OK (112,784)",112.0f32,784.0f32),("BAD(816,96)",816.0,96.0)] {
+                    let va=cpu_ast_eval(a,&perm,&origins,x,128.0,z);
+                    let vb=cpu_ast_eval(b,&perm,&origins,x,128.0,z);
+                    println!("[{label}] L.L={va:.6}  L.R={vb:.6}  sum={:.6}", va+vb);
+                }
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn octave_coord_magnitude() {
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            fn walk(n:&crate::ast::AstNode, x:f32, z:f32, maxmag:&mut f64){
+                use crate::ast::AstNode as A;
+                if let A::NoiseSampler{first,xz_scale,..}=n {
+                    let mut f=first.initial_freq as f64;
+                    for _ in 0..first.amplitudes.len(){
+                        let m=(x as f64)*(*xz_scale as f64)*f;
+                        if m.abs()>*maxmag {*maxmag=m.abs();}
+                        f*=2.0;
+                    }
+                }
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push(a);k.push(b);}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    A::WeirdScaledSampler{input,noise,..}=>{k.push(input);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { walk(c,x,z,maxmag); }
+            }
+            for (label,x,z) in [("OK (112,784)",112.0f32,784.0f32),("BAD(816,96)",816.0,96.0)] {
+                let mut mm=0f64; walk(depth,x,z,&mut mm);
+                println!("[{label}] max |x*freq| = {mm:.3e}  (2^25 = 3.36e7, 2^24=1.68e7)");
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn depth_topology() {
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            // print the first 3 levels of depth with structure only
+            fn d(n:&crate::ast::AstNode, ind:usize, max:usize){
+                use crate::ast::AstNode as A;
+                if ind>max{return;}
+                let p="  ".repeat(ind);
+                let tag=match n{
+                    A::Min(_,_)=>"Min",A::Max(_,_)=>"Max",A::Add(_,_)=>"Add",A::Sub(_,_)=>"Sub",A::Mul(_,_)=>"Mul",A::Div(_,_)=>"Div",
+                    A::CacheFlat(_)=>"CacheFlat",A::Cache2D(_)=>"Cache2D",A::NoiseSampler{..}=>"Noise",A::Spline{..}=>"Spline",
+                    A::RangeChoice{..}=>"RangeChoice",A::YClampedGradient{..}=>"YClamp",A::Constant(v)=>{print!("{p}Const({v})\n");return;},
+                    A::Shift{kind,..}=>{print!("{p}Shift({kind})\n");return;}
+                    A::ShiftedNoise{..}=>"ShiftedNoise",
+                    A::Abs(_)=>"Abs",A::Square(_)=>"Square",A::Cube(_)=>"Cube",A::Sqrt(_)=>"Sqrt",A::Squeeze(_)=>"Squeeze",
+                    A::FloorDiv(_,_)=>"FloorDiv",A::InputX=>{print!("{p}InputX\n");return;},A::InputY=>{print!("{p}InputY\n");return;},A::InputZ=>{print!("{p}InputZ\n");return;},
+                    _=>"other"};
+                println!("{p}{tag}");
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)|A::FloorDiv(a,b)=>{k.push(a);k.push(b);}
+                    A::Abs(a)|A::Square(a)|A::Cube(a)|A::Sqrt(a)|A::Squeeze(a)|A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { d(c,ind+1,max); }
+            }
+            println!("=== depth top 4 levels ===");
+            d(depth,0,4);
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn childA_walk_values() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            let childA = match depth { crate::ast::AstNode::Min(x,_)=>x.as_ref(), _=>return };
+            fn tag(n:&crate::ast::AstNode)->&'static str{
+                use crate::ast::AstNode as A;
+                match n{A::Min(_,_)=>"Min",A::Max(_,_)=>"Max",A::Add(_,_)=>"Add",A::Sub(_,_)=>"Sub",A::Mul(_,_)=>"Mul",A::Div(_,_)=>"Div",
+                A::CacheFlat(_)=>"CacheFlat",A::Cache2D(_)=>"Cache2D",A::NoiseSampler{..}=>"Noise",A::Spline{..}=>"Spline",
+                A::RangeChoice{..}=>"RangeChoice",A::YClampedGradient{..}=>"YClamp",A::Constant(_)=>"Const",
+                A::Shift{..}=>"Shift",A::ShiftedNoise{..}=>"ShiftedNoise",A::Abs(_)=>"Abs",A::Squeeze(_)=>"Squeeze",
+                A::Square(_)=>"Square",A::Cube(_)=>"Cube",A::Sqrt(_)=>"Sqrt",A::FloorDiv(_,_)=>"FloorDiv",
+                A::InputX=>"X",A::InputY=>"Y",A::InputZ=>"Z",_=>"?"}
+            }
+            fn walk(n:&crate::ast::AstNode, perm:&[i32], orig:&[f32], ind:usize, max:usize){
+                use crate::ast::AstNode as A;
+                if ind>max{return;}
+                let p="  ".repeat(ind);
+                let vok=cpu_ast_eval(n,perm,orig,112.0,128.0,784.0);
+                let vbad=cpu_ast_eval(n,perm,orig,816.0,128.0,96.0);
+                println!("{p}{} ok={vok:.5} bad={vbad:.5}", tag(n));
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)|A::FloorDiv(a,b)=>{k.push(a);k.push(b);}
+                    A::Abs(a)|A::Square(a)|A::Cube(a)|A::Sqrt(a)|A::Squeeze(a)|A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { walk(c,perm,orig,ind+1,max); }
+            }
+            println!("=== childA tree (ok vs bad) ===");
+            walk(childA,&perm,&origins,0,6);
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn expand_critical_min() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            // navigate: depth=Min(childA,...); childA=Add(CacheFlat(Cache2D(Add(Mul, Mul))), YClamp)
+            let childA = match depth { crate::ast::AstNode::Min(x,_)=>x.as_ref(), _=>return };
+            let flat = match childA { crate::ast::AstNode::Add(x,_)=>x.as_ref(), _=>return };
+            // flat = CacheFlat(Cache2D(Add(...)))
+            fn peel(n:&crate::ast::AstNode)->&crate::ast::AstNode{
+                use crate::ast::AstNode as A;
+                match n{A::CacheFlat(a)|A::Cache2D(a)=>peel(a),_=>n}
+            }
+            let add=peel(flat);
+            // add = Add(Mul(cf1, Add(Min,Const)), Mul(...))
+            if let crate::ast::AstNode::Add(a,_b)=add {
+                if let crate::ast::AstNode::Mul(_c,inner)=a.as_ref() {
+                    // inner = Add(Min, Const)
+                    if let crate::ast::AstNode::Add(mn,_cst)=inner.as_ref() {
+                        if let crate::ast::AstNode::Min(l,r)=mn.as_ref() {
+                            for (label,x,z) in [("OK (112,784)",112.0f32,784.0f32),("BAD(816,96)",816.0,96.0)] {
+                                let vl=cpu_ast_eval(l,&perm,&origins,x,128.0,z);
+                                let vr=cpu_ast_eval(r,&perm,&origins,x,128.0,z);
+                                println!("[{label}] Min.L={vl:.6} Min.R={vr:.6} -> min={:.6}", vl.min(vr));
+                            }
+                            // deeper: what is R?
+                            println!("R tag: {}", match r.as_ref(){crate::ast::AstNode::Add(_,_)=>"Add",crate::ast::AstNode::Mul(_,_)=>"Mul",crate::ast::AstNode::NoiseSampler{..}=>"Noise",crate::ast::AstNode::RangeChoice{..}=>"RC",crate::ast::AstNode::Spline{..}=>"Spline",crate::ast::AstNode::CacheFlat(_)=>"CacheFlat",crate::ast::AstNode::Cache2D(_)=>"Cache2D",crate::ast::AstNode::Shift{..}=>"Shift",crate::ast::AstNode::ShiftedNoise{..}=>"ShiftedNoise",_=>"?"});
+                            println!("L tag: {}", match l.as_ref(){crate::ast::AstNode::Add(_,_)=>"Add",crate::ast::AstNode::Mul(_,_)=>"Mul",crate::ast::AstNode::NoiseSampler{..}=>"Noise",crate::ast::AstNode::RangeChoice{..}=>"RC",crate::ast::AstNode::Spline{..}=>"Spline",crate::ast::AstNode::CacheFlat(_)=>"CacheFlat",crate::ast::AstNode::Cache2D(_)=>"Cache2D",crate::ast::AstNode::Shift{..}=>"Shift",crate::ast::AstNode::ShiftedNoise{..}=>"ShiftedNoise",_=>"?"});
+                        }
+                    }
+                }
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn expand_R() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            let childA = match depth { crate::ast::AstNode::Min(x,_)=>x.as_ref(), _=>return };
+            let flat = match childA { crate::ast::AstNode::Add(x,_)=>x.as_ref(), _=>return };
+            fn peel(n:&crate::ast::AstNode)->&crate::ast::AstNode{
+                use crate::ast::AstNode as A;
+                match n{A::CacheFlat(a)|A::Cache2D(a)=>peel(a),_=>n}
+            }
+            let add=peel(flat);
+            if let crate::ast::AstNode::Add(a,_b)=add {
+                if let crate::ast::AstNode::Mul(_c,inner)=a.as_ref() {
+                    if let crate::ast::AstNode::Add(mn,_cst)=inner.as_ref() {
+                        if let crate::ast::AstNode::Min(_l,r)=mn.as_ref() {
+                            println!("R = {:?}", std::mem::discriminant(r.as_ref()));
+                            fn walk(n:&crate::ast::AstNode, perm:&[i32], orig:&[f32], ind:usize, max:usize){
+                                use crate::ast::AstNode as A;
+                                if ind>max{return;}
+                                let p="  ".repeat(ind);
+                                let vok=cpu_ast_eval(n,perm,orig,112.0,128.0,784.0);
+                                let vbad=cpu_ast_eval(n,perm,orig,816.0,128.0,96.0);
+                                let tg=match n{A::Min(_,_)=>"Min",A::Max(_,_)=>"Max",A::Add(_,_)=>"Add",A::Sub(_,_)=>"Sub",A::Mul(_,_)=>"Mul",A::Div(_,_)=>"Div",
+                                    A::CacheFlat(_)=>"CacheFlat",A::Cache2D(_)=>"Cache2D",A::NoiseSampler{..}=>"Noise",A::Spline{..}=>"Spline",
+                                    A::RangeChoice{..}=>"RangeChoice",A::YClampedGradient{..}=>"YClamp",A::Constant(_)=>"Const",
+                                    A::Shift{..}=>"Shift",A::ShiftedNoise{..}=>"ShiftedNoise",A::Abs(_)=>"Abs",A::Squeeze(_)=>"Squeeze",
+                                    A::Square(_)=>"Sq",A::Cube(_)=>"Cu",A::Sqrt(_)=>"Sqrt",A::FloorDiv(_,_)=>"FDiv",
+                                    A::InputX=>"X",A::InputY=>"Y",A::InputZ=>"Z",_=>"?"};
+                                println!("{p}{tg} ok={vok:.5} bad={vbad:.5}");
+                                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                                match n {
+                                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)|A::FloorDiv(a,b)=>{k.push(a);k.push(b);}
+                                    A::Abs(a)|A::Square(a)|A::Cube(a)|A::Sqrt(a)|A::Squeeze(a)|A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                                    A::Shift{offset,..}=>{k.push(offset);}
+                                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                                    _=>{}
+                                }
+                                for c in k { walk(c,perm,orig,ind+1,max); }
+                            }
+                            println!("=== R tree ===");
+                            walk(r.as_ref(),&perm,&origins,0,7);
+                        }
+                    }
+                }
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_shiftednoise_013() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            fn find(n:&crate::ast::AstNode, found:&mut Vec<*const crate::ast::AstNode>, xs:f32){
+                use crate::ast::AstNode as A;
+                if let A::ShiftedNoise{xz_scale,..}=n { if (*xz_scale-xs).abs()<1e-4 { found.push(n as *const _); } }
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push(a);k.push(b);}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { find(c,found,xs); }
+            }
+            let mut found=vec![];
+            find(depth,&mut found,0.13);
+            println!("found {} ShiftedNoise(xz=0.13)", found.len());
+            for (idx,p) in found.iter().take(3).enumerate() {
+                let n = unsafe { &**p };
+                if let crate::ast::AstNode::ShiftedNoise{xz_scale,y_scale,shift_x,shift_y,shift_z,noise}=n {
+                    for (label,x,z) in [("OK ",112.0f32,784.0f32),("BAD",816.0,96.0)] {
+                        let d = x*xz_scale + cpu_ast_eval(shift_x,&perm,&origins,x,128.0,z);
+                        let e = 128.0*y_scale + cpu_ast_eval(shift_y,&perm,&origins,x,128.0,z);
+                        let f = z*xz_scale + cpu_ast_eval(shift_z,&perm,&origins,x,128.0,z);
+                        let nv = cpu_ast_eval(noise,&perm,&origins,d,e,f);
+                        println!("  SN[{idx}] {label}: sx={:.5} sy={:.5} sz={:.5} | d={d:.4} e={e:.4} f={f:.4} noise={nv:.5}",
+                            cpu_ast_eval(shift_x,&perm,&origins,x,128.0,z), cpu_ast_eval(shift_y,&perm,&origins,x,128.0,z), cpu_ast_eval(shift_z,&perm,&origins,x,128.0,z));
+                    }
+                }
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn all_shiftednoise_divergence() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            // collect distinct (xz_scale,y_scale) pairs and test each at OK/BAD
+            fn walk(n:&crate::ast::AstNode, perm:&[i32], orig:&[f32], seen:&mut std::collections::BTreeMap<String,(f32,f32)>){
+                use crate::ast::AstNode as A;
+                if let A::ShiftedNoise{xz_scale,y_scale,..}=n {
+                    seen.insert(format!("{xz_scale}_{y_scale}"),(*xz_scale,*y_scale));
+                }
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push(a);k.push(b);}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { walk(c,perm,orig,seen); }
+            }
+            let mut seen=std::collections::BTreeMap::new();
+            walk(depth,&perm,&origins,&mut seen);
+            println!("distinct ShiftedNoise scales: {}", seen.len());
+            for (k,(xz,ys)) in &seen { println!("  xz={xz} y={ys}"); }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn shiftednoise_divergence() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            // find one ShiftedNoise per scale
+            let mut found:std::collections::BTreeMap<String,(f32,f32)> = Default::default();
+            let mut nodes:Vec<*const crate::ast::AstNode> = vec![];
+            fn walk(n:&crate::ast::AstNode, found:&mut std::collections::BTreeMap<String,(f32,f32)>, nodes:&mut Vec<*const crate::ast::AstNode>){
+                use crate::ast::AstNode as A;
+                if let A::ShiftedNoise{xz_scale,y_scale,..}=n {
+                    let k=format!("{xz_scale}"); if !found.contains_key(&k){found.insert(k,(*xz_scale,*y_scale)); nodes.push(n as *const _);}
+                }
+                let mut kk:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{kk.push(a);kk.push(b);}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{kk.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{kk.push(input);kk.push(min);kk.push(max);kk.push(in_bounds);kk.push(out_of_bounds_lo);kk.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{kk.push(location);for v in values{kk.push(v);}}
+                    A::Shift{offset,..}=>{kk.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{kk.push(shift_x);kk.push(shift_y);kk.push(shift_z);kk.push(noise);}
+                    _=>{}
+                }
+                for c in kk { walk(c,found,nodes); }
+            }
+            walk(depth,&mut found,&mut nodes);
+            for p in &nodes {
+                let n = unsafe { &**p };
+                if let crate::ast::AstNode::ShiftedNoise{xz_scale,y_scale,shift_x,shift_y,shift_z,noise}=n {
+                    for (label,x,z) in [("OK ",112.0f32,784.0f32),("BAD",816.0,96.0)] {
+                        let d=x*xz_scale+cpu_ast_eval(shift_x,&perm,&origins,x,128.0,z);
+                        let e=128.0*y_scale+cpu_ast_eval(shift_y,&perm,&origins,x,128.0,z);
+                        let f=z*xz_scale+cpu_ast_eval(shift_z,&perm,&origins,x,128.0,z);
+                        let nv=cpu_ast_eval(noise,&perm,&origins,d,e,f);
+                        println!("SN(xz={xz_scale}) {label}: d={d:.4} e={e:.4} f={f:.4} noise={nv:.5}");
+                    }
+                }
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn final_f64_verdict() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins: Vec<f32> = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            // ---- find the critical spline: the one whose location is
+            // CacheFlat(Min(2, Max(Add(-0.8, Spline(Abs(ShiftedNoise))))))
+            // We just find the Spline whose first value is Const and locations are floats.
+            // Instead: evaluate whole depth f32 vs f64, minimal complete.
+            fn eval(n:&crate::ast::AstNode, p:&[i32], o:&[f32], x:f64, y:f64, z:f64)->f64 {
+                use crate::ast::AstNode as A;
+                match n {
+                    A::Constant(v)=>*v as f64, A::InputX=>x, A::InputY=>y, A::InputZ=>z,
+                    A::Add(a,b)=>eval(a,p,o,x,y,z)+eval(b,p,o,x,y,z),
+                    A::Sub(a,b)=>eval(a,p,o,x,y,z)-eval(b,p,o,x,y,z),
+                    A::Mul(a,b)=>eval(a,p,o,x,y,z)*eval(b,p,o,x,y,z),
+                    A::Div(a,b)=>eval(a,p,o,x,y,z)/eval(b,p,o,x,y,z),
+                    A::Min(a,b)=>eval(a,p,o,x,y,z).min(eval(b,p,o,x,y,z)),
+                    A::Max(a,b)=>eval(a,p,o,x,y,z).max(eval(b,p,o,x,y,z)),
+                    A::Abs(a)=>eval(a,p,o,x,y,z).abs(),
+                    A::Square(a)=>{let v=eval(a,p,o,x,y,z);v*v}
+                    A::Cube(a)=>{let v=eval(a,p,o,x,y,z);v*v*v}
+                    A::Sqrt(a)=>eval(a,p,o,x,y,z).sqrt(),
+                    A::Squeeze(a)=>{let v=eval(a,p,o,x,y,z).clamp(-1.0,1.0);v*0.5-v*v*v/24.0}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>eval(a,p,o,x,y,z),
+                    A::FloorDiv(a,b)=>(eval(a,p,o,x,y,z)/eval(b,p,o,x,y,z)).floor(),
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,..}=>{
+                        let iv=eval(input,p,o,x,y,z);let mn=eval(min,p,o,x,y,z);let mx=eval(max,p,o,x,y,z);
+                        if iv>=mn&&iv<mx {eval(in_bounds,p,o,x,y,z)} else {eval(out_of_bounds_lo,p,o,x,y,z)}}
+                    A::NoiseSampler{first,second,amplitude,xz_scale,y_scale,..}=>{
+                        const D:f64=1.0181268882175227;
+                        let f=|oc:&crate::ast::OctaveSampler,sc:f64|->f64{
+                            let mut fr=oc.initial_freq as f64; let mut am=oc.persistence as f64; let mut acc=0f64;
+                            for i in 0..oc.amplitudes.len(){ if oc.amplitudes[i]!=0.0 {
+                                let e=(oc.perm_offset+i as i32*256)/256;
+                                let px=crate::world::world::dbg_mp(x*sc*fr)+o[(e*3) as usize] as f64;
+                                let py=crate::world::world::dbg_mp(y*sc*fr)+o[(e*3+1) as usize] as f64;
+                                let pz=crate::world::world::dbg_mp(z*sc*fr)+o[(e*3+2) as usize] as f64;
+                                acc+=oc.amplitudes[i] as f64*crate::world::world::dbg_perlin(p,oc.perm_offset+i as i32*256,px,py,pz)*am; }
+                                fr*=2.0; am*=0.5; }
+                            acc };
+                        let vf=f(first, *xz_scale as f64);
+                        let t=if let Some(s)=second{vf+f(s,*xz_scale as f64*D)}else{vf};
+                        t*(*amplitude as f64)}
+                    A::Shift{kind,offset}=>{let (cx,cy,cz)=match kind{0=>(x*0.25,y*0.25,z*0.25),1=>(x*0.25,0.0,z*0.25),2=>(z*0.25,x*0.25,0.0),_=>(x,y,z)};
+                        eval(offset,p,o,cx,cy,cz)*4.0}
+                    A::ShiftedNoise{xz_scale,y_scale,shift_x,shift_y,shift_z,noise}=>{
+                        let d=x*(*xz_scale as f64)+eval(shift_x,p,o,x,y,z);
+                        let e=y*(*y_scale as f64)+eval(shift_y,p,o,x,y,z);
+                        let ff=z*(*xz_scale as f64)+eval(shift_z,p,o,x,y,z);
+                        eval(noise,p,o,d,e,ff)}
+                    A::YClampedGradient{from_y,to_y,from_value,to_value}=>{let t=((y-*from_y as f64)/((*to_y-*from_y) as f64)).clamp(0.0,1.0);*from_value as f64+t*((*to_value-*from_value) as f64)}
+                    A::Spline{locations,derivatives,location,values}=>{
+                        let t=eval(location,p,o,x,y,z); let nn=locations.len();
+                        let vs:Vec<f64>=values.iter().map(|v|eval(v,p,o,x,y,z)).collect();
+                        if nn==0{return 0.0;} if nn==1{return vs[0];}
+                        if t<locations[0] as f64 {let d0=derivatives[0] as f64; return if d0==0.0{vs[0]}else{vs[0]+d0*(t-locations[0] as f64)};}
+                        if t>=locations[nn-1] as f64 {let dn=derivatives[nn-1] as f64; return if dn==0.0{vs[nn-1]}else{vs[nn-1]+dn*(t-locations[nn-1] as f64)};}
+                        for k in 0..nn-1{ if t<locations[k+1] as f64 {
+                            let lk=locations[k] as f64;let lk1=locations[k+1] as f64;let dk=derivatives[k] as f64;let dk1=derivatives[k+1] as f64;
+                            let vk=vs[k];let vk1=vs[k+1];let w=lk1-lk;let pp=(t-lk)/w;
+                            let a=dk*w-(vk1-vk);let b=dk1*-1.0*w+(vk1-vk);
+                            return vk+pp*(vk1-vk)+pp*(1.0-pp)*(a+pp*(b-a));}}
+                        vs[nn-1]}
+                    _=>panic!("UNCOVERED node in f64 eval"),
+                }
+            }
+            for (label,x,z) in [("OK (112,784)",112.0f64,784.0f64),("BAD(816,96)",816.0,96.0)] {
+                let f32v=cpu_ast_eval(depth,&perm,&origins,x as f32,128.0,z as f32);
+                let f64v=eval(depth,&perm,&origins,x,128.0,z) as f32;
+                println!("[{label}] depth f32={f32v:.7} f64={f64v:.7} |diff|={:.2e}", (f32v-f64v).abs());
+            }
+            // sanity: prove f64 path differs somewhere
+            let s1 = (16777216.0f32 + 1.0) - 16777216.0;
+            let s2 = (16777216.0f64 + 1.0) - 16777216.0;
+            println!("sanity: f32 (2^24+1)-2^24 = {s1}, f64 = {s2}");
+        }).unwrap().join().unwrap();
+    }
+
+
+    #[test]
+    #[ignore]
+    fn cacheflat_mode_test() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            // mode: 0=passthrough, 1=flat->y0, 9=flat->999 (control)
+            fn ev(n:&crate::ast::AstNode,perm:&[i32],orig:&[f32],x:f32,y:f32,z:f32,mode:u8)->f32{
+                use crate::ast::AstNode as A;
+                match n {
+                    A::CacheFlat(a)=>match mode{9=>999.0,1|3=>ev(a,perm,orig,x,0.0,z,mode),_=>ev(a,perm,orig,x,y,z,mode)},
+                    A::Cache2D(a)=>match mode{2|3=>ev(a,perm,orig,x,0.0,z,mode),_=>ev(a,perm,orig,x,y,z,mode)},
+                    A::CacheInterpolated(a)=>ev(a,perm,orig,x,y,z,mode),
+                    A::Add(a,b)=>ev(a,perm,orig,x,y,z,mode)+ev(b,perm,orig,x,y,z,mode),
+                    A::Sub(a,b)=>ev(a,perm,orig,x,y,z,mode)-ev(b,perm,orig,x,y,z,mode),
+                    A::Mul(a,b)=>ev(a,perm,orig,x,y,z,mode)*ev(b,perm,orig,x,y,z,mode),
+                    A::Div(a,b)=>ev(a,perm,orig,x,y,z,mode)/ev(b,perm,orig,x,y,z,mode),
+                    A::Min(a,b)=>ev(a,perm,orig,x,y,z,mode).min(ev(b,perm,orig,x,y,z,mode)),
+                    A::Max(a,b)=>ev(a,perm,orig,x,y,z,mode).max(ev(b,perm,orig,x,y,z,mode)),
+                    A::Abs(a)=>ev(a,perm,orig,x,y,z,mode).abs(),
+                    A::Square(a)=>{let v=ev(a,perm,orig,x,y,z,mode);v*v}
+                    A::Squeeze(a)=>{let v=ev(a,perm,orig,x,y,z,mode).clamp(-1.0,1.0);v*0.5-v*v*v/24.0}
+                    A::Sqrt(a)=>ev(a,perm,orig,x,y,z,mode).sqrt(),
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,..}=>{
+                        let iv=ev(input,perm,orig,x,y,z,mode);let mn=ev(min,perm,orig,x,y,z,mode);let mx=ev(max,perm,orig,x,y,z,mode);
+                        if iv>=mn&&iv<mx{ev(in_bounds,perm,orig,x,y,z,mode)}else{ev(out_of_bounds_lo,perm,orig,x,y,z,mode)}}
+                    A::YClampedGradient{from_y,to_y,from_value,to_value}=>{let t=((y-from_y)/(to_y-from_y)).clamp(0.0,1.0);from_value+t*(to_value-from_value)}
+                    A::InputX=>x,A::InputY=>y,A::InputZ=>z,A::Constant(v)=>*v,
+                    // everything else (noise/spline/shift) uses cpu_ast_eval (stateless, no cache)
+                    _=>cpu_ast_eval(n,perm,orig,x,y,z),
+                }
+            }
+            // BAD point from doc, plus a control at OK point
+            for (label,x,y,z) in [("BAD(816,128,96)",816.0f32,128.0f32,96.0f32),("OK(112,128,784)",112.0,128.0,784.0)] {
+                let v0=ev(depth,&perm,&origins,x,y,z,0);
+                let v1=ev(depth,&perm,&origins,x,y,z,1);
+                let v2=ev(depth,&perm,&origins,x,y,z,2);
+                let v9=ev(depth,&perm,&origins,x,y,z,9);
+                println!("{label}: passthrough={v0:.5} CF_y0={v1:.5} C2D_y0={v2:.5} control999={v9:.5}");
+            }
+        }).unwrap().join().unwrap();
+    }
+
+
+    #[test]
+    #[ignore]
+    fn expand_divergent_min() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            // navigate to the divergent Min: depth=Min,childA=Add,CacheFlat,Cache2D,Add,Mul,Add,Min
+            use crate::ast::AstNode as A;
+            let childA=if let A::Min(x,_)=depth{x.as_ref()}else{return};
+            let flat=if let A::Add(x,_)=childA{x.as_ref()}else{return};
+            fn peel(n:&A)->&A{match n{A::CacheFlat(a)|A::Cache2D(a)=>peel(a),_=>n}}
+            let add=peel(flat);
+            let min_node = if let A::Add(a,_)=add {
+                if let A::Mul(_,inner)=a.as_ref(){
+                    if let A::Add(mn,_)=inner.as_ref(){ Some(mn.as_ref()) } else {None}
+                } else {None}
+            } else {None};
+            let min_node = match min_node { Some(m)=>m, None=>{println!("nav fail");return;} };
+            let (l,r)=if let A::Min(l,r)=min_node{(l.as_ref(),r.as_ref())}else{println!("not min");return;};
+            for (lab,x,z) in [("OK ",112.0f32,784.0f32),("BAD",816.0,96.0)] {
+                let lv=cpu_ast_eval(l,&perm,&origins,x,128.0,z);
+                let rv=cpu_ast_eval(r,&perm,&origins,x,128.0,z);
+                println!("{lab}: Min.L={lv:.6}  Min.R={rv:.6}  min={:.6}", lv.min(rv));
+            }
+            // walk R one level deeper
+            fn tg(n:&A)->&'static str{match n{A::Min(_,_)=>"Min",A::Max(_,_)=>"Max",A::Add(_,_)=>"Add",A::Sub(_,_)=>"Sub",A::Mul(_,_)=>"Mul",A::Div(_,_)=>"Div",A::CacheFlat(_)=>"CF",A::Cache2D(_)=>"C2D",A::NoiseSampler{..}=>"Noise",A::Spline{..}=>"Spline",A::RangeChoice{..}=>"RC",A::YClampedGradient{..}=>"YClamp",A::Constant(_)=>"Cst",A::Shift{..}=>"Sh",A::ShiftedNoise{..}=>"SN",A::Abs(_)=>"Abs",A::InputX=>"X",A::InputY=>"Y",A::InputZ=>"Z",_=>"?"}}
+            fn walk(n:&A,perm:&[i32],orig:&[f32],ind:usize,max:usize){
+                if ind>max{return;}
+                let p="  ".repeat(ind);
+                let vo=cpu_ast_eval(n,perm,orig,112.0,128.0,784.0);
+                let vb=cpu_ast_eval(n,perm,orig,816.0,128.0,96.0);
+                println!("{p}{} ok={vo:.5} bad={vb:.5}",tg(n));
+                let mut k:Vec<&A>=vec![];
+                match n{A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push(a);k.push(b);}A::Abs(a)|A::CacheFlat(a)|A::Cache2D(a)=>{k.push(a);}A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}A::Shift{offset,..}=>{k.push(offset);}A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}A::ShiftedNoise{..}=>{}_=>{}}
+                for c in k{walk(c,perm,orig,ind+1,max);}
+            }
+            println!("=== R subtree ===");
+            walk(r,&perm,&origins,0,4);
+        }).unwrap().join().unwrap();
+    }
+
+
+    #[test]
+    #[ignore]
+    fn noise_octave_magnitude() {
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            fn walk(n:&crate::ast::AstNode, x:f32, y:f32, z:f32){
+                use crate::ast::AstNode as A;
+                if let A::NoiseSampler{xz_scale,y_scale,first,..}=n {
+                    let n_oct = first.amplitudes.len();
+                    let mut maxmag=0f64;
+                    for o in 0..n_oct {
+                        let fq = first.initial_freq as f64 * 2f64.powi(o as i32);
+                        let mx = (x as f64).abs()* (*xz_scale as f64)*fq;
+                        let mz = (z as f64).abs()* (*xz_scale as f64)*fq;
+                        let my = (y as f64).abs()*(*y_scale as f64)*fq;
+                        for m in [mx,my,mz] { if m>maxmag{maxmag=m;} }
+                    }
+                    println!("  Noise xz={xz_scale} y={y_scale} n_oct={n_oct} init_f={} max|coord*freq|={maxmag:.0} (2^24={})", first.initial_freq, 16777216);
+                    return;
+                }
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push(a);k.push(b);}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    A::WeirdScaledSampler{input,noise,..}=>{k.push(input);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { walk(c,x,y,z); }
+            }
+            println!("=== BAD (816,128,96) ===");
+            walk(depth,816.0,128.0,96.0);
+        }).unwrap().join().unwrap();
+    }
+
+
+    #[test]
+    #[ignore]
+    fn sweep_x_divergence() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let refp = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.ref.txt");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            // parse ref depth
+            let txt = std::fs::read_to_string(refp).unwrap();
+            let (mut dx,mut dy,mut dz)=(5usize,49usize,5usize); let (mut cxx,mut czz)=(0i32,0i32);
+            let mut cur=false; let mut vals=vec![];
+            for l in txt.lines(){
+                if let Some(r)=l.strip_prefix("DIMS "){let v:Vec<usize>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();dx=v[0];dy=v[1];dz=v[2];}
+                if let Some(r)=l.strip_prefix("CHUNK "){let v:Vec<i32>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();cxx=v[0];czz=v[1];}
+                if l.starts_with("CHANNEL depth"){cur=true;vals=vec![0f32;dx*dy*dz];continue;}
+                if l.starts_with("CHANNEL "){cur=false;continue;}
+                if cur {let t:Vec<&str>=l.split_whitespace().collect(); if t.len()==4 {
+                    let i:usize=t[0].parse().unwrap();let j:usize=t[1].parse().unwrap();let k:usize=t[2].parse().unwrap();
+                    vals[i+k*dx+j*dy*0+j*dx*dz]=t[3].parse().unwrap();}}
+            }
+            let sx=cxx*16; let sz=czz*16;
+            println!("ref chunk=({cxx},{czz}) sx={sx} sz={sz}");
+            // dump first few ref values along i (x), j=0, k=0
+            for i in 0..dx { println!("  ref i={i} x={} depth={:.5}", sx+i as i32*4, vals[i]); }
+            // and along j (y) at i=0,k=0
+            println!("--- along y (i=0,k=0) ---");
+            for j in 0..8 { println!("  ref j={j} y={} depth={:.5}", -64+j as i32*8, vals[0+j*dx*dz]); }
+        }).unwrap().join().unwrap();
+    }
+
+
+    #[test]
+    #[ignore]
+    fn compare_depth_bad() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let perm = ctx.perm_table_set().buffer.clone();
+            let origins = ctx.perm_table_set().origins.clone();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth=&chans[8];
+            let txt = std::fs::read_to_string("/tmp/ref_chunk_50_50.txt").unwrap();
+            let (mut dx,mut dy,mut dz)=(5usize,49usize,5usize); let (mut cxx,mut czz)=(0i32,0i32);
+            let mut cur=false; let mut vals=vec![];
+            for l in txt.lines(){
+                if let Some(r)=l.strip_prefix("DIMS "){let v:Vec<usize>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();dx=v[0];dy=v[1];dz=v[2];}
+                if let Some(r)=l.strip_prefix("CHUNK "){let v:Vec<i32>=r.split_whitespace().map(|s|s.parse().unwrap()).collect();cxx=v[0];czz=v[1];}
+                if l.starts_with("CHANNEL depth"){cur=true;vals=vec![0f32;dx*dy*dz];continue;}
+                if l.starts_with("CHANNEL "){cur=false;continue;}
+                if cur {let t:Vec<&str>=l.split_whitespace().collect(); if t.len()==4 {
+                    let i:usize=t[0].parse().unwrap();let j:usize=t[1].parse().unwrap();let k:usize=t[2].parse().unwrap();
+                    vals[i+k*dx+j*dx*dz]=t[3].parse().unwrap();}}
+            }
+            let sx=cxx*16; let sz=czz*16;
+            println!("chunk({cxx},{czz}) sx={sx} sz={sz}");
+            // along x at j=16 (y=64), k=0
+            println!("--- along x, j=16(y=64), k=0 ---");
+            for i in 0..dx {
+                let wx=(sx+i as i32*4) as f32; let wy=(-64+16*8) as f32; let wz=(sz) as f32;
+                let c=cpu_ast_eval(depth,&perm,&origins,wx,wy,wz);
+                let r=vals[i+16*dx*dz];
+                println!("  x={wx} ref={r:.5} ours={c:.5} diff={:.5}", c-r);
+            }
+            // along z at i=0, j=16
+            println!("--- along z, i=0, j=16(y=64) ---");
+            for k in 0..dz {
+                let wx=(sx) as f32; let wy=(-64+16*8) as f32; let wz=(sz+k as i32*4) as f32;
+                let c=cpu_ast_eval(depth,&perm,&origins,wx,wy,wz);
+                let r=vals[0+k*dx+16*dx*dz];
+                println!("  z={wz} ref={r:.5} ours={c:.5} diff={:.5}", c-r);
+            }
+        }).unwrap().join().unwrap();
+    }
+
+
+    #[test]
+    #[ignore]
+    fn scan_splines_illegal() {
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            fn walk(n:&crate::ast::AstNode, bad:&mut usize, tot:&mut usize){
+                use crate::ast::AstNode as A;
+                if let A::Spline{locations,derivatives,values,..}=n {
+                    *tot+=1;
+                    let mut illegal=false;
+                    for w in locations.windows(2) { if w[1] <= w[0] { illegal=true; } }
+                    if locations.len()!=derivatives.len() || locations.len()!=values.len() { illegal=true; }
+                    if illegal {
+                        *bad+=1;
+                        if *bad<=8 { println!("ILLEGAL spline locs={:?} ders={:?} nvals={}", locations, derivatives, values.len()); }
+                    }
+                }
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push(a);k.push(b);}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    A::WeirdScaledSampler{input,noise,..}=>{k.push(input);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { walk(c,bad,tot); }
+            }
+            // scan ALL channels
+            let (mut bad, mut tot)=(0usize,0usize);
+            for c in chans { walk(c,&mut bad,&mut tot); }
+            println!("splines: {bad}/{tot} illegal (dup/unsorted/len-mismatch)");
+        }).unwrap().join().unwrap();
+    }
+
+
+    #[test]
+    #[ignore]
+    fn findrange_divergence() {
+        // MC MathHelper.binarySearch(0,n,|i| t<locs[i]) - 1
+        fn mc_find(locs:&[f32], t:f32)->i32{
+            let n=locs.len(); let (mut min,mut i)=(0i32, n as i32);
+            while i>0 { let j=i/2; let k=min+j; if t<locs[k as usize]{i=j;}else{min=k+1;i-=j+1;} }
+            min-1
+        }
+        // ours: first k in 0..n-1 with t<locs[k+1]; else n-1 (high extrap)
+        fn our_find(locs:&[f32], t:f32)->i32{
+            let n=locs.len();
+            if t<locs[0]{return -1;}
+            if t>=locs[n-1]{return (n-1) as i32;}
+            for k in 0..n-1 { if t<locs[k+1]{return k as i32;} }
+            (n-1) as i32
+        }
+        let cases: &[&[f32]] = &[
+            &[0.0,0.5,0.5,1.0],
+            &[-0.8,-0.8,-0.5,-0.5],
+            &[0.075,0.075,0.11,0.11,0.16,0.35,0.5,0.8,0.9,1.0,1.0],
+            &[0.025,0.1,0.175,0.2,0.4,0.4,0.8,0.85,1.0,1.05],
+            &[0.0,0.15,0.25],
+        ];
+        let mut total_div=0; let mut ex=0;
+        for (ci,locs) in cases.iter().enumerate(){
+            let lo=locs[0]-0.3; let hi=locs[locs.len()-1]+0.3;
+            let mut t=lo;
+            let mut div=0;
+            while t<=hi {
+                let a=mc_find(locs,t); let b=our_find(locs,t);
+                // MC: i<0 -> low extrap (val0); i==n-1 -> high extrap; else interp(i,i+1)
+                // ours: -1 low; n-1 high; else interp(k,k+1) -- only compare "slot identity"
+                let a_slot = if a<0 {-1} else if a==(locs.len()-1) as i32 {-2} else {a};
+                let b_slot = if b<0 {-1} else if b==(locs.len()-1) as i32 {-2} else {b};
+                if a_slot!=b_slot { div+=1; if ex<6 { println!("DIV case{ci} t={t:.4} mc={a}(slot{a_slot}) our={b}(slot{b_slot})"); ex+=1; } }
+                t+=0.0007;
+            }
+            println!("case{ci} locs={:?}: {div} divergences", locs);
+            total_div+=div;
+        }
+        println!("TOTAL findRange divergences = {total_div}");
+    }
+
+
+    #[test]
+    #[ignore]
+    fn octave_freq_magnitude() {
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            fn walk(n:&crate::ast::AstNode, wx:f64, wy:f64, wz:f64, mx:&mut f64, tag:&str){
+                use crate::ast::AstNode as A;
+                if let A::NoiseSampler{first, second, xz_scale, ..}=n {
+                    for (si,opt) in [Some(first), second.as_ref()].iter().enumerate() {
+                        if let Some(oct)=opt {
+                            let mut freq = oct.initial_freq as f64;
+                            for i in 0..oct.amplitudes.len() {
+                                let sx = wx * (*xz_scale as f64) * freq;
+                                if sx.abs() > *mx { *mx = sx.abs(); }
+                                let _ = i;
+                                freq *= 2.0;
+                            }
+                            println!("  [{tag}] sampler{} xz={} octaves={} init_freq={} maxcoord*freq={:.3e} (2^25={:.3e})",
+                                si, xz_scale, oct.amplitudes.len(), oct.initial_freq, *mx, 33554432.0);
+                        }
+                    }
+                }
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)=>{k.push(a);k.push(b);}
+                    A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,min,max,in_bounds,out_of_bounds_lo,out_of_bounds_hi}=>{k.push(input);k.push(min);k.push(max);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    A::WeirdScaledSampler{input,noise,..}=>{k.push(input);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { walk(c,wx,wy,wz,mx,tag); }
+            }
+            println!("=== (7,34) OK, world x=112 ===");
+            { let mut m=0.0; walk(&chans[8],112.0,128.0,544.0,&mut m,"ok"); }
+            println!("=== (50,50) BAD, world x=800 ===");
+            { let mut m=0.0; walk(&chans[8],800.0,128.0,800.0,&mut m,"bad"); }
+        }).unwrap().join().unwrap();
+    }
+
+
+    #[test]
+    #[ignore]
+    fn dump_depth_struct_rust() {
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let ctx = crate::world::WorldContext::new(&blob).unwrap();
+            let chans = match &ctx.ast_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth = &chans[8];
+            fn d(n:&crate::ast::AstNode, sb:&mut String, ind:usize){
+                use crate::ast::AstNode as A;
+                let p="  ".repeat(ind.min(30));
+                let tag=match n {
+                    A::Min(_,_)=>"Min",A::Max(_,_)=>"Max",A::Add(_,_)=>"Add",A::Sub(_,_)=>"Sub",A::Mul(_,_)=>"Mul",A::Div(_,_)=>"Div",
+                    A::Abs(_)=>"Abs",A::Square(_)=>"Sq",A::Cube(_)=>"Cube",A::Sqrt(_)=>"Sqrt",A::Squeeze(_)=>"Squeeze",
+                    A::CacheFlat(_)=>"CacheFlat",A::Cache2D(_)=>"Cache2D",A::CacheInterpolated(_)=>"CacheInterp",
+                    A::NoiseSampler{..}=>"Noise",A::Spline{..}=>"Spline",A::RangeChoice{..}=>"RangeChoice",
+                    A::YClampedGradient{..}=>"YClamp",A::Constant(_)=>"Const",A::InputY=>"InputY",A::InputX=>"InputX",A::InputZ=>"InputZ",
+                    A::Shift{..}=>"Shift",A::ShiftedNoise{..}=>"ShiftedNoise",A::WeirdScaledSampler{..}=>"Weird",
+                    _=>"?",
+                };
+                sb.push_str(&p); sb.push_str(tag);
+                match n {
+                    A::Constant(v)=>{sb.push_str(&format!(" v={v}"));}
+                    A::YClampedGradient{from_y,to_y,from_value,to_value}=>{sb.push_str(&format!(" fy={from_y} ty={to_y} fv={from_value} tv={to_value}"));}
+                    A::Spline{locations,derivatives,..}=>{sb.push_str(&format!(" n={} locs={:?} derivs={:?}", locations.len(), locations, derivatives));}
+                    A::RangeChoice{min,max,..}=>{
+                        let mn = if let A::Constant(v)=&**min {*v} else {f32::NAN};
+                        let mx = if let A::Constant(v)=&**max {*v} else {f32::NAN};
+                        sb.push_str(&format!(" min={mn} max={mx}"));}
+                    A::NoiseSampler{xz_scale,y_scale,..}=>{sb.push_str(&format!(" xz={xz_scale} y={y_scale}"));}
+                    _=>{}
+                }
+                sb.push('\n');
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)|A::FloorDiv(a,b)=>{k.push(a);k.push(b);}
+                    A::Abs(a)|A::Square(a)|A::Cube(a)|A::Sqrt(a)|A::Squeeze(a)|A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,in_bounds,out_of_bounds_lo,out_of_bounds_hi,..}=>{k.push(input);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    A::WeirdScaledSampler{input,noise,..}=>{k.push(input);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { d(c,sb,ind+1); }
+            }
+            let mut sb=String::new();
+            d(depth,&mut sb,0);
+            std::fs::write("/tmp/depth_struct_rust.txt", &sb).unwrap();
+            println!("wrote {} lines", sb.lines().count());
+        }).unwrap().join().unwrap();
+    }
+
+
+    #[test]
+    #[ignore]
+    fn mc_vs_rust_depth_trace() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let (raw_root, _shape, _biome, perm_entries, _simplex) =
+                crate::ast::deserialize::deserialize_full_with_perm(&blob).unwrap();
+            let pts = crate::world::constants::PermutationTableSet::from_entries(&perm_entries);
+            let perm = pts.buffer.clone();
+            let origins = pts.origins.clone();
+            let chans = match &raw_root { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth = &chans[8];
+            let (wx,wy,wz)=(800.0f32,128.0f32,800.0f32);
+            let mut out=String::new();
+            fn tr(n:&crate::ast::AstNode,p:&[i32],o:&[f32],x:f32,y:f32,z:f32,sb:&mut String,ind:usize)->f32{
+                use crate::ast::AstNode as A;
+                let v=cpu_ast_eval(n,p,o,x,y,z);
+                let pad="  ".repeat(ind.min(40));
+                let tag=match n{
+                    A::Min(_,_)=>"Min",A::Max(_,_)=>"Max",A::Add(_,_)=>"Add",A::Sub(_,_)=>"Sub",A::Mul(_,_)=>"Mul",A::Div(_,_)=>"Div",
+                    A::Abs(_)=>"Abs",A::Square(_)=>"Square",A::Cube(_)=>"Cube",A::Sqrt(_)=>"Sqrt",A::Squeeze(_)=>"Squeeze",
+                    A::CacheFlat(_)=>"CacheFlat",A::Cache2D(_)=>"Cache2D",A::CacheInterpolated(_)=>"CacheInterp",
+                    A::RangeChoice{..}=>"RangeChoice",A::NoiseSampler{..}=>"Noise",A::Spline{..}=>"Spline",
+                    A::YClampedGradient{..}=>"YClamp",A::Constant(_)=>"Const",A::InputX=>"InputX",A::InputY=>"InputY",A::InputZ=>"InputZ",
+                    A::Shift{..}=>"Shift",A::ShiftedNoise{..}=>"ShiftedNoise",A::WeirdScaledSampler{..}=>"Weird",
+                    _=>"?",
+                };
+                sb.push_str(&format!("{pad}{tag} = {v:.6}\n"));
+                if ind>300 {return v;}
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)|A::FloorDiv(a,b)=>{tr(a,p,o,x,y,z,sb,ind+1);tr(b,p,o,x,y,z,sb,ind+1);}
+                    A::Abs(a)|A::Square(a)|A::Cube(a)|A::Sqrt(a)|A::Squeeze(a)|A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{tr(a,p,o,x,y,z,sb,ind+1);}
+                    A::RangeChoice{input,..}=>{tr(input,p,o,x,y,z,sb,ind+1);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{tr(shift_x,p,o,x,y,z,sb,ind+1);tr(shift_y,p,o,x,y,z,sb,ind+1);tr(shift_z,p,o,x,y,z,sb,ind+1);tr(noise,p,o,x,y,z,sb,ind+1);}
+                    _=>{}
+                }
+                v
+            }
+            tr(depth,&perm,&origins,wx,wy,wz,&mut out,0);
+            std::fs::write("/tmp/rust_depth_values.txt",&out).unwrap();
+            println!("wrote {} lines", out.lines().count());
+        }).unwrap().join().unwrap();
+    }
+
+
+    #[test]
+    #[ignore]
+    fn dump_raw_vs_opt_depth() {
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let (raw, _, _) = crate::ast::deserialize::deserialize_full(&blob).unwrap();
+            let opt = crate::ast::opto::run_pipeline(raw.clone()).unwrap();
+            fn sig(n:&crate::ast::AstNode, sb:&mut String, ind:usize){
+                use crate::ast::AstNode as A;
+                let p="  ".repeat(ind.min(30));
+                let t=match n{
+                    A::Min(_,_)=>"Min",A::Max(_,_)=>"Max",A::Add(_,_)=>"Add",A::Sub(_,_)=>"Sub",A::Mul(_,_)=>"Mul",A::Div(_,_)=>"Div",
+                    A::CacheFlat(_)=>"CacheFlat",A::Cache2D(_)=>"Cache2D",A::CacheInterpolated(_)=>"CacheInterp",
+                    A::RangeChoice{..}=>"RangeChoice",A::NoiseSampler{..}=>"Noise",A::Spline{..}=>"Spline",
+                    A::YClampedGradient{..}=>"YClamp",A::Constant(_)=>"Const",A::InputY=>"InputY",A::InputX=>"InputX",A::InputZ=>"InputZ",
+                    A::Abs(_)=>"Abs",A::Squeeze(_)=>"Squeeze",A::Square(_)=>"Square",
+                    A::Shift{..}=>"Shift",A::ShiftedNoise{..}=>"ShiftedNoise",A::WeirdScaledSampler{..}=>"Weird",
+                    _=>"?",
+                };
+                sb.push_str(&p); sb.push_str(t); sb.push('\n');
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)|A::FloorDiv(a,b)=>{k.push(a);k.push(b);}
+                    A::Abs(a)|A::Square(a)|A::Cube(a)|A::Sqrt(a)|A::Squeeze(a)|A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,in_bounds,out_of_bounds_lo,out_of_bounds_hi,..}=>{k.push(input);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    A::WeirdScaledSampler{input,noise,..}=>{k.push(input);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { sig(c,sb,ind+1); }
+            }
+            let depc= |r:&crate::ast::AstNode|->crate::ast::AstNode{ match r { crate::ast::AstNode::Root(c)=> c[8].clone(), _=>panic!() } };
+            let mut s1=String::new(); let dr=depc(&raw); sig(&dr,&mut s1,0);
+            let mut s2=String::new(); let do_=depc(&opt); sig(&do_,&mut s2,0);
+            std::fs::write("/tmp/depth_raw.txt",&s1).unwrap();
+            std::fs::write("/tmp/depth_opt.txt",&s2).unwrap();
+            println!("raw lines={} opt lines={}", s1.lines().count(), s2.lines().count());
+        }).unwrap().join().unwrap();
+    }
+
+
+    #[test]
+    #[ignore]
+    fn dump_spline_values() {
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let (raw,_,_,_,_) = crate::ast::deserialize::deserialize_full_with_perm(&blob).unwrap();
+            let chans = match &raw { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            fn walk(n:&crate::ast::AstNode){
+                use crate::ast::AstNode as A;
+                if let A::Spline{locations,derivatives,values,..}=n {
+                    // only the one with 7 locs starting -0.45
+                    if locations.len()==7 && (locations[0]+0.45).abs()<1e-4 {
+                        println!("SPLINE locs={:?}", locations);
+                        println!("  derivs={:?}", derivatives);
+                        print!("  values=[");
+                        for v in values {
+                            match v {
+                                A::Constant(c)=>print!("{c}, "),
+                                A::Spline{locations:l,..}=>print!("<nested spline n={}>, ", l.len()),
+                                other=>print!("<{:?}>, ", std::mem::discriminant(other)),
+                            }
+                        }
+                        println!("]");
+                    }
+                }
+                let mut k:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)|A::FloorDiv(a,b)=>{k.push(a);k.push(b);}
+                    A::Abs(a)|A::Square(a)|A::Cube(a)|A::Sqrt(a)|A::Squeeze(a)|A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{k.push(a);}
+                    A::RangeChoice{input,in_bounds,out_of_bounds_lo,out_of_bounds_hi,..}=>{k.push(input);k.push(in_bounds);k.push(out_of_bounds_lo);k.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{k.push(location);for v in values{k.push(v);}}
+                    A::Shift{offset,..}=>{k.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{k.push(shift_x);k.push(shift_y);k.push(shift_z);k.push(noise);}
+                    A::WeirdScaledSampler{input,noise,..}=>{k.push(input);k.push(noise);}
+                    _=>{}
+                }
+                for c in k { walk(c); }
+            }
+            walk(&chans[8]);
+        }).unwrap().join().unwrap();
+    }
+
+
+    #[test]
+    #[ignore]
+    fn spline_t_trace() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let (raw,_,_,perm_entries,_) = crate::ast::deserialize::deserialize_full_with_perm(&blob).unwrap();
+            let pts = crate::world::constants::PermutationTableSet::from_entries(&perm_entries);
+            let perm = pts.buffer.clone(); let origins = pts.origins.clone();
+            let chans = match &raw { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth = &chans[8];
+            let (wx,wy,wz)=(800.0f32,128.0f32,800.0f32);
+
+            fn find_target(n:&crate::ast::AstNode, p:&[i32], o:&[f32], x:f32,y:f32,z:f32) -> bool {
+                use crate::ast::AstNode as A;
+                if let A::Spline{locations,values,location,..}=n {
+                    if locations.len()==7 && (locations[0]+0.45).abs()<1e-4 {
+                        let t=cpu_ast_eval(location,p,o,x,y,z);
+                        println!("=== target spline ===");
+                        println!("  input t = {:.8}", t);
+                        println!("  locs    = {:?}", locations);
+                        // which segment
+                        let mut seg=-1;
+                        if t < locations[0] { println!("  below range -> extrapolate vs[0]"); }
+                        else if t >= locations[locations.len()-1] { println!("  above range -> extrapolate vs[last]"); }
+                        else {
+                            for k in 0..locations.len()-1 {
+                                if t < locations[k+1] { seg=k as i32; break; }
+                            }
+                            println!("  segment = [{}..{}] = [{}, {}]", seg, seg+1, locations[seg as usize], locations[seg as usize+1]);
+                        }
+                        // print all 7 values
+                        for (i,v) in values.iter().enumerate() {
+                            let val=cpu_ast_eval(v,p,o,x,y,z);
+                            println!("  values[{i}] = {:.6}", val);
+                        }
+                        // now recurse into each nested spline with same t
+                        println!("  --- nested expansions ---");
+                        for (i,v) in values.iter().enumerate() {
+                            if let A::Spline{locations:nl,derivatives:nd,location:nloc,values:nv}=v {
+                                let nt=cpu_ast_eval(nloc,p,o,x,y,z);
+                                println!("  values[{i}] is Spline n={} locs={:?} derivs={:?} input_t={:.6}", nl.len(), nl, nd, nt);
+                                for (j,nvv) in nv.iter().enumerate() {
+                                    println!("      inner[{j}] = {:.6}", cpu_ast_eval(nvv,p,o,x,y,z));
+                                }
+                            }
+                        }
+                        return true;
+                    }
+                }
+                let mut kids:Vec<&crate::ast::AstNode>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)|A::FloorDiv(a,b)=>{kids.push(a);kids.push(b);}
+                    A::Abs(a)|A::Square(a)|A::Cube(a)|A::Sqrt(a)|A::Squeeze(a)|A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{kids.push(a);}
+                    A::RangeChoice{input,in_bounds,out_of_bounds_lo,out_of_bounds_hi,..}=>{kids.push(input);kids.push(in_bounds);kids.push(out_of_bounds_lo);kids.push(out_of_bounds_hi);}
+                    A::Spline{location,values,..}=>{kids.push(location);for v in values{kids.push(v);}}
+                    A::Shift{offset,..}=>{kids.push(offset);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{kids.push(shift_x);kids.push(shift_y);kids.push(shift_z);kids.push(noise);}
+                    A::WeirdScaledSampler{input,noise,..}=>{kids.push(input);kids.push(noise);}
+                    _=>{}
+                }
+                for c in kids { if find_target(c,p,o,x,y,z) { return true; } }
+                false
+            }
+            find_target(depth,&perm,&origins,wx,wy,wz);
+        }).unwrap().join().unwrap();
+    }
+
+
+    #[test]
+    #[ignore]
+    fn depth_xz_isolation() {
+        use super::tests::cpu_ast_eval;
+        std::thread::Builder::new().stack_size(512*1024*1024).spawn(|| {
+            let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+            let blob = std::fs::read(bin).unwrap();
+            let (raw,_,_,perm_entries,_) = crate::ast::deserialize::deserialize_full_with_perm(&blob).unwrap();
+            let pts = crate::world::constants::PermutationTableSet::from_entries(&perm_entries);
+            let perm = pts.buffer.clone(); let origins = pts.origins.clone();
+            let chans = match &raw { crate::ast::AstNode::Root(c)=>c, _=>panic!() };
+            let depth = &chans[8];
+            // (world_x, world_y, world_z, MC_ref, label)
+            let cases = [
+                (784.0f32,128.0f32,784.0f32,-0.6768934f32,"49_49 x=784 z=784"),
+                (784.0f32,128.0f32,816.0f32,-0.66730416f32,"49_51 x=784 z=816"),
+                (800.0f32,128.0f32,800.0f32,-0.67620826f32,"50_50 x=800 z=800"),
+                (112.0f32,128.0f32,544.0f32,f32::NAN,"7_34  x=112 z=544 (known OK)"),
+            ];
+            for (x,y,z,mc,label) in cases {
+                let cpu = cpu_ast_eval(depth,&perm,&origins,x,y,z);
+                let d = if mc.is_nan() { f32::NAN } else { (cpu-mc).abs() };
+                println!("{label}: CPU={cpu:.6} MC={mc:.6} diff={d:.4}");
+            }
+        }).unwrap().join().unwrap();
     }
 
     use crate::ast::AstNode;

@@ -126,12 +126,14 @@ pub struct SingleBatchExecutor {
     block_buf: wgpu::Buffer,
     /// External-input values (binding 6), lazily (re)created to fit the batch.
     external_buf: Option<wgpu::Buffer>,
-    /// §22 B-2: aquifer cell positions + lvl_y (vec4<i32>/cell), binding 8.
-    aquifer_p_buf: wgpu::Buffer,
-    /// §22 B-2: aquifer cell fluid state (u32/cell), binding 9.
-    aquifer_s_buf: wgpu::Buffer,
-    /// §23: per-chunk Beardifier pieces/junctions (u32), binding 11.
-    beard_pj_buf: wgpu::Buffer,
+    /// §22: aquifer cells, binding 8. Layout: [ aq_p (N vec4) | aq_s (N vec4) ];
+    /// only `.x` of the aq_s half carries the fluid state.
+    aquifer_buf: wgpu::Buffer,
+    /// §23: Beardifier data, binding 9. Layout:
+    /// [ weight table (13824 u32, bitcast f32) | per-chunk pj (4096 u32/chunk) ].
+    beard_buf: wgpu::Buffer,
+    /// Cached weight-table half of `beard_buf` (built once, reused per batch).
+    beard_w_cache: Vec<u32>,
     #[allow(dead_code)]
     bind_group_layout: wgpu::BindGroupLayout,
     /// §22: separate layout for the BlockOut shard (6 storage buffers).
@@ -199,22 +201,18 @@ impl SingleBatchExecutor {
         // height=512, cell_height=4; round to 1200. vec4<i32>/cell + u32/cell.
         const MAX_AQ_CELLS: usize = 1200;
         let aq_stride = MAX_AQ_CELLS * config.max_batch_size.max(1);
-        let aquifer_p_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("c2me_wgpu_aquifer_p"),
-            size: (aq_stride * 16) as u64,
+        // aq_p half + aq_s half; aq_s is padded to vec4 so one array type works.
+        let aquifer_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("c2me_wgpu_aquifer"),
+            size: (aq_stride * 16 * 2) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let aquifer_s_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("c2me_wgpu_aquifer_s"),
-            size: (aq_stride * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        // §23: fixed 4096-u32 stride per chunk (matches WGSL BEARD_STRIDE).
-        let beard_pj_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("c2me_wgpu_beard_pj"),
-            size: (4096usize * config.max_batch_size.max(1) * 4) as u64,
+        // §23: 24^3 weight table (13824 u32) followed by 4096-u32/chunk pj.
+        const BEARD_W_LEN: usize = 24 * 24 * 24;
+        let beard_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("c2me_wgpu_beard"),
+            size: ((BEARD_W_LEN + 4096 * config.max_batch_size.max(1)) * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -226,6 +224,14 @@ impl SingleBatchExecutor {
         let pipeline_layout = bind_group::create_pipeline_layout(&device, &bind_group_layout)
             .map_err(|e| format!("pipeline layout: {e}"))?;
 
+        // Write the static Beardifier weight table into the front of beard_buf
+        // once; per-batch uploads only touch the pj section after it.
+        {
+            let w: Vec<u32> = crate::world::beard::build_weight_table()
+                .iter().map(|f| f.to_bits()).collect();
+            queue.write_buffer(&beard_buf, 0, bytemuck::cast_slice(&w));
+        }
+
         Ok(Self {
             device,
             queue,
@@ -235,9 +241,10 @@ impl SingleBatchExecutor {
             output_buf,
             block_buf,
             external_buf: None,
-            aquifer_p_buf,
-            aquifer_s_buf,
-            beard_pj_buf,
+            aquifer_buf,
+            beard_buf,
+            beard_w_cache: crate::world::beard::build_weight_table()
+                .iter().map(|f| f.to_bits()).collect(),
             bind_group_layout,
             block_out_bg_layout,
             pipeline_layout,
@@ -307,7 +314,7 @@ impl SingleBatchExecutor {
             height_f: shape.height as f32,
             batch_count_x: num_chunks as i32,
             batch_count_z: 1,
-            _pad: [0; 8],
+            _pad: [0; 12],
         };
 
         // External inputs for CPU-evaluated subtrees (binding 6).
@@ -356,6 +363,15 @@ impl SingleBatchExecutor {
             params._pad[3] = am.default_fluid;
             params._pad[4] = am.lava_level as u32;
         }
+        // Ore-vein RNG seed in _pad[5..9]: (seedLo.lo, seedLo.hi, seedHi.lo, seedHi.hi).
+        {
+            let (lo, hi) = world.ore_seed();
+            params._pad[5] = lo as u32;
+            params._pad[6] = (lo as u64 >> 32) as u32;
+            params._pad[7] = hi as u32;
+            params._pad[8] = (hi as u64 >> 32) as u32;
+            params._pad[9] = if world.ore_veins.load(std::sync::atomic::Ordering::Relaxed) { 1 } else { 0 };
+        }
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
         // Packed chunk positions [cx,cz,...] for the shader (binding 4).
@@ -380,7 +396,9 @@ impl SingleBatchExecutor {
                 let start_y = min_y.div_euclid(12) - 1;
                 let size_y = (min_y + height).div_euclid(12)
                     - min_y.div_euclid(12) + 3;
+                let cells_per_chunk = (size_y * 9) as usize;
                 for &(cx, cz) in &batch.positions {
+                    let before = aq_p.len();
                     // Consume: remove so the map does not grow unboundedly.
                     if let Some(bytes) = tables.remove(&(cx, cz)) {
                         if let Some(t) = crate::world::aquifer::AquiferTable::parse(
@@ -388,13 +406,37 @@ impl SingleBatchExecutor {
                             t.pack_for_gpu(&mut aq_p, &mut aq_s);
                         }
                     }
+                    // Every chunk must occupy exactly `cells_per_chunk` slots:
+                    // the shader addresses cells as chunk_index * aq_sy * 9.
+                    // A chunk with no table (fresh region edge, or a dimension
+                    // without aquifers) is padded with inert cells so later
+                    // chunks do not shift out of place.
+                    if aq_p.len() < before + cells_per_chunk {
+                        // Vanilla always has a fully populated cell grid per
+                        // chunk, so a gap here means the Java side failed to
+                        // stage a table (async race or dimension mismatch).
+                        // Pad with zeroes so later chunks keep their stride
+                        // (the shader will fall through its "no cell found"
+                        // branch and write stone) and log it loudly.
+                        eprintln!("[c2me-wgpu] missing aquifer table for chunk ({cx}, {cz}); padding");
+                        aq_p.resize(before + cells_per_chunk, [0, 0, 0, 0]);
+                        aq_s.resize(before + cells_per_chunk, 0);
+                    }
                 }
             }
             if !aq_p.is_empty() {
-                self.queue.write_buffer(&self.aquifer_p_buf, 0,
-                    bytemuck::cast_slice(&aq_p));
-                self.queue.write_buffer(&self.aquifer_s_buf, 0,
-                    bytemuck::cast_slice(&aq_s));
+                // [ aq_p (vec4) | aq_s padded to vec4 (state in .x) ]
+                let n = aq_p.len();
+                let mut merged: Vec<[i32; 4]> = Vec::with_capacity(n * 2);
+                merged.extend_from_slice(&aq_p);
+                merged.extend(aq_s.iter().map(|&st| [st as i32, 0, 0, 0]));
+                self.queue.write_buffer(&self.aquifer_buf, 0,
+                    bytemuck::cast_slice(&merged));
+                // The shader needs the *actual* half offset, not the size of
+                // the pre-allocated buffer: only the first `n` vec4 entries
+                // were written, so aq_s starts at index `n`.
+                params._pad[10] = n as u32;
+                self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
             }
         }
 
@@ -415,7 +457,10 @@ impl SingleBatchExecutor {
                     }
                 }
             }
-            self.queue.write_buffer(&self.beard_pj_buf, 0,
+            // Weight table is written once at construction; only pj changes
+            // per batch, so write straight past it.
+            const BEARD_W_BYTES: u64 = (24 * 24 * 24) as u64 * 4;
+            self.queue.write_buffer(&self.beard_buf, BEARD_W_BYTES,
                 bytemuck::cast_slice(&pj));
         }
 
@@ -426,8 +471,6 @@ impl SingleBatchExecutor {
             .ok_or_else(|| "origin buffer not uploaded".to_string())?;
         let simplex_buf = world.simplex_buffer()
             .ok_or_else(|| "simplex buffer not uploaded".to_string())?;
-        let beard_w_buf = world.beard_weight_buffer()
-            .ok_or_else(|| "beard weight buffer not uploaded".to_string())?;
 
         // Reuse the persistent output buffer (binding 2).
 
@@ -487,10 +530,10 @@ impl SingleBatchExecutor {
                 wgpu::BindGroupEntry { binding: 2, resource: self.output_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: self.positions_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: self.block_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: self.aquifer_p_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: self.aquifer_s_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: beard_w_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: self.beard_pj_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: self.aquifer_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: self.beard_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: perm_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: origin_buf.as_entire_binding() },
             ],
         });
 
@@ -504,12 +547,6 @@ impl SingleBatchExecutor {
 
         // Dispatch compute pass
         {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("c2me_wgpu_batch_compute"),
-                timestamp_writes: None,
-            });
-            cpass.set_bind_group(0, &bind_group, &[]);
-
             // Cell grid per chunk = (16/cell_width, height/cell_height, 16/cell_width).
             // Workgroup size is (4,4,4), so dispatch that many workgroups.
             let cw = shape.cell_width.max(1) as u32;
@@ -533,7 +570,18 @@ impl SingleBatchExecutor {
             let bw_x = (16u32 + 3) / 4;              // 4
             let bw_y = (height + 3) / 4;
             let bw_z = (16u32 * num_chunks + 3) / 4;
+            
             for (i, pipeline) in pipelines.iter().enumerate() {
+                // IMPORTANT: Each shard gets its own compute pass. WebGPU only
+                // guarantees memory synchronization (barriers) between distinct
+                // passes, not between dispatches inside one pass. BlockOut reads
+                // the corner values written by shards B and C, so without this
+                // separation it may race and read stale/zeroed data, turning solid
+                // terrain into aquifer-filled water.
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("c2me_wgpu_batch_compute"),
+                    timestamp_writes: None,
+                });
                 cpass.set_pipeline(pipeline);
                 if shards[i].pass == crate::codegen::wgsl_gen::Pass::BlockOut {
                     cpass.set_bind_group(0, &block_out_bg, &[]);

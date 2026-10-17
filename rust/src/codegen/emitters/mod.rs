@@ -61,47 +61,29 @@ fn emit_octave_stack(
     domain_scale: f32,
 ) -> String {
     let n = oct.amplitudes.len();
+    assert!(n <= 16, "octave stack longer than 16 (octave_stack's array bound)");
     let n_u32 = n as u32;
     let amps_name = ctx.fresh_var(&format!("amps_{tag}"));
-    let acc_name = ctx.fresh_var(&format!("kacc_{tag}"));
-    let fx_name = ctx.fresh_var(&format!("fx_{tag}"));
-    let fy_name = ctx.fresh_var(&format!("fy_{tag}"));
-    let fz_name = ctx.fresh_var(&format!("fz_{tag}"));
-    let freq_name = ctx.fresh_var(&format!("freq_{tag}"));
-    let amp_name = ctx.fresh_var(&format!("ac_{tag}"));
-    let v_name = ctx.fresh_var(&format!("pv_{tag}"));
     let out_name = ctx.fresh_var(&format!("os_{tag}"));
 
-    let amp_vals = oct
-        .amplitudes
-        .iter()
-        .map(|v| format!("{v:.9e}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    // Pad to 16; the loop bound `n` means padding never affects the result.
+    let mut amp_vals: Vec<String> = oct.amplitudes.iter().map(|v| format!("{v:.9e}")).collect();
+    amp_vals.resize(16, "0.000000000e0".to_string());
     ctx.emit(format!(
-        "let {amps_name}: array<f32, {n_u32}> = array<f32, {n_u32}>({amp_vals});"
+        "let {amps_name}: array<f32, 16> = array<f32, 16>({});",
+        amp_vals.join(", ")
     ));
     let eff_xz = xz_scale * domain_scale;
     let eff_y = y_scale * domain_scale;
-    ctx.emit(format!("var {fx_name}: f32 = cell_x * {eff_xz:.9e};"));
-    ctx.emit(format!("var {fy_name}: f32 = cell_y * {eff_y:.9e};"));
-    ctx.emit(format!("var {fz_name}: f32 = cell_z * {eff_xz:.9e};"));
-    ctx.emit(format!("var {freq_name}: f32 = {:.9e};", oct.initial_freq));
-    ctx.emit(format!("var {amp_name}: f32 = {:.9e};", oct.persistence));
-    ctx.emit(format!("var {acc_name}: KahanSum = kahan_zero();"));
-    ctx.emit(format!("for (var i: u32 = 0u; i < {n_u32}u; i++) {{"));
-    ctx.emit(format!("  let a_i = {amps_name}[i];"));
-    ctx.emit("  if (a_i != 0.0) {".to_string());
+    // One call instead of the ~13-line inline expansion (see math_lib.wgsl).
     ctx.emit(format!(
-        "    let {v_name}: f32 = noise_perlin3d_origin({base}i + i32(i) * 256i, {fx_name} * {freq_name}, {fy_name} * {freq_name}, {fz_name} * {freq_name}) * a_i * {amp_name};",
-        base = oct.perm_offset
+        "let {out_name}: f32 = octave_stack(cell_x, cell_y, cell_z, {base}i, {n_u32}u, {amps_name}, {freq:.9e}, {ac:.9e}, {sxz:.9e}, {sy:.9e});",
+        base = oct.perm_offset,
+        freq = oct.initial_freq,
+        ac = oct.persistence,
+        sxz = eff_xz,
+        sy = eff_y,
     ));
-    ctx.emit(format!("    kahan_add(&{acc_name}, {v_name});"));
-    ctx.emit("  }".to_string());
-    ctx.emit(format!("  {freq_name} *= 2.0;"));
-    ctx.emit(format!("  {amp_name} *= 0.5;"));
-    ctx.emit("}".to_string());
-    ctx.emit(format!("let {out_name}: f32 = kahan_result({acc_name});"));
     out_name
 }
 

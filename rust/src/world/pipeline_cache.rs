@@ -103,7 +103,7 @@ pub fn get_or_compile(
     // pipeline cached under the old layout is invalid, so perturb the key
     // (and the on-disk cache path) with a layout version. Bump on any
     // binding change.
-    const LAYOUT_VERSION: u32 = 4;
+    const LAYOUT_VERSION: u32 = 7;
     let fingerprint = fingerprint ^ LAYOUT_VERSION.wrapping_mul(0x9E37_79B9);
     let key = (fingerprint, pass_id(pass));
     let entry_point = pass.entry_point();

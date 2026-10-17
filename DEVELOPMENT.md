@@ -1,8 +1,8 @@
 # C2ME WGPU 加速模块 — 开发文档
 
-> 最后更新：2026-10-11
-> 状态：**aquifer + Beardifier 全 GPU 完成（§22）**。桌面端到端反超纯 CPU
-> （Chunky r=500：15 s vs 23 s）。GPU 直接输出 per-block 方块状态，CPU 只写 palette。
+> 最后更新：2026-10-17
+> 状态：**aquifer + Beardifier 全 GPU 完成（§22）**，含 **Spline n==1 单点节点修复** 与 **shard B 瘦身**。
+> 桌面端到端反超纯 CPU（Chunky r=500：15 s vs 23 s）。GPU 直接输出 per-block 方块状态，CPU 只写 palette。
 > 历史细节见文末「附录：开发历程」。
 
 ---
@@ -46,7 +46,9 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 9. **平台未定义行为要显式兜底**：`sqrt(负)`、`clamp(NaN)` Java 有定义、GPU 未定义。
 10. **运算符优先级陷阱**：`+` 优先于 `&`（perm 索引）；WGSL 负数拼接 `--` 会解析失败。
 11. **插桩污染数据**：`nanoTime` 包住可内联调用会阻止 JIT，绝对值不可信，只看比例。
-12. **"肉眼无区别" ≠ 正确**：要方块级量化。
+12. **"肉眼无区别" ≠ 正确**：要方块级量化。**n==1 的 Spline 也常被当成常量**：MC 走
+    `outside()`，`derivs=[1.0]` 时返回 `coordinate` 本身（如 -0.45）而非 `values[0]`；漏掉会让
+    嵌套 values 全错，且只在特定 t 段暴露（Tectonic depth 偏差 ~0.08 → 海底 water↔stone）。
 
 **GPU 架构**
 13. **多 pass 是硬约束**：每类 shard 用独立 bind group layout，只含它实际用的 binding（≤8 storage buffer）。
@@ -65,27 +67,37 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
 ### 待办
 
-- **barrier 噪声分支**（aquifer 99.97%→100%）：只影响过渡带少数方块。
+- ~~**barrier 噪声分支**（aquifer 99.97%→100%）~~ → **暂不修**（与 §14 Pass E 同类，见下）。
 - **矿脉全 GPU 化**：仍是角点粗筛 + MC 精算。
-- **pass B 拆分**：3084 行超安全线（编译 ~10 s，Mali 风险），纯工程优化。
-- **§14 interpolated 边界 bug（Tectonic/Epic 触发）**：`squeeze` 等非线性节点包在
-  `interpolated` 外层时，MC 是"逐方块 外层(角点插值(内层))"，我们是"角点插值(整棵树)"，不等。
-  现象：浮空水、地表滴水石、怪地形。**vanilla 不触发，Tectonic/Epic 触发**。
-  修法（择日）：拦截 MC 的 `DensityInterpolator.fill()`，用 GPU 角点值填充 MC 缓冲，
+- ~~**pass B 超安全线**~~ → **已解决（2026-10-17）**：shard B 3084→1771 行。
+  做法不是拆 dispatch（单通道标量输出，拆开要额外 buffer 通信），而是把两处高频
+  内联公式提成 WGSL 函数：`spline_seg`（190 段 ×4 行 → 1 行）与 `octave_stack`
+  （52 个噪声栈 ×13 行 → 1 行）。数学 bit-identical（`numerical_validation_spline`
+  仍为 1.79e-7，实机地形逐块一致），并 bump `LAYOUT_VERSION` 5→6。
+  （注意与 §14 的 Pass E 区分：Pass E 是逐方块求值方案，会让 shard B 涨到 5537 行，最后才做。）
+- ~~**§14 interpolated 边界 bug（Tectonic/Epic 触发）**~~ → **暂不修（2026-10-17 决策）**：
+  `squeeze` 等非线性节点包在 `interpolated` 外层时，MC 是"逐方块 外层(角点插值(内层))"，
+  我们是"角点插值(整棵树)"，不等。现象：浮空水、怪坑、怪地形（滴水石锥症状已由 §22 的
+  Spline n==1 修复消除）。**vanilla 不触发，Tectonic/Epic 触发**。
+  修法（Pass E，**与边界问题一并最后修**）：拦截 MC 的 `DensityInterpolator.fill()`，用 GPU 角点值填充 MC 缓冲，
   让 MC 自己完成"插值 + 外层求值"。注意树里有 ~8 个 interpolator（含含水层噪声通道），
   需枚举 + 建实例↔子树映射 + 改 blobify 协议。
+  **不修的原因**：Pass E 实测把 CPS 封顶在 ~150（每 chunk 多一次 98k 逐方块 dispatch，
+  shard B 3084→5537 行，Mali 设备丢失风险），地形收益被性能成本抵消。
+- **aquifer barrier 分支（99.97%→100%）暂不修（2026-10-17 决策）**：与 Pass E 同类。
+  MC 的 `calculateDensity` 需 per-block 采样 barrierNoise（ch0），Tectonic 的 ch0 是
+  90 行结构；BlockOut binding 已满 8/8（铁律 13），加 perm/origins 需重构且 shader
+  逼近 Mali 安全区。收益仅过渡带 0.03% 方块，与 Pass E 一并搁置。
 
 ### 环境变量速查
 
 | 变量 | 值 | 效果 |
 |---|---|---|
-| `C2ME_WGPU_BLOCK_OUT` | `1` | GPU 输出 per-block 方块状态（核心路径） |
-| `C2ME_WGPU_AQUIFER` | `1` | GPU aquifer（水/岩浆/石） |
-| `C2ME_WGPU_BEARD` | `1` | GPU Beardifier（结构地基） |
 | `C2ME_WGPU_DEBUG` | `1` | 详细日志 → `logs/c2me-wgpu.log` |
 | `C2ME_WGPU_PROFILE` | `1` | 分阶段 GPU 计时 |
 | `C2ME_WGPU_SKIP_AQUIFER` / `MIN_STAGE` | `0` | 诊断快捷路径（产错地形，仅计时） |
-| `C2ME_DUMP_*` | — | 各种离线参考 dump（测完关掉） |
+| `C2ME_DUMP_*` | — | 各种离线参考 dump（测完关掉）；需同时设 `C2ME_DUMP_CHUNK` 才生效 |
+| `C2ME_DUMP_DIR` | 路径 | dump 目录，默认平台临时目录（Android 无 `/tmp`） |
 | `WGPU_BACKEND` / `WGPU_ADAPTER_NAME` | — | 标准 wgpu GPU 选择变量 |
 
 ---
@@ -167,6 +179,12 @@ MixinChunkGenerator.populateNoise：
 2. 每 chunk：stage aquifer/beard 表 → requestChunks → pollStatus → 取 blob
 3. GPU 直接输出 per-block 状态字节（0=air/1=stone/2=water/3=lava），Java 只把字节写进 chunk section 的 palette（含 heightmap 更新）
 4. cir.setReturnValue(completedFuture(chunk)) 取消原版生成
+5. **这是唯一的 GPU 写回路径**：旧的"GPU 只算角点密度、MC 在 CPU 上做三线性插值 +
+   aquifer + 矿脉"路径已按 §20 的测量结论删除（CPU 写回把 CPS 钉在 ~150，移动端 ~6）。
+   三个相关开关（`C2ME_WGPU_BLOCK_OUT/AQUIFER/BEARD`）也随之取消——它们已是正确性的
+   必要条件，关掉只会产生错地形。
+6. **已知缺口**：矿脉（`OreVeinSampler`，连片大矿脉）尚未在 GPU 上实现。
+   普通矿石（煤/铁/金等）由 biome feature 阶段放置，不经过这条路径，不受影响。
 
 ---
 
@@ -245,6 +263,13 @@ Rust 不认识的密度节点（地形 mod）在 CPU 按同一角点网格求值
 - **端到端 15s vs 纯 CPU 23s（反超 35%），功能完整，地形正确。**
 - 遗留 0.03% = 过渡带 `calculateDensity`（barrier 噪声）分支未实现。
 - 验证链全离线：CPU-f32 / blockPositions / WGSL / e2e / beard，5 个测试。
+- shard B 瘦身（2026-10-17）：`spline_seg` + `octave_stack` 两个 WGSL helper 替换
+  高频内联展开，3084→1771 行（重回 Mali ~2100 安全区），bit-identical。
+- Spline n==1 修复（2026-10-17）：单点 spline 漏了 `outside()` 外推 → 嵌套 values 全错
+  → depth 偏差 ~0.08 → 海底 y≈43–55 误判 stone（chunk 50,50 diff 8.88%）。改
+  `spline.rs`/`world.rs` 两处 n==1 分支 + bump `LAYOUT_VERSION` 4→5。验证：逐通道
+  bad=0/1225、逐格 diff 归零（回退复现 +0.08~0.098）、GPU rms 2.5e-5/5.7e-5、84 测试
+  全过、实机 Tectonic 与 Epic 滴水石锥均消失；怪坑（§14 非线性外层）仍独立存在。
 
 ### 关键文件
 
