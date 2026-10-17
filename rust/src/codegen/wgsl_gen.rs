@@ -647,8 +647,11 @@ fn calc_density(
     lvl_y2: i32, st2: u32,
     barrier_val: f32,
 ) -> f32 {
-    let is_lava1 = st1 == 3u; let is_water1 = st1 == 2u;
-    let is_lava2 = st2 == 3u; let is_water2 = st2 == 2u;
+    // MC FluidLevel.getBlockState(y): blocks above the fluid level are AIR.
+    let actual_st1 = select(0u, st1, wy < lvl_y1);
+    let actual_st2 = select(0u, st2, wy < lvl_y2);
+    let is_lava1 = actual_st1 == 3u; let is_water1 = actual_st1 == 2u;
+    let is_lava2 = actual_st2 == 3u; let is_water2 = actual_st2 == 2u;
     if (is_lava1 && is_water2) || (is_water1 && is_lava2) { return 2.0; }
     let j = abs(lvl_y1 - lvl_y2);
     if (j == 0) { return 0.0; }
@@ -819,8 +822,9 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
     return;
   }
 
-  // FluidLevelSampler: y < min(-54, seaLevel) → LAVA.
-  if (wy < -54) { block_buf[bidx] = 3u; return; }
+  // FluidLevelSampler: global lava level check.
+  let lava_level = i32(params._pad[4]);
+  if (wy < lava_level) { block_buf[bidx] = 3u; return; }
 
   let min_y_i = i32(params.min_y_f);
   let start_y_i = aq_fdiv(min_y_i, 12) - 1;
@@ -862,12 +866,13 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
   
   let r_lvl = aquifer_buf[u32(ri)].w;
   let r_st = u32(aquifer_buf[aq_half + u32(ri)].x);
+  let r_actual_st = select(0u, r_st, wy < r_lvl);
   
   let dist_op = max_dist(o, p);
-  if (dist_op <= 0.0) { block_buf[bidx] = select(0u, r_st, wy < r_lvl); return; }
+  if (dist_op <= 0.0) { block_buf[bidx] = r_actual_st; return; }
   
-  if (r_st == 2u && wy - 1 < aquifer_buf[u32(ri)].w) {
-      block_buf[bidx] = select(0u, r_st, wy < r_lvl); return;
+  if (r_actual_st == 2u && wy - 1 < lava_level) {
+      block_buf[bidx] = r_actual_st; return;
   }
   
   var s_lvl: i32 = r_lvl;
@@ -898,7 +903,7 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (dd + h_val > 0.0) { block_buf[bidx] = 1u; return; }
   }
   
-  block_buf[bidx] = select(0u, r_st, wy < r_lvl);
+  block_buf[bidx] = r_actual_st;
 }
 "#;
 
