@@ -72,6 +72,8 @@ pub enum Pass {
     /// state byte per block to `block_buf` (binding 7). Entry point
     /// `main_block`. Dispatched after the corner shards.
     BlockOut,
+    /// §14 Pass E: inner shard that computes all `InnerRef` corners.
+    Inner,
 }
 
 impl Pass {
@@ -82,6 +84,7 @@ impl Pass {
             Pass::B => "main_pass_b",
             Pass::C => "main_pass_c",
             Pass::BlockOut => "main_block",
+            Pass::Inner => "main_pass_inner",
         }
     }
 }
@@ -130,6 +133,7 @@ pub fn plan_shards(channel_count: usize) -> Vec<Shard> {
     // §20 block-output shard: not bound to any channel (start==end); it reads
     // ch11 corners from out_buf and writes block-state bytes. Gated.
     if block_out_enabled() {
+        out.push(Shard { pass: Pass::Inner, start: 0, end: 0 });
         out.push(Shard { pass: Pass::BlockOut, start: 0, end: 0 });
     }
     out
@@ -145,6 +149,7 @@ pub fn plan_shards(channel_count: usize) -> Vec<Shard> {
 ///                      function bodies). `emit_shader_for_pass` splices
 ///                      these between `BINDINGS_HEADER` and the entry point.
 pub struct GenCtx {
+    pub inner_count: usize,
     pub lines: Vec<String>,
     pub shared_decls: Vec<String>,
     pub next_var: u32,
@@ -185,6 +190,7 @@ impl GenCtx {
             next_cacheflat_slot: 0,
             next_cache_interp_slot: 0,
             pass,
+            inner_count: 0,
             memo_stack: vec![(false, rustc_hash::FxHashMap::default())],
             in_shadow: false,
             channel_range: (0, usize::MAX),
@@ -389,19 +395,87 @@ pub fn emit_shader_for_pass(root: &AstNode, pass: Pass) -> Result<String> {
 }
 
 /// Emit the shader module for one channel `shard` (see [`Shard`]).
-pub fn emit_shader_for_shard(root: &AstNode, shard: Shard) -> Result<String> {
+pub fn emit_shader_for_shard(
+    root: &AstNode,
+    shard: Shard,
+    inners: &[AstNode],
+    outer: Option<&AstNode>,
+) -> Result<String> {
+    if shard.pass == Pass::Inner {
+        let mut ctx = GenCtx::new(Pass::Inner);
+        let mut body = String::with_capacity(8192);
+        for (i, inner) in inners.iter().enumerate() {
+            let var = super::emitters::emit_node(inner, &mut ctx)?;
+            body.push_str(&format!(
+                "  out_buf[chunk_cell_base + {}u * cells_per_chunk + cell_idx] = {};\n",
+                16 + i, var
+            ));
+        }
+        
+        let prologue = MAIN_PASS_C_PROLOGUE.replace("fn main_pass_c(", "fn main_pass_inner(");
+        let mut usage = String::with_capacity(8192);
+        usage.push_str(&prologue);
+        usage.push_str(&body);
+        for line in &ctx.lines { usage.push_str(line); }
+        
+        let math_lib = emit_pruned_math_lib(&usage);
+        let mut out = String::with_capacity(math_lib.len() + usage.len() + 1024);
+        out.push_str(&math_lib);
+        out.push_str(BINDINGS_HEADER);
+        for decl in &ctx.shared_decls {
+            out.push_str(decl);
+            out.push('\n');
+        }
+        out.push_str(&prologue);
+        for line in &ctx.lines { out.push_str(line); out.push('\n'); }
+        out.push_str(&body);
+        out.push('}');
+        return Ok(out);
+    }
+
     if shard.pass == Pass::BlockOut {
-        // Standalone shader: no AST emitters. It still gets the pruned math
-        // library, because the ore-vein step needs the Xoroshiro RNG and
-        // (stage 2) per-block noise evaluation.
+        let mut ctx = GenCtx::new(Pass::BlockOut);
+        
+        let d_expr = if let Some(_out_tree) = outer {
+            // DIAGNOSTIC 2: read the first inner directly to see if data is present.
+            "tri_at(cbase + 16u * cpc, ix, iy, iz, ccx, s, tx, ty, tz)".to_string()
+        } else {
+            "d".to_string()
+        };
+        
+        let mut injected = String::with_capacity(4096);
+        // `emit_node` relies on these aliases for coordinate access.
+        injected.push_str("  let cell_x: f32 = f32(wx);\n");
+        injected.push_str("  let cell_y: f32 = f32(wy);\n");
+        injected.push_str("  let cell_z: f32 = f32(wz);\n");
+        for line in &ctx.lines {
+            injected.push_str(line);
+            injected.push('\n');
+        }
+        for decl in &ctx.shared_decls {
+            // Not supported in BlockOut for now (no workgroup mem), but log if any.
+            injected.push_str(decl);
+            injected.push('\n');
+        }
+        injected.push_str(&format!("  let d_final: f32 = {};\n", d_expr));
+        
         let mut usage = String::with_capacity(8192);
         usage.push_str(BLOCK_OUT_HEADER);
         usage.push_str(BLOCK_OUT_ENTRY);
+        usage.push_str(&injected);
+        
         let math_lib = emit_pruned_math_lib(&usage);
         let mut out = String::with_capacity(math_lib.len() + usage.len() + 1024);
         out.push_str(&math_lib);
         out.push_str(BLOCK_OUT_HEADER);
-        out.push_str(BLOCK_OUT_ENTRY);
+        
+        // Replace the fixed density `d` with our per-block `d_final` and
+        // inject the AST evaluation right after the block's world coordinates.
+        let entry = BLOCK_OUT_ENTRY.replace(
+            "  // §23: add the Beardifier contribution (per block, before the d>0 test).\n  var dd = d;",
+            &format!("{}\n  // §23: add the Beardifier contribution.\n  var dd = d_final;", injected)
+        );
+        out.push_str(&entry);
         return Ok(out);
     }
     let mut ctx = GenCtx::new(shard.pass);
@@ -437,7 +511,7 @@ fn emit_shader_inner(root: &AstNode, mut ctx: GenCtx) -> Result<String> {
         Pass::C => MAIN_PASS_C_PROLOGUE,
         // BlockOut is emitted by emit_shader_for_shard's early-return path
         // and never reaches here.
-        Pass::BlockOut => unreachable!("BlockOut handled separately"),
+        Pass::BlockOut | Pass::Inner => unreachable!("BlockOut/Inner handled separately"),
     };
 
     // Collect the code that actually *uses* the math library, so we can prune
@@ -631,7 +705,8 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ccy: i32 = height_i / cell_h + 1;
   let s: i32 = ccx * ccz;
   let cpc: u32 = u32(ccx * ccy * ccz);
-  let ch11_base: u32 = u32(chunk_index) * 16u * cpc + 11u * cpc;
+  let cbase: u32 = u32(chunk_index) * params._pad[11] * cpc;
+  let ch11_base: u32 = cbase + 11u * cpc;
 
   let ix: i32 = cx_i32 / cell_w;
   let iz: i32 = bz / cell_w;
@@ -692,7 +767,6 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (dd > 0.0) {
     var st: u32 = 1u;
     if (params._pad[9] == 1u) {
-      let cbase = u32(chunk_index) * 16u * cpc;
       let vt = tri_at(cbase + 12u * cpc, ix, iy, iz, ccx, s, tx, ty, tz);
       let vr = tri_at(cbase + 13u * cpc, ix, iy, iz, ccx, s, tx, ty, tz);
       let vg = tri_at(cbase + 14u * cpc, ix, iy, iz, ccx, s, tx, ty, tz);
@@ -871,7 +945,7 @@ fn main_entry(
                          + cy_i32 * cell_count_x * cell_count_z);
   // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
   // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
-  let chunk_cell_base: u32 = u32(chunk_index) * 16u * cells_per_chunk;
+  let chunk_cell_base: u32 = u32(chunk_index) * params._pad[11] * cells_per_chunk;
 
   // ── 铁律①: i32 world coords via origin subtraction ──────────────────
   let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
@@ -925,7 +999,7 @@ fn main_pass_a(
                          + cy_i32 * cell_count_x * cell_count_z);
   // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
   // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
-  let chunk_cell_base: u32 = u32(chunk_index) * 16u * cells_per_chunk;
+  let chunk_cell_base: u32 = u32(chunk_index) * params._pad[11] * cells_per_chunk;
   let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
   let world_z_i32: i32 = origin_z + cz_local * i32(params.cell_width);
   let world_y_i32: i32 = i32(params.min_y_f) + cy_i32 * i32(params.cell_height);
@@ -973,7 +1047,7 @@ fn main_pass_b(
                          + cy_i32 * cell_count_x * cell_count_z);
   // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
   // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
-  let chunk_cell_base: u32 = u32(chunk_index) * 16u * cells_per_chunk;
+  let chunk_cell_base: u32 = u32(chunk_index) * params._pad[11] * cells_per_chunk;
   let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
   let world_z_i32: i32 = origin_z + cz_local * i32(params.cell_width);
   let world_y_i32: i32 = i32(params.min_y_f) + cy_i32 * i32(params.cell_height);
@@ -1019,7 +1093,7 @@ fn main_pass_c(
                          + cy_i32 * cell_count_x * cell_count_z);
   // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
   // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
-  let chunk_cell_base: u32 = u32(chunk_index) * 16u * cells_per_chunk;
+  let chunk_cell_base: u32 = u32(chunk_index) * params._pad[11] * cells_per_chunk;
   let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
   let world_z_i32: i32 = origin_z + cz_local * i32(params.cell_width);
   let world_y_i32: i32 = i32(params.min_y_f) + cy_i32 * i32(params.cell_height);
@@ -1042,10 +1116,13 @@ mod tests {
         // by Java; everything else is dropped to save shader compile time.
         // BlockOut is on by default, so it always trails the corner shards.
         let shards = plan_shards(16);
-        let corner: Vec<_> = shards.iter().filter(|s| s.pass != Pass::BlockOut).collect();
+        let corner: Vec<_> = shards.iter()
+            .filter(|s| s.pass != Pass::BlockOut && s.pass != Pass::Inner)
+            .collect();
         assert_eq!(corner.len(), 2);
         assert_eq!((corner[0].pass, corner[0].start, corner[0].end), (Pass::B, 11, 12));
         assert_eq!((corner[1].pass, corner[1].start, corner[1].end), (Pass::C, 12, 15));
+        assert_eq!(shards[shards.len() - 2].pass, Pass::Inner);
         assert_eq!(shards.last().unwrap().pass, Pass::BlockOut);
     }
 
@@ -1059,15 +1136,15 @@ mod tests {
             assert_eq!(shards.len(), 1, "n={n}");
             assert_eq!((shards[0].pass, shards[0].start, shards[0].end), (Pass::Single, 0, n), "n={n}");
         }
-        // 12 channels: ch11 present, ch12 absent -> shard B only (+ BlockOut).
+        // 12 channels: ch11 present, ch12 absent -> shard B only (+ Inner/BlockOut).
         let twelve: Vec<_> = plan_shards(12).into_iter()
-            .filter(|s| s.pass != Pass::BlockOut).collect();
+            .filter(|s| s.pass != Pass::BlockOut && s.pass != Pass::Inner).collect();
         assert_eq!(twelve.len(), 1);
         assert_eq!((twelve[0].pass, twelve[0].start, twelve[0].end), (Pass::B, 11, 12));
         // 13+ channels: both ch11 and ch12 -> shards B and C (+ BlockOut).
         for n in [13usize, 14, 15, 16] {
             let shards: Vec<_> = plan_shards(n).into_iter()
-                .filter(|s| s.pass != Pass::BlockOut).collect();
+                .filter(|s| s.pass != Pass::BlockOut && s.pass != Pass::Inner).collect();
             assert_eq!(shards.len(), 2, "n={n}");
             assert_eq!((shards[0].pass, shards[0].start, shards[0].end), (Pass::B, 11, 12), "n={n}");
             // Shard C covers all three vein channels, clipped to what exists.

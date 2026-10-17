@@ -96,6 +96,12 @@ pub struct WorldContext {
     /// §22 fix: per-dimension aquifer mode. Dimensions without aquifers
     /// (Nether/End) skip the 12-cell scan and use sea-level semantics.
     pub(crate) aquifer_mode: std::sync::Mutex<AquiferMode>,
+    /// §14: finalDensity (ch11) split into interpolated boundaries (`inners`)
+    /// and the remaining per-block tree (`outer`). Empty when no split was
+    /// needed (vanilla terrain has no non-linear wrapper outside an interp).
+    pub(crate) density_inners: Vec<crate::ast::AstNode>,
+    pub(crate) density_outer: Option<crate::ast::AstNode>,
+
     /// Ore-vein RNG seed (seedLo, seedHi) from MC's `oreRandomDeriver`.
     /// Set once per world via `c2me_wgpu_set_ore_seed`; (0,0) means unset.
     pub(crate) ore_seed: std::sync::Mutex<(i64, i64)>,
@@ -190,6 +196,18 @@ impl WorldContext {
         // 2. Run 4-pass optimization pipeline (constant_fold → normalize → cse → dce)
         let ast_root = opto::run_pipeline(ast_root)?;
 
+        // §14 Pass E: pre-split finalDensity (ch11) into per-corner subtrees
+        // (`inners`) and a per-block `outer` tree, so the GPU can evaluate
+        // non-linear wrappers per block instead of per corner.
+        let (density_inners, density_outer) = match &ast_root {
+            crate::ast::AstNode::Root(channels) if channels.len() > 11 => {
+                let mut inners = Vec::new();
+                let outer = crate::ast::split::split(&channels[11], &mut inners);
+                (inners, Some(outer))
+            }
+            _ => (Vec::new(), None),
+        };
+
         // 3. Fingerprint = stable hash of optimized AST (Java ↔ Rust consistency)
         let fingerprint = hash_ast(&ast_root);
 
@@ -212,7 +230,7 @@ impl WorldContext {
         };
         let mut shader_srcs: Vec<String> = Vec::with_capacity(shards.len());
         for shard in &shards {
-            let src = wgsl_gen::emit_shader_for_shard(&ast_root, *shard)?;
+            let src = wgsl_gen::emit_shader_for_shard(&ast_root, *shard, &density_inners, density_outer.as_ref())?;
             crate::wgpu_debug!(
                 "[c2me-wgpu][codegen] shard {:?} [{}..{}) WGSL: {} lines, {} bytes",
                 shard.pass, shard.start, shard.end,
@@ -254,6 +272,8 @@ impl WorldContext {
             aquifer_tables: std::sync::Mutex::new(std::collections::HashMap::new()),
             beard_tables: std::sync::Mutex::new(std::collections::HashMap::new()),
             aquifer_mode: std::sync::Mutex::new(AquiferMode::default()),
+            density_inners,
+            density_outer,
             ore_seed: std::sync::Mutex::new((0, 0)),
             ore_veins: std::sync::atomic::AtomicBool::new(false),
         })
@@ -416,6 +436,10 @@ impl WorldContext {
     /// (finalDensity); shard C covers the vein channels. In Single mode
     /// (small test blobs) every channel is read back. The executor uses
     /// this to size staging and to pluck the right out_buf slices.
+    pub fn inner_count(&self) -> usize {
+        self.density_inners.len()
+    }
+
     pub fn readback_channels(&self) -> Vec<usize> {
         let mut out = Vec::new();
         for sh in &self.shards {
@@ -6065,6 +6089,58 @@ mod compile_time_scale {
         }).unwrap().join().unwrap();
     }
 
+
+    #[test]
+    #[ignore]
+    fn dump_pass_e_outer_tree() {
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/real_router.bin");
+        let blob = std::fs::read(bin).unwrap();
+        let ctx = crate::world::WorldContext::new(&blob).unwrap();
+        if let Some(outer) = &ctx.density_outer {
+            fn tag(n:&crate::ast::AstNode)->&'static str{
+                use crate::ast::AstNode as A;
+                match n {
+                    A::Min(_,_)=>"Min",A::Max(_,_)=>"Max",A::Add(_,_)=>"Add",A::Sub(_,_)=>"Sub",A::Mul(_,_)=>"Mul",A::Div(_,_)=>"Div",A::FloorDiv(_,_)=>"FloorDiv",
+                    A::Abs(_)=>"Abs",A::Square(_)=>"Square",A::Cube(_)=>"Cube",A::Sqrt(_)=>"Sqrt",A::Squeeze(_)=>"Squeeze",
+                    A::CacheFlat(_)=>"CacheFlat",A::Cache2D(_)=>"Cache2D",A::CacheInterpolated(_)=>"CacheInterp",
+                    A::RangeChoice{..}=>"RangeChoice",A::IntervalSelect{..}=>"IntervalSelect",
+                    A::NoiseSampler{..}=>"Noise",A::Spline{..}=>"Spline",A::YClampedGradient{..}=>"YClamp",
+                    A::Constant(_)=>"Const",A::InputX=>"X",A::InputY=>"Y",A::InputZ=>"Z",
+                    A::Shift{..}=>"Shift",A::ShiftedNoise{..}=>"ShiftedNoise",A::WeirdScaledSampler{..}=>"Weird",
+                    A::EndIslands{..}=>"EndIslands",A::Beardifier{..}=>"Beardifier",A::Aquifer{..}=>"Aquifer",
+                    A::InnerRef(_)=>"InnerRef",A::ExternalInput{..}=>"ExternalInput",
+                    A::InterpolatedNoiseSampler{..}=>"InterpNoise",
+                    _=>"??",
+                }
+            }
+            fn walk(n:&crate::ast::AstNode, sb:&mut String, ind:usize){
+                use crate::ast::AstNode as A;
+                let pad="  ".repeat(ind.min(20));
+                sb.push_str(&format!("{pad}{}\n", tag(n)));
+                if ind>20 {return;}
+                let mut kids:Vec<&A>=vec![];
+                match n {
+                    A::Min(a,b)|A::Max(a,b)|A::Add(a,b)|A::Sub(a,b)|A::Mul(a,b)|A::Div(a,b)|A::FloorDiv(a,b)=>{kids.push(a);kids.push(b);}
+                    A::Abs(a)|A::Square(a)|A::Cube(a)|A::Sqrt(a)|A::Squeeze(a)|A::CacheFlat(a)|A::Cache2D(a)|A::CacheInterpolated(a)=>{kids.push(a);}
+                    A::RangeChoice{input,in_bounds,out_of_bounds_lo,out_of_bounds_hi,..}=>{kids.push(input);kids.push(in_bounds);kids.push(out_of_bounds_lo);kids.push(out_of_bounds_hi);}
+                    A::IntervalSelect{input,in_bounds,out_of_bounds_lo,out_of_bounds_hi,..}=>{kids.push(input);kids.push(in_bounds);kids.push(out_of_bounds_lo);kids.push(out_of_bounds_hi);}
+                    A::ShiftedNoise{shift_x,shift_y,shift_z,noise,..}=>{kids.push(shift_x);kids.push(shift_y);kids.push(shift_z);kids.push(noise);}
+                    A::Shift{offset,..}=>{kids.push(offset);}
+                    A::WeirdScaledSampler{input,noise,..}=>{kids.push(input);kids.push(noise);}
+                    A::Spline{location,values,..}=>{kids.push(location);for v in values{kids.push(v);}}
+                    A::Aquifer{density,fluid_level}=>{kids.push(density);kids.push(fluid_level);}
+                    _=>{}
+                }
+                for k in kids { walk(k, sb, ind+1); }
+            }
+            let mut out = String::new();
+            walk(outer, &mut out, 0);
+            std::fs::write("/tmp/pass_e_outer.txt", &out).unwrap();
+            println!("wrote /tmp/pass_e_outer.txt");
+        } else {
+            println!("no density_outer found");
+        }
+    }
 
     #[test]
     #[ignore]

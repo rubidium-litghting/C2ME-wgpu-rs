@@ -145,8 +145,16 @@ pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
         AstNode::NoiseSampler { first, second, amplitude, xz_scale, y_scale, .. } => {
             emit_noise_sampler(ctx, first, second.as_ref(), *amplitude, *xz_scale, *y_scale)
         }
-        AstNode::InnerRef(_) => Err(anyhow::anyhow!(
-            "InnerRef emitted outside the BlockOut pass (should be substituted by outer-tree codegen)")),
+        AstNode::InnerRef(i) => {
+            // §14 Pass E: evaluate the per-block outer tree. `InnerRef(i)` means
+            // "read the trilinear corner value stored in channel 16+i".
+            let var = ctx.fresh_var("inner");
+            ctx.emit(format!(
+                "let {var}: f32 = tri_at(cbase + {}u * cpc, ix, iy, iz, ccx, s, tx, ty, tz);",
+                16 + i
+            ));
+            Ok(var)
+        }
         AstNode::Constant(_) => constant::emit(node, ctx),
         AstNode::InputX | AstNode::InputY | AstNode::InputZ => coordinate::emit(node, ctx),
         AstNode::Add(_, _)

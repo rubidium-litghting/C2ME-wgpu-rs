@@ -24,7 +24,16 @@ pub fn split(node: &AstNode, inners: &mut Vec<AstNode>) -> AstNode {
         | BiomeTree { .. } | NoiseSampler { .. } | InnerRef(_) => node.clone(),
 
         // The boundary: extract the whole subtree, replace with a ref.
+        // Both `InterpolatedNoiseSampler` and `CacheInterpolated` are MC's
+        // corner-grid interpolators. Non-linear nodes wrapped *outside* them
+        // must be evaluated per block on the interpolated result, so these
+        // subtrees must be split out.
         InterpolatedNoiseSampler { child } => {
+            let idx = inners.len();
+            inners.push((**child).clone());
+            InnerRef(idx)
+        }
+        CacheInterpolated(child) => {
             let idx = inners.len();
             inners.push((**child).clone());
             InnerRef(idx)
@@ -45,7 +54,6 @@ pub fn split(node: &AstNode, inners: &mut Vec<AstNode>) -> AstNode {
         Squeeze(a) => Squeeze(Box::new(split(a, inners))),
         CacheFlat(a) => CacheFlat(Box::new(split(a, inners))),
         Cache2D(a) => Cache2D(Box::new(split(a, inners))),
-        CacheInterpolated(a) => CacheInterpolated(Box::new(split(a, inners))),
         Shift { kind, offset } => Shift { kind: *kind, offset: Box::new(split(offset, inners)) },
         WeirdScaledSampler { mapper, input, noise } => WeirdScaledSampler {
             mapper: *mapper, input: Box::new(split(input, inners)),
