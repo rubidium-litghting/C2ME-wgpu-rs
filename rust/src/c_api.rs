@@ -110,16 +110,29 @@ pub unsafe extern "C" fn c2me_wgpu_setup_panic_hook() {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn c2me_wgpu_create_instance(
+pub unsafe extern "C-unwind" fn c2me_wgpu_create_instance(
     _features_mask: u64,
     err_buf: *mut c_char,
     err_buf_len: usize,
 ) -> i64 {
+    let result = std::panic::catch_unwind(|| {
+
     match WgpuInstance::instance() {
         Ok(_) => 1,
         Err(e) => {
             let msg = format!("{}", e);
             unsafe { write_err(err_buf, err_buf_len, &msg) };
+            0
+        }
+    }
+
+    });
+    match result {
+        Ok(res) => res,
+        Err(e) => {
+            let msg = format!("Rust panicked during GPU instance creation (e.g. EGL BadAccess): {:?}", e);
+            unsafe { crate::debug_log_line(&msg); }
+            unsafe { write_err(err_buf, err_buf_len, "Rust panicked during GPU instance creation") };
             0
         }
     }

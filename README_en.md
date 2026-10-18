@@ -30,6 +30,10 @@ onto the GPU.
 ---
 
 > 💡 **Resilience note**: If the GPU driver crashes or the device is lost, the game will safely halt to prevent deadlocks, and will log the detailed cause to `logs/c2me-wgpu.log` for offline diagnostics.
+>
+> ⚠️ **Cross-platform behavior**:
+> - **Desktop**: If an incompatible backend is forced (e.g. `WGPU_BACKEND=gl`), the wgpu panic is safely caught and the game **silently falls back to CPU** without crashing.
+> - **Android**: Since cross-compilation defaults to `panic=abort`, the same situation causes an **immediate crash**. However, the panic reason will be written to `logs/c2me-wgpu.log`. Please do not force `WGPU_BACKEND` on mobile devices.
 
 ## Requirements
 

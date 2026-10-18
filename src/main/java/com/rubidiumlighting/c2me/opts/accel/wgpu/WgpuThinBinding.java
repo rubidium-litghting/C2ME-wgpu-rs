@@ -230,31 +230,7 @@ public class WgpuThinBinding {
         // callers would itself explode. On any failure we just leave
         // instanceHandle=0 / available=false.
         if (linked) {
-            // Point the Rust logger at <gameDir>/logs/c2me-wgpu.log. Best-effort:
-            // never let this break class init.
-            try {
-                java.nio.file.Path logPath = net.fabricmc.loader.api.FabricLoader
-                        .getInstance().getGameDir()
-                        .resolve("logs").resolve("c2me-wgpu.log");
-                
-                // Clear the log file synchronously before telling Rust where it is.
-                // This ensures the "black box" only contains logs from the current session.
-                try {
-                    java.nio.file.Files.createDirectories(logPath.getParent());
-                    java.nio.file.Files.write(logPath, new byte[0]); // Truncate
-                } catch (Throwable t) {
-                    System.err.println("[c2me-wgpu] Failed to truncate log file: " + t);
-                }
 
-                byte[] bytes = logPath.toAbsolutePath().toString()
-                        .getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                try (Arena a = Arena.ofConfined()) {
-                    MemorySegment seg = a.allocateFrom(ValueLayout.JAVA_BYTE, bytes);
-                    MH_set_log_path.invokeExact(seg, (long) bytes.length);
-                }
-            } catch (Throwable t) {
-                System.err.println("[c2me-wgpu] set_log_path failed: " + t);
-            }
         }
 
         if (linked) {
