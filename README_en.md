@@ -192,7 +192,8 @@ The blob dump can also be set with the JVM property `-Dc2me.dumpBlob=<path>`;
 the environment variable is only a fallback when the property is unset.
 
 **Native extraction location**:
-By default, the mod extracts the `.so` or `.dll` from the jar to the OS temporary directory (e.g., `/tmp` on Linux) and deletes it on exit. If you need to debug native library loading failures, you can add `-Dc2me.wgpu.preserveNative=true` to your JVM launch arguments. The mod will extract the native library to the game's working directory instead, making it easier to inspect.
+By default, the mod extracts the `.so` or `.dll` from the jar into a `c2me-wgpu-natives/` folder in the game root directory. If that directory is not writable or loading fails (e.g., `noexec` mount), it automatically falls back to the OS temporary directory (e.g., `/tmp` on Linux).
+If you need to debug native library loading failures, you can add `-Dc2me.wgpu.preserveNative=true` to your JVM launch arguments. The mod will extract the native library directly to the game's working directory instead.
 
 > **Note:** variables prefixed with `C2ME_DUMP_` and those marked "Development
 > only" are strictly for troubleshooting and do not need to be set during
