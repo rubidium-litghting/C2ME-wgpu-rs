@@ -24,6 +24,8 @@
 
 package com.rubidiumlighting.c2me.opts.accel.wgpu;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import net.minecraft.util.math.noise.DoublePerlinNoiseSampler;
 import net.minecraft.util.math.noise.OctavePerlinNoiseSampler;
 import net.minecraft.util.math.Spline;
@@ -41,6 +43,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 
 public class NoiseRouterBlobifier {
+    private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu");
 
     // ── Permutation resource collection ─────────────────────────────
     private static final int PERM_MAGIC = 0x4D525750; // "PWPM"
@@ -410,7 +413,7 @@ public class NoiseRouterBlobifier {
                 buf.put(TAG_END_ISLANDS);
                 buf.putInt(idx);
             } catch (Throwable t) {
-                System.err.println("[c2me-wgpu] EndIslands serialize failed: " + t);
+                LOGGER.warn("[c2me-wgpu] EndIslands serialize failed: " + t);
                 writeConstant(buf, 0.0f);
             }
             return;
@@ -426,7 +429,7 @@ public class NoiseRouterBlobifier {
                 || df instanceof DensityFunctionTypes.WeirdScaledSampler
                 || df instanceof DensityFunctionTypes.Spline) {
             PLACEHOLDER_SEEN.computeIfAbsent(df.getClass().getName(), k -> {
-                System.err.println("[c2me-wgpu][placeholder] " + k);
+                LOGGER.warn("[c2me-wgpu][placeholder] " + k);
                 return Boolean.TRUE;
             });
             writeConstant(buf, 0.0f);
@@ -466,7 +469,7 @@ public class NoiseRouterBlobifier {
         // functions working without per-node adapters.
         final String cls = df.getClass().getName();
         if (UNSUPPORTED_SEEN.putIfAbsent(cls, Boolean.TRUE) == null) {
-            System.err.println("[c2me-wgpu] UNSUPPORTED NODE (externalized to CPU): " + cls);
+            LOGGER.warn("[c2me-wgpu] UNSUPPORTED NODE (externalized to CPU): " + cls);
         }
         int extIndex = EXTERNAL_NODES.size();
         EXTERNAL_NODES.add(df);
@@ -515,7 +518,7 @@ public class NoiseRouterBlobifier {
             return;
         }
         // Unknown spline node -> constant 0
-        System.err.println("[c2me-wgpu] unknown spline node: " + node.getClass().getName());
+        LOGGER.warn("[c2me-wgpu] unknown spline node: " + node.getClass().getName());
         writeConstant(buf, 0.0f);
     }
 
@@ -526,7 +529,7 @@ public class NoiseRouterBlobifier {
         if (locFn instanceof DensityFunctionTypes.Spline.DensityFunctionWrapper w) {
             return w.function().value();
         }
-        System.err.println("[c2me-wgpu] unwrapLocFn: unexpected class "
+        LOGGER.warn("[c2me-wgpu] unwrapLocFn: unexpected class "
                 + locFn.getClass().getName());
         return null;
     }
@@ -593,7 +596,7 @@ public class NoiseRouterBlobifier {
             buf.putInt(baseIdx * 256);
             buf.putInt(arr.length);
         } catch (Throwable t) {
-            System.err.println("[c2me-wgpu] writeRawOctaveStack failed: " + t);
+            LOGGER.warn("[c2me-wgpu] writeRawOctaveStack failed: " + t);
             buf.putInt(0); buf.putInt(0);
         }
     }
@@ -641,7 +644,7 @@ public class NoiseRouterBlobifier {
                 buf.putDouble(p.originY);
                 buf.putDouble(p.originZ);
             } catch (Throwable t) {
-                System.err.println("[c2me-wgpu] perm resource: skip sampler: " + t);
+                LOGGER.warn("[c2me-wgpu] perm resource: skip sampler: " + t);
                 for (int i = 0; i < 256; i++) buf.putInt(0);
                 buf.putDouble(0); buf.putDouble(0); buf.putDouble(0);
             }
@@ -669,7 +672,7 @@ public class NoiseRouterBlobifier {
                 buf.putDouble(sns.originY);
                 buf.putDouble(sns.originZ);
             } catch (Throwable t) {
-                System.err.println("[c2me-wgpu] simplex resource: skip: " + t);
+                LOGGER.warn("[c2me-wgpu] simplex resource: skip: " + t);
                 for (int i = 0; i < 512; i++) buf.putInt(0);
                 buf.putDouble(0); buf.putDouble(0); buf.putDouble(0);
             }
@@ -752,7 +755,7 @@ public class NoiseRouterBlobifier {
                 }
             }
             if (arr == null) {
-                System.err.println("[c2me-wgpu] registerOneStack: no PerlinNoiseSampler[] field");
+                LOGGER.warn("[c2me-wgpu] registerOneStack: no PerlinNoiseSampler[] field");
                 return null;
             }
             int baseIdx = PERM_SAMPLERS.size();
@@ -773,7 +776,7 @@ public class NoiseRouterBlobifier {
                     : (float) (Math.pow(2.0, n - 1) / (Math.pow(2.0, n) - 1.0));
             return new StackInfo(baseIdx * 256, initialFreq, persistence, amps);
         } catch (Throwable t) {
-            System.err.println("[c2me-wgpu] registerOneStack failed: " + t);
+            LOGGER.warn("[c2me-wgpu] registerOneStack failed: " + t);
             return null;
         }
     }
@@ -802,7 +805,7 @@ public class NoiseRouterBlobifier {
                     dperlin = CURRENT_NOISE_CONFIG.getOrCreateSampler(keyOpt.get());
                 }
             } catch (Throwable t) {
-                System.err.println("[c2me-wgpu] getOrCreateSampler failed: " + t);
+                LOGGER.warn("[c2me-wgpu] getOrCreateSampler failed: " + t);
             }
         }
         if (!(dperlin instanceof DoublePerlinNoiseSampler)) {
@@ -830,7 +833,7 @@ public class NoiseRouterBlobifier {
             DPS_INFO.put(dperlin, info);
             return info;
         } catch (Throwable t) {
-            System.err.println("[c2me-wgpu] registerNoiseSampler failed: " + t);
+            LOGGER.warn("[c2me-wgpu] registerNoiseSampler failed: " + t);
             return null;
         }
     }

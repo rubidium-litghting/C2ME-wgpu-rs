@@ -94,11 +94,21 @@ fn log_path() -> std::path::PathBuf {
 }
 
 /// Append one line to the Rust log file. The path is supplied by Java
-/// (or defaults to `<cwd>/logs/c2me-wgpu.log`). Needed because the game's
-/// `latest.log` only captures Java logging — Rust's stderr is easily lost,
-/// especially on Android where the process can abort.
+/// (or defaults to `<cwd>/logs/c2me-wgpu.log`).
 ///
-/// Each call opens/appends/closes so nothing stays buffered across a crash.
+/// **Why an independent file instead of standard Java logging?**
+/// GPU driver crashes (DeviceLost) or Rust segfaults can abort the process
+/// instantly. If we routed logs through the Java SLF4J async queue, the last
+/// few seconds of diagnostic information would be lost. This synchronous
+/// file append acts as a crash-resistant "black box" for low-level debugging.
+/// High-level status is still reported back to Java via the C API.
+pub type LogCallback = extern "C" fn(*const u8, usize);
+static LOG_CALLBACK: std::sync::OnceLock<LogCallback> = std::sync::OnceLock::new();
+
+pub(crate) fn set_log_callback(cb: LogCallback) {
+    let _ = LOG_CALLBACK.set(cb);
+}
+
 pub(crate) fn debug_log_line(msg: &str) {
     let path = log_path();
     if let Some(parent) = path.parent() {
@@ -107,6 +117,12 @@ pub(crate) fn debug_log_line(msg: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "{msg}");
+    }
+    
+    // Also notify Java if a callback is registered.
+    if let Some(cb) = LOG_CALLBACK.get() {
+        let bytes = msg.as_bytes();
+        cb(bytes.as_ptr(), bytes.len());
     }
 }
 
@@ -177,7 +193,6 @@ macro_rules! wgpu_debug {
     ($($arg:tt)*) => {
         if $crate::debug_enabled() {
             let __msg = format!($($arg)*);
-            eprintln!("{__msg}");
             $crate::debug_log_line(&__msg);
         }
     };

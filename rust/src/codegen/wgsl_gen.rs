@@ -500,7 +500,7 @@ fn emit_shader_inner(root: &AstNode, mut ctx: GenCtx) -> Result<String> {
     // Bring-up: emit the tiny shader for *every* pass, so the diagnostic
     // keeps working now that WorldContext emits per-shard modules.
     if crate::minimal_shader() {
-        crate::wgpu_debug!("[c2me-wgpu][codegen] MINIMAL shader requested");
+        crate::wgpu_debug!("[codegen] MINIMAL shader requested");
         let mut out = String::with_capacity(2048);
         out.push_str(BINDINGS_HEADER);
         out.push_str(MINIMAL_ENTRY);

@@ -100,8 +100,6 @@ pub struct WorldContext {
     /// and the remaining per-block tree (`outer`). Empty when no split was
     /// needed (vanilla terrain has no non-linear wrapper outside an interp).
     pub(crate) density_inners: Vec<crate::ast::AstNode>,
-    pub(crate) density_outer: Option<crate::ast::AstNode>,
-    pub(crate) barrier_noise: Option<crate::ast::AstNode>,
 
     /// Ore-vein RNG seed (seedLo, seedHi) from MC's `oreRandomDeriver`.
     /// Set once per world via `c2me_wgpu_set_ore_seed`; (0,0) means unset.
@@ -162,16 +160,16 @@ fn create_init_buffer(
     } else {
         // create_buffer requires COPY_DST and a non-zero size.
         let size = contents.len().max(4) as u64;
-        crate::wgpu_debug!("[c2me-wgpu] create_buffer({label}, {size} bytes)...");
+        crate::wgpu_debug!("create_buffer({label}, {size} bytes)...");
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size,
             usage: usage | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        crate::wgpu_debug!("[c2me-wgpu] create_buffer({label}) ok, write_buffer...");
+        crate::wgpu_debug!("create_buffer({label}) ok, write_buffer...");
         queue.write_buffer(&buf, 0, contents);
-        crate::wgpu_debug!("[c2me-wgpu] write_buffer({label}) done");
+        crate::wgpu_debug!("write_buffer({label}) done");
         buf
     }
 }
@@ -221,7 +219,7 @@ impl WorldContext {
             _ => 0,
         };
         let shards = if crate::force_single() {
-            crate::wgpu_debug!("[c2me-wgpu][codegen] FORCE_SINGLE: one shader over all channels");
+            crate::wgpu_debug!("[codegen] FORCE_SINGLE: one shader over all channels");
             if channel_count > 0 {
                 vec![wgsl_gen::Shard { pass: wgsl_gen::Pass::Single, start: 0, end: channel_count }]
             } else {
@@ -234,7 +232,7 @@ impl WorldContext {
         for shard in &shards {
             let src = wgsl_gen::emit_shader_for_shard(&ast_root, *shard, &density_inners, density_outer.as_ref(), barrier_noise.as_ref())?;
             crate::wgpu_debug!(
-                "[c2me-wgpu][codegen] shard {:?} [{}..{}) WGSL: {} lines, {} bytes",
+                "[codegen] shard {:?} [{}..{}) WGSL: {} lines, {} bytes",
                 shard.pass, shard.start, shard.end,
                 src.lines().count(), src.len()
             );
@@ -275,8 +273,6 @@ impl WorldContext {
             beard_tables: std::sync::Mutex::new(std::collections::HashMap::new()),
             aquifer_mode: std::sync::Mutex::new(AquiferMode::default()),
             density_inners,
-            density_outer,
-            barrier_noise,
             ore_seed: std::sync::Mutex::new((0, 0)),
             ore_veins: std::sync::atomic::AtomicBool::new(false),
         })
@@ -301,23 +297,23 @@ impl WorldContext {
         // The queue comes from the same global `WgpuInstance` as `device`,
         // so there is no need to thread it through every caller.
         let queue = &crate::instance::WgpuInstance::instance()?.queue;
-        crate::wgpu_debug!("[c2me-wgpu][compile] compile_pipeline start");
+        crate::wgpu_debug!("[compile] compile_pipeline start");
 
-        crate::wgpu_debug!("[c2me-wgpu][compile] creating bind group layout...");
+        crate::wgpu_debug!("[compile] creating bind group layout...");
         let bg_layout = bind_group::create_layout(device)?;
-        crate::wgpu_debug!("[c2me-wgpu][compile] bind group layout ok, creating pipeline layout...");
+        crate::wgpu_debug!("[compile] bind group layout ok, creating pipeline layout...");
         let pipeline_layout = bind_group::create_pipeline_layout(device, &bg_layout)?;
         // §22: BlockOut uses its own (smaller) layout — 6 storage buffers,
         // under the 8-per-stage limit.
         let bo_bg_layout = bind_group::create_block_out_layout(device)?;
         let bo_pipeline_layout = bind_group::create_pipeline_layout(device, &bo_bg_layout)?;
-        crate::wgpu_debug!("[c2me-wgpu][compile] pipeline layout ok, compiling pipeline...");
+        crate::wgpu_debug!("[compile] pipeline layout ok, compiling pipeline...");
 
         let mut pipelines: Vec<wgpu::ComputePipeline> =
             Vec::with_capacity(self.shards.len());
         for (i, shard) in self.shards.iter().enumerate() {
             crate::wgpu_debug!(
-                "[c2me-wgpu][compile] compiling shard {:?} [{}..{})...",
+                "[compile] compiling shard {:?} [{}..{})...",
                 shard.pass, shard.start, shard.end
             );
             let layout = if shard.pass == crate::codegen::wgsl_gen::Pass::BlockOut {
@@ -334,7 +330,7 @@ impl WorldContext {
             )?;
             pipelines.push(pipeline);
         }
-        crate::wgpu_debug!("[c2me-wgpu][compile] {} pipeline(s) compiled ok", pipelines.len());
+        crate::wgpu_debug!("[compile] {} pipeline(s) compiled ok", pipelines.len());
         self.pipelines = pipelines;
 
         // Upload the permutation table buffer (binding 1). Even if the
@@ -347,13 +343,13 @@ impl WorldContext {
             } else {
                 self.perm_table_set.buffer.clone()
             };
-            crate::wgpu_debug!("[c2me-wgpu][compile] uploading perm buffer ({} i32)...", buffer_data.len());
+            crate::wgpu_debug!("[compile] uploading perm buffer ({} i32)...", buffer_data.len());
             let perm_buffer = create_init_buffer(
                 device, queue, "c2me_wgpu_permutations",
                 bytemuck::cast_slice(&buffer_data),
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             );
-            crate::wgpu_debug!("[c2me-wgpu][compile] perm buffer ok");
+            crate::wgpu_debug!("[compile] perm buffer ok");
             self.perm_buffer = Some(perm_buffer);
         }
 
@@ -364,13 +360,13 @@ impl WorldContext {
             } else {
                 self.perm_table_set.origins.clone()
             };
-            crate::wgpu_debug!("[c2me-wgpu][compile] uploading origin buffer...");
+            crate::wgpu_debug!("[compile] uploading origin buffer...");
             let ob = create_init_buffer(
                 device, queue, "c2me_wgpu_perm_origins",
                 bytemuck::cast_slice(&origin_data),
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             );
-            crate::wgpu_debug!("[c2me-wgpu][compile] origin buffer ok");
+            crate::wgpu_debug!("[compile] origin buffer ok");
             self.origin_buffer = Some(ob);
         }
 
@@ -382,13 +378,13 @@ impl WorldContext {
                 data.extend_from_slice(&e.perm);
             }
             if data.is_empty() { data.push(0); }
-            crate::wgpu_debug!("[c2me-wgpu][compile] uploading simplex buffer ({} i32)...", data.len());
+            crate::wgpu_debug!("[compile] uploading simplex buffer ({} i32)...", data.len());
             let sb = create_init_buffer(
                 device, queue, "c2me_wgpu_simplex",
                 bytemuck::cast_slice(&data),
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             );
-            crate::wgpu_debug!("[c2me-wgpu][compile] simplex buffer ok");
+            crate::wgpu_debug!("[compile] simplex buffer ok");
             self.simplex_buffer = Some(sb);
         }
 
@@ -403,7 +399,7 @@ impl WorldContext {
             self.beard_weight_buffer = Some(bb);
         }
 
-        crate::wgpu_debug!("[c2me-wgpu][compile] compile_pipeline done");
+        crate::wgpu_debug!("[compile] compile_pipeline done");
         Ok(())
     }
 
@@ -535,6 +531,7 @@ impl WorldContext {
 #[cfg(test)]
 
     pub(crate) fn dbg_mp(v: f64) -> f64 { v - (v/33554432.0+0.5).floor()*33554432.0 }
+    #[allow(dead_code)]
     pub(crate) fn dbg_perlin(perm:&[i32],p:i32,x:f64,y:f64,z:f64)->f64{
         let ix=x.floor() as i32; let iy=y.floor() as i32; let iz=z.floor() as i32;
         let fx=x-ix as f64; let fy=y-iy as f64; let fz=z-iz as f64;
@@ -1652,19 +1649,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     // and no DOMAIN_SCALE, so the GPU result should exactly equal a
     // straightforward Rust transcription of MC's Perlin algorithm.
 
+    #[allow(dead_code)]
     fn cpu_maintain_precision(v: f32) -> f32 {
         let divisor = 33554432.0f32;
         v - (v / divisor + 0.5).floor() * divisor
     }
 
+    #[allow(dead_code)]
     fn cpu_fade(t: f32) -> f32 {
         t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
     }
 
+    #[allow(dead_code)]
     fn cpu_lerp(a: f32, b: f32, t: f32) -> f32 {
         t.mul_add(b - a, a)
     }
 
+    #[allow(dead_code)]
     fn cpu_trilinear(
         c000: f32,
         c100: f32,
@@ -1687,6 +1688,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         cpu_lerp(y0, y1, tz)
     }
 
+    #[allow(dead_code)]
     fn cpu_perlin3d_impl(perm: &[i32], p: i32, x: f32, y: f32, z: f32) -> f32 {
         let ix = x.floor() as i32;
         let iy = y.floor() as i32;
@@ -1748,6 +1750,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         cpu_trilinear(n000, n100, n010, n110, n001, n101, n011, n111, u, v, w)
     }
 
+    #[allow(dead_code)]
     fn cpu_noise_perlin3d(perm: &[i32], p: i32, x: f32, y: f32, z: f32) -> f32 {
         let px = cpu_maintain_precision(x);
         let py = cpu_maintain_precision(y);
@@ -1755,6 +1758,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         cpu_perlin3d_impl(perm, p, px, py, pz)
     }
 
+    #[allow(dead_code)]
     fn cpu_kahan_add(acc: &mut (f32, f32), v: f32) {
         let y = v - acc.1;
         let t = acc.0 + y;
@@ -1762,6 +1766,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         acc.0 = t;
     }
 
+    #[allow(dead_code)]
     fn cpu_octave_stack(
         perm: &[i32],
         base: i32,
@@ -1787,6 +1792,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         acc.0
     }
 
+    #[allow(dead_code)]
     fn cpu_noise_sampler(
         perm: &[i32],
         first: (i32, f32, f32, &[f32]),
@@ -1811,6 +1817,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         total * amplitude
     }
 
+    #[allow(dead_code)]
     fn build_run_blob(
         flags: u8,
         amplitude: f32,
@@ -2173,6 +2180,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }
 
     // CPU reference WITH origin (MC order: maintainPrecision(coord) + origin).
+    #[allow(dead_code)]
     fn cpu_perlin3d_origin(
         perm: &[i32],
         p: i32,
@@ -2189,6 +2197,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         cpu_perlin3d_impl(perm, p, px, py, pz)
     }
 
+    #[allow(dead_code)]
     fn build_run_blob_origin(
         flags: u8,
         amplitude: f32,
@@ -2691,6 +2700,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         assert!(max_d < 1e-4, "spline diverged {:.6e}", max_d);
     }
 
+    #[allow(dead_code)]
     fn push_simple_noise(blob: &mut Vec<u8>, perm_offset: i32) {
         blob.push(0x84); // TAG_NOISE_SAMPLER
         blob.push(0); // type = Perlin
@@ -3238,9 +3248,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }
 
     // ── EndIslands: GPU 2D-simplex vs Rust CPU reference ──────────────
+    #[allow(dead_code)]
     fn cpu_sx_map(perm: &[i32], a: i32) -> i32 {
         perm[(a & 255) as usize]
     }
+    #[allow(dead_code)]
     fn cpu_sx_grad(h: i32, x: f32, y: f32) -> f32 {
         let t = 0.5 - x * x - y * y;
         if t < 0.0 { return 0.0; }
@@ -3251,6 +3263,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         };
         t4 * dp
     }
+    #[allow(dead_code)]
     fn cpu_simplex2d(perm: &[i32], x: f32, y: f32) -> f32 {
         const SKEW: f32 = 0.3660254037844386;
         const UNSKEW: f32 = 0.21132486540518713;
@@ -3272,6 +3285,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let gi2 = cpu_sx_map(perm, ii + 1 + cpu_sx_map(perm, jj + 1)) % 12;
         70.0 * (cpu_sx_grad(gi0, x0, y0) + cpu_sx_grad(gi1, x1, y1) + cpu_sx_grad(gi2, x2, y2))
     }
+    #[allow(dead_code)]
     fn cpu_end_islands(perm: &[i32], bx: i32, bz: i32) -> f32 {
         let x = bx / 8;
         let z = bz / 8;
@@ -3487,12 +3501,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }
 
 
+    #[allow(dead_code)]
     fn cpu_scale_tunnels(x: f32) -> f32 {
         if x < -0.5 { 0.75 } else if x < 0.0 { 1.0 } else if x < 0.5 { 1.5 } else { 2.0 }
     }
+    #[allow(dead_code)]
     fn cpu_scale_caves(x: f32) -> f32 {
         if x < -0.75 { 0.5 } else if x < -0.5 { 0.75 } else if x < 0.5 { 1.0 } else if x < 0.75 { 2.0 } else { 3.0 }
     }
+    #[allow(dead_code)]
     fn cpu_perlin_origin(perm: &[i32], origins: &[f32], po: i32, x: f32, y: f32, z: f32) -> f32 {
         let e = po / 256;
         let px = cpu_maintain_precision(x) + origins[(e * 3) as usize];
@@ -3500,6 +3517,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let pz = cpu_maintain_precision(z) + origins[(e * 3 + 2) as usize];
         cpu_perlin3d_impl(perm, po, px, py, pz)
     }
+    #[allow(dead_code)]
     fn cpu_oct(perm: &[i32], origins: &[f32], oct: &crate::ast::OctaveSampler, cx: f32, cy: f32, cz: f32) -> f32 {
         let mut freq = oct.initial_freq;
         let mut amp = oct.persistence;
@@ -3513,6 +3531,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         }
         acc.0
     }
+    #[allow(dead_code)]
     fn cpu_perlin_ysmear(perm: &[i32], origins: &[f32], po: i32, x: f32, y: f32, z: f32, yfreq: f32, ysmear: f32) -> f32 {
         let e = po / 256;
         let px = x + origins[(e*3) as usize];
@@ -3551,6 +3570,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         let n011=dot(g(abb),fx,dy-1.0,fz-1.0); let n111=dot(g(bbb),fx-1.0,dy-1.0,fz-1.0);
         cpu_trilinear(n000,n100,n010,n110,n001,n101,n011,n111,cpu_fade(fx),cpu_fade(fy),cpu_fade(fz))
     }
+    #[allow(dead_code)]
     fn cpu_interp_noise_sampler(perm: &[i32], origins: &[f32],
         lb:i32,lc:i32,ub:i32,uc:i32,ib:i32,ic:i32,
         bx:f32,by:f32,bz:f32,
@@ -3590,6 +3610,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         pub static INNER_VALS: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
     }
 
+    #[allow(dead_code)]
     pub(crate) fn cpu_ast_eval(node: &crate::ast::AstNode, perm: &[i32], origins: &[f32], x: f32, y: f32, z: f32) -> f32 {
         use crate::ast::AstNode as A;
         match node {

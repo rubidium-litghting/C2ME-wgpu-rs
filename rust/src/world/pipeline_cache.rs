@@ -120,14 +120,14 @@ pub fn get_or_compile(
     // 2. Slow path: compile. Outside the lock — compilation may take
     //    hundreds of ms and we don't want to block other lookups.
     let t_src0 = std::time::Instant::now();
-    crate::wgpu_debug!("[c2me-wgpu][compile] shader source: {} lines, {} bytes",
+    crate::wgpu_debug!("[compile] shader source: {} lines, {} bytes",
               shader_src.lines().count(), shader_src.len());
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(&format!("c2me_wgpu_shader_{fingerprint:08x}_p{}", pass_id(pass))),
         source: wgpu::ShaderSource::Wgsl(shader_src.into()),
     });
-    crate::wgpu_debug!("[c2me-wgpu][compile] create_shader_module done in {:?}",
+    crate::wgpu_debug!("[compile] create_shader_module done in {:?}",
               t_src0.elapsed());
 
     // Build the compute pipeline. The `wgpu::PipelineCache` is optional:
@@ -135,7 +135,7 @@ pub fn get_or_compile(
     // `C2ME_WGPU_NO_PIPELINE_CACHE=1` skips it entirely.
     let t_pipe0 = std::time::Instant::now();
     let pipeline = if crate::no_pipeline_cache() {
-        crate::wgpu_debug!("[c2me-wgpu][compile] pipeline cache disabled; compiling without it");
+        crate::wgpu_debug!("[compile] pipeline cache disabled; compiling without it");
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&format!("c2me_wgpu_pipeline_{fingerprint:08x}_p{}", pass_id(pass))),
             layout: Some(pipeline_layout),
@@ -170,13 +170,13 @@ pub fn get_or_compile(
 
         if let Some(data) = pc.get_data() {
             if let Err(e) = save(fingerprint, &data) {
-                crate::wgpu_debug!("[c2me-wgpu][cache] save failed: {e}");
+                crate::wgpu_debug!("[cache] save failed: {e}");
             }
         }
         p
     };
 
-    crate::wgpu_debug!("[c2me-wgpu][compile] create_compute_pipeline done in {:?}",
+    crate::wgpu_debug!("[compile] create_compute_pipeline done in {:?}",
               t_pipe0.elapsed());
 
     // 3. Insert. If another thread raced us, drop the loser.
@@ -218,11 +218,11 @@ pub fn load(fingerprint: u32) -> Result<Option<Vec<u8>>> {
     };
     match decompress(&compressed) {
         Ok(raw) => {
-            crate::wgpu_debug!("[c2me-wgpu][cache] loaded pipeline cache {fingerprint:08x} ({} bytes)", raw.len());
+            crate::wgpu_debug!("[cache] loaded pipeline cache {fingerprint:08x} ({} bytes)", raw.len());
             Ok(Some(raw))
         }
         Err(e) => {
-            crate::wgpu_debug!("[c2me-wgpu][cache] corrupt cache {fingerprint:08x}: {e}; ignoring");
+            crate::wgpu_debug!("[cache] corrupt cache {fingerprint:08x}: {e}; ignoring");
             Ok(None)
         }
     }
@@ -238,7 +238,7 @@ pub fn save(fingerprint: u32, raw_blob: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, &compressed).with_context(|| format!("write {tmp:?}"))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("rename to {path:?}"))?;
-    crate::wgpu_debug!("[c2me-wgpu][cache] saved pipeline cache {fingerprint:08x} ({} raw -> {} compressed)",
+    crate::wgpu_debug!("[cache] saved pipeline cache {fingerprint:08x} ({} raw -> {} compressed)",
               raw_blob.len(), compressed.len());
     Ok(())
 }

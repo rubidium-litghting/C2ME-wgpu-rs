@@ -358,7 +358,7 @@ public final class WgpuBatchCoordinator {
         double avgBatchMs = (g / 1e6) / b;
         double avgChunkMs = (g / 1e6) / Math.max(1, c);
         String line = String.format(
-                "[c2me-wgpu] CPS=%.1f  batches=%d  chunks=%d  avgBatch=%.2fms  avgChunk=%.3fms  (window=%.2fs)",
+                "CPS=%.1f  batches=%d  chunks=%d  avgBatch=%.2fms  avgChunk=%.3fms  (window=%.2fs)",
                 cps, b, c, avgBatchMs, avgChunkMs, sec);
         LOGGER.info(line);
         // Mirror to the chat HUD when the client can show it; the queue keeps

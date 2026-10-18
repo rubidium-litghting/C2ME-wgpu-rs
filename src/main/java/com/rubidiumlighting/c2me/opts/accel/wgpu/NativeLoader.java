@@ -88,7 +88,7 @@ public class NativeLoader {
     private static SymbolLookup load0(String libName) {
         try (final InputStream in = NativeLoader.class.getClassLoader().getResourceAsStream(libName)) {
             if (in == null) {
-                LOGGER.warn("Cannot find native library {}, wgpu acceleration unavailable for this platform", libName);
+                LOGGER.warn("[c2me-wgpu] Cannot find native library {}, wgpu acceleration unavailable for this platform", libName);
                 return null;
             }
             final Path tempFile;
@@ -101,7 +101,7 @@ public class NativeLoader {
             Files.copy(in, tempFile, StandardCopyOption.REPLACE_EXISTING);
             return SymbolLookup.libraryLookup(tempFile, arena);
         } catch (Throwable e) {
-            LOGGER.warn("Failed to load wgpu native library", e);
+            LOGGER.warn("[c2me-wgpu] Failed to load wgpu native library", e);
             return null;
         }
     }

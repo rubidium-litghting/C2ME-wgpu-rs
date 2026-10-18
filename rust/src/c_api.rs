@@ -127,7 +127,6 @@ pub unsafe extern "C" fn c2me_wgpu_create_instance(
 /// (or both null/0 for empty blob in this skeleton).
 /// `err_buf` must be null or valid mutable buffer of `err_buf_len` bytes.
 #[unsafe(no_mangle)]
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_world_destroy(world_h: i64) -> i32 {
     if world_h == 0 { return STATUS_INVALID_HANDLE; }
     let mut table = get_handle_table().lock().unwrap();
@@ -575,6 +574,12 @@ pub unsafe extern "C" fn c2me_wgpu_set_aquifer_mode(
 //
 /// # Safety
 /// `ptr` must point to `len` UTF-8 bytes (or be null with len 0).
+#[unsafe(no_mangle)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2me_wgpu_set_log_callback(cb: crate::LogCallback) {
+    crate::set_log_callback(cb);
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_set_log_path(ptr: *const u8, len: usize) {
     if ptr.is_null() || len == 0 {

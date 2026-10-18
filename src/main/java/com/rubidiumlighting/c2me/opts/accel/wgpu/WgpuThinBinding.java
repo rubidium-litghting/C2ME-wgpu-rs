@@ -29,6 +29,10 @@ import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import java.lang.invoke.MethodType;
 import java.nio.ByteBuffer;
 //import java.lang.foreign.Arena;
 
@@ -39,6 +43,7 @@ import java.nio.ByteBuffer;
  * All failures throw RuntimeException (fallback catches at Mixin level).
  */
 public class WgpuThinBinding {
+    private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu");
 
     // Status codes returned by poll_status / take_result_blob
     public static final int STATUS_PENDING = 0;
@@ -61,6 +66,7 @@ public class WgpuThinBinding {
     private static MethodHandle MH_set_aquifer_mode;
     private static MethodHandle MH_set_ore_seed;
     private static MethodHandle MH_set_log_path;
+    private static MethodHandle MH_set_log_callback;
 
     /** Non-null when the FFM downcall linking failed (e.g. a symbol is
      *  missing from the native library). Lets callers report the real cause
@@ -249,6 +255,22 @@ public class WgpuThinBinding {
                 } else {
                     instanceHandle = h;
                     available = true;
+                    
+                    // Register Rust log callback using global Arena (lifetime = JVM)
+                    try {
+                        MethodHandle target = MethodHandles.lookup().findStatic(
+                                WgpuThinBinding.class, "onRustLog",
+                                MethodType.methodType(void.class, MemorySegment.class, long.class));
+                        MemorySegment upcall = NativeLoader.linker.upcallStub(
+                                target, FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG),
+                                Arena.global());
+                        MH_set_log_callback = NativeLoader.linker.downcallHandle(
+                                NativeLoader.lookup.find("c2me_wgpu_set_log_callback").orElseThrow(),
+                                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+                        MH_set_log_callback.invokeExact(upcall);
+                    } catch (Throwable t) {
+                        System.err.println("[c2me-wgpu] Failed to register Rust log callback: " + t);
+                    }
                 }
             } catch (Throwable t) {
                 System.err.println("[c2me-wgpu] create_instance failed: " + t);
@@ -533,4 +555,16 @@ public class WgpuThinBinding {
         }
     }
 
+
+    /** Upcall receiver from Rust. */
+    private static void onRustLog(MemorySegment msgPtr, long msgLen) {
+        if (msgPtr.address() == 0L || msgLen <= 0 || msgLen > 1024 * 1024) return;
+        try {
+            byte[] bytes = msgPtr.reinterpret(msgLen).toArray(ValueLayout.JAVA_BYTE);
+            String msg = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+            LOGGER.info("[c2me-wgpu] " + msg);
+        } catch (Throwable t) {
+            LOGGER.error("[c2me-wgpu] onRustLog callback failed", t);
+        }
+    }
 }

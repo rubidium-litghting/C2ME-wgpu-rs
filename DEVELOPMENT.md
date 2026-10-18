@@ -3,6 +3,7 @@
 > 最后更新：2026-10-17
 > 状态：**0.1.4 发布版**。完整实现 Pass E、GPU 矿脉、以及 100% 对齐原版的 AquiferSampler 逻辑。实机验证兼容 Epic Terrain 与 Tectonic。
 > 移动端实测：Chunky A/B 测试在 Mali-G610 平板上，端到端总耗时从 3m12s 缩短至 2m19s（+61%）；纯地形生成实时吞吐从 23.52 CPS 提升至 30.65 CPS（+30.3%）。
+> 服务端实测 (Headless，无渲染干扰)：Chunky r=500 跑纯原版地形，纯 CPU 耗时 27s (平均 121.1 cps)，GPU 加速耗时 21s (平均 143.6 cps，峰值 215.7 cps)。端到端提速 22%，峰值提速 44.7%。注：纯 CPU 模式下主线程排队（Amdahl 定律）会锁死并发上限，CPU 占用率通常只能达到 70-80%。
 > 桌面端到端反超纯 CPU（Chunky r=500：15 s vs 23 s）。GPU 直接输出 per-block 方块状态，CPU 只写 palette。
 > 历史细节见文末「附录：开发历程」。
 

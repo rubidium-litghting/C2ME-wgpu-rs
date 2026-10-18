@@ -54,9 +54,7 @@ use crate::world::bind_group;
 /// Total channels = 16 (original) + this.
 pub const MAX_INNER_COUNT: usize = 128;
 
-const OUT_CHANNELS: usize = 2;
 /// Global channel index of the first read-back channel (finalDensity).
-const CH_FIRST: usize = 11;
 
 /// Block height in blocks for this world's shape (16*H*16 blocks/chunk).
 fn shape_height(world: &WorldContext) -> u32 { world.shape().height.max(1) as u32 }
@@ -75,7 +73,7 @@ fn fake_gpu_delay() -> Duration {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(0);
         if ms > 0 {
-            crate::wgpu_debug!("[c2me-wgpu][probe] fake GPU delay = {} ms/batch", ms);
+            crate::wgpu_debug!("[probe] fake GPU delay = {} ms/batch", ms);
         }
         Duration::from_millis(ms)
     })
@@ -136,8 +134,6 @@ pub struct SingleBatchExecutor {
     /// §23: Beardifier data, binding 9. Layout:
     /// [ weight table (13824 u32, bitcast f32) | per-chunk pj (4096 u32/chunk) ].
     beard_buf: wgpu::Buffer,
-    /// Cached weight-table half of `beard_buf` (built once, reused per batch).
-    beard_w_cache: Vec<u32>,
     #[allow(dead_code)]
     bind_group_layout: wgpu::BindGroupLayout,
     /// §22: separate layout for the BlockOut shard (6 storage buffers).
@@ -251,8 +247,6 @@ impl SingleBatchExecutor {
             external_buf: None,
             aquifer_buf,
             beard_buf,
-            beard_w_cache: crate::world::beard::build_weight_table()
-                .iter().map(|f| f.to_bits()).collect(),
             bind_group_layout,
             block_out_bg_layout,
             pipeline_layout,
@@ -428,7 +422,7 @@ impl SingleBatchExecutor {
                         // Pad with zeroes so later chunks keep their stride
                         // (the shader will fall through its "no cell found"
                         // branch and write stone) and log it loudly.
-                        eprintln!("[c2me-wgpu] missing aquifer table for chunk ({cx}, {cz}); padding");
+                        eprintln!("missing aquifer table for chunk ({cx}, {cz}); padding");
                         aq_p.resize(before + cells_per_chunk, [0, 0, 0, 0]);
                         aq_s.resize(before + cells_per_chunk, 0);
                     }
@@ -857,7 +851,7 @@ fn profile_accumulate(chunks: u64, enc: f64, sub: f64, rb: f64, dec: f64, tot: f
     if n >= N {
         let bn = n as f64;
         crate::profile_log(&format!(
-            "[c2me-wgpu][profile] avg over {} batches ({} chunks): encode={:.2} submit={:.2} readback={:.2} decode={:.2} total={:.2} ms/batch",
+            "[profile] avg over {} batches ({} chunks): encode={:.2} submit={:.2} readback={:.2} decode={:.2} total={:.2} ms/batch",
             n, P_CHUNKS.load(Relaxed),
             P_ENC.load(Relaxed) as f64 / 1000.0 / bn,
             P_SUB.load(Relaxed) as f64 / 1000.0 / bn,

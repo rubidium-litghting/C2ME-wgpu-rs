@@ -107,7 +107,6 @@ public abstract class MixinChunkGenerator {
     private static final java.util.concurrent.atomic.AtomicBoolean BEARD_DUMPED =
             new java.util.concurrent.atomic.AtomicBoolean(false);
 
-
     private static final boolean ASYNC_SCHED =
             !"0".equals(System.getenv("C2ME_WGPU_ASYNC_SCHED"));
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
@@ -937,9 +936,6 @@ public abstract class MixinChunkGenerator {
             LOGGER.warn("[c2me-wgpu] aquifer dump failed", t);
         }
     }
-
-
-
 
     /** Strip RegistryEntryHolder + Wrapper(cache) layers so a router
      *  node can be single-shot sampled for diagnostics. */
