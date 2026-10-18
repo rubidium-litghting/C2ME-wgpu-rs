@@ -55,6 +55,19 @@ public class NativeLoader {
     public static final Linker linker = Linker.nativeLinker();
 
     static {
+        // Truncate the log file as the very first action.
+        try {
+            java.nio.file.Path logPath = net.fabricmc.loader.api.FabricLoader
+                    .getInstance().getGameDir()
+                    .resolve("logs").resolve("c2me-wgpu.log");
+            java.nio.file.Files.createDirectories(logPath.getParent());
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(logPath.toFile(), false)) {
+                // Truncates to 0 bytes.
+            }
+        } catch (Throwable t) {
+            System.err.println("[c2me-wgpu] Failed to truncate log file: " + t);
+        }
+
         String libName = String.format("natives/%s-%s/%s",
                 NORMALIZED_OS, NORMALIZED_ARCH,
                 System.mapLibraryName("c2me_wgpu"));

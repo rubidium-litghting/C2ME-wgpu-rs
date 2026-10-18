@@ -89,8 +89,14 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   - **国际化/本地化 (i18n)**：将目前聊天栏硬编码的中文提示（如 ZGC 警告、GPU 回退原因等）全部迁移到 Minecraft 的 `lang/en_us.json` 和 `lang/zh_cn.json` 中，根据玩家语言自动切换，避免英文用户看到中文。
   - **全新的配置文件系统（替代环境变量）**：
     - 彻底淘汰环境变量（诊断用的 `C2ME_DUMP_*` 除外）。
-    - 必须自己手写配置文件的读写逻辑（如 `config.json`），不引入第三方配置库。
-    - 配置文件需包含：GPU 选择（可覆盖底层的自动选择逻辑）、矿脉开关、Beardifier 开关等。
+    - 必须自己手写配置文件的读写逻辑（`config/c2me-wgpu.json`），不引入第三方配置库。
+    - **GPU 选择定稿流程**：
+      1. **C API 列举**：Rust 提供 `c2me_wgpu_list_gpus` 接口，利用临时 `wgpu::Instance` 枚举所有可用 GPU，返回带序号的列表，Java 端将其缓存在内存中。
+      2. **生成配置与注释**：Java 首次生成配置文件时，将内存中的 GPU 列表以注释形式写入 `config/c2me-wgpu.json`（纯供人阅读参考，程序解析不依赖注释）。
+      3. **FFM 传参**：创建世界时，Java 呼叫 `c2me_wgpu_create_instance` 并传入选定的 `gpu_index`。
+      4. **Rust 按序号选择**：Rust 内部根据 `gpu_index` 选定设备；若越界或该 GPU 不达标（如缺少必要 feature），则自动回退到默认选卡逻辑（优先集成显卡）。
+      5. **ModMenu GUI**：直接读取 Java 内存中缓存的 GPU 列表，通过按钮循环切换 `gpu_index`，无需解析配置文件或注释。
+    - 配置文件还需包含：矿脉开关、Beardifier 开关等。
   - **ModMenu 可选支持（软依赖）**：
     - 绝不可将 ModMenu 或 Cloth Config 设为强制依赖（Hard Dependency）。
     - 如果玩家装了 ModMenu，则提供 GUI 配置界面；如果没装，玩家可以通过直接编辑 `config.json` 来修改配置，功能必须正常运作。
