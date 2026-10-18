@@ -68,6 +68,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 21. **先数消费者，再决定算多少**：16 通道里只有 2 个被读，别默认全算。
 22. **假通过的测试比没测试更危险**：`eprintln` 而非 `assert` 的判据会沉默。
 23. **热路径加原子操作会拖垮性能**：计数用纯 `incrementAndGet`。
+24. **跨语言日志需防截断**：Rust 的 `panic` 若触发 `abort`，JVM 会被瞬间带走。务必在 FFI 边界拦截，并用 `sync_all()` 强刷黑匣子文件。
+25. **死锁下 `System.exit` 无效**：当主线程死锁时，`System.exit` 的 Shutdown Hook 会被卡死。必须调用 `LogManager.shutdown()` 刷盘后，使用 `Runtime.getRuntime().halt(1)` 强杀进程。
 
 ### 待办与 0.1.5 规划（2026-10-18 更新）
 
@@ -90,8 +92,9 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 - [x] **健壮性**：
   - 增加更多边缘平台（如未测试的 macOS Metal）的预防性回退逻辑。
   - 统一处理未捕获的 GPU DeviceLost，确保游戏不会因为驱动崩溃而卡死。
-- [ ] **文档梳理**：
+- [x] **文档梳理**：
   - 整理目前的 Debug 环境变量说明，把不再使用的变量（如 `MIN_STAGE`）彻底从文档中删除。
+  - 补充了 FFM Upcall 日志回传机制与防死锁机制的说明。
 
 ### 环境变量速查
 
@@ -249,6 +252,12 @@ Rust 不认识的密度节点（地形 mod）在 CPU 按同一角点网格求值
 - §17 aquifer 逐帧归因：~65% 写回，一半控制流一半噪声。
 - §18 各种"取巧"思路：heightmap 一次性、aquifer 部分 GPU 化等，多数证伪。
   **结论：够长的杠杆是"整体写回 GPU 化"（§20–§22 已实现）。**
+### 日志架构与防死锁机制（0.1.5 新增）
+
+- **FFM Upcall 日志回传**：Rust 侧不再直接向 `STDERR` 打印调试信息。所有的 `wgpu_debug!` 调用会通过 Panama FFM 的回调函数（`upcallStub`）直接传给 Java 端的 SLF4J `LOGGER`，完美合并进 `latest.log`，且格式统一。
+- **黑匣子防崩溃日志**：Rust 侧独立保留了对 `c2me-wgpu.log` 的写入。每次写入后执行 `f.flush()`，并在 `setup_panic_hook` 中执行 `f.sync_all()`，确保即便发生 `SIGABRT`（如 `panic=abort` 或 Android 驱动崩溃），底层原因依然能落盘。
+- **强制退出防死锁**：当 GPU 发生 `DeviceLost` 或底层线程崩溃时，主线程会卡死在 C2ME 的 Future 上。此时 `WgpuBatchCoordinator` 会主动调用 `LogManager.shutdown()` 刷出 Java 日志，然后调用 `Runtime.getRuntime().halt(1)` 物理断电，彻底避免加载界面无限卡死。
+
 ### §19–§22 核心结论（近期）
 
 **§19 端到端 A/B（异步调度裁定）**：桌面异步调度曾净负（30 vs 纯 CPU 23s），

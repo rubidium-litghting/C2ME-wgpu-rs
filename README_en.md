@@ -29,6 +29,8 @@ onto the GPU.
 
 ---
 
+> 💡 **Resilience note**: If the GPU driver crashes or the device is lost, the game will safely halt to prevent deadlocks, and will log the detailed cause to `logs/c2me-wgpu.log` for offline diagnostics.
+
 ## Requirements
 
 | | |
