@@ -103,23 +103,84 @@ public class NativeLoader {
     }
 
     private static SymbolLookup load0(String libName) {
+        final String fileName = libName.substring(libName.lastIndexOf('/') + 1);
+        java.util.List<Path> candidates = new java.util.ArrayList<>();
+
+        // 1. Build candidate paths in order of preference
+        if (Boolean.getBoolean("c2me.wgpu.preserveNative")) {
+            // Debug mode: drop it directly in the working directory (.minecraft/versions/xxx)
+            candidates.add(Path.of(".", fileName));
+        } else {
+            // Default: try gameDir cache first
+            try {
+                Path gameDir = net.fabricmc.loader.api.FabricLoader.getInstance().getGameDir();
+                Path nativeCacheDir = gameDir.resolve("c2me-wgpu-natives");
+                candidates.add(nativeCacheDir.resolve(fileName));
+            } catch (Throwable e) {
+                LOGGER.warn("[c2me-wgpu] Failed to resolve game dir cache path", e);
+            }
+
+            // Fallback: system temp dir
+            try {
+                candidates.add(Files.createTempFile(null, fileName));
+            } catch (Throwable t) {
+                LOGGER.warn("[c2me-wgpu] Failed to create temp file for native extraction", t);
+            }
+        }
+
+        if (candidates.isEmpty()) {
+            LOGGER.error("[c2me-wgpu] No valid extraction paths available for native library");
+            return null;
+        }
+
+        // 2. Iterate through candidates: extract -> load
+        for (Path targetPath : candidates) {
+            boolean isTmp = targetPath.toString().startsWith(System.getProperty("java.io.tmpdir"));
+            try {
+                if (targetPath.getParent() != null) {
+                    Files.createDirectories(targetPath.getParent());
+                }
+                
+                extractResource(libName, targetPath);
+                
+                if (isTmp && !Boolean.getBoolean("c2me.wgpu.preserveNative")) {
+                    targetPath.toFile().deleteOnExit();
+                }
+                
+                // Try to load. If this throws (e.g., noexec mount), we fall through to the next candidate.
+                SymbolLookup lookup = SymbolLookup.libraryLookup(targetPath, arena);
+                LOGGER.info("[c2me-wgpu] Successfully loaded native library from {}", targetPath);
+                return lookup;
+                
+            } catch (Throwable e) {
+                LOGGER.warn("[c2me-wgpu] Failed to extract/load native library from " + targetPath + ", trying next fallback...", e);
+                // Clean up the failed file so the next attempt starts fresh
+                try { Files.deleteIfExists(targetPath); } catch (Throwable ignored) {}
+            }
+        }
+
+        LOGGER.error("[c2me-wgpu] All native library extraction and loading attempts failed.");
+        return null;
+    }
+
+    private static void extractResource(String libName, Path target) throws Exception {
         try (final InputStream in = NativeLoader.class.getClassLoader().getResourceAsStream(libName)) {
             if (in == null) {
-                LOGGER.warn("[c2me-wgpu] Cannot find native library {}, wgpu acceleration unavailable for this platform", libName);
-                return null;
+                throw new IllegalStateException("Cannot find native library " + libName);
             }
-            final Path tempFile;
-            if (Boolean.getBoolean("c2me.wgpu.preserveNative")) {
-                tempFile = Path.of(".", libName.substring(libName.lastIndexOf('/') + 1));
-            } else {
-                tempFile = Files.createTempFile(null, libName.substring(libName.lastIndexOf('/') + 1));
-                tempFile.toFile().deleteOnExit();
+            Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
+            
+            // On POSIX systems (Linux, Android, OHOS), dlopen usually only requires
+            // read access. However, some strict SELinux policies or directories
+            // mounted with `noexec` might reject loading a library without the
+            // executable bit set. We explicitly set it to be safe, but ignore
+            // any failures (e.g. on Windows or read-only filesystems).
+            if (!NORMALIZED_OS.equals("windows")) {
+                boolean success = target.toFile().setExecutable(true);
+                if (!success) {
+                    LOGGER.debug("[c2me-wgpu] Could not set executable permission on {}", target);
+                }
             }
-            Files.copy(in, tempFile, StandardCopyOption.REPLACE_EXISTING);
-            return SymbolLookup.libraryLookup(tempFile, arena);
-        } catch (Throwable e) {
-            LOGGER.warn("[c2me-wgpu] Failed to load wgpu native library", e);
-            return null;
         }
     }
 

@@ -103,6 +103,7 @@ fn get_or_create_executor() -> Result<&'static Mutex<ExecutorThread>, String> {
 ///
 /// # Safety
 /// `err_buf` must be null or point to a mutable buffer of `err_buf_len` bytes.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_setup_panic_hook() {
     crate::setup_panic_hook();
 }
@@ -591,6 +592,7 @@ pub unsafe extern "C" fn c2me_wgpu_set_aquifer_mode(
 //
 /// # Safety
 /// `ptr` must point to `len` UTF-8 bytes (or be null with len 0).
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_set_log_callback(cb: crate::LogCallback) {
     crate::set_log_callback(cb);
 }
