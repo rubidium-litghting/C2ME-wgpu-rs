@@ -322,6 +322,67 @@ if (!project.hasProperty('skipRust') || !project.property('skipRust').toBoolean(
         logger.lifecycle("[c2me-wgpu] Android build skipped (ANDROID_NDK_HOME unset or -PskipAndroid)")
     }
 
+    // ── OpenHarmony build ──
+    // Attempt to use `cargo-ohos build` to compile for aarch64-unknown-linux-ohos.
+    // If cargo-ohos is not installed or OHOS NDK is not found, we gracefully skip.
+    boolean buildOhos = !(project.hasProperty('skipOhos') && project.property('skipOhos').toBoolean())
+    
+    if (buildOhos) {
+        // Check if cargo-ohos is available
+        try {
+            def checkProc = new ProcessBuilder('cargo', 'ohos', '--version')
+                    .directory(rustDir)
+                    .redirectErrorStream(true)
+                    .start()
+            int checkCode = checkProc.waitFor()
+            if (checkCode != 0) {
+                buildOhos = false
+            }
+        } catch (Exception e) {
+            buildOhos = false
+        }
+    }
+
+    if (buildOhos) {
+        tasks.register('rustBuildOhos') {
+            group = 'build'
+            description = 'Cross-compile the Rust cdylib for OpenHarmony (cargo-ohos).'
+            inputs.dir(new File(rustDir, 'src'))
+            inputs.file(new File(rustDir, 'Cargo.toml'))
+            inputs.file(new File(rustDir, 'Cargo.lock'))
+            outputs.dir(rustNativesRoot)
+
+            doLast {
+                logger.lifecycle("[c2me-wgpu] cargo ohos build -r")
+                def proc = new ProcessBuilder('cargo', 'ohos', 'build', '-r')
+                        .directory(rustDir)
+                        .inheritIO()
+                        .start()
+                int code = proc.waitFor()
+                if (code != 0) {
+                    throw new GradleException("cargo ohos build failed (exit ${code})")
+                }
+                def built = new File(rustDir, "target/aarch64-unknown-linux-ohos/release/${rustLibName}")
+                if (built.exists()) {
+                    def stageDir = new File(rustNativesRoot, "natives/ohos-aarch64")
+                    stageDir.mkdirs()
+                    copy {
+                        from built
+                        into stageDir
+                    }
+                    logger.lifecycle("[c2me-wgpu] Staged OHOS native -> ${stageDir}/${rustLibName}")
+                } else {
+                    logger.lifecycle("[c2me-wgpu] OHOS native lib not found after build, skipping staging.")
+                }
+            }
+        }
+        processResources.dependsOn rustBuildOhos
+        sourcesJar.dependsOn rustBuildOhos
+        checkLicenseMain.dependsOn rustBuildOhos
+    } else {
+        logger.lifecycle("[c2me-wgpu] OHOS build skipped (cargo-ohos not found or -PskipOhos)")
+    }
+
     // Package the staged natives into the JAR explicitly (avoids registering
     // build/rust-natives as a source set, which would confuse license/source scans).
     processResources {
@@ -345,3 +406,6 @@ publishing {
         // mavenLocal()
     }
 }
+
+
+

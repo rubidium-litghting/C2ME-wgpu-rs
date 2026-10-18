@@ -45,9 +45,10 @@ public class NativeLoader {
      *  we look under natives/android-<arch>/ instead of linux-<arch>/. The two
      *  are NOT ABI-compatible (Android = bionic, desktop Linux = glibc). */
     public static final boolean IS_ANDROID = detectAndroid();
+    public static final boolean IS_OHOS = detectOhos();
 
     public static final String NORMALIZED_ARCH = normalizeArch(SystemPropertyUtil.get("os.arch", ""));
-    public static final String NORMALIZED_OS = IS_ANDROID ? "android" : normalizeOs(SystemPropertyUtil.get("os.name", ""));
+    public static final String NORMALIZED_OS = IS_ANDROID ? "android" : (IS_OHOS ? "ohos" : normalizeOs(SystemPropertyUtil.get("os.name", "")));
 
     private static final Arena arena = Arena.ofAuto();
     public static final SymbolLookup lookup;
@@ -83,6 +84,22 @@ public class NativeLoader {
         } catch (Throwable ignored) {
             return false;
         }
+    }
+
+    private static boolean detectOhos() {
+        try {
+            // Allow explicit override (e.g., running AMCL on HarmonyOS where os.version might be ambiguous)
+            String force = SystemPropertyUtil.get("c2me.native.platform", "");
+            if (force.contains("ohos")) {
+                return true;
+            }
+            // Some OHOS environments report "OpenHarmony" or "HarmonyOS" in os.version
+            String osVersion = SystemPropertyUtil.get("os.version", "").toLowerCase();
+            if (osVersion.contains("harmony") || osVersion.contains("ohos")) {
+                return true;
+            }
+        } catch (Throwable ignored) {}
+        return false;
     }
 
     private static SymbolLookup load0(String libName) {

@@ -142,6 +142,9 @@
 
 blob dump 也可以通过 JVM 属性 `-Dc2me.dumpBlob=<path>` 设置；当该属性未设置时，环境变量仅作为回退。
 
+**原生库解压位置排查**：
+默认情况下，模组会将 jar 包内的 `.so` 或 `.dll` 解压到操作系统的临时目录（如 Linux 的 `/tmp`），并在游戏退出时删除。如果你需要排查底层库加载失败的问题，可以在 JVM 启动参数中添加 `-Dc2me.wgpu.preserveNative=true`，模组将把原生库解压到游戏当前的工作目录中，方便你进行调试。
+
 > **注意：** 以 `C2ME_DUMP_` 为前缀的变量以及标记为“仅开发用”的变量严格用于故障排查，正常游玩时无需设置。
 
 > **Rust 侧日志文件：** 原生库将其诊断信息写入 `<gameDir>/logs/c2me-wgpu.log`（路径由 Java 在启动时传入）。这独立于 Minecraft 自身的 `logs/latest.log`，后者仅捕获 Java 日志。
