@@ -1,7 +1,7 @@
 # C2ME WGPU 加速模块 — 开发文档
 
 > 最后更新：2026-10-17
-> 状态：**0.1.4 发布版**。完整实现 Pass E、GPU 矿脉、以及 100% 对齐原版的 AquiferSampler 逻辑。实机验证兼容 Epic Terrain 与 Tectonic。
+> 状态：**0.1.5 发布版**。完整实现 Pass E、GPU 矿脉、100% 对齐原版的 AquiferSampler 逻辑，并重构了 FFM 日志架构与底层防死锁机制。实机验证兼容 Epic Terrain 与 Tectonic。
 > 移动端实测：Chunky A/B 测试在 Mali-G610 平板上，端到端总耗时从 3m12s 缩短至 2m19s（+61%）；纯地形生成实时吞吐从 23.52 CPS 提升至 30.65 CPS（+30.3%）。
 > 服务端实测 (Headless，无渲染干扰)：Chunky r=500 跑纯原版地形，纯 CPU 耗时 27s (平均 121.1 cps)，GPU 加速耗时 21s (平均 143.6 cps，峰值 215.7 cps)。端到端提速 22%，峰值提速 44.7%。注：纯 CPU 模式下主线程排队（Amdahl 定律）会锁死并发上限，CPU 占用率通常只能达到 70-80%。
 > 桌面端到端反超纯 CPU（Chunky r=500：15 s vs 23 s）。GPU 直接输出 per-block 方块状态，CPU 只写 palette。
@@ -78,7 +78,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 - ✅ **Shard B 瘦身**：高频内联公式函数化，从 3084 行降到 1771 行。
 
 **0.1.5 目标：代码整理与用户友好化（进入等 Issue 阶段）**
-- [ ] **代码清洁**：
+- [x] **代码清洁**：
   - 清理排查期间留下的历史冗余代码、无用 `#[allow(dead_code)]`。
   - 审查并移除重复的 `c2me_wgpu.log` 日志写入逻辑（如果有）。
   - 修复项目内大量的 cargo `unused` 警告。
@@ -87,7 +87,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   - 优化聊天栏提示：初次进入世界时友好提示“GPU 加速已启用/回退原因”，避免玩家在不知情的情况下吃 CPU 帧数。
   - 在模组图标或配置里展示当前运行的 GPU 名称和硬件状态。
   - 如果可能，提供对 F3 调试屏幕的自定义扩展，显示当前 GPU 生成的 CPS。
-- [ ] **健壮性**：
+- [x] **健壮性**：
   - 增加更多边缘平台（如未测试的 macOS Metal）的预防性回退逻辑。
   - 统一处理未捕获的 GPU DeviceLost，确保游戏不会因为驱动崩溃而卡死。
 - [ ] **文档梳理**：

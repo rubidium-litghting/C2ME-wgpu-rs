@@ -66,6 +66,7 @@ public class WgpuThinBinding {
     private static MethodHandle MH_set_aquifer_mode;
     private static MethodHandle MH_set_ore_seed;
     private static MethodHandle MH_set_log_path;
+    private static MethodHandle MH_setup_panic_hook;
     private static MethodHandle MH_set_log_callback;
 
     /** Non-null when the FFM downcall linking failed (e.g. a symbol is
@@ -206,6 +207,10 @@ public class WgpuThinBinding {
                     )
             );
 
+            MH_setup_panic_hook = NativeLoader.linker.downcallHandle(
+                    NativeLoader.lookup.find("c2me_wgpu_setup_panic_hook").orElseThrow(),
+                    FunctionDescriptor.ofVoid()
+            );
             MH_set_log_path = NativeLoader.linker.downcallHandle(
                     NativeLoader.lookup.find("c2me_wgpu_set_log_path").orElseThrow(),
                     FunctionDescriptor.ofVoid(
@@ -231,6 +236,16 @@ public class WgpuThinBinding {
                 java.nio.file.Path logPath = net.fabricmc.loader.api.FabricLoader
                         .getInstance().getGameDir()
                         .resolve("logs").resolve("c2me-wgpu.log");
+                
+                // Clear the log file synchronously before telling Rust where it is.
+                // This ensures the "black box" only contains logs from the current session.
+                try {
+                    java.nio.file.Files.createDirectories(logPath.getParent());
+                    java.nio.file.Files.write(logPath, new byte[0]); // Truncate
+                } catch (Throwable t) {
+                    System.err.println("[c2me-wgpu] Failed to truncate log file: " + t);
+                }
+
                 byte[] bytes = logPath.toAbsolutePath().toString()
                         .getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 try (Arena a = Arena.ofConfined()) {
@@ -255,6 +270,8 @@ public class WgpuThinBinding {
                 } else {
                     instanceHandle = h;
                     available = true;
+                    
+                    MH_setup_panic_hook.invokeExact();
                     
                     // Register Rust log callback using global Arena (lifetime = JVM)
                     try {

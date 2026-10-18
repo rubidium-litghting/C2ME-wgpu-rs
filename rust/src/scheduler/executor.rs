@@ -260,6 +260,7 @@ impl SingleBatchExecutor {
         world: &WorldContext,
         batch: &Batch,
     ) -> Result<Arc<ExecutedBatch>, String> {
+        
         if batch.positions.is_empty() {
             return Err("empty batch".into());
         }

@@ -104,6 +104,12 @@ fn get_or_create_executor() -> Result<&'static Mutex<ExecutorThread>, String> {
 /// # Safety
 /// `err_buf` must be null or point to a mutable buffer of `err_buf_len` bytes.
 #[unsafe(no_mangle)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2me_wgpu_setup_panic_hook() {
+    crate::setup_panic_hook();
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_create_instance(
     _features_mask: u64,
     err_buf: *mut c_char,

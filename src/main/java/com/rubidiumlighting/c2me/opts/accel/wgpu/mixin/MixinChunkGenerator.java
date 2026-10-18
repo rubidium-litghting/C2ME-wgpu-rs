@@ -264,9 +264,13 @@ public abstract class MixinChunkGenerator {
                 ds.coordinator.requestAsync(chunk.getPos().x, chunk.getPos().z)
                         .whenComplete((gpu, err) -> {
                             if (err != null) {
-                                LOGGER.warn("[c2me-wgpu] async GPU request failed", err);
+                                LOGGER.error("[c2me-wgpu] Async GPU request failed! This usually means the GPU crashed or the native library panicked.", err);
+                                // First, try to complete the result exceptionally so C2ME's future chain unwinds.
                                 result.completeExceptionally(err);
-                                return;
+                                
+                                // If C2ME swallows the exception and deadlocks, this will forcibly terminate the game.
+                                // We use Error to bypass C2ME's normal Exception catching.
+                                throw new Error("C2ME-wgpu GPU Crash: " + err.getMessage(), err);
                             }
                             // Enqueue write-back onto C2ME's worker pool. The
                             // chunk's position lock is held by C2ME's

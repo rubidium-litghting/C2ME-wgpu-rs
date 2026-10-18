@@ -63,7 +63,7 @@ public final class WgpuBatchCoordinator {
     /** Max time (ms) to wait for more requests before flushing a short batch. */
     private static final long MAX_WAIT_MS = 5L;
     /** Abandon a GPU request after this long. */
-    private static final long REQUEST_TIMEOUT_NS = 10_000_000_000L;
+    private static final long REQUEST_TIMEOUT_NS = 30_000_000_000L;
 
     /** One chunk's slice of a batch result. */
     public static final class GpuChunk {
@@ -288,7 +288,15 @@ public final class WgpuBatchCoordinator {
                 Thread.currentThread().interrupt();
                 return;
             } catch (Throwable t) {
-                LOGGER.error("[c2me-wgpu] completion loop error", t);
+                LOGGER.error("[c2me-wgpu] FATAL: completion loop error. Main thread is likely deadlocked. Forcing JVM halt.", t);
+                // Flush Log4j buffers before killing the process
+                try {
+                    org.apache.logging.log4j.LogManager.shutdown();
+                } catch (Throwable ignored) {}
+                
+                // System.exit can deadlock if shutdown hooks wait on the deadlocked main thread.
+                // halt(1) is the only safe way to kill the process.
+                Runtime.getRuntime().halt(1); 
             }
         }
     }
@@ -301,17 +309,21 @@ public final class WgpuBatchCoordinator {
         try {
             while ((st = WgpuThinBinding.pollStatus(req)) == WgpuThinBinding.STATUS_PENDING) {
                 if (System.nanoTime() > deadline) {
-                    failAll(ib.batch, new RuntimeException("GPU request timed out"));
+                    LOGGER.error("[c2me-wgpu] FATAL: GPU request timed out after 30s. The native worker is likely deadlocked. Terminating JVM.");
+                    Runtime.getRuntime().halt(1);
                     return;
                 }
                 java.util.concurrent.locks.LockSupport.parkNanos(100_000L);
             }
         } catch (Throwable t) {
-            failAll(ib.batch, t);
+            LOGGER.error("[c2me-wgpu] FATAL: Exception while polling GPU status.", t);
+            Runtime.getRuntime().halt(1);
             return;
         }
         if (st != WgpuThinBinding.STATUS_DONE) {
-            failAll(ib.batch, new RuntimeException("GPU request status=" + st));
+            LOGGER.error("[c2me-wgpu] FATAL: GPU request returned status=" + st + ". Terminating JVM to prevent deadlock.");
+            try { org.apache.logging.log4j.LogManager.shutdown(); } catch (Throwable ignored) {}
+            Runtime.getRuntime().halt(1);
             return;
         }
 

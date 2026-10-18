@@ -75,6 +75,33 @@ pub(crate) fn no_pipeline_cache() -> bool {
     })
 }
 
+/// Installs a panic hook that writes the panic message to the "black box" log
+/// and forces it to disk *before* the process aborts. This is critical for
+/// `panic=abort` environments (like Android cross-compiles) where the JVM
+/// would otherwise be killed without a chance to log the cause.
+pub(crate) fn setup_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("[FATAL PANIC] {}", info);
+        let path = log_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{msg}");
+            let _ = f.flush();
+            // Force OS to write to disk immediately.
+            let _ = f.sync_all();
+        }
+        
+        // Try to notify Java as well, though it may be too late.
+        if let Some(cb) = LOG_CALLBACK.get() {
+            let bytes = msg.as_bytes();
+            cb(bytes.as_ptr(), bytes.len());
+        }
+    }));
+}
+
 /// Path to the Rust-side log file, set once by Java through
 /// `c2me_wgpu_set_log_path`. Falls back to `<cwd>/logs/c2me-wgpu.log`
 /// (the launcher's working directory is the game dir) when unset.
@@ -117,6 +144,7 @@ pub(crate) fn debug_log_line(msg: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "{msg}");
+        let _ = f.flush(); // Force userspace buffer to OS
     }
     
     // Also notify Java if a callback is registered.
