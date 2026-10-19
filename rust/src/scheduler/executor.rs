@@ -20,6 +20,7 @@ use crate::scheduler::batcher::Batch;
 #[cfg(test)]
 use crate::scheduler::batcher::Priority;
 use crate::resources::staging_chain::{StagingChain, SlotHandle};
+use crate::ast::deserialize::ShapeConfig;
 use crate::world::WorldContext;
 use crate::world::constants::WorldgenParams;
 use crate::world::bind_group;
@@ -276,85 +277,17 @@ impl SingleBatchExecutor {
 
         let shape = world.shape();
 
-        // Build WorldgenParams
-        // `batch.positions` holds CHUNK coords; the shader wants BLOCK coords.
-        // A chunk is 16 blocks wide along X and Z.
-        // Per-chunk origins now live in the `positions` buffer; params
-        // keeps the batch-min origin for legacy scalar math (unused by the
-        // prologue but harmless).
-        let origin_x = batch.positions.iter().map(|p| p.0).min().unwrap_or(0) * 16;
-        let origin_z = batch.positions.iter().map(|p| p.1).min().unwrap_or(0) * 16;
-
-
-        let params = WorldgenParams {
-            batch_origin_x: origin_x,
-            batch_origin_z: origin_z,
-            cell_width: shape.cell_width as f32,
-            cell_height: shape.cell_height as f32,
-            min_y_f: shape.min_y as f32,
-            height_f: shape.height as f32,
-            batch_count_x: num_chunks as i32,
-            batch_count_z: 1,
-            _pad: [0; 12],
-        };
-
-        // External inputs for CPU-evaluated subtrees (binding 6).
-        let ext_count = world.external_count();
-        let ext_data = world.external_data();
-        let ext_bytes = (ext_data.len() * 4).max(4);
-        let ext_buf = if ext_count > 0 {
-            let need_recreate = match &self.external_buf {
-                Some(b) => b.size() < ext_bytes as u64 || b.size() < 4,
-                None => true,
-            };
-            if need_recreate {
-                self.external_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("c2me_wgpu_external_inputs"),
-                    size: ext_bytes as u64,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }));
-            }
-            let buf = self.external_buf.as_ref().unwrap();
-            self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&ext_data));
-            buf.as_entire_binding()
-        } else {
-            // No external inputs: bind a dedicated 4-byte dummy so binding 6
-            // stays valid. (Reusing output_buf here would alias binding 2's
-            // read-write storage and can trip wgpu validation.)
-            if self.external_buf.is_none() {
-                self.external_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("c2me_wgpu_external_dummy"),
-                    size: 4,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }));
-            }
-            self.external_buf.as_ref().unwrap().as_entire_binding()
-        };
-
-        // Update the persistent params buffer (binding 0).
-        let mut params = params;
-        params._pad[0] = ext_count as u32;
-        // §22: per-dimension aquifer mode in _pad[1..5].
-        {
-            let am = world.aquifer_mode();
-            params._pad[1] = if am.has_aquifers { 1 } else { 0 };
-            params._pad[2] = am.sea_level as u32;
-            params._pad[3] = am.default_fluid;
-            params._pad[4] = am.lava_level as u32;
+        // Build per-batch params (all _pad slots except [10], which the
+        // aquifer upload fills in below), upload the three side tables
+        // (external inputs / aquifer / beard), then write params ONCE.
+        let mut params = Self::build_params(world, batch, num_chunks, shape);
+        let ext_buf = self.ensure_external_buffer(world);
+        if let Some(aq_n) = self.upload_aquifer_tables(world, batch, shape) {
+            // aq_s half-offset: only the first `aq_n` vec4 entries were
+            // written, so the state half starts at index `aq_n`.
+            params._pad[10] = aq_n as u32;
         }
-        // Ore-vein RNG seed in _pad[5..9]: (seedLo.lo, seedLo.hi, seedHi.lo, seedHi.hi).
-        {
-            let (lo, hi) = world.ore_seed();
-            params._pad[5] = lo as u32;
-            params._pad[6] = (lo as u64 >> 32) as u32;
-            params._pad[7] = hi as u32;
-            params._pad[8] = (hi as u64 >> 32) as u32;
-            params._pad[9] = if world.ore_veins.load(std::sync::atomic::Ordering::Relaxed) { 1 } else { 0 };
-        }
-        // _pad[11] is the total channel count, used by WGSL chunk strides.
-        params._pad[11] = (16 + MAX_INNER_COUNT) as u32;
+        self.upload_beard_data(world, batch);
         self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
 
         // Packed chunk positions [cx,cz,...] for the shader (binding 4).
@@ -364,88 +297,7 @@ impl SingleBatchExecutor {
             packed_positions.push(cx);
             packed_positions.push(cz);
         }
-        // Update the persistent positions buffer (binding 4).
         self.queue.write_buffer(&self.positions_buf, 0, bytemuck::cast_slice(&packed_positions));
-
-        // §22 B-2: expand per-chunk aquifer tables (batch order) and upload
-        // to binding 8/9. Aquifer cells are 16-block wide → sizeX/sizeZ = 3
-        // for a 16-wide chunk; sizeY follows the 12-block vertical stride.
-        {
-            let mut aq_p: Vec<[i32; 4]> = Vec::new();
-            let mut aq_s: Vec<u32> = Vec::new();
-            if let Ok(mut tables) = world.aquifer_tables.lock() {
-                let min_y = shape.min_y;
-                let height = shape.height;
-                let start_y = min_y.div_euclid(12) - 1;
-                let size_y = (min_y + height).div_euclid(12)
-                    - min_y.div_euclid(12) + 3;
-                let cells_per_chunk = (size_y * 9) as usize;
-                for &(cx, cz) in &batch.positions {
-                    let before = aq_p.len();
-                    // Consume: remove so the map does not grow unboundedly.
-                    if let Some(bytes) = tables.remove(&(cx, cz)) {
-                        if let Some(t) = crate::world::aquifer::AquiferTable::parse(
-                                &bytes, 3, size_y, 3, cx - 1, start_y, cz - 1) {
-                            t.pack_for_gpu(&mut aq_p, &mut aq_s);
-                        }
-                    }
-                    // Every chunk must occupy exactly `cells_per_chunk` slots:
-                    // the shader addresses cells as chunk_index * aq_sy * 9.
-                    // A chunk with no table (fresh region edge, or a dimension
-                    // without aquifers) is padded with inert cells so later
-                    // chunks do not shift out of place.
-                    if aq_p.len() < before + cells_per_chunk {
-                        // Vanilla always has a fully populated cell grid per
-                        // chunk, so a gap here means the Java side failed to
-                        // stage a table (async race or dimension mismatch).
-                        // Pad with zeroes so later chunks keep their stride
-                        // (the shader will fall through its "no cell found"
-                        // branch and write stone) and log it loudly.
-                        eprintln!("missing aquifer table for chunk ({cx}, {cz}); padding");
-                        aq_p.resize(before + cells_per_chunk, [0, 0, 0, 0]);
-                        aq_s.resize(before + cells_per_chunk, 0);
-                    }
-                }
-            }
-            if !aq_p.is_empty() {
-                // [ aq_p (vec4) | aq_s padded to vec4 (state in .x) ]
-                let n = aq_p.len();
-                let mut merged: Vec<[i32; 4]> = Vec::with_capacity(n * 2);
-                merged.extend_from_slice(&aq_p);
-                merged.extend(aq_s.iter().map(|&st| [st as i32, 0, 0, 0]));
-                self.queue.write_buffer(&self.aquifer_buf, 0,
-                    bytemuck::cast_slice(&merged));
-                // The shader needs the *actual* half offset, not the size of
-                // the pre-allocated buffer: only the first `n` vec4 entries
-                // were written, so aq_s starts at index `n`.
-                params._pad[10] = n as u32;
-                self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
-            }
-        }
-
-        // §23: pack per-chunk beard data (fixed 4096-u32 stride; empty chunks
-        // get a zeroed stride so `beard_pj[base]==0` disables beard).
-        {
-            const STRIDE: usize = 4096;
-            let mut pj = vec![0u32; STRIDE * batch.positions.len()];
-            if let Ok(mut tables) = world.beard_tables.lock() {
-                for (ci, &(cx, cz)) in batch.positions.iter().enumerate() {
-                    if let Some(bytes) = tables.remove(&(cx, cz)) {
-                        let n = (bytes.len() / 4).min(STRIDE);
-                        let dst = ci * STRIDE;
-                        for i in 0..n {
-                            pj[dst + i] = u32::from_le_bytes(
-                                bytes[i*4..i*4+4].try_into().unwrap());
-                        }
-                    }
-                }
-            }
-            // Weight table is written once at construction; only pj changes
-            // per batch, so write straight past it.
-            const BEARD_W_BYTES: u64 = (24 * 24 * 24) as u64 * 4;
-            self.queue.write_buffer(&self.beard_buf, BEARD_W_BYTES,
-                bytemuck::cast_slice(&pj));
-        }
 
         // Get or create perm buffer (binding 1)
         let perm_buf = world.perm_buffer()
@@ -495,7 +347,7 @@ impl SingleBatchExecutor {
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: ext_buf,
+                    resource: ext_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
@@ -650,6 +502,173 @@ impl SingleBatchExecutor {
         }))
     }
 
+    /// Build the per-batch [`WorldgenParams`]. Every `_pad` slot is filled
+    /// except `_pad[10]` (the aquifer state half-offset), which only becomes
+    /// known after [`Self::upload_aquifer_tables`].
+    fn build_params(
+        world: &WorldContext,
+        batch: &Batch,
+        num_chunks: u32,
+        shape: &ShapeConfig,
+    ) -> WorldgenParams {
+        // `batch.positions` holds CHUNK coords; the shader wants BLOCK coords.
+        // A chunk is 16 blocks wide along X and Z. Per-chunk origins live in
+        // the `positions` buffer; params keeps the batch-min origin for legacy
+        // scalar math (unused by the prologue but harmless).
+        let origin_x = batch.positions.iter().map(|p| p.0).min().unwrap_or(0) * 16;
+        let origin_z = batch.positions.iter().map(|p| p.1).min().unwrap_or(0) * 16;
+        let mut params = WorldgenParams {
+            batch_origin_x: origin_x,
+            batch_origin_z: origin_z,
+            cell_width: shape.cell_width as f32,
+            cell_height: shape.cell_height as f32,
+            min_y_f: shape.min_y as f32,
+            height_f: shape.height as f32,
+            batch_count_x: num_chunks as i32,
+            batch_count_z: 1,
+            _pad: [0; 12],
+        };
+        params._pad[0] = world.external_count() as u32;
+        // §22: per-dimension aquifer mode in _pad[1..5].
+        {
+            let am = world.aquifer_mode();
+            params._pad[1] = if am.has_aquifers { 1 } else { 0 };
+            params._pad[2] = am.sea_level as u32;
+            params._pad[3] = am.default_fluid;
+            params._pad[4] = am.lava_level as u32;
+        }
+        // Ore-vein RNG seed in _pad[5..9]: (seedLo.lo, seedLo.hi, seedHi.lo, seedHi.hi).
+        {
+            let (lo, hi) = world.ore_seed();
+            params._pad[5] = lo as u32;
+            params._pad[6] = (lo as u64 >> 32) as u32;
+            params._pad[7] = hi as u32;
+            params._pad[8] = (hi as u64 >> 32) as u32;
+            params._pad[9] = if world.ore_veins.load(std::sync::atomic::Ordering::Relaxed) { 1 } else { 0 };
+        }
+        // _pad[11] is the total channel count, used by WGSL chunk strides.
+        params._pad[11] = (16 + MAX_INNER_COUNT) as u32;
+        params
+    }
+
+    /// Return the external-inputs buffer (binding 6), (re)creating it if the
+    /// current CPU-side payload needs more room. Returns an `Arc` clone so the
+    /// caller can keep touching other `self` fields while holding it.
+    fn ensure_external_buffer(&mut self, world: &WorldContext) -> wgpu::Buffer {
+        let ext_count = world.external_count();
+        let ext_data = world.external_data();
+        let ext_bytes = (ext_data.len() * 4).max(4);
+        if ext_count > 0 {
+            let need_recreate = match &self.external_buf {
+                Some(b) => b.size() < ext_bytes as u64 || b.size() < 4,
+                None => true,
+            };
+            if need_recreate {
+                self.external_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("c2me_wgpu_external_inputs"),
+                    size: ext_bytes as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            let buf = self.external_buf.as_ref().unwrap();
+            self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&ext_data));
+            buf.clone()
+        } else {
+            // No external inputs: bind a dedicated 4-byte dummy so binding 6
+            // stays valid. (Reusing output_buf here would alias binding 2's
+            // read-write storage and can trip wgpu validation.)
+            if self.external_buf.is_none() {
+                self.external_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("c2me_wgpu_external_dummy"),
+                    size: 4,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            self.external_buf.as_ref().unwrap().clone()
+        }
+    }
+
+    /// Expand and upload the per-chunk aquifer tables (binding 8). Returns
+    /// `Some(n)` with the `aq_p` cell count written, or `None` if no table was
+    /// staged for any chunk in the batch.
+    fn upload_aquifer_tables(
+        &mut self,
+        world: &WorldContext,
+        batch: &Batch,
+        shape: &ShapeConfig,
+    ) -> Option<usize> {
+        let mut aq_p: Vec<[i32; 4]> = Vec::new();
+        let mut aq_s: Vec<u32> = Vec::new();
+        if let Ok(mut tables) = world.aquifer_tables.lock() {
+            let min_y = shape.min_y;
+            let height = shape.height;
+            let start_y = min_y.div_euclid(12) - 1;
+            let size_y = (min_y + height).div_euclid(12) - min_y.div_euclid(12) + 3;
+            let cells_per_chunk = (size_y * 9) as usize;
+            for &(cx, cz) in &batch.positions {
+                let before = aq_p.len();
+                // Consume: remove so the map does not grow unboundedly.
+                if let Some(bytes) = tables.remove(&(cx, cz)) {
+                    if let Some(t) = crate::world::aquifer::AquiferTable::parse(
+                            &bytes, 3, size_y, 3, cx - 1, start_y, cz - 1) {
+                        t.pack_for_gpu(&mut aq_p, &mut aq_s);
+                    }
+                }
+                // Every chunk must occupy exactly `cells_per_chunk` slots: the
+                // shader addresses cells as chunk_index * aq_sy * 9. A chunk
+                // with no table (fresh region edge, or a dimension without
+                // aquifers) is padded with inert cells so later chunks do not
+                // shift out of place.
+                if aq_p.len() < before + cells_per_chunk {
+                    // Vanilla always has a fully populated cell grid per chunk,
+                    // so a gap here means the Java side failed to stage a table
+                    // (async race or dimension mismatch). Pad with zeroes so
+                    // later chunks keep their stride (the shader falls through
+                    // its "no cell found" branch and writes stone) and log it.
+                    eprintln!("missing aquifer table for chunk ({cx}, {cz}); padding");
+                    aq_p.resize(before + cells_per_chunk, [0, 0, 0, 0]);
+                    aq_s.resize(before + cells_per_chunk, 0);
+                }
+            }
+        }
+        if aq_p.is_empty() {
+            return None;
+        }
+        // [ aq_p (vec4) | aq_s padded to vec4 (state in .x) ]
+        let n = aq_p.len();
+        let mut merged: Vec<[i32; 4]> = Vec::with_capacity(n * 2);
+        merged.extend_from_slice(&aq_p);
+        merged.extend(aq_s.iter().map(|&st| [st as i32, 0, 0, 0]));
+        self.queue.write_buffer(&self.aquifer_buf, 0, bytemuck::cast_slice(&merged));
+        Some(n)
+    }
+
+    /// Pack and upload the per-chunk Beardifier data (binding 9). Each chunk
+    /// gets a fixed `STRIDE`-u32 slot; empty chunks get a zeroed stride so
+    /// `beard_pj[base] == 0` disables beard.
+    fn upload_beard_data(&mut self, world: &WorldContext, batch: &Batch) {
+        const STRIDE: usize = 4096;
+        const BEARD_W_BYTES: u64 = (24 * 24 * 24) as u64 * 4;
+        let mut pj = vec![0u32; STRIDE * batch.positions.len()];
+        if let Ok(mut tables) = world.beard_tables.lock() {
+            for (ci, &(cx, cz)) in batch.positions.iter().enumerate() {
+                if let Some(bytes) = tables.remove(&(cx, cz)) {
+                    let n = (bytes.len() / 4).min(STRIDE);
+                    let dst = ci * STRIDE;
+                    for i in 0..n {
+                        pj[dst + i] = u32::from_le_bytes(
+                            bytes[i*4..i*4+4].try_into().unwrap());
+                    }
+                }
+            }
+        }
+        // Weight table is written once at construction; only pj changes per
+        // batch, so write straight past it.
+        self.queue.write_buffer(&self.beard_buf, BEARD_W_BYTES, bytemuck::cast_slice(&pj));
+    }
+
     fn read_results(
         &mut self,
         batch: &Batch,
@@ -784,27 +803,7 @@ impl Drop for ExecutorThread {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn executor_config_defaults() {
-        let cfg = ExecutorConfig::default();
-        assert!(cfg.max_batch_size >= 8);
-        assert!(cfg.flush_timeout_ms <= 500);
-        assert_eq!(cfg.staging_capacity, 3);
-    }
-
-    #[test]
-    fn batch_has_sorted_positions() {
-        let batch = Batch {
-            positions: vec![(3, 3), (0, 0), (1, 0)],
-            max_priority: Priority::Normal,
-        };
-        assert_eq!(batch.positions.len(), 3);
-    }
-}
 
 // ── profiling aggregator ────────────────────────────────────────────────
 // One averaged line every PROFILE_EVERY batches, so the log doesn't flood
@@ -841,5 +840,27 @@ fn profile_accumulate(chunks: u64, enc: f64, sub: f64, rb: f64, dec: f64, tot: f
         P_N.store(0, Relaxed); P_CHUNKS.store(0, Relaxed);
         P_ENC.store(0, Relaxed); P_SUB.store(0, Relaxed);
         P_RB.store(0, Relaxed); P_DEC.store(0, Relaxed); P_TOT.store(0, Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn executor_config_defaults() {
+        let cfg = ExecutorConfig::default();
+        assert!(cfg.max_batch_size >= 8);
+        assert!(cfg.flush_timeout_ms <= 500);
+        assert_eq!(cfg.staging_capacity, 3);
+    }
+
+    #[test]
+    fn batch_has_sorted_positions() {
+        let batch = Batch {
+            positions: vec![(3, 3), (0, 0), (1, 0)],
+            max_priority: Priority::Normal,
+        };
+        assert_eq!(batch.positions.len(), 3);
     }
 }
