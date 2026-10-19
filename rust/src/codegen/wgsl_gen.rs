@@ -1,26 +1,4 @@
-/*
- * The MIT License (MIT)
- *
- * Copyright (c) 2026 RubidiumLighting
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// SPDX-License-Identifier: MIT
 
 //! Top-level WGSL code generator.
 //!
@@ -132,10 +110,10 @@ pub fn plan_shards(channel_count: usize) -> Vec<Shard> {
     }
     // §20 block-output shard: not bound to any channel (start==end); it reads
     // ch11 corners from out_buf and writes block-state bytes. Gated.
-    if block_out_enabled() {
-        out.push(Shard { pass: Pass::Inner, start: 0, end: 0 });
-        out.push(Shard { pass: Pass::BlockOut, start: 0, end: 0 });
-    }
+    // BlockOut is the only GPU write-back path (the CPU density path was
+    // removed as a measured net loss, §20), so it is unconditional.
+    out.push(Shard { pass: Pass::Inner, start: 0, end: 0 });
+    out.push(Shard { pass: Pass::BlockOut, start: 0, end: 0 });
     out
 }
 
@@ -267,22 +245,6 @@ impl GenCtx {
     }
 }
 
-/// Check whether the AST requires two-pass dispatch.
-///
-/// **Always returns `false`** as of phase 4-3: `CacheInterpolated` now
-/// runs in single-pass mode using `workgroupBarrier()` to synchronise
-/// corner computation and trilinear lerp within one dispatch. This is
-/// the correct WGSL pattern — `var<workgroup>` shared memory does NOT
-/// persist across separate dispatches, so a two-dispatch approach would
-/// leave pass B reading uninitialised memory.
-///
-/// The function is retained for API stability and as a hook in case a
-/// future AST node genuinely needs multi-dispatch (e.g. a node that
-/// requires a global memory fence between phases).
-pub fn requires_two_pass(_root: &AstNode) -> bool {
-    false
-}
-
 /// Emit a full shader module string for the given AST root and pass.
 ///
 /// Most callers should use `emit_shader` (which auto-selects `Pass::Single`
@@ -299,6 +261,59 @@ pub fn requires_two_pass(_root: &AstNode) -> bool {
 ///
 /// Safety: if any referenced name cannot be matched to a block, we fall back
 /// to the full library rather than risk emitting an incomplete module.
+/// Net change in `{`/`}` depth contributed by one WGSL line, skipping
+/// braces inside `//` and `/* */` comments. WGSL block comments do not nest.
+fn brace_delta(line: &str, in_block_comment: &mut bool) -> i32 {
+    let b = line.as_bytes();
+    let mut i = 0;
+    let mut delta = 0i32;
+    while i < b.len() {
+        if *in_block_comment {
+            if i + 1 < b.len() && b[i] == b'*' && b[i + 1] == b'/' {
+                *in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'/' {
+            break;
+        }
+        if i + 1 < b.len() && b[i] == b'/' && b[i + 1] == b'*' {
+            *in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        match b[i] {
+            b'{' => delta += 1,
+            b'}' => delta -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    delta
+}
+
+/// Prune `math_lib.wgsl` down to the top-level items (fn/struct/const)
+/// that are reachable from `usage` (the concatenated shared-decls + prologue
+/// + entry body).
+///
+/// The full lib is ~1000 lines but a given NoiseRouter only references a
+/// fraction of it. Mali-G610 aborts when asked to compile a ~5.4k-line
+/// shader, so shaving unused helpers matters. Blocks are emitted in their
+/// original order, so any declaration-order assumptions stay intact.
+///
+/// A block starts at a top-level (brace depth 0, not inside a comment)
+/// `fn` / `struct` / `const` line. Tracking brace depth means a keyword
+/// appearing inside a function body or a block comment can never be
+/// mistaken for a declaration — the earlier "column-0 prefix" heuristic
+/// could mis-split if the library ever grew such a line.
+///
+/// Safety: the blocks plus the dropped prefix are checked to reconstruct
+/// the library exactly; on any mismatch (or if a referenced name cannot be
+/// matched to a block) we fall back to the full library rather than risk
+/// emitting an incomplete module.
 fn emit_pruned_math_lib(usage: &str) -> String {
     use std::collections::HashSet;
 
@@ -309,34 +324,52 @@ fn emit_pruned_math_lib(usage: &str) -> String {
         text: String,
     }
 
-    // Split into blocks: a block starts at a top-level `fn`/`struct`/`const`
-    // line (column 0) and runs until the next such line.
+    let mut prefix = String::new();
     let mut blocks: Vec<Block> = Vec::new();
     let mut cur = String::new();
     let mut cur_name: Option<String> = None;
+    let mut depth: i32 = 0;
+    let mut in_block_comment = false;
+
     for line in lib.lines() {
-        let is_start = line.starts_with("fn ")
-            || line.starts_with("struct ")
-            || line.starts_with("const ");
-        if is_start {
-            if let Some(n) = cur_name.take() {
-                blocks.push(Block { name: n, text: std::mem::take(&mut cur) });
-            } else {
-                cur.clear(); // drop leading license/comment header
-            }
+        let starts_block = !in_block_comment
+            && depth == 0
+            && (line.starts_with("fn ")
+                || line.starts_with("struct ")
+                || line.starts_with("const "));
+        if starts_block {
             let rest = line.split_whitespace().nth(1).unwrap_or("");
             let name = rest
                 .split(|c: char| !(c.is_alphanumeric() || c == '_'))
                 .next()
                 .unwrap_or("")
                 .to_string();
+            if let Some(prev) = cur_name.take() {
+                blocks.push(Block { name: prev, text: std::mem::take(&mut cur) });
+            } else {
+                prefix = std::mem::take(&mut cur);
+            }
             cur_name = Some(name);
         }
         cur.push_str(line);
         cur.push('\n');
+        depth += brace_delta(line, &mut in_block_comment);
     }
-    if let Some(n) = cur_name.take() {
-        blocks.push(Block { name: n, text: cur });
+    if let Some(prev) = cur_name.take() {
+        blocks.push(Block { name: prev, text: cur });
+    } else {
+        prefix.push_str(&cur);
+    }
+
+    // Lossless-reconstruction guard: header + blocks must equal the source.
+    // Any dropped or duplicated line (e.g. a mis-split) trips this and we
+    // ship the full library instead.
+    let reconstructed: String = prefix
+        .chars()
+        .chain(blocks.iter().flat_map(|b| b.text.chars()))
+        .collect();
+    if reconstructed.trim_end() != lib.trim_end() {
+        return lib.to_string();
     }
 
     let name_set: HashSet<&str> = blocks.iter().map(|b| b.name.as_str()).collect();
@@ -413,7 +446,7 @@ pub fn emit_shader_for_shard(
             ));
         }
         
-        let prologue = MAIN_PASS_C_PROLOGUE.replace("fn main_pass_c(", "fn main_pass_inner(");
+        let prologue = prologue_for(Pass::Inner);
         let mut usage = String::with_capacity(8192);
         usage.push_str(&prologue);
         usage.push_str(&body);
@@ -478,10 +511,22 @@ pub fn emit_shader_for_shard(
         
         // Replace the fixed density `d` with our per-block `d_final` and
         // inject the AST evaluation right after the block's world coordinates.
-        let entry = BLOCK_OUT_ENTRY.replace(
-            "  // §23: add the Beardifier contribution (per block, before the d>0 test).\n  var dd = d;",
-            &format!("{}\n  // §23: add the Beardifier contribution.\n  var dd = d_final;", injected)
+        //
+        // `str::replace` is silent when the needle is absent, which would
+        // ship a shader that ignores the AST (DEVELOPMENT.md §22). Assert the
+        // anchor exists, and assert the substitution actually happened.
+        const BLOCK_OUT_INJECT_ANCHOR: &str =
+            "  // \u{a7}23: add the Beardifier contribution (per block, before the d>0 test).\n  var dd = d;";
+        assert!(
+            BLOCK_OUT_ENTRY.contains(BLOCK_OUT_INJECT_ANCHOR),
+            "block_out.wgsl lost the AST-injection anchor; update \
+             BLOCK_OUT_INJECT_ANCHOR alongside the WGSL"
         );
+        let entry = BLOCK_OUT_ENTRY.replace(
+            BLOCK_OUT_INJECT_ANCHOR,
+            &format!("{}\n  // \u{a7}23: add the Beardifier contribution.\n  var dd = d_final;", injected)
+        );
+        debug_assert!(entry.contains("var dd = d_final;"), "AST injection did not take effect");
         out.push_str(&entry);
         return Ok(out);
     }
@@ -511,15 +556,9 @@ fn emit_shader_inner(root: &AstNode, mut ctx: GenCtx) -> Result<String> {
     emitters::root::emit(root, &mut ctx)?;
 
     // Phase B — assemble final shader source in the correct WGSL order.
-    let prologue = match ctx.pass {
-        Pass::Single => MAIN_ENTRY_PROLOGUE,
-        Pass::A => MAIN_PASS_A_PROLOGUE,
-        Pass::B => MAIN_PASS_B_PROLOGUE,
-        Pass::C => MAIN_PASS_C_PROLOGUE,
-        // BlockOut is emitted by emit_shader_for_shard's early-return path
-        // and never reaches here.
-        Pass::BlockOut | Pass::Inner => unreachable!("BlockOut/Inner handled separately"),
-    };
+    // BlockOut/Inner are emitted by emit_shader_for_shard's early-return
+    // paths and never reach here; prologue_for() still covers them.
+    let prologue = prologue_for(ctx.pass);
 
     // Collect the code that actually *uses* the math library, so we can prune
     // unreferenced helpers out of it.
@@ -528,7 +567,7 @@ fn emit_shader_inner(root: &AstNode, mut ctx: GenCtx) -> Result<String> {
         usage.push_str(decl);
         usage.push('\n');
     }
-    usage.push_str(prologue);
+    usage.push_str(&prologue);
     for line in &ctx.lines {
         usage.push_str(line);
         usage.push('\n');
@@ -543,7 +582,7 @@ fn emit_shader_inner(root: &AstNode, mut ctx: GenCtx) -> Result<String> {
         out.push_str(decl);
         out.push('\n');
     }
-    out.push_str(prologue);
+    out.push_str(&prologue);
     for line in &ctx.lines {
         out.push_str(line);
         out.push('\n');
@@ -575,345 +614,8 @@ pub fn emit_shader(root: &AstNode) -> Result<String> {
 ///   0 = air (d <= 0), 1 = stone (d > 0).
 /// This is the "GPU outputs block states" path; Java only writes the palette.
 /// (Aquifer/vein/beard are NOT applied here yet — this is the minimal loop.)
-const BLOCK_OUT_ENTRY: &str = r#"
-// §23 Beardifier. Layout of beard_pj (per chunk, fixed stride 16 u32):
-//   [0] piece_count, [1] junction_count,
-//   [2..2+7*pc] pieces (7 i32: minX,minY,minZ,maxX,maxY,maxZ,adapt,delta),
-//   junctions follow (3 i32 each).
-const BEARD_STRIDE: u32 = 4096u;
-const BEARD_W_OFF: u32 = 13824u; // 24*24*24, beard_w section length
-const ADAPT_BURY: i32 = 1; const ADAPT_THIN: i32 = 2;
-const ADAPT_BOX: i32 = 3; const ADAPT_ENCAP: i32 = 4;
+const BLOCK_OUT_ENTRY: &str = include_str!("block_out.wgsl");
 
-fn beard_gsw(x: i32, y: i32, z: i32, yy: i32) -> f32 {
-  let i = x + 12; let j = y + 12; let k = z + 12;
-  if (i < 0 || i >= 24 || j < 0 || j >= 24 || k < 0 || k >= 24) { return 0.0; }
-  let d = f32(yy) + 0.5;
-  let e = f32(x * x) + d * d + f32(z * z);
-  // MC uses a double fastInverseSqrt; f32 with exact inverseSqrt is within
-  // ~1e-7 relative, negligible for structure shaping.
-  let f = -d * inverseSqrt(e / 2.0) / 2.0;
-  return f * bitcast<f32>(beard_buf[u32(k * 576 + i * 24 + j)]);
-}
-fn beard_mag(x: f32, y: f32, z: f32) -> f32 {
-  let d = sqrt(x * x + y * y + z * z);
-  return 1.0 - clamp(d / 6.0, 0.0, 1.0);
-}
-fn beard_sample(base: u32, bx: i32, by: i32, bz: i32) -> f32 {
-  let pc = i32(beard_buf[BEARD_W_OFF + base]);
-  let jc = i32(beard_buf[BEARD_W_OFF + base + 1u]);
-  var d = 0.0;
-  var o = base + 2u;
-  for (var n: i32 = 0; n < pc; n = n + 1) {
-    let minx = i32(beard_buf[BEARD_W_OFF + o]); let miny = i32(beard_buf[BEARD_W_OFF + o+1u]);
-    let minz = i32(beard_buf[BEARD_W_OFF + o+2u]); let maxx = i32(beard_buf[BEARD_W_OFF + o+3u]);
-    let maxy = i32(beard_buf[BEARD_W_OFF + o+4u]); let maxz = i32(beard_buf[BEARD_W_OFF + o+5u]);
-    let ad = i32(beard_buf[BEARD_W_OFF + o+6u]); let gld = i32(beard_buf[BEARD_W_OFF + o+7u]);
-    o = o + 8u;
-    let m = max(0, max(minx - bx, bx - maxx));
-    let nn = max(0, max(minz - bz, bz - maxz));
-    let oo = miny + gld;
-    let p = by - oo;
-    var q = 0; if (ad == ADAPT_BURY || ad == ADAPT_THIN) { q = p; }
-    else if (ad == ADAPT_BOX) { q = max(0, max(oo - by, by - maxy)); }
-    else if (ad == ADAPT_ENCAP) { q = max(0, max(miny - by, by - maxy)); }
-    if (ad == ADAPT_BURY) { d = d + beard_mag(f32(m), f32(q) * 0.5, f32(nn)); }
-    else if (ad == ADAPT_THIN || ad == ADAPT_BOX) { d = d + beard_gsw(m, q, nn, p) * 0.8; }
-    else if (ad == ADAPT_ENCAP) { d = d + beard_mag(f32(m) * 0.5, f32(q) * 0.5, f32(nn) * 0.5) * 0.8; }
-  }
-  for (var n: i32 = 0; n < jc; n = n + 1) {
-    let sx = i32(beard_buf[BEARD_W_OFF + o]); let sy = i32(beard_buf[BEARD_W_OFF + o+1u]); let sz = i32(beard_buf[BEARD_W_OFF + o+2u]);
-    o = o + 3u;
-    let r = bx - sx; let l = by - sy; let mm = bz - sz;
-    d = d + beard_gsw(r, l, mm, l) * 0.4;
-  }
-  return d;
-}
-
-fn aq_fdiv(a: i32, b: i32) -> i32 {
-  let q = a / b; let r = a % b;
-  if (r != 0 && ((r < 0) != (b < 0))) { return q - 1; }
-  return q;
-}
-
-fn max_dist(i: i32, a: i32) -> f32 {
-  let d = 25.0;
-  return 1.0 - abs(f32(a - i)) / 25.0;
-}
-
-fn calc_density(
-    wy: i32,
-    lvl_y1: i32, st1: u32,
-    lvl_y2: i32, st2: u32,
-    barrier_val: f32,
-) -> f32 {
-    // MC FluidLevel.getBlockState(y): blocks above the fluid level are AIR.
-    let actual_st1 = select(0u, st1, wy < lvl_y1);
-    let actual_st2 = select(0u, st2, wy < lvl_y2);
-    let is_lava1 = actual_st1 == 3u; let is_water1 = actual_st1 == 2u;
-    let is_lava2 = actual_st2 == 3u; let is_water2 = actual_st2 == 2u;
-    if (is_lava1 && is_water2) || (is_water1 && is_lava2) { return 2.0; }
-    let j = abs(lvl_y1 - lvl_y2);
-    if (j == 0) { return 0.0; }
-    let d = 0.5 * f32(lvl_y1 + lvl_y2);
-    let e = f32(wy) + 0.5 - d;
-    let f = f32(j) / 2.0;
-    let o = f - abs(e);
-    var q: f32 = 0.0;
-    if (e > 0.0) {
-        let p = o;
-        if (p > 0.0) { q = p / 1.5; } else { q = p / 2.5; }
-    } else {
-        let p = 3.0 + o;
-        if (p > 0.0) { q = p / 3.0; } else { q = p / 10.0; }
-    }
-    var r = 0.0;
-    if (q >= -2.0 && q <= 2.0) {
-        r = barrier_val;
-    }
-    return 2.0 * (r + q);
-}
-
-// ── Ore veins (§24) ─────────────────────────────────────────────────
-// Mirrors net.minecraft.world.gen.OreVeinSampler. Runs on blocks the aquifer
-// already classified as solid (density > 0), optionally replacing them with a
-// vein ore / raw-ore / stone variant.
-
-fn vein_clamped_map(v: f32, from_lo: f32, from_hi: f32, to_lo: f32, to_hi: f32) -> f32 {
-  let t = clamp((v - from_lo) / (from_hi - from_lo), 0.0, 1.0);
-  return t * (to_hi - to_lo) + to_lo;
-}
-
-// Trilinearly interpolate channel at `base` for the current block.
-fn tri_at(base: u32, ix: i32, iy: i32, iz: i32, ccx: i32, s: i32,
-          tx: f32, ty: f32, tz: f32) -> f32 {
-  let c000 = out_buf[base + u32(ix + iz * ccx + iy * s)];
-  let c100 = out_buf[base + u32(ix + 1 + iz * ccx + iy * s)];
-  let c010 = out_buf[base + u32(ix + iz * ccx + (iy + 1) * s)];
-  let c110 = out_buf[base + u32(ix + 1 + iz * ccx + (iy + 1) * s)];
-  let c001 = out_buf[base + u32(ix + (iz + 1) * ccx + iy * s)];
-  let c101 = out_buf[base + u32(ix + 1 + (iz + 1) * ccx + iy * s)];
-  let c011 = out_buf[base + u32(ix + (iz + 1) * ccx + (iy + 1) * s)];
-  let c111 = out_buf[base + u32(ix + 1 + (iz + 1) * ccx + (iy + 1) * s)];
-  let x00 = c000 + tx * (c100 - c000);
-  let x10 = c010 + tx * (c110 - c010);
-  let x01 = c001 + tx * (c101 - c001);
-  let x11 = c011 + tx * (c111 - c011);
-  let y0 = x00 + ty * (x10 - x00);
-  let y1 = x01 + ty * (x11 - x01);
-  return y0 + tz * (y1 - y0);
-}
-
-// 0 = not a vein block (leave as stone); otherwise a block-state code 4..9.
-fn vein_state(wx: i32, wy: i32, wz: i32, vt: f32, vr: f32, vg: f32) -> u32 {
-  let is_copper = vt > 0.0;
-  let min_y: i32 = select(-60, 0, is_copper);
-  let max_y: i32 = select(-8, 50, is_copper);
-  let e = abs(vt);
-  let j = max_y - wy;
-  let k = wy - min_y;
-  if (k < 0 || j < 0) { return 0u; }
-  let l = min(j, k);
-  let f = vein_clamped_map(f32(l), 0.0, 20.0, -0.2, 0.0);
-  if (e + f < 0.4) { return 0u; }
-  // randomDeriver.split(wx, wy, wz): Xoroshiro(hashCode ^ seedLo, seedHi).
-  let h = java_hash3(wx, wy, wz);
-  let m = vec2<u32>(h.x ^ params._pad[5], h.y ^ params._pad[6]);
-  var st: vec4<u32> = vec4<u32>(m.x, m.y, params._pad[7], params._pad[8]);
-  if (xoro_next_float(&st) > 0.7) { return 0u; }
-  if (vr >= 0.0) { return 0u; }
-  let g = vein_clamped_map(e, 0.4, 0.6, 0.1, 0.3);
-  if (xoro_next_float(&st) < g && vg > -0.3) {
-    if (xoro_next_float(&st) < 0.02) {
-      return select(9u, 7u, is_copper);   // raw iron : raw copper
-    }
-    return select(8u, 6u, is_copper);     // deepslate iron : copper ore
-  }
-  return select(5u, 4u, is_copper);       // tuff : granite
-}
-
-@compute @workgroup_size(4, 4, 4)
-fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let num_chunks: i32 = params.batch_count_x;
-  let cx_i32: i32 = i32(gid.x);
-  let cy_i32: i32 = i32(gid.y);
-  let cz_i32: i32 = i32(gid.z);
-  let chunk_index: i32 = cz_i32 / 16;
-  let bz: i32 = cz_i32 % 16;
-  let height_i: i32 = i32(params.height_f);
-  if (cx_i32 >= 16 || cy_i32 >= height_i || bz >= 16 || chunk_index >= num_chunks) { return; }
-
-  let cell_w: i32 = i32(params.cell_width);
-  let cell_h: i32 = i32(params.cell_height);
-  let ccx: i32 = 16 / cell_w + 1;
-  let ccz: i32 = 16 / cell_w + 1;
-  let ccy: i32 = height_i / cell_h + 1;
-  let s: i32 = ccx * ccz;
-  let cpc: u32 = u32(ccx * ccy * ccz);
-  let cbase: u32 = u32(chunk_index) * 144u * cpc;
-  let ch11_base: u32 = cbase + 11u * cpc;
-
-  let ix: i32 = cx_i32 / cell_w;
-  let iz: i32 = bz / cell_w;
-  let iy: i32 = cy_i32 / cell_h;
-  let tx: f32 = f32(cx_i32 % cell_w) / f32(cell_w);
-  let tz: f32 = f32(bz % cell_w) / f32(cell_w);
-  let ty: f32 = f32(cy_i32 % cell_h) / f32(cell_h);
-
-  let c000 = out_buf[ch11_base + u32(ix + iz * ccx + iy * s)];
-  let c100 = out_buf[ch11_base + u32(ix + 1 + iz * ccx + iy * s)];
-  let c010 = out_buf[ch11_base + u32(ix + iz * ccx + (iy + 1) * s)];
-  let c110 = out_buf[ch11_base + u32(ix + 1 + iz * ccx + (iy + 1) * s)];
-  let c001 = out_buf[ch11_base + u32(ix + (iz + 1) * ccx + iy * s)];
-  let c101 = out_buf[ch11_base + u32(ix + 1 + (iz + 1) * ccx + iy * s)];
-  let c011 = out_buf[ch11_base + u32(ix + (iz + 1) * ccx + (iy + 1) * s)];
-  let c111 = out_buf[ch11_base + u32(ix + 1 + (iz + 1) * ccx + (iy + 1) * s)];
-
-  let x00 = c000 + tx * (c100 - c000);
-  let x10 = c010 + tx * (c110 - c010);
-  let x01 = c001 + tx * (c101 - c001);
-  let x11 = c011 + tx * (c111 - c011);
-  let y0 = x00 + ty * (x10 - x00);
-  let y1 = x01 + ty * (x11 - x01);
-  let d = y0 + tz * (y1 - y0);
-
-  let per_chunk: u32 = u32(16 * height_i * 16);
-  let bidx: u32 = u32(chunk_index) * per_chunk + u32(cx_i32 + bz * 16 + cy_i32 * 256);
-
-  // §22 aquifer (12-cell scan + FluidLevel). Global block coords:
-  let chunk_cx = positions[chunk_index * 2];
-  let chunk_cz = positions[chunk_index * 2 + 1];
-  let wx: i32 = chunk_cx * 16 + cx_i32;
-  let wz: i32 = chunk_cz * 16 + bz;
-  let wy: i32 = i32(params.min_y_f) + cy_i32;
-
-  // §23: add the Beardifier contribution (per block, before the d>0 test).
-  var dd = d;
-  {
-    let bbase = u32(chunk_index) * BEARD_STRIDE;
-    let bcount = beard_buf[BEARD_W_OFF + bbase];
-    if (bcount > 0u) { dd = dd + beard_sample(bbase, wx, wy, wz); }
-  }
-
-  // §22: per-dimension aquifer mode from params._pad[1..5].
-  let has_aq = params._pad[1];
-  if (has_aq == 0u) {
-    // No aquifers (Nether/End): sea-level semantics, no 12-cell scan.
-    if (dd > 0.0) { block_buf[bidx] = 1u; return; }
-    let sea = i32(params._pad[2]);
-    let dfl = params._pad[3];
-    let lava_y = i32(params._pad[4]);
-    if (wy < min(lava_y, sea)) { block_buf[bidx] = 3u; return; }
-    if (wy < sea) { block_buf[bidx] = dfl; return; }
-    block_buf[bidx] = 0u; return;
-  }
-
-  // d > 0 → solid. MC then lets OreVeinSampler replace solid blocks.
-  if (dd > 0.0) {
-    var st: u32 = 1u;
-    if (params._pad[9] == 1u) {
-      let vt = tri_at(cbase + 12u * cpc, ix, iy, iz, ccx, s, tx, ty, tz);
-      let vr = tri_at(cbase + 13u * cpc, ix, iy, iz, ccx, s, tx, ty, tz);
-      let vg = tri_at(cbase + 14u * cpc, ix, iy, iz, ccx, s, tx, ty, tz);
-      let vs = vein_state(wx, wy, wz, vt, vr, vg);
-      if (vs != 0u) { st = vs; }
-    }
-    block_buf[bidx] = st;
-    return;
-  }
-
-  // FluidLevelSampler: global lava level check.
-  let lava_level = i32(params._pad[4]);
-  if (wy < lava_level) { block_buf[bidx] = 3u; return; }
-
-  let min_y_i = i32(params.min_y_f);
-  let start_y_i = aq_fdiv(min_y_i, 12) - 1;
-  let aq_sy = aq_fdiv(min_y_i + height_i, 12) - aq_fdiv(min_y_i, 12) + 3;
-  let aq_base = chunk_index * aq_sy * 9; // AQ_SX(3) * AQ_SY * AQ_SZ(3)
-  // aquifer_buf holds aq_p in [0, half) and aq_s in [half, 2*half).
-  let aq_half: u32 = params._pad[10];
-
-  let l = aq_fdiv(wx - 5, 16);
-  let m = aq_fdiv(wy + 1, 12);
-  let n = aq_fdiv(wz - 5, 16);
-
-  var o: i32 = 2147483647; var p: i32 = 2147483647; var q: i32 = 2147483647;
-  var ri: i32 = -1; var si: i32 = -1; var ti: i32 = -1;
-  for (var u: i32 = 0; u <= 1; u = u + 1) {
-    for (var v: i32 = -1; v <= 1; v = v + 1) {
-      for (var w: i32 = 0; w <= 1; w = w + 1) {
-        let i = (l + u) - chunk_cx + 1;
-        let j = (m + v) - start_y_i;
-        let k = (n + w) - chunk_cz + 1;
-        if (i < 0 || i >= 3 || k < 0 || k >= 3 || j < 0 || j >= aq_sy) { continue; }
-        let idx = aq_base + (j * 3 + k) * 3 + i;
-        let cp = aquifer_buf[u32(idx)];
-        let ad = cp.x - wx; let ae = cp.y - wy; let af = cp.z - wz;
-        let ag = ad * ad + ae * ae + af * af;
-        if (o >= ag) {
-          q = p; p = o; o = ag;
-          ti = si; si = ri; ri = idx;
-        } else if (p >= ag) {
-          q = p; p = ag;
-          ti = si; si = idx;
-        } else if (q >= ag) {
-          q = ag; ti = idx;
-        }
-      }
-    }
-  }
-  if (ri < 0) { block_buf[bidx] = 1u; return; }
-  
-  let r_lvl = aquifer_buf[u32(ri)].w;
-  let r_st = u32(aquifer_buf[aq_half + u32(ri)].x);
-  let r_actual_st = select(0u, r_st, wy < r_lvl);
-  
-  let dist_op = max_dist(o, p);
-  if (dist_op <= 0.0) { block_buf[bidx] = r_actual_st; return; }
-  
-  if (r_actual_st == 2u && wy - 1 < lava_level) {
-      block_buf[bidx] = r_actual_st; return;
-  }
-  
-  var s_lvl: i32 = r_lvl;
-  var s_st: u32 = r_st;
-  if (si >= 0) {
-    s_lvl = aquifer_buf[u32(si)].w;
-    s_st = u32(aquifer_buf[aq_half + u32(si)].x);
-  }
-  var t_lvl: i32 = r_lvl;
-  var t_st: u32 = r_st;
-  if (ti >= 0) {
-    t_lvl = aquifer_buf[u32(ti)].w;
-    t_st = u32(aquifer_buf[aq_half + u32(ti)].x);
-  }
-  
-  let e_val = dist_op * calc_density(wy, r_lvl, r_st, s_lvl, s_st, barrier_val);
-  if (dd + e_val > 0.0) { block_buf[bidx] = 1u; return; }
-  
-  let dist_oq = max_dist(o, q);
-  if (dist_oq > 0.0) {
-      let g_val = dist_op * dist_oq * calc_density(wy, r_lvl, r_st, t_lvl, t_st, barrier_val);
-      if (dd + g_val > 0.0) { block_buf[bidx] = 1u; return; }
-  }
-  
-  let dist_pq = max_dist(p, q);
-  if (dist_pq > 0.0) {
-      let h_val = dist_op * dist_pq * calc_density(wy, s_lvl, s_st, t_lvl, t_st, barrier_val);
-      if (dd + h_val > 0.0) { block_buf[bidx] = 1u; return; }
-  }
-  
-  block_buf[bidx] = r_actual_st;
-}
-"#;
-
-/// `C2ME_WGPU_BLOCK_OUT=1` enables the block-output shard (§20 minimal loop).
-/// BlockOut is the only GPU write-back path (the CPU density path was
-/// removed as a measured net loss, §20). It is no longer switchable: a
-/// session without it would write empty chunks.
-pub fn block_out_enabled() -> bool {
-    true
-}
 
 const MINIMAL_ENTRY: &str = r#"
 @compute @workgroup_size(4, 4, 4)
@@ -984,19 +686,17 @@ struct WorldgenParams {
 @group(0) @binding(11) var<storage, read>       perm_origin: array<f32>;
 "#;
 
-/// `main_entry` opening (single-pass mode) — sets up `cell_x / cell_y /
-/// cell_z` for the coordinate emitter and `cell_idx` / `cells_per_chunk`
-/// for the root emitter's writeback. 铁律① applied here: world coords
-/// computed in i32 first, then cast to f32 for noise input.
+/// `@compute` entry-point prologue shared by every pass.
 ///
-/// Workgroup layout (phase 3.5):
-///   `@workgroup_size(4, 4, 4)` — one workgroup computes a 4×4×4 cell cube
-///   = 64 invocations. Each invocation handles exactly one cell. The
-///   `local_invocation_id` (`lid`) is exposed as `lx / ly / lz` for
-///   Cache2D / CacheFlat emitters that need workgroup-local indexing.
-const MAIN_ENTRY_PROLOGUE: &str = r#"
+/// All passes (`main_entry`, `main_pass_a/b/c`, `main_pass_inner`) run the
+/// identical cell/chunk coordinate setup and differ only in the function
+/// name, so the body lives here once and is instantiated per pass by
+/// [`prologue_for`]. Keeping a single copy is deliberate: the stride /
+/// origin arithmetic below is the contract with `mc_stride.rs` and the Java
+/// readback layout, and a divergence between passes is a silent data bug.
+const PROLOGUE_TEMPLATE: &str = r#"
 @compute @workgroup_size(4, 4, 4)
-fn main_entry(
+fn __ENTRY__(
   @builtin(global_invocation_id) gid: vec3<u32>,
   @builtin(local_invocation_id)  lid: vec3<u32>,
 ) {
@@ -1051,150 +751,10 @@ fn main_entry(
   let cell_z: f32 = f32(world_z_i32);
 "#;
 
-/// `main_pass_a` opening — same prologue as `main_entry` but the entry
-/// point name is `main_pass_a`. Pass A only writes to shared memory
-/// (handled by the CacheInterpolated emitter); the root emitter's
-/// `out_buf` writes are skipped at the GenCtx level when `pass == Pass::A`.
-const MAIN_PASS_A_PROLOGUE: &str = r#"
-@compute @workgroup_size(4, 4, 4)
-fn main_pass_a(
-  @builtin(global_invocation_id) gid: vec3<u32>,
-  @builtin(local_invocation_id)  lid: vec3<u32>,
-) {
-  let lx: u32 = lid.x;
-  let ly: u32 = lid.y;
-  let lz: u32 = lid.z;
-  let cx_i32: i32 = i32(gid.x);
-  let cy_i32: i32 = i32(gid.y);
-  let cz_i32: i32 = i32(gid.z);
-  let cell_count_x: i32 = 16 / i32(params.cell_width) + 1;
-  let cell_count_z: i32 = 16 / i32(params.cell_width) + 1;
-  let cell_count_y: i32 = i32(params.height_f) / i32(params.cell_height) + 1;
-  let cells_per_chunk: u32 = u32(cell_count_x * cell_count_y * cell_count_z);
-
-  // ── multi-chunk dispatch: gid.z spans cell_count_z × num_chunks ─────
-  // Every chunk in the batch owns a contiguous band of `cell_count_z`
-  // z-slices, so ONE dispatch generates all of them. The chunk's world
-  // origin comes from the `positions` buffer (sorted [cx,cz,...]).
-  let num_chunks: i32 = i32(arrayLength(&positions)) / 2;
-  let chunk_index: i32 = cz_i32 / cell_count_z;
-  let cz_local: i32 = cz_i32 % cell_count_z;
-  if (cx_i32 >= cell_count_x || cy_i32 >= cell_count_y
-      || cz_local >= cell_count_z || chunk_index >= num_chunks) {
-    return;
-  }
-
-  let origin_x: i32 = positions[chunk_index * 2] * 16;
-  let origin_z: i32 = positions[chunk_index * 2 + 1] * 16;
-  // Local cell index within this chunk (MC-native stride).
-  let cell_idx: u32 = u32(cx_i32
-                         + cz_local * cell_count_x
-                         + cy_i32 * cell_count_x * cell_count_z);
-  // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
-  // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
-  let chunk_cell_base: u32 = u32(chunk_index) * 144u * cells_per_chunk;
-  let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
-  let world_z_i32: i32 = origin_z + cz_local * i32(params.cell_width);
-  let world_y_i32: i32 = i32(params.min_y_f) + cy_i32 * i32(params.cell_height);
-  let cell_x: f32 = f32(world_x_i32);
-  let cell_y: f32 = f32(world_y_i32);
-  let cell_z: f32 = f32(world_z_i32);
-"#;
-
-/// `main_pass_b` opening — same as A but entry point is `main_pass_b`.
-/// Pass B reads the shared memory populated by A and writes `out_buf`.
-const MAIN_PASS_B_PROLOGUE: &str = r#"
-@compute @workgroup_size(4, 4, 4)
-fn main_pass_b(
-  @builtin(global_invocation_id) gid: vec3<u32>,
-  @builtin(local_invocation_id)  lid: vec3<u32>,
-) {
-  let lx: u32 = lid.x;
-  let ly: u32 = lid.y;
-  let lz: u32 = lid.z;
-  let cx_i32: i32 = i32(gid.x);
-  let cy_i32: i32 = i32(gid.y);
-  let cz_i32: i32 = i32(gid.z);
-  let cell_count_x: i32 = 16 / i32(params.cell_width) + 1;
-  let cell_count_z: i32 = 16 / i32(params.cell_width) + 1;
-  let cell_count_y: i32 = i32(params.height_f) / i32(params.cell_height) + 1;
-  let cells_per_chunk: u32 = u32(cell_count_x * cell_count_y * cell_count_z);
-
-  // ── multi-chunk dispatch: gid.z spans cell_count_z × num_chunks ─────
-  // Every chunk in the batch owns a contiguous band of `cell_count_z`
-  // z-slices, so ONE dispatch generates all of them. The chunk's world
-  // origin comes from the `positions` buffer (sorted [cx,cz,...]).
-  let num_chunks: i32 = i32(arrayLength(&positions)) / 2;
-  let chunk_index: i32 = cz_i32 / cell_count_z;
-  let cz_local: i32 = cz_i32 % cell_count_z;
-  if (cx_i32 >= cell_count_x || cy_i32 >= cell_count_y
-      || cz_local >= cell_count_z || chunk_index >= num_chunks) {
-    return;
-  }
-
-  let origin_x: i32 = positions[chunk_index * 2] * 16;
-  let origin_z: i32 = positions[chunk_index * 2 + 1] * 16;
-  // Local cell index within this chunk (MC-native stride).
-  let cell_idx: u32 = u32(cx_i32
-                         + cz_local * cell_count_x
-                         + cy_i32 * cell_count_x * cell_count_z);
-  // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
-  // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
-  let chunk_cell_base: u32 = u32(chunk_index) * 144u * cells_per_chunk;
-  let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
-  let world_z_i32: i32 = origin_z + cz_local * i32(params.cell_width);
-  let world_y_i32: i32 = i32(params.min_y_f) + cy_i32 * i32(params.cell_height);
-  let cell_x: f32 = f32(world_x_i32);
-  let cell_y: f32 = f32(world_y_i32);
-  let cell_z: f32 = f32(world_z_i32);
-"#;
-/// `main_pass_c` opening — same prologue as B, entry point `main_pass_c`.
-const MAIN_PASS_C_PROLOGUE: &str = r#"
-@compute @workgroup_size(4, 4, 4)
-fn main_pass_c(
-  @builtin(global_invocation_id) gid: vec3<u32>,
-  @builtin(local_invocation_id)  lid: vec3<u32>,
-) {
-  let lx: u32 = lid.x;
-  let ly: u32 = lid.y;
-  let lz: u32 = lid.z;
-  let cx_i32: i32 = i32(gid.x);
-  let cy_i32: i32 = i32(gid.y);
-  let cz_i32: i32 = i32(gid.z);
-  let cell_count_x: i32 = 16 / i32(params.cell_width) + 1;
-  let cell_count_z: i32 = 16 / i32(params.cell_width) + 1;
-  let cell_count_y: i32 = i32(params.height_f) / i32(params.cell_height) + 1;
-  let cells_per_chunk: u32 = u32(cell_count_x * cell_count_y * cell_count_z);
-
-  // ── multi-chunk dispatch: gid.z spans cell_count_z × num_chunks ─────
-  // Every chunk in the batch owns a contiguous band of `cell_count_z`
-  // z-slices, so ONE dispatch generates all of them. The chunk's world
-  // origin comes from the `positions` buffer (sorted [cx,cz,...]).
-  let num_chunks: i32 = i32(arrayLength(&positions)) / 2;
-  let chunk_index: i32 = cz_i32 / cell_count_z;
-  let cz_local: i32 = cz_i32 % cell_count_z;
-  if (cx_i32 >= cell_count_x || cy_i32 >= cell_count_y
-      || cz_local >= cell_count_z || chunk_index >= num_chunks) {
-    return;
-  }
-
-  let origin_x: i32 = positions[chunk_index * 2] * 16;
-  let origin_z: i32 = positions[chunk_index * 2 + 1] * 16;
-  // Local cell index within this chunk (MC-native stride).
-  let cell_idx: u32 = u32(cx_i32
-                         + cz_local * cell_count_x
-                         + cy_i32 * cell_count_x * cell_count_z);
-  // Chunk-major output base: 16 channels per chunk, so chunk i's channel c
-  // lives at (i*16 + c) * cells_per_chunk. Matches Java's readback layout.
-  let chunk_cell_base: u32 = u32(chunk_index) * 144u * cells_per_chunk;
-  let world_x_i32: i32 = origin_x + cx_i32 * i32(params.cell_width);
-  let world_z_i32: i32 = origin_z + cz_local * i32(params.cell_width);
-  let world_y_i32: i32 = i32(params.min_y_f) + cy_i32 * i32(params.cell_height);
-  let cell_x: f32 = f32(world_x_i32);
-  let cell_y: f32 = f32(world_y_i32);
-  let cell_z: f32 = f32(world_z_i32);
-"#;
-
+/// Instantiate [`PROLOGUE_TEMPLATE`] for `pass`'s entry-point name.
+fn prologue_for(pass: Pass) -> String {
+    PROLOGUE_TEMPLATE.replace("__ENTRY__", pass.entry_point())
+}
 
 #[cfg(test)]
 mod tests {

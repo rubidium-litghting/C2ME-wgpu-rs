@@ -1,26 +1,4 @@
-/*
- * The MIT License (MIT)
- *
- * Copyright (c) 2026 RubidiumLighting
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// SPDX-License-Identifier: MIT
 
 //! Deserialize Java NoiseRouterBlobifier binary format → AstNode.
 //!
@@ -36,14 +14,19 @@
 use anyhow::anyhow;
 
 use crate::Result;
-use crate::ast::AstNode;
-use crate::ast::NoiseType;
-use crate::ast::OctaveSampler;
+use crate::ast::{
+    AstNode, NoiseType, OctaveSampler,
+    TAG_ABS, TAG_ADD, TAG_AQUIFER, TAG_BEARDIFIER, TAG_BIOME_TREE,
+    TAG_CACHE_2D, TAG_CACHE_FLAT, TAG_CACHE_INTERP, TAG_CONSTANT,
+    TAG_CUBE, TAG_DIV, TAG_END_ISLANDS, TAG_EXTERNAL_INPUT,
+    TAG_FIND_TOP_SURF, TAG_FLOOR_DIV, TAG_INPUT_X, TAG_INPUT_Y,
+    TAG_INPUT_Z, TAG_INTERP_NOISE, TAG_INTERP_NOISE_SAMPLER,
+    TAG_INTERVAL_SEL, TAG_MAX, TAG_MIN, TAG_MUL, TAG_NOISE_SAMPLER,
+    TAG_RANGE_CHOICE, TAG_ROOT, TAG_SHIFT, TAG_SHIFTED_NOISE,
+    TAG_SIMPLEX_2D, TAG_SIMPLEX_3D, TAG_SPLINE, TAG_SQRT, TAG_SQUARE,
+    TAG_SQUEEZE, TAG_SUB, TAG_WEIRD_SCALED, TAG_Y_CLAMPED_GRAD,
+};
 
-/// Parse a full blob including header. Returns (Root node, Shape config, BiomeTree).
-///
-/// Protocol layout:
-///   [HEADER 10B] [NODE_TREE (recursive)] [SHAPE_CONFIG 16B] [BIOME_SOURCE (BiomeTree)]
 /// A single Perlin permutation table + its origin offset, as shipped in the
 /// optional PERM_RESOURCE trailer appended by the Java side.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,624 +49,352 @@ pub struct SimplexEntry {
 /// Magic of the SIMPLEX_RESOURCE trailer: "SXRM" little-endian.
 pub const SIMPLEX_MAGIC: u32 = 0x4D52_5358;
 
+/// Bounds-checked little-endian cursor over a blob.
+///
+/// Every read in this module goes through this type, so a truncated or
+/// malformed blob yields an `Err` naming the exact field that ran out of
+/// bytes instead of a `unwrap()` panic or a silent misparse. Adding a new
+/// node no longer requires hand-computing offsets or writing guard checks.
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+
+    fn take(&mut self, n: usize, ctx: &str) -> Result<&'a [u8]> {
+        if self.remaining() < n {
+            return Err(anyhow!(
+                "binary blob deserialize error: truncated payload while parsing {ctx}"
+            ));
+        }
+        let s = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(s)
+    }
+
+    fn u8(&mut self, ctx: &str) -> Result<u8> {
+        Ok(self.take(1, ctx)?[0])
+    }
+    fn u16(&mut self, ctx: &str) -> Result<u16> {
+        Ok(u16::from_le_bytes(self.take(2, ctx)?.try_into().unwrap()))
+    }
+    fn u32(&mut self, ctx: &str) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4, ctx)?.try_into().unwrap()))
+    }
+    fn i32(&mut self, ctx: &str) -> Result<i32> {
+        Ok(i32::from_le_bytes(self.take(4, ctx)?.try_into().unwrap()))
+    }
+    fn i64(&mut self, ctx: &str) -> Result<i64> {
+        Ok(i64::from_le_bytes(self.take(8, ctx)?.try_into().unwrap()))
+    }
+    fn f32(&mut self, ctx: &str) -> Result<f32> {
+        Ok(f32::from_le_bytes(self.take(4, ctx)?.try_into().unwrap()))
+    }
+    fn f64(&mut self, ctx: &str) -> Result<f64> {
+        Ok(f64::from_le_bytes(self.take(8, ctx)?.try_into().unwrap()))
+    }
+}
+
 pub fn deserialize_full(blob: &[u8]) -> Result<(AstNode, ShapeConfig, AstNode)> {
     let (root, shape, biome, _perm, _simplex) = deserialize_full_with_perm(blob)?;
     Ok((root, shape, biome))
 }
 
-/// Like [`deserialize_full`] but also decodes the optional PERM_RESOURCE
-/// trailer. Returns an empty Vec when the trailer is absent.
 pub fn deserialize_full_with_perm(
     blob: &[u8],
 ) -> Result<(AstNode, ShapeConfig, AstNode, Vec<PermEntry>, Vec<SimplexEntry>)> {
-    // 1. check blob.len() >= 10, else Deserialize("truncated header")
-    ensure(blob.len() >= 10, "header")?;
-    // 2. read u32 magic at offset 0, assert == 0x4D433257
-    ensure(blob[0..4] == [0x4D, 0x43, 0x32, 0x57], "magic")?;
-    // 3. read u16 version at offset 4, assert == 1
-    ensure(blob[4..6] == [0x01, 0x00], "version")?;
+    let mut r = Reader::new(blob);
 
-    // 4. parse tree from offset 10 via parse_node
-    let (root, tree_len) = parse_node(blob, 10)?;
-    let mut cursor = 10 + tree_len;
+    // Header: magic(u32) version(u16) reserved([u8;4]).
+    if r.take(4, "header")? != [0x4D, 0x43, 0x32, 0x57] {
+        return Err(anyhow!("binary blob deserialize error: bad magic"));
+    }
+    let version = r.u16("header version")?;
+    if version != 1 {
+        return Err(anyhow!(
+            "binary blob deserialize error: unsupported version {version}"
+        ));
+    }
+    r.take(4, "header reserved")?;
 
-    // 5. parse SHAPE_CONFIG = [min_y:i32, height:i32, cell_width:i32, cell_height:i32]
-    ensure(blob.len() >= cursor + 16, "SHAPE_CONFIG")?;
-    let min_y = i32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap());
-    let height = i32::from_le_bytes(blob[cursor + 4..cursor + 8].try_into().unwrap());
-    let cell_width = i32::from_le_bytes(blob[cursor + 8..cursor + 12].try_into().unwrap());
-    let cell_height = i32::from_le_bytes(blob[cursor + 12..cursor + 16].try_into().unwrap());
-    cursor += 16;
+    // NODE_TREE (Root) — SHAPE_CONFIG — BIOME_SOURCE.
+    let root = parse_node(&mut r)?;
     let shape_cfg = ShapeConfig {
-        min_y,
-        height,
-        cell_width,
-        cell_height,
+        min_y: r.i32("SHAPE_CONFIG min_y")?,
+        height: r.i32("SHAPE_CONFIG height")?,
+        cell_width: r.i32("SHAPE_CONFIG cell_width")?,
+        cell_height: r.i32("SHAPE_CONFIG cell_height")?,
     };
+    let biome_tree = parse_node(&mut r)?;
 
-    // 6. parse BIOME_SOURCE remainder (BiomeTree — tag 0xF0 with its payload)
-    ensure(cursor < blob.len(), "BIOME_SOURCE (empty)")?;
-    let (biome_tree, biome_len) = parse_node(blob, cursor)?;
-    cursor += biome_len;
-    // (allow trailing bytes for future extension; protocol doesn't forbid them)
-    let _ = cursor;
-
-    // 7. optional PERM_RESOURCE trailer, then SIMPLEX_RESOURCE
-    let (perm_entries, after_perm) = parse_perm_resource(blob, cursor).unwrap_or_default();
-    let simplex_entries = parse_simplex_resource(blob, after_perm).unwrap_or_default();
+    // Optional trailers (per-table, then simplex table). Trailing bytes past
+    // them are allowed for future extension.
+    let perm_entries = parse_perm_resource(&mut r).unwrap_or_default();
+    let simplex_entries = parse_simplex_resource(&mut r).unwrap_or_default();
 
     Ok((root, shape_cfg, biome_tree, perm_entries, simplex_entries))
 }
 
-/// Parse the optional PERM_RESOURCE trailer starting at `offset`.
-/// Returns empty Vec when no trailer is present.
-fn parse_perm_resource(blob: &[u8], offset: usize) -> Result<(Vec<PermEntry>, usize)> {
-    if offset + 8 > blob.len() {
-        return Ok((Vec::new(), offset));
+/// Parse the optional PERM_RESOURCE trailer. Returns an empty Vec (and leaves
+/// the cursor untouched) when the trailer is absent.
+fn parse_perm_resource(r: &mut Reader<'_>) -> Result<Vec<PermEntry>> {
+    let saved = r.pos;
+    if r.remaining() < 8 {
+        return Ok(Vec::new());
     }
-    let magic = u32::from_le_bytes(blob[offset..offset + 4].try_into().unwrap());
-    if magic != PERM_MAGIC {
-        return Ok((Vec::new(), offset));
+    if r.u32("PERM_RESOURCE magic")? != PERM_MAGIC {
+        r.pos = saved;
+        return Ok(Vec::new());
     }
-    let count = u32::from_le_bytes(blob[offset + 4..offset + 8].try_into().unwrap()) as usize;
-    let mut cursor = offset + 8;
+    let count = r.u32("PERM_RESOURCE count")? as usize;
     let entry_size = 256 * 4 + 3 * 8;
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(r.remaining() / entry_size));
     for _ in 0..count {
-        if cursor + entry_size > blob.len() {
-            break;
+        if r.remaining() < entry_size {
+            break; // tolerate a truncated trailer
         }
         let mut perm = [0u32; 256];
-        for (i, slot) in perm.iter_mut().enumerate() {
-            let p = cursor + i * 4;
-            *slot = u32::from_le_bytes(blob[p..p + 4].try_into().unwrap());
+        for slot in perm.iter_mut() {
+            *slot = r.u32("PERM_RESOURCE perm")?;
         }
-        cursor += 256 * 4;
         let mut origin = [0f64; 3];
         for slot in origin.iter_mut() {
-            *slot = f64::from_le_bytes(blob[cursor..cursor + 8].try_into().unwrap());
-            cursor += 8;
+            *slot = r.f64("PERM_RESOURCE origin")?;
         }
         out.push(PermEntry { perm, origin });
     }
-    Ok((out, cursor))
+    Ok(out)
 }
 
-/// Parse the optional SIMPLEX_RESOURCE trailer starting at `offset`.
+/// Parse the optional SIMPLEX_RESOURCE trailer.
 /// Each entry is int[512] (2048 B) + 3×f64 origin (24 B) = 2072 B.
-fn parse_simplex_resource(blob: &[u8], offset: usize) -> Result<Vec<SimplexEntry>> {
-    if offset + 8 > blob.len() {
+fn parse_simplex_resource(r: &mut Reader<'_>) -> Result<Vec<SimplexEntry>> {
+    let saved = r.pos;
+    if r.remaining() < 8 {
         return Ok(Vec::new());
     }
-    let magic = u32::from_le_bytes(blob[offset..offset + 4].try_into().unwrap());
-    if magic != SIMPLEX_MAGIC {
+    if r.u32("SIMPLEX_RESOURCE magic")? != SIMPLEX_MAGIC {
+        r.pos = saved;
         return Ok(Vec::new());
     }
-    let count = u32::from_le_bytes(blob[offset + 4..offset + 8].try_into().unwrap()) as usize;
-    let mut cursor = offset + 8;
+    let count = r.u32("SIMPLEX_RESOURCE count")? as usize;
     let entry_size = 512 * 4 + 3 * 8;
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(count.min(r.remaining() / entry_size));
     for _ in 0..count {
-        if cursor + entry_size > blob.len() { break; }
+        if r.remaining() < entry_size {
+            break;
+        }
         let mut perm = [0i32; 512];
         for slot in perm.iter_mut() {
-            *slot = i32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
+            *slot = r.i32("SIMPLEX_RESOURCE perm")?;
         }
         let mut origin = [0f64; 3];
         for slot in origin.iter_mut() {
-            *slot = f64::from_le_bytes(blob[cursor..cursor + 8].try_into().unwrap());
-            cursor += 8;
+            *slot = r.f64("SIMPLEX_RESOURCE origin")?;
         }
         out.push(SimplexEntry { perm, origin });
     }
     Ok(out)
 }
 
-/// Recursively parse one `[tag:u8][payload]` node starting at bytes[offset..].
-/// Returns (node, bytes_consumed).
-pub fn parse_octave_block(bytes: &[u8], cursor: &mut usize) -> Result<OctaveSampler> {
-    let cur = *cursor;
-    let rem = bytes.len().saturating_sub(cur);
-    ensure(rem >= 4 + 4 + 4 + 4, "OctaveSampler header")?;
-    let perm_offset = i32::from_le_bytes(bytes[cur..cur + 4].try_into().unwrap());
-    *cursor += 4;
-    let initial_freq = f32::from_le_bytes(bytes[cur + 4..cur + 8].try_into().unwrap());
-    *cursor += 4;
-    let persistence = f32::from_le_bytes(bytes[cur + 8..cur + 12].try_into().unwrap());
-    *cursor += 4;
-    let octaves = i32::from_le_bytes(bytes[cur + 12..cur + 16].try_into().unwrap());
-    *cursor += 4;
-    if octaves < 0 || octaves > 64 {
+/// Parse one `OctaveBlock` payload:
+///   [perm_offset:i32] [initial_freq:f32] [persistence:f32]
+///   [octaves:i32] [amplitudes: f32 × octaves]
+fn parse_octave_block(r: &mut Reader<'_>) -> Result<OctaveSampler> {
+    let perm_offset = r.i32("OctaveSampler perm_offset")?;
+    let initial_freq = r.f32("OctaveSampler initial_freq")?;
+    let persistence = r.f32("OctaveSampler persistence")?;
+    let octaves = r.i32("OctaveSampler octaves")?;
+    if !(0..=64).contains(&octaves) {
         return Err(anyhow!("OctaveSampler: bogus octaves={octaves}"));
     }
     let n = octaves as usize;
-    let rem = bytes.len().saturating_sub(*cursor);
-    ensure(rem >= n * 4, "OctaveSampler amplitudes")?;
+    let amp_bytes = r.take(n * 4, "OctaveSampler amplitudes")?;
     let mut amplitudes = Vec::with_capacity(n);
-    for i in 0..n {
-        let off = *cursor + i * 4;
-        amplitudes.push(f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()));
+    for chunk in amp_bytes.chunks_exact(4) {
+        amplitudes.push(f32::from_le_bytes(chunk.try_into().unwrap()));
     }
-    *cursor += n * 4;
     Ok(OctaveSampler { perm_offset, initial_freq, persistence, amplitudes })
 }
 
-fn parse_node(bytes: &[u8], offset: usize) -> Result<(AstNode, usize)> {
-    if offset >= bytes.len() {
-        return Err(anyhow!("binary blob deserialize error: unexpected EOF"));
-    }
-    let tag = bytes[offset];
-    let mut cursor = offset + 1;
+// ── Child-parsing helpers ───────────────────────────────────────────────
+// Most nodes are "N recursively parsed children, optionally with scalar
+// payloads interleaved". These helpers collapse the repeated
+// `parse_node(...)?; cursor += len;` boilerplate.
+
+fn sub(r: &mut Reader<'_>) -> Result<Box<AstNode>> {
+    Ok(Box::new(parse_node(r)?))
+}
+
+fn binary(r: &mut Reader<'_>) -> Result<(Box<AstNode>, Box<AstNode>)> {
+    Ok((sub(r)?, sub(r)?))
+}
+
+fn sext(r: &mut Reader<'_>) -> Result<[Box<AstNode>; 6]> {
+    Ok([sub(r)?, sub(r)?, sub(r)?, sub(r)?, sub(r)?, sub(r)?])
+}
+
+/// Recursively parse one `[tag:u8][payload]` node.
+///
+/// Tags are matched against the `TAG_*` constants in [`crate::ast`], which are
+/// the single source of truth shared with `NoiseRouterBlobifier.java` and the
+/// `Hash` impl. Adding a node means adding its constant there and one arm here.
+fn parse_node(r: &mut Reader<'_>) -> Result<AstNode> {
     use AstNode::*;
-    let node = match tag {
-        0x01 => {
-            // Constant(f32) — 4 bytes IEEE 754 LE
-            ensure(bytes.len() >= cursor + 4, "Constant")?;
-            let bits = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
-            Constant(f32::from_bits(bits))
-        }
-        0x02 => InputX,
-        0x03 => InputY,
-        0x04 => InputZ,
+    let tag = r.u8("node tag")?;
+    Ok(match tag {
+        TAG_CONSTANT => Constant(f32::from_bits(r.u32("Constant")?)),
+        TAG_INPUT_X => InputX,
+        TAG_INPUT_Y => InputY,
+        TAG_INPUT_Z => InputZ,
 
-        // ── Binary arithmetic ops (0x10..0x15) ───────────────────────────
-        0x10 => {
-            // Add(a, b)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?;
-            cursor += lb;
-            Add(Box::new(a), Box::new(b))
-        }
-        0x11 => {
-            // Sub(a, b)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?;
-            cursor += lb;
-            Sub(Box::new(a), Box::new(b))
-        }
-        0x12 => {
-            // Mul(a, b)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?;
-            cursor += lb;
-            Mul(Box::new(a), Box::new(b))
-        }
-        0x13 => {
-            // Div(a, b)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?;
-            cursor += lb;
-            Div(Box::new(a), Box::new(b))
-        }
-        0x14 => {
-            // Min(a, b)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?;
-            cursor += lb;
-            Min(Box::new(a), Box::new(b))
-        }
-        0x15 => {
-            // Max(a, b)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?;
-            cursor += lb;
-            Max(Box::new(a), Box::new(b))
-        }
-        0x24 => {
-            // FloorDiv(a, b) — 二元，和 Add 同构
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            let (b, lb) = parse_node(bytes, cursor)?;
-            cursor += lb;
-            FloorDiv(Box::new(a), Box::new(b))
-        }
+        // ── Binary ops ──────────────────────────────────────────────────
+        TAG_ADD => { let (a, b) = binary(r)?; Add(a, b) }
+        TAG_SUB => { let (a, b) = binary(r)?; Sub(a, b) }
+        TAG_MUL => { let (a, b) = binary(r)?; Mul(a, b) }
+        TAG_DIV => { let (a, b) = binary(r)?; Div(a, b) }
+        TAG_MIN => { let (a, b) = binary(r)?; Min(a, b) }
+        TAG_MAX => { let (a, b) = binary(r)?; Max(a, b) }
+        TAG_FLOOR_DIV => { let (a, b) = binary(r)?; FloorDiv(a, b) }
 
-        // ── Unary arithmetic ops (0x20..0x23) ───────────────────────────
-        0x20 => {
-            // Abs(a)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            Abs(Box::new(a))
-        }
-        0x21 => {
-            // Square(a)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            Square(Box::new(a))
-        }
-        0x22 => {
-            // Cube(a)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            Cube(Box::new(a))
-        }
-        0x23 => {
-            // Sqrt(a)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            Sqrt(Box::new(a))
-        }
+        // ── Unary ops ───────────────────────────────────────────────────
+        TAG_ABS => Abs(sub(r)?),
+        TAG_SQUARE => Square(sub(r)?),
+        TAG_CUBE => Cube(sub(r)?),
+        TAG_SQRT => Sqrt(sub(r)?),
+        TAG_SQUEEZE => Squeeze(sub(r)?),
 
-        0x25 => {
-            // Squeeze(a)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            Squeeze(Box::new(a))
-        }
-
-        // ── Noise samplers (0x80..0x90) ───────────────────────────────────
-        0x82 => {
-            // SimplexNoise2D { seed: i64 }
-            ensure(bytes.len() >= cursor + 8, "SimplexNoise2D seed")?;
-            let seed = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-            cursor += 8;
-            SimplexNoise2D { seed }
-        }
-        0x83 => {
-            // SimplexNoise3D { seed: i64 }
-            ensure(bytes.len() >= cursor + 8, "SimplexNoise3D seed")?;
-            let seed = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-            cursor += 8;
-            SimplexNoise3D { seed }
-        }
-        0x84 => {
-            // Payload:
-            //   [type:u8] [flags:u8] [amplitude:f32] [xz_scale:f32] [y_scale:f32]
-            //   [first: OctaveBlock]
-            //   if flags & 1: [second: OctaveBlock]
-            //
-            // OctaveBlock:
-            //   [perm_offset:i32] [lacunarity:f32] [octaves:i32]
-            //   [amplitudes: f32 × octaves]
-            ensure(bytes.len() >= cursor + 1 + 1 + 4 + 4 + 4, "NoiseSampler header")?;
-            let noise_type = match bytes[cursor] {
+        // ── Noise samplers ──────────────────────────────────────────────
+        TAG_SIMPLEX_2D => SimplexNoise2D { seed: r.i64("SimplexNoise2D seed")? },
+        TAG_SIMPLEX_3D => SimplexNoise3D { seed: r.i64("SimplexNoise3D seed")? },
+        TAG_NOISE_SAMPLER => {
+            let noise_type = match r.u8("NoiseSampler type")? {
                 0 => NoiseType::Perlin,
                 1 => NoiseType::Simplex,
-                _ => return Err(anyhow!("unknown noise type in NoiseSampler")),
+                other => return Err(anyhow!("unknown noise type in NoiseSampler: {other}")),
             };
-            cursor += 1;
-            let flags = bytes[cursor];
-            cursor += 1;
-            let amplitude =
-                f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
-            let xz_scale =
-                f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
-            let y_scale =
-                f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
-            let first = parse_octave_block(bytes, &mut cursor)?;
+            let flags = r.u8("NoiseSampler flags")?;
+            let amplitude = r.f32("NoiseSampler amplitude")?;
+            let xz_scale = r.f32("NoiseSampler xz_scale")?;
+            let y_scale = r.f32("NoiseSampler y_scale")?;
+            let first = parse_octave_block(r)?;
             let second = if flags & 1 != 0 {
-                Some(parse_octave_block(bytes, &mut cursor)?)
+                Some(parse_octave_block(r)?)
             } else {
                 None
             };
-            NoiseSampler {
-                noise_type,
-                first,
-                second,
-                amplitude,
-                xz_scale,
-                y_scale,
-            }
+            NoiseSampler { noise_type, first, second, amplitude, xz_scale, y_scale }
         }
-
-        // ── 新增：InterpolatedNoiseSampler (0x90) ──────────────────────
-        0x90 => {
-            // 假设 payload 为一个子节点（输入噪声）
-            let (child, len) = parse_node(bytes, cursor)?;
-            cursor += len;
-            InterpolatedNoiseSampler {
-                child: Box::new(child),
-            }
+        TAG_INTERP_NOISE => InterpolatedNoiseSampler { child: sub(r)? },
+        TAG_SHIFT => {
+            let kind = r.u8("Shift kind")?;
+            Shift { kind, offset: sub(r)? }
         }
-
-        // ── Shift / ShiftA / ShiftB (0xB4) ──────────────────────────────
-        0xB4 => {
-            // [kind:u8] [offset: NoiseSampler node]
-            ensure(bytes.len() >= cursor + 1, "Shift kind")?;
-            let kind = bytes[cursor];
-            cursor += 1;
-            let (offset, lo) = parse_node(bytes, cursor)?;
-            cursor += lo;
-            Shift {
-                kind,
-                offset: Box::new(offset),
-            }
+        TAG_SHIFTED_NOISE => {
+            let xz_scale = r.f32("ShiftedNoise xz_scale")?;
+            let y_scale = r.f32("ShiftedNoise y_scale")?;
+            let shift_x = sub(r)?;
+            let shift_y = sub(r)?;
+            let shift_z = sub(r)?;
+            let noise = sub(r)?;
+            ShiftedNoise { xz_scale, y_scale, shift_x, shift_y, shift_z, noise }
         }
-
-        // ── ShiftedNoise (0xB5) ────────────────────────────────────────
-        0xB5 => {
-            // [xzScale:f32] [yScale:f32] [shiftX][shiftY][shiftZ][noise]
-            ensure(bytes.len() >= cursor + 8, "ShiftedNoise scales")?;
-            let xz_scale = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
-            let y_scale = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
-            let (sx, l1) = parse_node(bytes, cursor)?;
-            cursor += l1;
-            let (sy, l2) = parse_node(bytes, cursor)?;
-            cursor += l2;
-            let (sz, l3) = parse_node(bytes, cursor)?;
-            cursor += l3;
-            let (nz, l4) = parse_node(bytes, cursor)?;
-            cursor += l4;
-            ShiftedNoise {
-                xz_scale,
-                y_scale,
-                shift_x: Box::new(sx),
-                shift_y: Box::new(sy),
-                shift_z: Box::new(sz),
-                noise: Box::new(nz),
-            }
+        TAG_WEIRD_SCALED => {
+            let mapper = r.u8("WeirdScaled mapper")?;
+            let input = sub(r)?;
+            let noise = sub(r)?;
+            WeirdScaledSampler { mapper, input, noise }
         }
+        TAG_INTERP_NOISE_SAMPLER => InterpNoiseSampler {
+            xz_scale: r.f32("InterpNoiseSampler xz_scale")?,
+            y_scale: r.f32("InterpNoiseSampler y_scale")?,
+            xz_factor: r.f32("InterpNoiseSampler xz_factor")?,
+            y_factor: r.f32("InterpNoiseSampler y_factor")?,
+            smear: r.f32("InterpNoiseSampler smear")?,
+            lower_base: r.i32("InterpNoiseSampler lower_base")?,
+            lower_count: r.i32("InterpNoiseSampler lower_count")?,
+            upper_base: r.i32("InterpNoiseSampler upper_base")?,
+            upper_count: r.i32("InterpNoiseSampler upper_count")?,
+            interp_base: r.i32("InterpNoiseSampler interp_base")?,
+            interp_count: r.i32("InterpNoiseSampler interp_count")?,
+        },
 
-        0x86 => {
-            // [mapper:u8] [input: node] [noise: NoiseSampler]
-            ensure(bytes.len() >= cursor + 1, "WeirdScaled mapper")?;
-            let mapper = bytes[cursor];
-            cursor += 1;
-            let (input, l1) = parse_node(bytes, cursor)?;
-            cursor += l1;
-            let (noise, l2) = parse_node(bytes, cursor)?;
-            cursor += l2;
-            WeirdScaledSampler {
-                mapper,
-                input: Box::new(input),
-                noise: Box::new(noise),
-            }
-        }
+        // ── Structure terrain ───────────────────────────────────────────
+        TAG_END_ISLANDS => EndIslands { perm_index: r.i32("EndIslands perm_index")? },
+        TAG_BEARDIFIER => Beardifier { struct_index: r.i32("Beardifier struct_index")? },
 
-        0x87 => {
-            ensure(bytes.len() >= cursor + 40, "InterpNoiseSampler")?;
-            let rd_f = |b: &[u8], o: usize| f32::from_le_bytes(b[o..o+4].try_into().unwrap());
-            let rd_i = |b: &[u8], o: usize| i32::from_le_bytes(b[o..o+4].try_into().unwrap());
-            let xz_scale = rd_f(bytes, cursor); cursor += 4;
-            let y_scale = rd_f(bytes, cursor); cursor += 4;
-            let xz_factor = rd_f(bytes, cursor); cursor += 4;
-            let y_factor = rd_f(bytes, cursor); cursor += 4;
-            let smear = rd_f(bytes, cursor); cursor += 4;
-            let lower_base = rd_i(bytes, cursor); cursor += 4;
-            let lower_count = rd_i(bytes, cursor); cursor += 4;
-            let upper_base = rd_i(bytes, cursor); cursor += 4;
-            let upper_count = rd_i(bytes, cursor); cursor += 4;
-            let interp_base = rd_i(bytes, cursor); cursor += 4;
-            let interp_count = rd_i(bytes, cursor); cursor += 4;
-            InterpNoiseSampler {
-                xz_scale, y_scale, xz_factor, y_factor, smear,
-                lower_base, lower_count, upper_base, upper_count,
-                interp_base, interp_count,
-            }
-        }
-
-        // ── Structure terrain / Shape selection (0xA0..0xB3) ───────────────
-        0xA0 => {
-            // EndIslands { perm_index: i32 }
-            ensure(bytes.len() >= cursor + 4, "EndIslands perm_index")?;
-            let perm_index = i32::from_le_bytes(
-                bytes[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
-            EndIslands { perm_index }
-        }
-
-        // ── 新增：Beardifier (0xA1) ────────────────────────────────────
-        0xA1 => {
-            ensure(bytes.len() >= cursor + 4, "Beardifier struct_index")?;
-            let struct_index = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
-            Beardifier { struct_index }
-        }
-
-        // ── Spline (0xB0) ──────────────────────────────────────────────
-        0xB0 => {
-            // [min:f32][max:f32][count:i32][locations: f32×count]
-            // [derivatives: f32×count][location: node][values: node × count]
-            ensure(bytes.len() >= cursor + 12, "Spline header")?;
-            let _min = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
-            let _max = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
-            let count = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-            cursor += 4;
+        // ── Shape / selection ───────────────────────────────────────────
+        TAG_SPLINE => {
+            // min/max are recomputable from `locations` and are dropped.
+            let _min = r.f32("Spline min")?;
+            let _max = r.f32("Spline max")?;
+            let count = r.i32("Spline count")? as usize;
             let mut locations = Vec::with_capacity(count);
-            for _ in 0..count {
-                ensure(bytes.len() >= cursor + 4, "Spline location")?;
-                locations.push(f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()));
-                cursor += 4;
-            }
+            for _ in 0..count { locations.push(r.f32("Spline location")?); }
             let mut derivatives = Vec::with_capacity(count);
-            for _ in 0..count {
-                ensure(bytes.len() >= cursor + 4, "Spline derivative")?;
-                derivatives.push(f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()));
-                cursor += 4;
-            }
-            let (location, ll) = parse_node(bytes, cursor)?;
-            cursor += ll;
+            for _ in 0..count { derivatives.push(r.f32("Spline derivative")?); }
+            let location = sub(r)?;
             let mut values = Vec::with_capacity(count);
-            for _ in 0..count {
-                let (v, lv) = parse_node(bytes, cursor)?;
-                cursor += lv;
-                values.push(v);
-            }
-            Spline {
-                locations,
-                derivatives,
-                location: Box::new(location),
-                values,
-            }
+            for _ in 0..count { values.push(parse_node(r)?); }
+            Spline { locations, derivatives, location, values }
         }
-
-        0xB1 => {
-            // RangeChoice(input, min, max, in_bounds, out_lo, out_hi)
-            let (input, l1) = parse_node(bytes, cursor)?;
-            cursor += l1;
-            let (min, l2) = parse_node(bytes, cursor)?;
-            cursor += l2;
-            let (max, l3) = parse_node(bytes, cursor)?;
-            cursor += l3;
-            let (in_bounds, l4) = parse_node(bytes, cursor)?;
-            cursor += l4;
-            let (out_lo, l5) = parse_node(bytes, cursor)?;
-            cursor += l5;
-            let (out_hi, l6) = parse_node(bytes, cursor)?;
-            cursor += l6;
+        TAG_RANGE_CHOICE => {
+            let [input, min, max, in_bounds, out_lo, out_hi] = sext(r)?;
             RangeChoice {
-                input: Box::new(input),
-                min: Box::new(min),
-                max: Box::new(max),
-                in_bounds: Box::new(in_bounds),
-                out_of_bounds_lo: Box::new(out_lo),
-                out_of_bounds_hi: Box::new(out_hi),
+                input, min, max, in_bounds,
+                out_of_bounds_lo: out_lo,
+                out_of_bounds_hi: out_hi,
             }
         }
-
-        // ── 新增：IntervalSelect (0xB2) ────────────────────────────────
-        0xB2 => {
-            let (input, l1) = parse_node(bytes, cursor)?;
-            cursor += l1;
-            let (min, l2) = parse_node(bytes, cursor)?;
-            cursor += l2;
-            let (max, l3) = parse_node(bytes, cursor)?;
-            cursor += l3;
-            let (in_bounds, l4) = parse_node(bytes, cursor)?;
-            cursor += l4;
-            let (out_lo, l5) = parse_node(bytes, cursor)?;
-            cursor += l5;
-            let (out_hi, l6) = parse_node(bytes, cursor)?;
-            cursor += l6;
+        TAG_INTERVAL_SEL => {
+            let [input, min, max, in_bounds, out_lo, out_hi] = sext(r)?;
             IntervalSelect {
-                input: Box::new(input),
-                min: Box::new(min),
-                max: Box::new(max),
-                in_bounds: Box::new(in_bounds),
-                out_of_bounds_lo: Box::new(out_lo),
-                out_of_bounds_hi: Box::new(out_hi),
+                input, min, max, in_bounds,
+                out_of_bounds_lo: out_lo,
+                out_of_bounds_hi: out_hi,
             }
         }
+        TAG_Y_CLAMPED_GRAD => YClampedGradient {
+            from_y: r.f32("YClampedGradient from_y")?,
+            to_y: r.f32("YClampedGradient to_y")?,
+            from_value: r.f32("YClampedGradient from_value")?,
+            to_value: r.f32("YClampedGradient to_value")?,
+        },
 
-        // ── 新增：YClampedGradient (0xB3) ──────────────────────────────
-        0xB3 => {
-            ensure(bytes.len() >= cursor + 16, "YClampedGradient")?;
-            let from_y = f32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap());
-            cursor += 4;
-            let to_y = f32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap());
-            cursor += 4;
-            let from_value = f32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap());
-            cursor += 4;
-            let to_value = f32::from_le_bytes(bytes[cursor..cursor+4].try_into().unwrap());
-            cursor += 4;
-            YClampedGradient { from_y, to_y, from_value, to_value }
-        }
+        // ── Caches / surface / aquifer ──────────────────────────────────
+        TAG_CACHE_FLAT => CacheFlat(sub(r)?),
+        TAG_CACHE_2D => Cache2D(sub(r)?),
+        TAG_CACHE_INTERP => CacheInterpolated(sub(r)?),
+        TAG_FIND_TOP_SURF => FindTopSurface {
+            density: sub(r)?,
+            initial: sub(r)?,
+            min_y: r.i32("FindTopSurface min_y")?,
+            max_y: r.i32("FindTopSurface max_y")?,
+        },
+        TAG_AQUIFER => Aquifer { density: sub(r)?, fluid_level: sub(r)? },
 
-        // ── Caches / Surface / Aquifer (0xC0..0xE0) ─────────────────────────
-        0xC0 => {
-            // CacheFlat(child)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            CacheFlat(Box::new(a))
-        }
-        0xC1 => {
-            // Cache2D(child)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            Cache2D(Box::new(a))
-        }
-        0xC2 => {
-            // CacheInterpolated(child)
-            let (a, la) = parse_node(bytes, cursor)?;
-            cursor += la;
-            CacheInterpolated(Box::new(a))
-        }
-        0xD0 => {
-            // FindTopSurface { density, initial, min_y:i32, max_y:i32 }
-            let (density, ld) = parse_node(bytes, cursor)?;
-            cursor += ld;
-            let (initial, li) = parse_node(bytes, cursor)?;
-            cursor += li;
-            ensure(bytes.len() >= cursor + 8, "FindTopSurface min_y/max_y")?;
-            let min_y = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
-            let max_y = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
-            FindTopSurface {
-                density: Box::new(density),
-                initial: Box::new(initial),
-                min_y,
-                max_y,
-            }
-        }
-
-        // ── 新增：Aquifer (0xE0) ────────────────────────────────────────
-        0xE0 => {
-            // 假设有两个子节点：density 和 fluid_level
-            let (density, l1) = parse_node(bytes, cursor)?;
-            cursor += l1;
-            let (fluid_level, l2) = parse_node(bytes, cursor)?;
-            cursor += l2;
-            Aquifer {
-                density: Box::new(density),
-                fluid_level: Box::new(fluid_level),
-            }
-        }
-
-        // ── 新增：BiomeTree (0xF0) ──────────────────────────────────────
-        0xF0 => {
-            // 解析一个种子（i64）作为简单占位
-            ensure(bytes.len() >= cursor + 8, "BiomeTree seed")?;
-            let seed = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-            cursor += 8;
-            BiomeTree { seed }
-        }
-
-        0xFD => {
-            // ExternalInput — a subtree the serializer could not translate;
-            // values come from the external-input buffer (binding 6).
-            ensure(bytes.len() >= cursor + 4, "ExternalInput index")?;
-            let index = i32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
-            cursor += 4;
-            ExternalInput { index }
-        }
-
-        0xFE => {
-            // ROOT — tag 0xFE + channel_count(u16 LE) + [channel_count × recursive nodes]
-            // MC NoiseRouter always has 16 channels but tests can use fewer.
-            ensure(bytes.len() >= cursor + 2, "ROOT channel_count")?;
-            let channel_count = u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().unwrap());
-            cursor += 2;
+        // ── Biome / external / root ─────────────────────────────────────
+        TAG_BIOME_TREE => BiomeTree { seed: r.i64("BiomeTree seed")? },
+        TAG_EXTERNAL_INPUT => ExternalInput { index: r.i32("ExternalInput index")? },
+        TAG_ROOT => {
+            let channel_count = r.u16("ROOT channel_count")?;
             let mut channels = Vec::with_capacity(channel_count as usize);
-            for _ in 0..channel_count {
-                let (child, child_len) = parse_node(bytes, cursor)?;
-                cursor += child_len;
-                channels.push(child);
-            }
+            for _ in 0..channel_count { channels.push(parse_node(r)?); }
             Root(channels)
         }
         // All tags emitted by NoiseRouterBlobifier are handled above.
-        // Unknown tags are a hard error (Java side logs UNSUPPORTED NODE
+        // Unknown tags are a hard error (the Java side logs UNSUPPORTED NODE
         // and falls back to a constant 0, so they should not reach here).
         other => return Err(anyhow!("unsupported AST node tag: 0x{other:02X}")),
-    };
-    Ok((node, cursor - offset))
-}
-
-/// Minimum remaining-bytes check helper.
-fn ensure(have: bool, ctx: &str) -> Result<()> {
-    if have {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "binary blob deserialize error: truncated payload while parsing {ctx}"
-        ))
-    }
+    })
 }
 
 /// MC shape config: min Y, total world height, horizontal & vertical cell size.
@@ -699,6 +410,123 @@ pub struct ShapeConfig {
 mod tests {
     use super::*;
     use crate::ast::AstNode;
+
+    /// Test-only structural encoder for the NoiseRouterBlobifier wire format.
+    ///
+    /// Tests describe the tree shape (`Node::add(Node::input_x(), ...)`) and
+    /// the envelope is emitted here once, instead of hand-assembling byte
+    /// arrays whose offsets drift with the protocol. `roundtrip_simple_root`
+    /// deliberately keeps its raw byte array: it is the independent wire
+    /// canary that catches a builder/parser that drifted together.
+    mod blob {
+        use crate::ast::{
+            TAG_ABS, TAG_ADD, TAG_BIOME_TREE, TAG_CACHE_2D, TAG_CACHE_FLAT,
+            TAG_CACHE_INTERP, TAG_CONSTANT, TAG_END_ISLANDS, TAG_FIND_TOP_SURF,
+            TAG_INPUT_X, TAG_INPUT_Y, TAG_INPUT_Z, TAG_MUL, TAG_RANGE_CHOICE,
+            TAG_ROOT, TAG_SQRT, TAG_SUB,
+        };
+
+        /// A node's serialized bytes: `[tag:u8][payload]`.
+        pub struct Node(Vec<u8>);
+
+        impl Node {
+            fn tagged(tag: u8, payload: impl AsRef<[u8]>) -> Self {
+                let mut v = vec![tag];
+                v.extend_from_slice(payload.as_ref());
+                Node(v)
+            }
+            fn unary(tag: u8, child: Node) -> Self {
+                let mut v = vec![tag];
+                v.extend(child.0);
+                Node(v)
+            }
+            fn binary(tag: u8, a: Node, b: Node) -> Self {
+                let mut v = vec![tag];
+                v.extend(a.0);
+                v.extend(b.0);
+                Node(v)
+            }
+
+            pub fn constant(v: f32) -> Self { Self::tagged(TAG_CONSTANT, v.to_le_bytes()) }
+            pub fn input_x() -> Self { Node(vec![TAG_INPUT_X]) }
+            pub fn input_y() -> Self { Node(vec![TAG_INPUT_Y]) }
+            pub fn input_z() -> Self { Node(vec![TAG_INPUT_Z]) }
+
+            pub fn add(a: Node, b: Node) -> Self { Self::binary(TAG_ADD, a, b) }
+            pub fn sub(a: Node, b: Node) -> Self { Self::binary(TAG_SUB, a, b) }
+            pub fn mul(a: Node, b: Node) -> Self { Self::binary(TAG_MUL, a, b) }
+
+            pub fn abs(a: Node) -> Self { Self::unary(TAG_ABS, a) }
+            pub fn sqrt(a: Node) -> Self { Self::unary(TAG_SQRT, a) }
+
+            pub fn end_islands(perm_index: i32) -> Self {
+                Self::tagged(TAG_END_ISLANDS, perm_index.to_le_bytes())
+            }
+            pub fn cache_flat(c: Node) -> Self { Self::unary(TAG_CACHE_FLAT, c) }
+            pub fn cache_2d(c: Node) -> Self { Self::unary(TAG_CACHE_2D, c) }
+            pub fn cache_interp(c: Node) -> Self { Self::unary(TAG_CACHE_INTERP, c) }
+
+            pub fn range_choice(
+                input: Node, min: Node, max: Node,
+                in_bounds: Node, out_lo: Node, out_hi: Node,
+            ) -> Self {
+                let mut v = vec![TAG_RANGE_CHOICE];
+                for n in [input, min, max, in_bounds, out_lo, out_hi] { v.extend(n.0); }
+                Node(v)
+            }
+            pub fn find_top_surface(density: Node, initial: Node, min_y: i32, max_y: i32) -> Self {
+                let mut v = vec![TAG_FIND_TOP_SURF];
+                v.extend(density.0);
+                v.extend(initial.0);
+                v.extend(min_y.to_le_bytes());
+                v.extend(max_y.to_le_bytes());
+                Node(v)
+            }
+            pub fn root(channels: Vec<Node>) -> Self {
+                let mut v = vec![TAG_ROOT];
+                v.extend((channels.len() as u16).to_le_bytes());
+                for c in channels { v.extend(c.0); }
+                Node(v)
+            }
+            pub fn biome_tree(seed: i64) -> Self {
+                Self::tagged(TAG_BIOME_TREE, seed.to_le_bytes())
+            }
+        }
+
+        /// Envelope assembler: header + root tree + SHAPE_CONFIG + BIOME_SOURCE.
+        pub struct BlobBuilder {
+            root: Node,
+            shape: [i32; 4],
+            biome: Node,
+        }
+
+        pub fn blob(root: Node) -> BlobBuilder {
+            BlobBuilder {
+                root,
+                shape: [-64, 384, 4, 4],
+                biome: Node::biome_tree(0),
+            }
+        }
+
+        impl BlobBuilder {
+            pub fn shape(mut self, min_y: i32, height: i32, cell_width: i32, cell_height: i32) -> Self {
+                self.shape = [min_y, height, cell_width, cell_height];
+                self
+            }
+            pub fn biome(mut self, seed: i64) -> Self {
+                self.biome = Node::biome_tree(seed);
+                self
+            }
+            pub fn build(self) -> Vec<u8> {
+                let mut v = vec![0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0, 0, 0, 0];
+                v.extend(self.root.0);
+                for x in self.shape { v.extend(x.to_le_bytes()); }
+                v.extend(self.biome.0);
+                v
+            }
+        }
+    }
+
 
     // ────────────────────────────────────────────────────────────────────────
     // 测试 blob 字节说明（协议与 deserialize_full / parse_node 严格对齐）：
@@ -854,25 +682,16 @@ mod tests {
 
     // ── 子阶段 2.3-1 算术运算测试 ────────────────────────────────────────
 
-    /// 测试二元算术 op（Add / Sub / Mul）嵌套解析：
+    /// 二元算术 op 嵌套解析：
     ///   ROOT(1ch) = Mul( Add(Constant(1.5), InputX), Sub(InputY, Constant(2.0)) )
     #[test]
     fn test_arithmetic_binary_ops() {
-        let f1p5 = 1.5f32.to_le_bytes();
-        let f2p0 = 2.0f32.to_le_bytes();
-
-        let blob: &[u8] = &[
-            // HEADER 10B
-            0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ROOT(1 ch)
-            0xFE, 0x01, 0x00, // Mul → 0x12
-            0x12, // Add → 0x10
-            0x10, 0x01, f1p5[0], f1p5[1], f1p5[2], f1p5[3], 0x02, // Sub → 0x11
-            0x11, 0x03, 0x01, f2p0[0], f2p0[1], f2p0[2], f2p0[3], // SHAPE_CONFIG 16B
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // BIOME
-            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
-        ];
-
-        let (root, _, _) = deserialize_full(blob).unwrap();
+        use blob::Node;
+        let root = Node::root(vec![Node::mul(
+            Node::add(Node::constant(1.5), Node::input_x()),
+            Node::sub(Node::input_y(), Node::constant(2.0)),
+        )]);
+        let (parsed, _, _) = deserialize_full(&blob::blob(root).build()).unwrap();
 
         let expected = AstNode::Root(vec![AstNode::Mul(
             Box::new(AstNode::Add(
@@ -884,65 +703,45 @@ mod tests {
                 Box::new(AstNode::Constant(2.0)),
             )),
         )]);
-        assert_eq!(root, expected);
+        assert_eq!(parsed, expected);
     }
 
-    /// 测试一元算术 op（Abs / Sqrt）嵌套解析：
+    /// 一元算术 op 嵌套解析：
     ///   ROOT(1ch) = Sqrt( Abs( Sub(InputX, Constant(5.0)) ) )
     #[test]
     fn test_arithmetic_unary_ops() {
-        let f5p0 = 5.0f32.to_le_bytes();
-
-        let blob: &[u8] = &[
-            // HEADER
-            0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ROOT(1 ch)
-            0xFE, 0x01, 0x00, // Sqrt → 0x23
-            0x23, // Abs → 0x20
-            0x20, // Sub(X, 5.0) → 0x11
-            0x11, 0x02, 0x01, f5p0[0], f5p0[1], f5p0[2], f5p0[3], // SHAPE_CONFIG 16B
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // BIOME
-            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
-        ];
-
-        let (root, _, _) = deserialize_full(blob).unwrap();
+        use blob::Node;
+        let root = Node::root(vec![Node::sqrt(Node::abs(Node::sub(
+            Node::input_x(),
+            Node::constant(5.0),
+        )))]);
+        let (parsed, _, _) = deserialize_full(&blob::blob(root).build()).unwrap();
 
         let expected = AstNode::Root(vec![AstNode::Sqrt(Box::new(AstNode::Abs(Box::new(
             AstNode::Sub(Box::new(AstNode::InputX), Box::new(AstNode::Constant(5.0))),
         ))))]);
-        assert_eq!(root, expected);
+        assert_eq!(parsed, expected);
     }
-
-    // ── 子阶段 2.3-2 噪声采样器测试 ──────────────────────────────────────
 
     // ── 子阶段 2.3-3 地形结构 / 形状选择测试 ───────────────────────────────
 
-    /// 测试 EndIslands + RangeChoice(6 子节点嵌套) 组合
+    /// EndIslands + RangeChoice(6 子节点嵌套) 组合
     #[test]
     fn test_shape_selection_tags() {
-        let f64p0 = 64.0f32.to_le_bytes();
-        let f0p0 = 0.0f32.to_le_bytes();
-        let f384 = 384.0f32.to_le_bytes();
-        let f0p5 = 0.5f32.to_le_bytes();
-        let f_neg1 = (-1.0f32).to_le_bytes();
-        let f_p1 = 1.0f32.to_le_bytes();
+        use blob::Node;
+        let root = Node::root(vec![
+            Node::end_islands(5),
+            Node::range_choice(
+                Node::sub(Node::input_y(), Node::constant(64.0)),
+                Node::constant(0.0),
+                Node::constant(384.0),
+                Node::mul(Node::input_z(), Node::constant(0.5)),
+                Node::constant(-1.0),
+                Node::constant(1.0),
+            ),
+        ]);
+        let (parsed, _, _) = deserialize_full(&blob::blob(root).build()).unwrap();
 
-        let blob: &[u8] = &[
-            // HEADER
-            0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // ROOT(2 ch)
-            0xFE, 0x02, 0x00, // ch0: EndIslands(InputX)  → 0xA0
-            0xA0, 0x05, 0x00, 0x00, 0x00, // ch0: EndIslands{perm_index:5}
-            0xB1, // input = Sub(Y, 64.0) → 0x11
-            0x11, 0x03, 0x01, f64p0[0], f64p0[1], f64p0[2], f64p0[3], // min = 0.0
-            0x01, f0p0[0], f0p0[1], f0p0[2], f0p0[3], // max = 384.0
-            0x01, f384[0], f384[1], f384[2], f384[3], // in_bounds = Mul(Z, 0.5)
-            0x12, 0x04, 0x01, f0p5[0], f0p5[1], f0p5[2], f0p5[3], // out_lo = -1.0
-            0x01, f_neg1[0], f_neg1[1], f_neg1[2], f_neg1[3], // out_hi = 1.0
-            0x01, f_p1[0], f_p1[1], f_p1[2], f_p1[3], // SHAPE_CONFIG 16B
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // BIOME
-            0xF0, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00, 0x00,
-        ];
-
-        let (root, _, _) = deserialize_full(blob).unwrap();
         let expected = AstNode::Root(vec![
             AstNode::EndIslands { perm_index: 5 },
             AstNode::RangeChoice {
@@ -960,97 +759,26 @@ mod tests {
                 out_of_bounds_hi: Box::new(AstNode::Constant(1.0)),
             },
         ]);
-        assert_eq!(root, expected);
+        assert_eq!(parsed, expected);
     }
 
     // ── 子阶段 2.3-4 缓存 / 表面 / 含水层测试 ─────────────────────────────
 
-    /// 测试 CacheFlat/Cache2D/CacheInterpolated 三层嵌套 + FindTopSurface i32 解析
+    /// CacheFlat/Cache2D/CacheInterpolated 三层嵌套 + FindTopSurface i32 解析
     #[test]
     fn test_cache_and_surface_tags() {
-        let f0p0 = 0.0f32.to_le_bytes();
-        let min_y_bytes = (-64i32).to_le_bytes();
-        let max_y_bytes = 320i32.to_le_bytes();
+        use blob::Node;
+        let root = Node::root(vec![
+            Node::cache_interp(Node::cache_2d(Node::cache_flat(Node::input_x()))),
+            Node::find_top_surface(
+                Node::input_y(),
+                Node::constant(0.0),
+                -64,
+                320,
+            ),
+        ]);
+        let (parsed, _, _) = deserialize_full(&blob::blob(root).build()).unwrap();
 
-        let blob: &[u8] = &[
-            // HEADER
-            0x4D,
-            0x43,
-            0x32,
-            0x57,
-            0x01,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            // ROOT(2 ch)
-            0xFE,
-            0x02,
-            0x00,
-            // ch0: CacheInterpolated(Cache2D(CacheFlat(InputX)))
-            0xC2,
-            0xC1,
-            0xC0,
-            0x02,
-            // ch1: FindTopSurface (0xD0)
-            0xD0,
-            // density = InputY
-            0x03,
-            // initial = Constant(0.0)
-            0x01,
-            f0p0[0],
-            f0p0[1],
-            f0p0[2],
-            f0p0[3],
-            // min_y = -64
-            min_y_bytes[0],
-            min_y_bytes[1],
-            min_y_bytes[2],
-            min_y_bytes[3],
-            // max_y = 320
-            max_y_bytes[0],
-            max_y_bytes[1],
-            max_y_bytes[2],
-            max_y_bytes[3],
-            // SHAPE_CONFIG 16B
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            // BIOME
-            0xF0,
-            0x15,
-            0xCD,
-            0x5B,
-            0x07,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-            0x15,
-            0xCD,
-            0x5B,
-            0x07,
-            0x00,
-            0x00,
-            0x00,
-            0x00,
-        ];
-
-        let (root, _, _) = deserialize_full(blob).unwrap();
         let expected = AstNode::Root(vec![
             AstNode::CacheInterpolated(Box::new(AstNode::Cache2D(Box::new(AstNode::CacheFlat(
                 Box::new(AstNode::InputX),
@@ -1062,6 +790,41 @@ mod tests {
                 max_y: 320,
             },
         ]);
-        assert_eq!(root, expected);
+        assert_eq!(parsed, expected);
+    }
+
+    // ── Envelope canary ─────────────────────────────────────────────────
+    //
+    // Unlike the structural tests above, this one hand-writes every byte.
+    // It is the independent check that `mod blob`'s envelope (header,
+    // SHAPE_CONFIG, BIOME_SOURCE ordering) matches the protocol as actually
+    // written by NoiseRouterBlobifier.java — if the builder and parser
+    // drift together, this test is what still fails.
+
+    #[test]
+    fn envelope_wire_canary() {
+        use blob::Node;
+        // Same tree as roundtrip_simple_root, built by the builder.
+        let built = blob::blob(Node::root(vec![
+            Node::constant(3.14),
+            Node::input_x(),
+        ]))
+        .shape(-64, 384, 4, 4)
+        .biome(0x0000_0007_5BCD_1500)
+        .build();
+
+        // Independent, hand-written reference for that same tree.
+        let manual: &[u8] = &[
+            0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xFE, 0x02, 0x00,
+            0x01, 0xC3, 0xF5, 0x48, 0x40,
+            0x02,
+            0xC0, 0xFF, 0xFF, 0xFF,
+            0x80, 0x01, 0x00, 0x00,
+            0x04, 0x00, 0x00, 0x00,
+            0x04, 0x00, 0x00, 0x00,
+            0xF0, 0x00, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(built, manual, "mod blob no longer matches the wire format");
     }
 }

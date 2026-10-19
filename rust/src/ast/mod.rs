@@ -1,26 +1,4 @@
-/*
- * The MIT License (MIT)
- *
- * Copyright (c) 2026 RubidiumLighting
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// SPDX-License-Identifier: MIT
 
 //! AST module — intermediate representation of a Minecraft NoiseRouter.
 //!
@@ -69,6 +47,12 @@ pub const TAG_CACHE_INTERP: u8 = 0xC2;
 pub const TAG_FIND_TOP_SURF: u8 = 0xD0;
 pub const TAG_AQUIFER: u8 = 0xE0;
 pub const TAG_BIOME_TREE: u8 = 0xF0;
+pub const TAG_WEIRD_SCALED: u8 = 0x86;
+pub const TAG_INTERP_NOISE_SAMPLER: u8 = 0x87;
+pub const TAG_SHIFTED_NOISE: u8 = 0xB5;
+pub const TAG_SHIFT: u8 = 0xB4;
+pub const TAG_INNER_REF: u8 = 0xED;
+pub const TAG_EXTERNAL_INPUT: u8 = 0xFD;
 pub const TAG_ROOT: u8 = 0xFE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -312,7 +296,7 @@ impl Hash for AstNode {
                 f32_to_hash_bits(*v).hash(state);
             }
 
-            AstNode::InnerRef(i) => { 0xEDu8.hash(state); i.hash(state); }
+            AstNode::InnerRef(i) => { TAG_INNER_REF.hash(state); i.hash(state); }
 
             // ── Inputs ──────────────────────────────────────────────────────
             AstNode::InputX => TAG_INPUT_X.hash(state),
@@ -388,7 +372,6 @@ impl Hash for AstNode {
                 y_scale,
             } => {
                 TAG_NOISE_SAMPLER.hash(state);
-                0x84u8.hash(state);
                 noise_type.hash(state);
                 first.hash(state);
                 second.hash(state);
@@ -405,16 +388,16 @@ impl Hash for AstNode {
                 seed.hash(state);
             }
             AstNode::InterpolatedNoiseSampler { child } => {
-                0x90u8.hash(state);
+                TAG_INTERP_NOISE.hash(state);
                 child.hash(state);
             }
             AstNode::Shift { kind, offset } => {
-                0xB4u8.hash(state);
+                TAG_SHIFT.hash(state);
                 kind.hash(state);
                 offset.hash(state);
             }
             AstNode::WeirdScaledSampler { mapper, input, noise } => {
-                0x86u8.hash(state);
+                TAG_WEIRD_SCALED.hash(state);
                 mapper.hash(state);
                 input.hash(state);
                 noise.hash(state);
@@ -424,7 +407,7 @@ impl Hash for AstNode {
                 lower_base, lower_count, upper_base, upper_count,
                 interp_base, interp_count,
             } => {
-                0x87u8.hash(state);
+                TAG_INTERP_NOISE_SAMPLER.hash(state);
                 for v in [xz_scale, y_scale, xz_factor, y_factor, smear] {
                     f32_to_hash_bits(*v).hash(state);
                 }
@@ -435,7 +418,7 @@ impl Hash for AstNode {
             AstNode::ShiftedNoise {
                 xz_scale, y_scale, shift_x, shift_y, shift_z, noise,
             } => {
-                0xB5u8.hash(state);
+                TAG_SHIFTED_NOISE.hash(state);
                 f32_to_hash_bits(*xz_scale).hash(state);
                 f32_to_hash_bits(*y_scale).hash(state);
                 shift_x.hash(state);
@@ -450,13 +433,13 @@ impl Hash for AstNode {
                 perm_index.hash(state);
             }
             AstNode::Beardifier { struct_index } => {
-                0xA1u8.hash(state);
+                TAG_BEARDIFIER.hash(state);
                 struct_index.hash(state);
             }
 
             // ── Shape / Selection ───────────────────────────────────────────
             AstNode::Spline { locations, derivatives, location, values } => {
-                0xB0u8.hash(state);
+                TAG_SPLINE.hash(state);
                 locations.len().hash(state);
                 for v in locations { f32_to_hash_bits(*v).hash(state); }
                 for v in derivatives { f32_to_hash_bits(*v).hash(state); }
@@ -488,7 +471,7 @@ impl Hash for AstNode {
                 out_of_bounds_lo,
                 out_of_bounds_hi,
             } => {
-                0xB2u8.hash(state);
+                TAG_INTERVAL_SEL.hash(state);
                 input.hash(state);
                 min.hash(state);
                 max.hash(state);
@@ -497,7 +480,7 @@ impl Hash for AstNode {
                 out_of_bounds_hi.hash(state);
             }
             AstNode::YClampedGradient { from_y, to_y, from_value, to_value } => {
-                0xB3u8.hash(state);
+                TAG_Y_CLAMPED_GRAD.hash(state);
                 f32_to_hash_bits(*from_y).hash(state);
                 f32_to_hash_bits(*to_y).hash(state);
                 f32_to_hash_bits(*from_value).hash(state);
@@ -535,19 +518,19 @@ impl Hash for AstNode {
                 density,
                 fluid_level,
             } => {
-                0xE0u8.hash(state);
+                TAG_AQUIFER.hash(state);
                 density.hash(state);
                 fluid_level.hash(state);
             }
 
             // ── Biome ───────────────────────────────────────────────────────
             AstNode::BiomeTree { seed } => {
-                0xF0u8.hash(state);
+                TAG_BIOME_TREE.hash(state);
                 seed.hash(state);
             }
 
             AstNode::ExternalInput { index } => {
-                0xFDu8.hash(state);
+                TAG_EXTERNAL_INPUT.hash(state);
                 index.hash(state);
             }
 

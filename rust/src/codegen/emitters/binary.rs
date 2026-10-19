@@ -1,26 +1,4 @@
-/*
- * The MIT License (MIT)
- *
- * Copyright (c) 2026 RubidiumLighting
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// SPDX-License-Identifier: MIT
 
 use crate::ast::AstNode;
 use crate::codegen::emitters::emit_node;
@@ -30,24 +8,27 @@ use anyhow::anyhow;
 
 pub fn emit(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
     match node {
-        AstNode::Add(a, b) => bin(ctx, a, b, "+"),
-        AstNode::Sub(a, b) => bin(ctx, a, b, "-"),
-        AstNode::Mul(a, b) => bin(ctx, a, b, "*"),
-        AstNode::Div(a, b) => bin(ctx, a, b, "/"),
-        AstNode::Min(a, b) => bin_fn(ctx, a, b, "min"),
-        AstNode::Max(a, b) => bin_fn(ctx, a, b, "max"),
+        AstNode::Add(a, b) => infix(ctx, a, b, "+"),
+        AstNode::Sub(a, b) => infix(ctx, a, b, "-"),
+        AstNode::Mul(a, b) => infix(ctx, a, b, "*"),
+        AstNode::Div(a, b) => infix(ctx, a, b, "/"),
+        AstNode::Min(a, b) => call(ctx, a, b, "min"),
+        AstNode::Max(a, b) => call(ctx, a, b, "max"),
         _ => Err(anyhow!("binary emitter got non-binary node: {node:?}")),
     }
 }
 
-fn bin(ctx: &mut GenCtx, a: &AstNode, b: &AstNode, op: &str) -> Result<String> {
+/// Emit `let v: f32 = <a> <op> <b>;` for WGSL's infix operators.
+fn infix(ctx: &mut GenCtx, a: &AstNode, b: &AstNode, op: &str) -> Result<String> {
     let va = emit_node(a, ctx)?;
     let vb = emit_node(b, ctx)?;
     let var = ctx.fresh_var("bin");
     ctx.emit(format!("let {var}: f32 = {va} {op} {vb};"));
     Ok(var)
 }
-fn bin_fn(ctx: &mut GenCtx, a: &AstNode, b: &AstNode, f: &str) -> Result<String> {
+
+/// Emit `let v: f32 = <f>(<a>, <b>);` for WGSL builtin calls.
+fn call(ctx: &mut GenCtx, a: &AstNode, b: &AstNode, f: &str) -> Result<String> {
     let va = emit_node(a, ctx)?;
     let vb = emit_node(b, ctx)?;
     let var = ctx.fresh_var("bin");
