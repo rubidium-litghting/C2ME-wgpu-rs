@@ -65,9 +65,9 @@ public class ModuleEntryPoint {
                 }
                 LOGGER.warn("[c2me-wgpu] {}, falling back to CPU", dt);
             } else {
-                dt = WgpuThinBinding.getGpuName();
                 st = Status.OK;
-                LOGGER.info("[c2me-wgpu] wgpu acceleration enabled, GPU: {}", dt);
+                dt = "wgpu acceleration enabled";
+                LOGGER.info("[c2me-wgpu] wgpu acceleration enabled");
             }
         } catch (IllegalCallerException e) {
             st = Status.FFM_DISABLED;

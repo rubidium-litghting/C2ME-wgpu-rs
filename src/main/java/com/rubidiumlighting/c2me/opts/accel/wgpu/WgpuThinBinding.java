@@ -39,7 +39,9 @@ import java.nio.ByteBuffer;
 /**
  * Thin Panama FFM binding to the Rust wgpu shared library.
  * <p>
- * 5 downcall handles, handle + poll model, no upcall callbacks.
+ * Downcall handles over a handle + poll model, plus one upcall for Rust log
+ * forwarding. The exact set of downcalls is an internal detail and changes
+ * as features land.
  * All failures throw RuntimeException (fallback catches at Mixin level).
  */
 public class WgpuThinBinding {
@@ -58,7 +60,6 @@ public class WgpuThinBinding {
     private static MethodHandle MH_poll_status;
     private static MethodHandle MH_take_result_blob;
     private static MethodHandle MH_take_block_blob;
-    private static MethodHandle MH_get_gpu_name;
     private static MethodHandle MH_free_result_blob;
     private static MethodHandle MH_set_external_inputs;
     private static MethodHandle MH_set_aquifer_table;
@@ -147,13 +148,6 @@ public class WgpuThinBinding {
                             ValueLayout.JAVA_LONG,
                             ValueLayout.ADDRESS,
                             ValueLayout.ADDRESS
-                    )
-            );
-
-            MH_get_gpu_name = NativeLoader.linker.downcallHandle(
-                    NativeLoader.lookup.find("c2me_wgpu_get_gpu_name").orElseThrow(),
-                    FunctionDescriptor.of(
-                            ValueLayout.ADDRESS          // -> *const c_char (static UTF-8)
                     )
             );
 
@@ -268,36 +262,6 @@ public class WgpuThinBinding {
             } catch (Throwable t) {
                 System.err.println("[c2me-wgpu] create_instance failed: " + t);
             }
-        }
-    }
-
-    public static String getGpuName() {
-        if (MH_get_gpu_name == null) {
-            return "unknown (not linked)";
-        }
-        try {
-            var result = MH_get_gpu_name.invoke();
-            if (result instanceof MemorySegment) {
-                var segment = (MemorySegment) result;
-                if (segment.address() == 0) {
-                    return "unknown (null address)";
-                }
-                // 如果 byteSize 为 0，重新创建一个段，假设长度 256
-                if (segment.byteSize() == 0) {
-                    segment = MemorySegment.ofAddress(segment.address())
-                            .reinterpret(256, Arena.global(), null);
-                }
-                try {
-                    return segment.getString(0);
-                } catch (IndexOutOfBoundsException | IllegalArgumentException e) {
-                    return "unknown (invalid string)";
-                }
-            } else {
-                return "unknown (not a MemorySegment)";
-            }
-        } catch (Throwable t) {
-            t.printStackTrace();
-            return "unknown (exception)";
         }
     }
 

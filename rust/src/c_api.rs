@@ -7,7 +7,7 @@
 //!   • Returns i32 status → 0 PENDING / 1 DONE / 2 ERROR / -1 INVALID_HANDLE
 //!   • All pointer pairs are (ptr, len). No bare un-sized pointers allowed.
 
-use std::ffi::{c_char, CString};
+use std::ffi::c_char;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -81,11 +81,50 @@ fn get_or_create_executor() -> Result<&'static Mutex<ExecutorThread>, String> {
 ///
 /// # Safety
 /// `err_buf` must be null or point to a mutable buffer of `err_buf_len` bytes.
+/// Resolve a world handle to its `Arc<WorldContext>`.
+///
+/// Every `world_h`-taking entry point needs this, and each one previously
+/// inlined `lock().unwrap()` -- a poisoned mutex would panic across the FFI
+/// boundary, which `DEVELOPMENT.md` #24 warns against. Returning `Err`
+/// instead lets callers report a status code.
+fn resolve_world(world_h: i64) -> Result<Arc<WorldContext>, &'static str> {
+    if world_h == 0 {
+        return Err("invalid world handle (null)");
+    }
+    let table = get_handle_table()
+        .lock()
+        .map_err(|_| "world handle table mutex poisoned")?;
+    table
+        .get(&world_h)
+        .cloned()
+        .ok_or("invalid world handle (not found in table)")
+}
+
+/// Borrow an FFI `(ptr, len)` byte buffer as a slice, mapping null/0 to empty.
+///
+/// # Safety
+/// `ptr` must be valid for `len` reads when non-null.
+unsafe fn bytes_from_ffi<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
+    if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    }
+}
+
+/// Install the panic hook that flushes the log before aborting.
+///
+/// # Safety
+/// No memory contract. May be called from any thread; installing the hook
+/// twice is a harmless overwrite. Declared `unsafe` only for FFI symmetry.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_setup_panic_hook() {
     crate::setup_panic_hook();
 }
 
+/// # Safety
+/// `err_buf` must be valid for writes of `err_buf_len` bytes (or null with
+/// `err_buf_len == 0`). It is only touched on the failure path.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn c2me_wgpu_create_instance(
     _features_mask: u64,
@@ -125,10 +164,34 @@ pub unsafe extern "C-unwind" fn c2me_wgpu_create_instance(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_world_destroy(world_h: i64) -> i32 {
     if world_h == 0 { return STATUS_INVALID_HANDLE; }
-    let mut table = get_handle_table().lock().unwrap();
-    if table.remove(&world_h).is_some() { 0 } else { STATUS_INVALID_HANDLE }
+    let mut table = match get_handle_table().lock() {
+        Ok(t) => t,
+        Err(_) => return STATUS_ERROR,
+    };
+    let existed = table.remove(&world_h).is_some();
+    // Release the table lock before dropping the WorldContext: its Drop may
+    // free GPU resources and must not run while the global table is held.
+    drop(table);
+    if !existed {
+        return STATUS_INVALID_HANDLE;
+    }
+    // `world_new` created the handle with `Arc::into_raw(world_arc.clone())`,
+    // so the raw pointer owns one strong reference. The table entry held the
+    // other; removing it dropped that one. Reclaim the raw-pointer reference
+    // here, otherwise every destroyed world leaks its WorldContext.
+    //
+    // SAFETY: `world_h` came from `Arc::into_raw` in `world_new` and is only
+    // converted back here, exactly once (a second call finds no table entry
+    // and returns above without touching the pointer).
+    unsafe { drop(Arc::from_raw(world_h as *const WorldContext)) };
+    0
 }
 
+/// # Safety
+/// `config_blob_ptr` must be valid for `config_blob_len` reads (or null with
+/// len 0). `err_buf` must be valid for writes of `err_buf_len` bytes. The
+/// returned handle owns an `Arc<WorldContext>` and must be released with
+/// [`c2me_wgpu_world_destroy`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_world_new(
     instance_h: i64,
@@ -174,7 +237,16 @@ pub unsafe extern "C" fn c2me_wgpu_world_new(
     // Store in global handle table as Arc<WorldContext>.
     let world_arc = Arc::new(ctx);
     let handle = Arc::into_raw(world_arc.clone()) as i64;
-    let mut table = get_handle_table().lock().unwrap();
+    let mut table = match get_handle_table().lock() {
+        Ok(t) => t,
+        Err(_) => {
+            // Handle was already leaked via into_raw; reclaim it so we do not
+            // leak the WorldContext on a poisoned-table path.
+            unsafe { drop(Arc::from_raw(handle as *const WorldContext)) };
+            unsafe { write_err(err_buf, err_buf_len, "world handle table mutex poisoned") };
+            return 0;
+        }
+    };
     table.insert(handle, world_arc);
     handle
 }
@@ -198,20 +270,11 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
     err_buf: *mut c_char,
     err_buf_len: usize,
 ) -> i64 {
-    if world_h == 0 {
-        unsafe { write_err(err_buf, err_buf_len, "invalid world handle (null)") };
-        return 0;
-    }
-
-    // Retrieve the Arc<WorldContext> from the handle table.
-    let world_arc = {
-        let table = get_handle_table().lock().unwrap();
-        match table.get(&world_h) {
-            Some(arc) => arc.clone(),
-            None => {
-                unsafe { write_err(err_buf, err_buf_len, "invalid world handle (not found in table)") };
-                return 0;
-            }
+    let world_arc = match resolve_world(world_h) {
+        Ok(arc) => arc,
+        Err(msg) => {
+            unsafe { write_err(err_buf, err_buf_len, msg) };
+            return 0;
         }
     };
 
@@ -324,13 +387,25 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
             } else {
                 ResultBlob::from_f32_data(&all_f32s, combined_offsets, chunk_idx)
             };
-            *req_bg.result.lock().unwrap() = Some(result_blob);
+            match req_bg.result.lock() {
+                Ok(mut slot) => *slot = Some(result_blob),
+                Err(_) => {
+                    req_bg.status.store(STATUS_ERROR, Ordering::Release);
+                    return;
+                }
+            }
             // §20 block-state bytes as a separate blob (raw u32, no CRC needed
             // by Java's reader — reuse ResultBlob only as a byte container).
             if !executed.block_data.is_empty() {
                 let bytes: Vec<u8> = executed.block_data.iter()
                     .flat_map(|v| v.to_le_bytes()).collect();
-                *req_bg.block.lock().unwrap() = Some(ResultBlob::from_bytes(bytes));
+                match req_bg.block.lock() {
+                    Ok(mut slot) => *slot = Some(ResultBlob::from_bytes(bytes)),
+                    Err(_) => {
+                        req_bg.status.store(STATUS_ERROR, Ordering::Release);
+                        return;
+                    }
+                }
             }
             req_bg.status.store(STATUS_DONE, Ordering::Release);
         }
@@ -362,6 +437,12 @@ pub extern "C" fn c2me_wgpu_poll_status(request_h: i64) -> i32 {
 /// After this returns successfully, the handle is freed and must not be reused.
 /// Caller reads blob via MemorySegment.reinterpret(len); blob is valid until
 /// the caller drops the segment.
+/// # Safety
+/// `request_h` must be a handle from [`c2me_wgpu_request_chunks`] that has
+/// reached `STATUS_DONE` and has not been passed here before: this call does
+/// `Arc::from_raw` and frees the request. `out_ptr`/`out_len` must be valid
+/// for one write each. The returned blob must be released with
+/// [`c2me_wgpu_free_result_blob`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_take_result_blob(
     request_h: i64,
@@ -380,8 +461,12 @@ pub unsafe extern "C" fn c2me_wgpu_take_result_blob(
     if status != STATUS_DONE {
         return STATUS_ERROR;
     }
-    let Some(blob) = req.result.lock().unwrap().take() else {
-        return -1;
+    let blob = match req.result.lock() {
+        Ok(mut slot) => match slot.take() {
+            Some(b) => b,
+            None => return -1,
+        },
+        Err(_) => return STATUS_ERROR,
     };
     if !blob.verify_crc() {
         return 2;
@@ -397,6 +482,12 @@ pub unsafe extern "C" fn c2me_wgpu_take_result_blob(
 // ---------------------------------------------------------------------------
 // ⑤b Consume the §20 per-block state blob (u32 per block). Same lifetime
 //     rules as take_result_blob.
+/// # Safety
+/// `request_h` must be a live handle from [`c2me_wgpu_request_chunks`],
+/// **not yet** consumed by [`c2me_wgpu_take_result_blob`] (this borrows the
+/// request; that call frees it). `out_ptr`/`out_len` must be valid for one
+/// write each. The returned blob must be released with
+/// [`c2me_wgpu_free_result_blob`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_take_block_blob(
     request_h: i64,
@@ -410,7 +501,13 @@ pub unsafe extern "C" fn c2me_wgpu_take_block_blob(
     // take_result_blob. Two from_raw on one handle would free twice -> UAF.
     let req: &BatchRequest = unsafe { &*(request_h as *const BatchRequest) };
     if req.status.load(Ordering::Acquire) != STATUS_DONE { return STATUS_ERROR; }
-    let Some(blob) = req.block.lock().unwrap().take() else { return -1; };
+    let blob = match req.block.lock() {
+        Ok(mut slot) => match slot.take() {
+            Some(b) => b,
+            None => return -1,
+        },
+        Err(_) => return STATUS_ERROR,
+    };
     let (ptr, len) = blob.into_raw_parts();
     unsafe {
         ptr::write(out_ptr, ptr as *const u8);
@@ -442,15 +539,9 @@ pub unsafe extern "C" fn c2me_wgpu_set_external_inputs(
     data_ptr: *const f32,
     data_len: usize,
 ) -> i32 {
-    if world_h == 0 {
-        return STATUS_INVALID_HANDLE;
-    }
-    let world_arc = {
-        let table = get_handle_table().lock().unwrap();
-        match table.get(&world_h) {
-            Some(arc) => arc.clone(),
-            None => return STATUS_INVALID_HANDLE,
-        }
+    let world_arc = match resolve_world(world_h) {
+        Ok(arc) => arc,
+        Err(_) => return STATUS_INVALID_HANDLE,
     };
     let data: Vec<f32> = if data_ptr.is_null() {
         Vec::new()
@@ -477,21 +568,11 @@ pub unsafe extern "C" fn c2me_wgpu_set_aquifer_table(
     table_ptr: *const u8,
     table_len: usize,
 ) -> i32 {
-    if world_h == 0 {
-        return STATUS_INVALID_HANDLE;
-    }
-    let world_arc = {
-        let table = get_handle_table().lock().unwrap();
-        match table.get(&world_h) {
-            Some(arc) => arc.clone(),
-            None => return STATUS_INVALID_HANDLE,
-        }
+    let world_arc = match resolve_world(world_h) {
+        Ok(arc) => arc,
+        Err(_) => return STATUS_INVALID_HANDLE,
     };
-    let bytes: Vec<u8> = if table_ptr.is_null() {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(table_ptr, table_len) }.to_vec()
-    };
+    let bytes: Vec<u8> = unsafe { bytes_from_ffi(table_ptr, table_len) }.to_vec();
     if let Ok(mut m) = world_arc.aquifer_tables.lock() {
         m.insert((cx, cz), bytes);
     }
@@ -510,13 +591,11 @@ pub unsafe extern "C" fn c2me_wgpu_set_beard_table(
     ptr: *const u8,
     len: usize,
 ) -> i32 {
-    if world_h == 0 { return STATUS_INVALID_HANDLE; }
-    let world_arc = {
-        let table = get_handle_table().lock().unwrap();
-        match table.get(&world_h) { Some(a) => a.clone(), None => return STATUS_INVALID_HANDLE }
+    let world_arc = match resolve_world(world_h) {
+        Ok(arc) => arc,
+        Err(_) => return STATUS_INVALID_HANDLE,
     };
-    let bytes: Vec<u8> = if ptr.is_null() { Vec::new() }
-        else { unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec() };
+    let bytes: Vec<u8> = unsafe { bytes_from_ffi(ptr, len) }.to_vec();
     if let Ok(mut m) = world_arc.beard_tables.lock() { m.insert((cx, cz), bytes); }
     0
 }
@@ -533,16 +612,18 @@ pub unsafe extern "C" fn c2me_wgpu_set_ore_seed(
     seed_lo: i64,
     seed_hi: i64,
 ) -> i32 {
-    if world_h == 0 { return STATUS_INVALID_HANDLE; }
-    let world_arc = {
-        let table = get_handle_table().lock().unwrap();
-        match table.get(&world_h) { Some(a) => a.clone(), None => return STATUS_INVALID_HANDLE }
+    let world_arc = match resolve_world(world_h) {
+        Ok(arc) => arc,
+        Err(_) => return STATUS_INVALID_HANDLE,
     };
     world_arc.set_ore_seed(seed_lo, seed_hi);
     0
 }
 
 /// `has_aquifers`: 0/1. `default_fluid`: 0=air / 2=water / 3=lava.
+/// # Safety
+/// No memory contract: all arguments are by-value. An invalid `world_h`
+/// returns [`STATUS_INVALID_HANDLE`] instead of dereferencing anything.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_set_aquifer_mode(
     world_h: i64,
@@ -551,10 +632,9 @@ pub unsafe extern "C" fn c2me_wgpu_set_aquifer_mode(
     default_fluid: i32,
     lava_level: i32,
 ) -> i32 {
-    if world_h == 0 { return STATUS_INVALID_HANDLE; }
-    let world_arc = {
-        let table = get_handle_table().lock().unwrap();
-        match table.get(&world_h) { Some(a) => a.clone(), None => return STATUS_INVALID_HANDLE }
+    let world_arc = match resolve_world(world_h) {
+        Ok(arc) => arc,
+        Err(_) => return STATUS_INVALID_HANDLE,
     };
     world_arc.set_aquifer_mode(crate::world::world::AquiferMode {
         has_aquifers: has_aquifers != 0,
@@ -575,6 +655,9 @@ pub unsafe extern "C" fn c2me_wgpu_set_log_callback(cb: crate::LogCallback) {
     crate::set_log_callback(cb);
 }
 
+/// # Safety
+/// `ptr` must be valid for `len` reads (or null, which is a no-op). The bytes
+/// are interpreted as UTF-8; invalid UTF-8 is silently ignored.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_set_log_path(ptr: *const u8, len: usize) {
     if ptr.is_null() || len == 0 {
@@ -584,23 +667,6 @@ pub unsafe extern "C" fn c2me_wgpu_set_log_path(ptr: *const u8, len: usize) {
     if let Ok(s) = std::str::from_utf8(bytes) {
         crate::set_log_path(s);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Extra helper: GPU name.
-/// Returns a statically-allocated UTF-8 C string. Caller must NOT free.
-#[unsafe(no_mangle)]
-pub extern "C" fn c2me_wgpu_get_gpu_name() -> *const c_char {
-    let name = match WgpuInstance::instance() {
-        Ok(inst) => inst.adapter_info.name.clone(),
-        Err(_) => "unknown".to_string(),
-    };
-    // 使用 CString 并泄漏，返回指向静态内存的指针
-    let c_str = CString::new(name).unwrap_or_else(|_| CString::new("unknown").unwrap());
-    let ptr = c_str.as_ptr();
-    // 泄漏 CString 防止释放（整个程序生命周期内有效）
-    std::mem::forget(c_str);
-    ptr
 }
 
 // ---------------------------------------------------------------------------

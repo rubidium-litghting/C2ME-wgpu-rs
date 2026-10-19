@@ -599,6 +599,13 @@ impl SingleBatchExecutor {
         batch: &Batch,
         shape: &ShapeConfig,
     ) -> Option<usize> {
+        // Dimensions without aquifers (Nether/End) legitimately have no
+        // tables. Skip the whole expansion: writing padded zero cells would
+        // only make the shader fall through to "no cell found" for every
+        // block, and logging it would spam once per chunk.
+        if !world.aquifer_mode().has_aquifers {
+            return None;
+        }
         let mut aq_p: Vec<[i32; 4]> = Vec::new();
         let mut aq_s: Vec<u32> = Vec::new();
         if let Ok(mut tables) = world.aquifer_tables.lock() {

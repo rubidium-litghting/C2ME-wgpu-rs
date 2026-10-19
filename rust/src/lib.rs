@@ -3,7 +3,7 @@
 //! C2ME wgpu-rs GPU world generation accelerator.
 //!
 //! Architecture (90% Rust / <350 lines Java):
-//!   Java (Panama FFM 5 downcalls, no upcall)
+//!   Java (Panama FFM downcalls; one upcall for Rust->Java log forwarding)
 //!       │ handle + poll model
 //!       ▼
 //!   c_api.rs ─► instance / ast / codegen / world / scheduler / resources / result

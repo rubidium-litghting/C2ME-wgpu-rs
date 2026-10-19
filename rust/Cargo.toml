@@ -30,3 +30,13 @@ rand = "0.10"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+[lints.clippy]
+# Every `pub unsafe extern "C"` function is a contract with the Java side;
+# the obligations must be written next to the signature, not memorised.
+# See DEVELOPMENT.md #24 / #26 for why these boundaries matter here.
+missing_safety_doc = "deny"
+# Kept as a warning: most blocks here are one-line FFI wrappers (`write_err`,
+# `from_raw_parts`) whose obligations are already stated in the enclosing
+# function's `# Safety`. Denying would demand the same comment 27 times.
+undocumented_unsafe_blocks = "warn"
