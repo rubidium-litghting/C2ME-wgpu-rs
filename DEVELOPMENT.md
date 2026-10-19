@@ -97,9 +97,13 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
       4. **Rust 按序号选择**：Rust 内部根据 `gpu_index` 选定设备；若越界或该 GPU 不达标（如缺少必要 feature），则自动回退到默认选卡逻辑（优先集成显卡）。
       5. **ModMenu GUI**：直接读取 Java 内存中缓存的 GPU 列表，通过按钮循环切换 `gpu_index`，无需解析配置文件或注释。
     - 配置文件还需包含：矿脉开关、Beardifier 开关等。
-  - **ModMenu 可选支持（软依赖）**：
-    - 绝不可将 ModMenu 或 Cloth Config 设为强制依赖（Hard Dependency）。
-    - 如果玩家装了 ModMenu，则提供 GUI 配置界面；如果没装，玩家可以通过直接编辑 `config.json` 来修改配置，功能必须正常运作。
+  - **ModMenu 可选支持（软依赖）与零 GUI 依赖**：
+    - 绝不可将 ModMenu、Cloth Config 或其它 GUI 库设为强制依赖（Hard Dependency）。
+    - 仅通过 `modCompileOnly` 引入 ModMenu API。
+    - **不引入任何第三方 GUI 库**。核心界面完全利用 MC 1.20+ 自带的布局系统（`GridWidget`、`DirectionalLayoutWidget`、`ScrollableLayout`）手搓实现。
+    - 封装一个极简的 `WgpuRowHelper`，提供 `addBoolean()`、`addIntSlider()` 等 Builder 方法，供数据驱动动态生成。
+    - 采用“翻页式（Pagination）”或原生滚动条，防止配置项过多溢出屏幕。
+    - 如果玩家装了 ModMenu，则提供图形界面；如果没装，玩家直接修改 `config/c2me-wgpu.json`，功能必须正常运作。
   - **加载界面状态提示（Loading Screen）**：
     - 在方块加载/世界生成界面，通过 Mixin 注入文字提示，告诉玩家当前状态：
       - `[C2ME-wgpu] 正在编译着色器...`
