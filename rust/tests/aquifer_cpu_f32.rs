@@ -4,7 +4,6 @@
 //! 只复现 12-cell 扫描 + 查表 + 分类；barrier 噪声（calculateDensity）先跳过。
 //! 目标：验证控制流框架可复现（接受边界误差）。
 
-use std::collections::HashMap;
 
 const START_X: i32 = -1; const START_Y: i32 = -7; const START_Z: i32 = -1;
 const SIZE_X: i32 = 3;  const SIZE_Z: i32 = 3;

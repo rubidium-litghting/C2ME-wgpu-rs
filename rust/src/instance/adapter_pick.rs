@@ -13,6 +13,10 @@
 //! User can override via the standard wgpu `WGPU_ADAPTER_NAME` env var
 //! (case-insensitive substring match). If set but no adapter matches, we log
 //! and fall back to the priority order below rather than aborting.
+//!
+//! NOTE: every environment variable here will eventually be replaced by the
+//! 0.1.5 config file / GUI. The reads are kept as-is so the migration can be
+//! done variable-by-variable against a known-good reference.
 
 use crate::Result;
 use std::env;
@@ -38,7 +42,12 @@ pub fn pick_best(instance: &wgpu::Instance) -> Result<wgpu::Adapter> {
         }) {
             return Ok(adapter.clone());
         } else {
-            eprintln!("[c2me-wgpu-rs] WGPU_ADAPTER_NAME=\"{}\" matched no adapter; using default priority order", name);
+            let msg = format!(
+                "[c2me-wgpu-rs] WGPU_ADAPTER_NAME=\"{name}\" matched no adapter; using default priority order");
+            #[cfg(test)]
+            eprintln!("{msg}");
+            #[cfg(not(test))]
+            crate::debug_log_line(&msg);
         }
     }
     let priority_order = [

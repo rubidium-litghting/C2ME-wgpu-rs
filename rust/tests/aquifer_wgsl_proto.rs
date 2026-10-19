@@ -6,9 +6,6 @@ fn state_code(s: &str) -> u32 {
     let n = s.rsplit(':').next().unwrap_or(s);
     match n { "air" => 0, "stone" => 1, "water" => 2, "lava" => 3, _ => 0 }
 }
-fn state_name(c: u32) -> &'static str {
-    match c { 0 => "air", 1 => "stone", 2 => "water", 3 => "lava", _ => "?" }
-}
 
 #[test]
 fn aquifer_wgsl_proto() {

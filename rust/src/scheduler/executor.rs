@@ -627,7 +627,12 @@ impl SingleBatchExecutor {
                     // (async race or dimension mismatch). Pad with zeroes so
                     // later chunks keep their stride (the shader falls through
                     // its "no cell found" branch and writes stone) and log it.
-                    eprintln!("missing aquifer table for chunk ({cx}, {cz}); padding");
+                    // In tests the Java side never runs, so `aquifer_tables`
+                    // is always empty -- the absence is expected, not an
+                    // error. Only the production path logs it.
+                    #[cfg(not(test))]
+                    crate::debug_log_line(&format!(
+                        "missing aquifer table for chunk ({cx}, {cz}); padding"));
                     aq_p.resize(before + cells_per_chunk, [0, 0, 0, 0]);
                     aq_s.resize(before + cells_per_chunk, 0);
                 }
@@ -733,6 +738,12 @@ impl ExecutorThread {
     ) -> Result<Self, String> {
         let (sender, receiver) = channel::bounded(4);
 
+        // Startup handshake: the worker owns buffer allocation, which can fail
+        // (OOM, unsupported limit). Without this, spawn() would return Ok while
+        // the thread had already died, and every later request_chunks() would
+        // surface only "executor channel closed" with the real cause lost.
+        let (init_tx, init_rx) = channel::bounded(1);
+
         let handle = thread::Builder::new()
             .name("c2me_wgpu_executor".into())
             .spawn(move || {
@@ -743,18 +754,26 @@ impl ExecutorThread {
                 ) {
                     Ok(e) => e,
                     Err(e) => {
-                        eprintln!("Failed to create executor: {}", e);
+                        let _ = init_tx.send(Err(e));
                         return;
                     }
                 };
+                let _ = init_tx.send(Ok(()));
                 Self::run_loop(&mut executor, &receiver);
             })
             .map_err(|e| format!("failed to spawn executor thread: {e}"))?;
 
-        Ok(Self {
-            handle: Some(handle),
-            sender,
-        })
+        match init_rx.recv() {
+            Ok(Ok(())) => Ok(Self { handle: Some(handle), sender }),
+            Ok(Err(e)) => {
+                let _ = handle.join();
+                Err(format!("executor init failed: {e}"))
+            }
+            Err(_) => {
+                let _ = handle.join();
+                Err("executor thread died during init".to_string())
+            }
+        }
     }
 
     /// Submit a batch synchronously (blocking) and return the result.
