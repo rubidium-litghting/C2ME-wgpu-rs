@@ -74,6 +74,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
 27. **低频偶发失败先抓证据，别倒推**：`world::tests` 里 9 个 GPU 测试各自 `ExecutorThread::spawn` 一套约 600 MB buffer，16 线程并行时资源叠加，集显上约 1/5~1/8 概率偶发失败，且无固定 panic 原文。曾误判为显存 OOM——实际 `vulkaninfo` 显示 device-local budget 4.86 GiB、`dmesg` 无 amdgpu OOM 记录，10 次连跑不复现。生产路径 `get_or_create_executor()` 是 `OnceLock<Mutex<>>` 单 executor + 串行，**游戏运行不受影响**。修复方向（暂缓）：测试改用小 `ExecutorConfig`（batch 实际只有 1~3 个 chunk，却按 64 预分配），或加全局 GPU 锁。复现时务必保留完整 stderr + `free -h` + `mem_info_gtt_used` + `dmesg | tail`。
 
+28. **动地形正确性必须跑 `real_router_vs_vanilla`**：它是唯一对照真实 Minecraft 输出（`src/test/resources/real_router.ref.txt`）的测试，因耗时约 2s 已默认 `#[ignore]`。改动 emitter / aquifer / beard / 矿脉 / 反序列化，或任何会改变 WGSL 数值输出的代码后，必须手动跑 `cd rust && cargo test --lib -- --ignored real_router_vs_vanilla`。其余 84 个测试全绿**不能**替代这一步——它们只验证"CPU 参考实现与 GPU 一致"，不验证"GPU 与 vanilla 一致"（见教训 #20）。
+
 ### 待办与 0.1.5 规划（2026-10-18 更新）
 
 **0.1.4 已完全解决的历史遗留（存档记录）**

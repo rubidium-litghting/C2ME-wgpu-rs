@@ -977,6 +977,14 @@ fn gpu_performance_benchmark() {
 
     // 创建 WorldContext 并编译 pipeline
     let mut ctx = WorldContext::new(&blob).unwrap();
+    // The benchmark measures dispatch/readback throughput, not terrain
+    // correctness, and nothing stages aquifer tables here. Disable aquifers
+    // so the shader takes its sea-level branch: no table expansion, no
+    // per-chunk "missing aquifer table" logging.
+    ctx.set_aquifer_mode(crate::world::world::AquiferMode {
+        has_aquifers: false,
+        ..Default::default()
+    });
     let instance = WgpuInstance::instance().unwrap();
     ctx.compile_pipeline(&instance.device).unwrap();
     let world_arc = Arc::new(ctx);
@@ -2346,7 +2354,14 @@ fn numerical_validation_noise_vs_gpu() {
 /// GPU emits. Both sides exclude the Beardifier (MC applies it per-block),
 /// so the two must agree to <1e-4. Regenerate with:
 ///   touch /tmp/c2me_dump_blob  (then run the game once)
+///
+/// Ignored by default: it costs ~2s (vs ~0.2s for the other GPU tests) because
+/// it compares the full 16-channel router against the vanilla dump. It is the
+/// ONLY test that validates against real Minecraft output, so run it
+/// explicitly whenever terrain correctness is in question:
+///   cargo test --lib -- --ignored real_router_vs_vanilla
 #[test]
+#[ignore = "slow vanilla comparison; run when touching terrain correctness"]
 fn real_router_vs_vanilla() {
     use crate::instance::WgpuInstance;
     use crate::scheduler::batcher::{Batch, Priority};

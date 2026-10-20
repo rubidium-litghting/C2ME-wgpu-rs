@@ -189,6 +189,12 @@ blob dump 也可以通过 JVM 属性 `-Dc2me.dumpBlob=<path>` 设置；当该属
 
 ### 运行测试的注意事项
 
+**动地形相关代码后必须额外跑对照测试。** `real_router_vs_vanilla` 是唯一验证 GPU 输出与真实 Minecraft 一致的测试，因耗时约 2 秒已默认忽略。改动 emitter、aquifer、beard、矿脉或反序列化后请手动执行：
+
+```
+cd rust && cargo test --lib -- --ignored real_router_vs_vanilla
+```
+
 `cargo test` 在集成显卡上可能偶发 GPU 测试失败（约每 5~8 次一次）。原因是测试为每个用例单独创建 executor（各约 600 MB GPU buffer），并行执行时资源叠加；这是测试架构问题，与游戏运行路径无关——游戏内只有一个 executor 且由 Mutex 串行化。若复现，请附完整 `cargo test` 输出以便定位。
 
 ---
