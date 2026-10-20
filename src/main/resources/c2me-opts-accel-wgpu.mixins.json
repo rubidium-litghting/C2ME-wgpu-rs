@@ -9,7 +9,8 @@
     "SimplexNoiseSamplerAccessor",
     "ChunkNoiseSamplerAccessor",
     "NoiseChunkGeneratorInvoker",
-    "AquiferImplAccessor"
+    "AquiferImplAccessor",
+    "XoroshiroSplitterAccessor"
   ],
   "client": [
     "client.MixinMinecraftClientNotify"
