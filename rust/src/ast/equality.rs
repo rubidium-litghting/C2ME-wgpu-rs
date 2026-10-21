@@ -13,11 +13,22 @@ use rustc_hash::FxHasher;
 
 use crate::ast::AstNode;
 
-/// Hash an AST subtree using FxHash32.
+/// Hash an AST subtree using FxHash32 (truncated).
+///
+/// Used for the pipeline-cache key, which is a `u32` fingerprint.
 pub fn hash_ast(node: &AstNode) -> u32 {
+    hash_ast_u64(node) as u32
+}
+
+/// Full-width FxHash64 of an AST subtree.
+///
+/// Used by the optimizer passes (CSE, normalize) where a 32-bit hash would
+/// make accidental collisions between distinct subtrees likely enough to
+/// matter. Both passes previously carried an identical private copy.
+pub fn hash_ast_u64(node: &AstNode) -> u64 {
     let mut hasher = FxHasher::default();
     node.hash(&mut hasher);
-    hasher.finish() as u32
+    hasher.finish()
 }
 
 // AstNode already derives PartialEq for structural equality.

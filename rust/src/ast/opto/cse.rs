@@ -23,8 +23,8 @@
 //! its expression ID.
 
 use crate::ast::AstNode;
+use crate::ast::equality::hash_ast_u64;
 use rustc_hash::FxHashMap;
-use std::hash::{Hash, Hasher};
 
 pub fn eliminate(root: AstNode) -> AstNode {
     let mut table: FxHashMap<u64, AstNode> = FxHashMap::default();
@@ -33,20 +33,13 @@ pub fn eliminate(root: AstNode) -> AstNode {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn fingerprint(n: &AstNode) -> u64 {
-    use rustc_hash::FxHasher;
-    let mut h = FxHasher::default();
-    n.hash(&mut h);
-    h.finish()
-}
-
 fn rec(node: AstNode, table: &mut FxHashMap<u64, AstNode>) -> AstNode {
     // 1. Post-order: dedup children first
     let child_deduped = postorder_map(node, |child| rec(child, table));
 
     // 2. Now compute fp of the child-deduped node. If we've already stored an
     //    exactly-equal node for this fp, return the stored clone.
-    let fp = fingerprint(&child_deduped);
+    let fp = hash_ast_u64(&child_deduped);
     match table.entry(fp) {
         std::collections::hash_map::Entry::Occupied(o) => o.get().clone(),
         std::collections::hash_map::Entry::Vacant(v) => {
@@ -159,10 +152,7 @@ where
 mod tests {
     use super::*;
     use AstNode::*;
-
-    fn boxed(n: AstNode) -> Box<AstNode> {
-        Box::new(n)
-    }
+    use crate::ast::opto::test_support::boxed;
 
     /// Simple case: two structurally equal but separately-constructed
     /// subtrees inside a Root — after CSE, both children resolve to the
@@ -185,7 +175,7 @@ mod tests {
             assert_eq!(v[0], v[1]);
             // 2) Both must produce the same fingerprint — which is the
             //    actual invariant we use in `table.entry(fp)` matching.
-            assert_eq!(fingerprint(&v[0]), fingerprint(&v[1]));
+            assert_eq!(hash_ast_u64(&v[0]), hash_ast_u64(&v[1]));
         } else {
             panic!("expected Root output");
         }
@@ -230,8 +220,8 @@ mod tests {
         let x = Add(boxed(InputX), boxed(InputY));
         let y = Mul(boxed(InputX), boxed(InputY));
         assert_ne!(
-            fingerprint(&x),
-            fingerprint(&y),
+            hash_ast_u64(&x),
+            hash_ast_u64(&y),
             "Add and Mul with same children must have different fingerprints"
         );
         let root = Root(vec![x, y]);

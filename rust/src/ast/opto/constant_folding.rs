@@ -212,10 +212,7 @@ fn rec(node: AstNode) -> AstNode {
 mod tests {
     use super::*;
     use AstNode::*;
-
-    fn boxed(n: AstNode) -> Box<AstNode> {
-        Box::new(n)
-    }
+    use crate::ast::opto::test_support::boxed;
 
     #[test]
     fn fold_scalar_constants() {

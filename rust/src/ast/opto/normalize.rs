@@ -15,8 +15,7 @@
 //! KahanSum for long chains (see issue tracker).
 
 use crate::ast::AstNode;
-use rustc_hash::FxHasher;
-use std::hash::{Hash, Hasher};
+use crate::ast::equality::hash_ast_u64;
 
 pub fn canonicalize(root: AstNode) -> AstNode {
     rec(root)
@@ -118,17 +117,11 @@ where
 {
     let fa = rec(a);
     let fb = rec(b);
-    if fingerprint(&fa) <= fingerprint(&fb) {
+    if hash_ast_u64(&fa) <= hash_ast_u64(&fb) {
         ctor(Box::new(fa), Box::new(fb))
     } else {
         ctor(Box::new(fb), Box::new(fa))
     }
-}
-
-fn fingerprint(n: &AstNode) -> u64 {
-    let mut h = FxHasher::default();
-    n.hash(&mut h);
-    h.finish()
 }
 
 // ======================================================================
@@ -138,10 +131,7 @@ fn fingerprint(n: &AstNode) -> u64 {
 mod tests {
     use super::*;
     use AstNode::*;
-
-    fn boxed(n: AstNode) -> Box<AstNode> {
-        Box::new(n)
-    }
+    use crate::ast::opto::test_support::boxed;
 
     /// Basic canonicalization: the two operand orders collapse into one.
     #[test]

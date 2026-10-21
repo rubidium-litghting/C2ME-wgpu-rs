@@ -29,3 +29,15 @@ pub fn run_pipeline(root: AstNode) -> Result<AstNode> {
     let n = dce::strip_dead(n);
     Ok(n)
 }
+
+/// Helpers shared by the pass test modules.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::ast::AstNode;
+
+    /// Box a node, so test expressions read as `Add(boxed(InputX), boxed(..))`
+    /// instead of `Box::new(...)` at every site.
+    pub(crate) fn boxed(n: AstNode) -> Box<AstNode> {
+        Box::new(n)
+    }
+}

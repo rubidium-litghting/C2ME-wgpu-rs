@@ -55,8 +55,7 @@ pub fn strip_dead(root: AstNode) -> AstNode {
 mod tests {
     use super::*;
     use AstNode::*;
-
-    fn boxed(n: AstNode) -> Box<AstNode> { Box::new(n) }
+    use crate::ast::opto::test_support::boxed;
 
     /// DCE must be the identity function: the AST round-trips unchanged.
     #[test]
