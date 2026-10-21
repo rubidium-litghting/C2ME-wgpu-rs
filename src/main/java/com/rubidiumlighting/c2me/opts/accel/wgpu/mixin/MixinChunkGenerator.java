@@ -654,17 +654,21 @@ public abstract class MixinChunkGenerator {
             // addDebugInfo() hook (no reflection on obfuscated fields).
             if (settings.oreVeins()) {
                 try {
-                    StringBuilder sb = new StringBuilder();
-                    noiseConfig.getOreRandomDeriver().addDebugInfo(sb);
-                    java.util.regex.Matcher m = java.util.regex.Pattern
-                            .compile("seedLo: (-?\\d+), seedHi: (-?\\d+)")
-                            .matcher(sb);
-                    if (m.find()) {
-                        WgpuThinBinding.setOreSeed(world,
-                                Long.parseLong(m.group(1)), Long.parseLong(m.group(2)));
+                    // Read the splitter's seed words directly. The previous
+                    // addDebugInfo() + regex route ties ore placement to the
+                    // wording of a debug formatter that Minecraft does not
+                    // guarantee -- the same hazard already fixed for the
+                    // aquifer seed.
+                    net.minecraft.util.math.random.RandomSplitter deriver =
+                            noiseConfig.getOreRandomDeriver();
+                    if (deriver instanceof
+                            net.minecraft.util.math.random.Xoroshiro128PlusPlusRandom.Splitter sp) {
+                        XoroshiroSplitterAccessor acc = (XoroshiroSplitterAccessor) (Object) sp;
+                        WgpuThinBinding.setOreSeed(world, acc.c2me$getSeedLo(), acc.c2me$getSeedHi());
                         LOGGER.info("[c2me-wgpu] ore-vein seed staged");
                     } else {
-                        LOGGER.warn("[c2me-wgpu] could not parse ore seed from '{}'", sb);
+                        LOGGER.warn("[c2me-wgpu] unexpected ore splitter type {}; "
+                                + "ore veins stay on CPU", deriver.getClass().getName());
                     }
                 } catch (Throwable t) {
                     LOGGER.warn("[c2me-wgpu] ore seed staging failed", t);

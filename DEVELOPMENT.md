@@ -100,7 +100,6 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
       3. **FFM 传参**：创建世界时，Java 呼叫 `c2me_wgpu_create_instance` 并传入选定的 `gpu_index`。
       4. **Rust 按序号选择**：Rust 内部根据 `gpu_index` 选定设备；若越界或该 GPU 不达标（如缺少必要 feature），则自动回退到默认选卡逻辑（优先集成显卡）。
       5. **ModMenu GUI**：直接读取 Java 内存中缓存的 GPU 列表，通过按钮循环切换 `gpu_index`，无需解析配置文件或注释。
-    - 配置文件还需包含：矿脉开关、Beardifier 开关等。
   - **ModMenu 可选支持（软依赖）与零 GUI 依赖**：
     - 绝不可将 ModMenu、Cloth Config 或其它 GUI 库设为强制依赖（Hard Dependency）。
     - 仅通过 `modCompileOnly` 引入 ModMenu API。
