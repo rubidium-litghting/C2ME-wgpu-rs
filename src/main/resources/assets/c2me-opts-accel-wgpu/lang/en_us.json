@@ -1,0 +1,9 @@
+{
+  "c2me-opts-accel-wgpu.notify.ffm_disabled": "Panama FFM is not enabled; GPU acceleration is unavailable.",
+  "c2me-opts-accel-wgpu.notify.ffm_disabled.hint": "\n  Add JVM argument: --enable-native-access=com.rubidiumlighting.c2me.opts.accel.wgpu",
+  "c2me-opts-accel-wgpu.notify.native_unavailable": "No native library is available for this platform; GPU acceleration is unavailable.",
+  "c2me-opts-accel-wgpu.notify.init_failed": "wgpu initialization failed, falling back to CPU: %s",
+  "c2me-opts-accel-wgpu.notify.gc_hint": "ZGC is not in use; chunk generation may slow down due to GC pauses.",
+  "c2me-opts-accel-wgpu.notify.gc_hint.hint": "\n  Suggested JVM argument: -XX:+UseZGC",
+  "c2me-opts-accel-wgpu.notify.dim_fallback": "This dimension fell back to CPU: the GPU cannot handle this terrain (%s)"
+}

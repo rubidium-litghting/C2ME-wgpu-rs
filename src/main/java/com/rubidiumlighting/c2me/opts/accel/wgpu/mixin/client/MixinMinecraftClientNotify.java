@@ -52,13 +52,14 @@ public class MixinMinecraftClientNotify {
         if (mc.inGameHud == null) return;
         ChatHud chat = mc.inGameHud.getChatHud();
         if (chat == null) return;
-        String m;
-        while ((m = WgpuFallbackNotice.poll()) != null) {
-            chat.addMessage(Text.literal(m).formatted(Formatting.YELLOW));
+        WgpuFallbackNotice.Notice n;
+        while ((n = WgpuFallbackNotice.poll()) != null) {
+            chat.addMessage(Text.translatable(n.key(), n.args()).formatted(Formatting.YELLOW));
         }
 
         // Throughput stats. These are only produced when C2ME_WGPU_DEBUG is
         // set, so the "spam" is confined to debug sessions; no throttle here.
+        String m;
         while ((m = WgpuFallbackNotice.pollStats()) != null) {
             chat.addMessage(Text.literal(m).formatted(Formatting.GRAY));
         }
@@ -74,14 +75,14 @@ public class MixinMinecraftClientNotify {
         // 1. GPU status
         ModuleEntryPoint.Status st = ModuleEntryPoint.getStatus();
         Text msg = switch (st) {
-            case FFM_DISABLED -> Text.literal("[c2me-wgpu] ")
-                    .append(Text.literal("Panama FFM 未启用，GPU 加速不可用。").formatted(Formatting.YELLOW))
-                    .append(Text.literal("\n  JVM 参数需加：--enable-native-access=com.rubidiumlighting.c2me.opts.accel.wgpu").formatted(Formatting.GRAY));
-            case NATIVE_UNAVAILABLE -> Text.literal("[c2me-wgpu] ")
-                    .append(Text.literal("此平台没有可用的原生库，GPU 加速不可用。").formatted(Formatting.YELLOW));
-            case INIT_FAILED -> Text.literal("[c2me-wgpu] ")
-                    .append(Text.literal("wgpu 初始化失败，已回退 CPU：").formatted(Formatting.YELLOW))
-                    .append(Text.literal(String.valueOf(ModuleEntryPoint.getDetail())).formatted(Formatting.GRAY));
+            case FFM_DISABLED -> prefix()
+                    .append(Text.translatable("c2me-opts-accel-wgpu.notify.ffm_disabled").formatted(Formatting.YELLOW))
+                    .append(Text.translatable("c2me-opts-accel-wgpu.notify.ffm_disabled.hint").formatted(Formatting.GRAY));
+            case NATIVE_UNAVAILABLE -> prefix()
+                    .append(Text.translatable("c2me-opts-accel-wgpu.notify.native_unavailable").formatted(Formatting.YELLOW));
+            case INIT_FAILED -> prefix()
+                    .append(Text.translatable("c2me-opts-accel-wgpu.notify.init_failed",
+                            String.valueOf(ModuleEntryPoint.getDetail())).formatted(Formatting.YELLOW));
             default -> null;
         };
         if (msg != null) chat.addMessage(msg);
@@ -91,10 +92,16 @@ public class MixinMinecraftClientNotify {
         // so the desktop-oriented advice would be actively harmful there.
         if (!NativeLoader.IS_ANDROID && !c2me$gcWarned && !c2me$isZgc()) {
             c2me$gcWarned = true;
-            chat.addMessage(Text.literal("[c2me-wgpu] ")
-                    .append(Text.literal("检测到未使用 ZGC，区块生成可能因 GC 停顿而变慢。").formatted(Formatting.YELLOW))
-                    .append(Text.literal("\n  建议加入 JVM 参数：-XX:+UseZGC").formatted(Formatting.GRAY)));
+            chat.addMessage(prefix()
+                    .append(Text.translatable("c2me-opts-accel-wgpu.notify.gc_hint").formatted(Formatting.YELLOW))
+                    .append(Text.translatable("c2me-opts-accel-wgpu.notify.gc_hint.hint").formatted(Formatting.GRAY)));
         }
+    }
+
+    /** The "[c2me-wgpu] " tag. Not translated: it identifies the mod, and
+     *  players grep logs/chat for it regardless of their language. */
+    private static net.minecraft.text.MutableText prefix() {
+        return Text.literal("[c2me-wgpu] ");
     }
 
     private static boolean c2me$isZgc() {

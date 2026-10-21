@@ -1,0 +1,9 @@
+{
+  "c2me-opts-accel-wgpu.notify.ffm_disabled": "Panama FFM 未启用，GPU 加速不可用。",
+  "c2me-opts-accel-wgpu.notify.ffm_disabled.hint": "\n  JVM 参数需加：--enable-native-access=com.rubidiumlighting.c2me.opts.accel.wgpu",
+  "c2me-opts-accel-wgpu.notify.native_unavailable": "此平台没有可用的原生库，GPU 加速不可用。",
+  "c2me-opts-accel-wgpu.notify.init_failed": "wgpu 初始化失败，已回退 CPU：%s",
+  "c2me-opts-accel-wgpu.notify.gc_hint": "检测到未使用 ZGC，区块生成可能因 GC 停顿而变慢。",
+  "c2me-opts-accel-wgpu.notify.gc_hint.hint": "\n  建议加入 JVM 参数：-XX:+UseZGC",
+  "c2me-opts-accel-wgpu.notify.dim_fallback": "该维度已回退 CPU：GPU 无法处理此地形（%s）"
+}

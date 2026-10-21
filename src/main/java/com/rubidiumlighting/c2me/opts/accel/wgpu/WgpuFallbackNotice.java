@@ -41,18 +41,26 @@ public final class WgpuFallbackNotice {
 
     private WgpuFallbackNotice() {}
 
-    private static final Queue<String> PENDING = new ConcurrentLinkedQueue<>();
+    /** A pending notice as a translation key plus its arguments.
+     *
+     *  <p>Translation cannot happen here: notices are enqueued from C2ME
+     *  worker threads, and resolving a key depends on the client's current
+     *  language, which is a client-thread concern. The mixin builds the
+     *  {@code Text} when it drains the queue. */
+    public record Notice(String key, Object[] args) {}
+
+    private static final Queue<Notice> PENDING = new ConcurrentLinkedQueue<>();
     private static final Set<String> SEEN = ConcurrentHashMap.newKeySet();
 
-    /** Enqueue {@code message} once per distinct {@code key}. */
-    public static void report(String key, String message) {
-        if (SEEN.add(key)) {
-            PENDING.add(message);
+    /** Enqueue a notice once per distinct {@code dedupKey}. */
+    public static void report(String dedupKey, String translationKey, Object... args) {
+        if (SEEN.add(dedupKey)) {
+            PENDING.add(new Notice(translationKey, args));
         }
     }
 
-    /** Return the next pending message, or {@code null} if none. */
-    public static String poll() {
+    /** Return the next pending notice, or {@code null} if none. */
+    public static Notice poll() {
         return PENDING.poll();
     }
 

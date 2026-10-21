@@ -686,7 +686,7 @@ public abstract class MixinChunkGenerator {
                     ? t.getMessage()
                     : t.getClass().getSimpleName();
             WgpuFallbackNotice.report("dim-init",
-                    "[c2me-wgpu] 该维度已回退 CPU：GPU 无法处理此地形（" + reason + "）");
+                    "c2me-opts-accel-wgpu.notify.dim_fallback", reason);
             return null;
         }
     }
