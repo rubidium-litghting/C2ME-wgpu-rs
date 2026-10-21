@@ -291,6 +291,27 @@ Rust 不认识的密度节点（地形 mod）在 CPU 按同一角点网格求值
   - **Android 端**：交叉编译默认 `panic=abort`，`catch_unwind` 失效。wgpu 的 panic 会触发 `SIGABRT`，**JVM 会被瞬间强杀**，游戏直接闪退。此时唯一可依赖的是提前注册的 `setup_panic_hook`，它会在 `abort` 前执行 `sync_all()`，把 panic 堆栈强行写入黑匣子 `c2me-wgpu.log`。
   - **结论**：Android 用户如果设置了不兼容的 `WGPU_BACKEND` 环境变量（如 `gl`），游戏会闪退，但不会丢失崩溃原因。桌面端用户可以放心随意切换后端。
 
+### 运行期错误处理的分层设计（为什么 panic 后不降级 CPU）
+
+初始化失败和运行期失败走两条完全不同的路径，这是刻意的：
+
+- **初始化失败 → 回退 CPU**。`c2me_wgpu_create_instance` 是 `extern "C-unwind"` 且被 `catch_unwind` 包裹，adapter 选择、feature 检查、shader 编译失败都能捕获，Java 侧得到 `STATUS_INIT_FAILED`，`ModuleEntryPoint` 记录原因并让该维度走 vanilla/C2ME CPU 生成。这条路径是安全的，因为此时还没分配任何 GPU 资源。
+- **运行期失败 → halt**。`WgpuBatchCoordinator.complete()` 在 `pollStatus` 超时、抛异常、或返回 `STATUS_ERROR` 时直接 `LogManager.shutdown()` + `Runtime.getRuntime().halt(1)`。
+
+**为什么运行期不也回退 CPU？** 因为此时状态已经不可信，具体有五个障碍：
+
+1. **后台线程没有 `catch_unwind`**。`c2me_wgpu_request_chunks` 把工作丢进 `std::thread::spawn`，里面只处理 `Result::Err`。若 `execute_batch` panic（wgpu 内部断言、驱动返回意外状态），桌面端线程展开退出时 `status` 停在 `STATUS_PENDING`（因为 panic 发生在 `store(DONE/ERROR)` 之前），Java 侧只能等 30 秒超时；移动端 `panic=abort` 直接带走进程。
+2. **`BatchRequest` 引用计数未知**。panic 时 `req_bg` 的 Arc 被 drop，但 Java 侧还持有 `Arc::into_raw` 的指针。若它永远不调 `take_result_blob`，那个 Arc 永不释放；若 Rust 侧 panic 发生在持锁期间，`Mutex<Option<ResultBlob>>` 还会中毒。
+3. **无法区分「可恢复错误」与「device lost」**。`execute_batch` 返回 `Err` 可能是提交阶段的问题，也可能是 device lost 的前兆。现在完全没有监听 `device.lost()` 的 future。
+4. **锁中毒会传染**。若 panic 时持有 `HANDLE_TABLE` 或 `PENDING_QUEUE` 锁，后续所有 FFI 调用都会因 `lock()` 失败而返回错误——这时候"降级"已无从谈起。
+5. **静默降级会掩盖 bug**。地形突然变成 CPU 生成的慢速版本，但没人知道为什么，比直接崩溃更难排查。
+
+**`on_uncaptured_error` 覆盖到哪一层？** wgpu 的 validation error 和 OOM 已被它拦截，只记日志不 panic，`execute_batch` 会返回 `Err` 走 `STATUS_ERROR` 路径。但它**覆盖不到** `device lost` 和 wgpu 内部断言失败——那两类仍然是 panic。
+
+**如果将来要做「运行期 panic 降级 CPU」**，按依赖顺序需要：① 后台线程加 `catch_unwind` 并引入 `STATUS_PANICKED`；② 审计 panic 路径的 Arc 计数与锁中毒；③ Java 侧区分「可降级」和「必须 halt」；④ 监听 `device.lost()`；⑤ 解决锁中毒问题（换成不中毒的锁或保证 panic 前释放）。其中 ⑤ 在 ① 落地前无法完全保证，所以这是个渐进式工程，不是一次改动。
+
+**当前结论**：halt 是保守但正确的选择。`setup_panic_hook` 会把堆栈 `sync_all()` 写进 `c2me-wgpu.log`，崩溃原因不会丢。
+
 ### §19–§22 核心结论（近期）
 
 **§19 端到端 A/B（异步调度裁定）**：桌面异步调度曾净负（30 vs 纯 CPU 23s），

@@ -70,8 +70,9 @@ public final class WgpuBatchCoordinator {
         public final MemorySegment seg;
         public final int batchIndex;
         /** §20 per-block state bytes (u32/block, chunk-major) for the whole
-         *  batch, or null when the block-output shard is disabled. The caller
-         *  slices its chunk via batchIndex. */
+         *  batch. BlockOut is the only write-back path, so this is non-null
+         *  whenever the request succeeded; the caller slices its chunk via
+         *  batchIndex. */
         public final MemorySegment blockSeg;
         GpuChunk(MemorySegment seg, int batchIndex, MemorySegment blockSeg) {
             this.seg = seg;
@@ -89,6 +90,11 @@ public final class WgpuBatchCoordinator {
     private final BlockingQueue<Job> queue = new LinkedBlockingQueue<>();
     private final long worldHandle;
     private volatile boolean running = true;
+    /** Set by {@link #run} when its loop exits. Lets {@link #completeLoop}
+     *  distinguish "inflight is momentarily empty" from "no more batches can
+     *  arrive" — otherwise it could exit in the window between the submit
+     *  thread polling a batch and enqueuing it, stranding that batch. */
+    private volatile boolean runDone = false;
 
     /** Number of batches allowed in flight (submitted to Rust, not yet
      *  completed). Matches the Rust staging chain depth so the GPU side can
@@ -121,7 +127,6 @@ public final class WgpuBatchCoordinator {
     private final AtomicLong statBatches = new AtomicLong();
     private final AtomicLong statChunks = new AtomicLong();
     private final AtomicLong statGpuNanos = new AtomicLong();
-    private final AtomicLong statSubmitNanos = new AtomicLong();
     private volatile long statsWindowStart = System.nanoTime();
 
     public WgpuBatchCoordinator(long worldHandle,
@@ -153,12 +158,36 @@ public final class WgpuBatchCoordinator {
         return job.future;
     }
 
-    /** Stop the coordinator thread. */
+    /** Stop the coordinator and fail every request that has not been sent
+     *  to Rust yet.
+     *
+     *  <p>Callers must not submit new chunks after this returns.
+     *
+     *  <p>Queued jobs hold no Rust-side handle, so their futures can be
+     *  completed exceptionally right away — that is what lets C2ME release
+     *  the chunk position locks (SchedulingManager releases locks from the
+     *  future's whenComplete; a future that never completes holds the lock
+     *  forever).
+     *
+     *  <p>In-flight batches are deliberately NOT failed here: each holds a
+     *  Rust-side request handle that only {@code takeResultBlob} can consume.
+     *  {@link #completeLoop} keeps draining until {@code inflight} is empty,
+     *  so those handles are always released.
+     */
     public void shutdown() {
+        if (!running) {
+            return;
+        }
         running = false;
+        List<Job> queued = new ArrayList<>();
+        queue.drainTo(queued);
+        if (!queued.isEmpty()) {
+            failAll(queued, new RuntimeException("WgpuBatchCoordinator shut down"));
+        }
     }
 
     private void run() {
+        try {
         while (running) {
             try {
                 Job first = queue.poll(50, TimeUnit.MILLISECONDS);
@@ -204,6 +233,9 @@ public final class WgpuBatchCoordinator {
                 LOGGER.error("[c2me-wgpu] batch coordinator loop error", t);
             }
         }
+        } finally {
+            runDone = true;
+        }
     }
 
     /** Evaluate every external subtree at each chunk's corner grid, in the
@@ -238,48 +270,49 @@ public final class WgpuBatchCoordinator {
         WgpuThinBinding.setExternalInputs(worldHandle, numExt, data);
     }
 
-    /** Pipeline mode: upload externals (no-op when none), submit to Rust
-     *  (returns a PENDING handle immediately), and hand the batch to the
-     *  completion thread. Blocks on `inflight` when STAGING batches are
-     *  already in flight (backpressure). */
-    private void submit(List<Job> batch, int[] positions) throws InterruptedException {
-        long __t0 = System.nanoTime();
-        long req;
+    /** Upload externals (no-op when none) and submit the batch to Rust.
+     *  Returns the in-flight record, or null if the request could not be
+     *  issued — in that case the batch's futures have already been failed. */
+    private Inflight submitRequest(List<Job> batch, int[] positions) {
         uploadExternalInputs(batch);
+        long req;
         try {
             req = WgpuThinBinding.requestChunks(worldHandle, positions);
         } catch (Throwable t) {
             failAll(batch, t);
-            return;
+            return null;
         }
         if (req == 0L) {
             failAll(batch, new RuntimeException("requestChunks returned 0"));
-            return;
+            return null;
         }
-        inflight.put(new Inflight(batch, req));
-        statSubmitNanos.addAndGet(System.nanoTime() - __t0);
+        return new Inflight(batch, req);
     }
 
-    /** Serial mode (external inputs present): submit then wait, like before. */
+    /** Pipeline mode: hand the submitted batch to the completion thread.
+     *  Blocks on `inflight` when STAGING batches are already in flight
+     *  (backpressure). */
+    private void submit(List<Job> batch, int[] positions) throws InterruptedException {
+        Inflight ib = submitRequest(batch, positions);
+        if (ib != null) {
+            inflight.put(ib);
+        }
+    }
+
+    /** Serial mode (external inputs present): submit then wait inline. */
     private void submitAndComplete(List<Job> batch, int[] positions) {
-        long __t0 = System.nanoTime();
-        long req;
-        uploadExternalInputs(batch);
-        try {
-            req = WgpuThinBinding.requestChunks(worldHandle, positions);
-        } catch (Throwable t) {
-            failAll(batch, t);
-            return;
+        long t0 = System.nanoTime();
+        Inflight ib = submitRequest(batch, positions);
+        if (ib != null) {
+            complete(ib, t0);
         }
-        if (req == 0L) {
-            failAll(batch, new RuntimeException("requestChunks returned 0"));
-            return;
-        }
-        complete(new Inflight(batch, req), __t0);
     }
 
     private void completeLoop() {
-        while (running) {
+        // Keep draining after `running` clears: each Inflight holds a Rust-side
+        // request handle that only take_*_blob releases. Exiting early would
+        // leak it.
+        while (running || !runDone || !inflight.isEmpty()) {
             try {
                 Inflight ib = inflight.poll(50, TimeUnit.MILLISECONDS);
                 if (ib == null) continue;

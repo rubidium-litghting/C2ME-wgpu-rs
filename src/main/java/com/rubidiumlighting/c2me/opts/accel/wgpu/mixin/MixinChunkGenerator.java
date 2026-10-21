@@ -269,6 +269,10 @@ public abstract class MixinChunkGenerator {
         DimState ds = DIM_STATES.get(settings);
         if (ds != null && ds.seed != currentSeed) {
             DIM_STATES.remove(settings);
+            // Stop the batch coordinator before the world handle goes away:
+            // its threads still reference that handle, and any queued job must
+            // have its future completed so C2ME can release the position lock.
+            ds.coordinator.shutdown();
             long oldHandle = ds.worldHandle;
             if (oldHandle != 0L) {
                 java.util.concurrent.CompletableFuture
