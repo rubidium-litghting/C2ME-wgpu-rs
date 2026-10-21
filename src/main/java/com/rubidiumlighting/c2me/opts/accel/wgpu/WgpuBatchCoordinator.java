@@ -111,7 +111,16 @@ public final class WgpuBatchCoordinator {
     private static final class Inflight {
         final List<Job> batch;
         final long req;
-        Inflight(List<Job> batch, long req) { this.batch = batch; this.req = req; }
+        /** When this batch was submitted to Rust. Used to measure how long the
+         *  batch occupied the pipeline; taking the timestamp at poll() time
+         *  instead would only measure the drain, which is near zero once the
+         *  GPU has finished. */
+        final long submitT0;
+        Inflight(List<Job> batch, long req, long submitT0) {
+            this.batch = batch;
+            this.req = req;
+            this.submitT0 = submitT0;
+        }
     }
 
     // ── external (CPU-evaluated) density subtrees ──────────────────
@@ -286,7 +295,7 @@ public final class WgpuBatchCoordinator {
             failAll(batch, new RuntimeException("requestChunks returned 0"));
             return null;
         }
-        return new Inflight(batch, req);
+        return new Inflight(batch, req, System.nanoTime());
     }
 
     /** Pipeline mode: hand the submitted batch to the completion thread.
@@ -316,7 +325,7 @@ public final class WgpuBatchCoordinator {
             try {
                 Inflight ib = inflight.poll(50, TimeUnit.MILLISECONDS);
                 if (ib == null) continue;
-                complete(ib, System.nanoTime());
+                complete(ib, ib.submitT0);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 return;
@@ -400,11 +409,29 @@ public final class WgpuBatchCoordinator {
         if (b == 0) return;
         double sec = win / 1e9;
         double cps = c / sec;
+        // Two different questions, deliberately reported separately:
+        //   batchMs — how long one batch took from submit to blob-taken. With
+        //     pipelining this includes time spent queued behind other batches,
+        //     so it is a LATENCY, not a compute cost.
+        //   chunkMs — wall time per chunk, i.e. 1/cps scaled. This is the
+        //     number that compares across versions; the old g/b/c form inflated
+        //     it by roughly the pipeline depth.
         double avgBatchMs = (g / 1e6) / b;
-        double avgChunkMs = (g / 1e6) / Math.max(1, c);
+        double avgChunkMs = c > 0 ? win / 1e6 / c : 0.0;
+        // `g` sums each batch's submit-to-readback lifetime, so g/win is the
+        // average number of batches occupying the pipeline at once. Compare it
+        // to STAGING: near STAGING means the coordinator always had work
+        // queued (GPU-bound); well below means it was starved waiting for
+        // chunks (CPU/C2ME-bound). Note the cast — `g / win` on two longs is
+        // integer division and truncates to 0, 1, 2, ...
+        double inflight = (double) g / (win > 0 ? win : 1);
+        // A batch counts as in flight from submit until its blob is taken, so
+        // at most STAGING are queued plus the one completeLoop is draining.
+        final int maxInflight = STAGING + 1;
         String line = String.format(
-                "CPS=%.1f  batches=%d  chunks=%d  avgBatch=%.2fms  avgChunk=%.3fms  (window=%.2fs)",
-                cps, b, c, avgBatchMs, avgChunkMs, sec);
+                "CPS=%.1f  batches=%d  chunks=%d  batchMs=%.2f  chunkMs=%.2f  "
+                + "inflight=%.2f/%d  (window=%.2fs)",
+                cps, b, c, avgBatchMs, avgChunkMs, inflight, maxInflight, sec);
         LOGGER.info(line);
         // Mirror to the chat HUD when the client can show it; the queue keeps
         // only the newest line, so headless/paused sessions do not build up.

@@ -1045,6 +1045,30 @@ fn gpu_performance_benchmark() {
         0.0
     };
 
+    // This benchmark does NOT reproduce the in-game workload exactly. Three
+    // differences bias it (mostly toward optimistic numbers):
+    //
+    //   1. Aquifers are disabled on this WorldContext (see the
+    //      set_aquifer_mode call above), so the BlockOut shader takes its
+    //      sea-level early-exit instead of running the 12-cell scan. Real
+    //      overworld chunks always pay for that scan.
+    //   2. Submission is synchronous here (submit → wait → read back → next),
+    //      while WgpuBatchCoordinator keeps STAGING=3 batches in flight. Since
+    //      readback is ~93% of batch time, the pipeline only hides the CPU-side
+    //      ~1.5 ms, so this difference is small.
+    //   3. Batches are a fixed 64 chunks. In-game the coordinator's 5 ms
+    //      gather window often expires first, and logs show ~2.3 chunks/batch.
+    //      Small batches amortise the per-batch fixed cost (bind group, submit,
+    //      staging slot) over far fewer chunks.
+    //
+    // Treat the number below as a ceiling for this router on this GPU, not as
+    // a prediction of in-game CPS.
+    println!(
+        "⚠️  注意：本基准关闭了含水层（跳过 12-cell 扫描）、同步提交、固定 64 区块/批；"
+    );
+    println!(
+        "   真实游戏里含水层常开、三批流水线、每批常只有 2~3 个区块。以下数值是上限参考，不等于游戏内 CPS。"
+    );
     println!(
         "✅ 性能测试完成：生成 {} 个区块，耗时 {:.3}s，吞吐量 {:.1} 区块/秒",
         total_chunks, total_seconds, chunks_per_second
