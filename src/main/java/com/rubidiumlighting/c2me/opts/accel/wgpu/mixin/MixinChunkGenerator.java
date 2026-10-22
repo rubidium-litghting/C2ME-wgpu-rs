@@ -25,6 +25,7 @@
 package com.rubidiumlighting.c2me.opts.accel.wgpu.mixin;
 
 import com.rubidiumlighting.c2me.opts.accel.wgpu.ChunkDumper;
+import com.rubidiumlighting.c2me.opts.accel.wgpu.config.Config;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.DimState;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.ModuleEntryPoint;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.NoiseRouterBlobifier;
@@ -71,22 +72,6 @@ public abstract class MixinChunkGenerator {
     private static final java.util.Set<ChunkGeneratorSettings> FAILED_DIMS =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-    /** Debug export switches, read once at class-init from the environment.
-     *   - {@code C2ME_VANILLA_REF=1}  : skip GPU, let vanilla generate, then
-     *     dump the resulting blocks (see the RETURN injection below) so GPU
-     *     terrain can be compared against true vanilla terrain offline.
-     *  The other {@code C2ME_DUMP_*} switches live in {@link ChunkDumper}.
-     */
-    private static final boolean VANILLA_REF =
-            "1".equals(System.getenv("C2ME_VANILLA_REF"));
-    /** Async scheduling (§18.6b): non-blocking GPU request + write-back on
-     *  C2ME's worker pool. This is the only GPU path. Set C2ME_WGPU_ASYNC_SCHED=0
-     *  to disable it entirely (GPU off for this run, plain C2ME CPU generation),
-     *  useful as an A/B baseline. */
-
-
-    private static final boolean ASYNC_SCHED =
-            !"0".equals(System.getenv("C2ME_WGPU_ASYNC_SCHED"));
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
     private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,
                                  StructureAccessor structureAccessor, Chunk chunk,
@@ -106,7 +91,7 @@ public abstract class MixinChunkGenerator {
         // Vanilla-reference mode: skip the GPU and let MC generate normally.
         // The RETURN injection below dumps the resulting blocks so we can
         // compare GPU terrain against true vanilla terrain offline.
-        if (VANILLA_REF) {
+        if (Config.get().debugVanillaRef) {
             return;
         }
 
@@ -197,7 +182,7 @@ public abstract class MixinChunkGenerator {
             // chunks, so batches can grow.
             final long pos = chunk.getPos().toLong();
             final com.ishland.c2me.base.common.scheduler.SchedulingManager sched =
-                    ASYNC_SCHED ? schedulingManagerOf(structureAccessor) : null;
+                    schedulingManagerOf(structureAccessor);
             if (sched != null) {
                 final Chunk fChunk = chunk;
                 final DimState fDs = ds;
@@ -217,9 +202,14 @@ public abstract class MixinChunkGenerator {
                             // chunk's position lock is held by C2ME's
                             // ScheduledTask until `result` completes (§18.6b).
                             sched.positionedExecutor(pos).execute(() -> {
+                                final boolean prof = Config.get().debugStageTiming;
+                                final long tWrite = prof ? System.nanoTime() : 0L;
                                 try {
                                     writeDensityToChunk(fChunk, gpu.blockSeg,
                                             gpu.batchIndex, fDs);
+                                    if (prof) {
+                                        profileCpuAccumulate((System.nanoTime() - tWrite) / 1000);
+                                    }
                                     if (ChunkDumper.DUMP_BLOCKS) {
                                         ChunkDumper.maybeDumpBlocks(fChunk, "gpu");
                                     }
@@ -313,7 +303,7 @@ public abstract class MixinChunkGenerator {
     private void afterPopulateNoise(Blender blender, NoiseConfig noiseConfig,
                                     StructureAccessor structureAccessor, Chunk chunk,
                                     CallbackInfoReturnable<CompletableFuture<Chunk>> cir) {
-        if (!VANILLA_REF) {
+        if (!Config.get().debugVanillaRef) {
             return;
         }
         CompletableFuture<Chunk> f = cir.getReturnValue();
@@ -475,6 +465,32 @@ public abstract class MixinChunkGenerator {
      *  `blockSeg` is null only if the BlockOut shard produced no blob (should
      *  not happen now that it is on by default); we log and leave the chunk
      *  empty rather than crashing the world. */
+    // Aggregated CPU write-back timing (the last stage: copying the GPU's
+    // block bytes into the chunk). One averaged line every 128 chunks, so the
+    // log is not flooded at ~100 chunks/s. Gated by debug_stage_timing.
+    private static final java.util.concurrent.atomic.AtomicLong CPUPROF_N =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong CPUPROF_US =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    private static void profileCpuAccumulate(long us) {
+        // Synchronized: with two independent atomics, two threads could both
+        // observe n >= 128 and the second would read cnt == 0 after the first
+        // reset, dividing by zero and aborting the write-back.
+        synchronized (CPUPROF_N) {
+            long n = CPUPROF_N.incrementAndGet();
+            CPUPROF_US.addAndGet(us);
+            if (n >= 128) {
+                long cnt = CPUPROF_N.getAndSet(0);
+                long total = CPUPROF_US.getAndSet(0);
+                if (cnt > 0) {
+                    LOGGER.info("[c2me-wgpu][writeback-timing] avg over {} chunks: write={}us/chunk",
+                            cnt, total / cnt);
+                }
+            }
+        }
+    }
+
     private static void writeDensityToChunk(Chunk chunk,
                                             java.lang.foreign.MemorySegment blockSeg,
                                             int batchIndex, DimState ds) {

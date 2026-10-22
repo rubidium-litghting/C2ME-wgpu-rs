@@ -24,6 +24,8 @@
 
 package com.rubidiumlighting.c2me.opts.accel.wgpu;
 
+import com.rubidiumlighting.c2me.opts.accel.wgpu.config.Config;
+
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.MemorySegment;
@@ -53,6 +55,7 @@ public class WgpuThinBinding {
     public static final int STATUS_ERROR = 2;
     public static final int STATUS_INVALID_HANDLE = -1;
 
+    private static MethodHandle MH_update_config;
     private static MethodHandle MH_create_instance;
     private static MethodHandle MH_world_new;
     private static MethodHandle MH_world_destroy;
@@ -82,11 +85,21 @@ public class WgpuThinBinding {
     static {
         boolean linked = true;
         try {
+            MH_update_config = NativeLoader.linker.downcallHandle(
+                    NativeLoader.lookup.find("c2me_wgpu_update_config").orElseThrow(),
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_INT,        // -> i32 (0 = ok)
+                            ValueLayout.JAVA_INT,        // debug: u32
+                            ValueLayout.JAVA_INT,        // disable_pipeline_cache: u32
+                            ValueLayout.JAVA_INT,        // profile: u32
+                            ValueLayout.JAVA_INT         // mapped_at_creation: i32
+                    )
+            );
+
             MH_create_instance = NativeLoader.linker.downcallHandle(
                     NativeLoader.lookup.find("c2me_wgpu_create_instance").orElseThrow(),
                     FunctionDescriptor.of(
                             ValueLayout.JAVA_LONG,       // -> i64 instance_handle (0 on error)
-                            ValueLayout.JAVA_LONG,       // features_mask: u64
                             ValueLayout.ADDRESS,         // err_buf: *mut c_char
                             ValueLayout.JAVA_LONG        // err_buf_len: usize
                     )
@@ -230,8 +243,21 @@ public class WgpuThinBinding {
         if (linked) {
             try (Arena errArena = Arena.ofConfined()) {
                 MemorySegment errBuf = errArena.allocate(1024);
+                var cfg = Config.get();
+                // invokeExact infers the call site's type from how the result
+                // is used. Discarding it would make the site (...)void while
+                // the handle is (...)int, throwing WrongMethodTypeException.
+                int cfgStatus = (int) MH_update_config.invokeExact(
+                        cfg.debugVerboseLogging ? 1 : 0,
+                        cfg.disablePipelineCache ? 1 : 0,
+                        cfg.debugStageTiming ? 1 : 0,
+                        cfg.mappedAtCreation == null
+                                ? -1 : (cfg.mappedAtCreation ? 1 : 0)
+                );
+                if (cfgStatus != 0) {
+                    LOGGER.warn("[c2me-wgpu] update_config returned {}", cfgStatus);
+                }
                 long h = (long) MH_create_instance.invokeExact(
-                        0L,                    // features_mask: 0 = default
                         errBuf,
                         errBuf.byteSize()
                 );

@@ -26,31 +26,67 @@ pub mod result;
 
 pub use error::{C2meError, Result};
 
+/// Runtime configuration, supplied by the Java side from `config/c2me-wgpu.json`.
+///
+/// Previously each of these was an independent `C2ME_WGPU_*` environment
+/// variable, read once into a `OnceLock`. That made hot-reload impossible and
+/// spread the schema across two languages. Now the Java side parses the file
+/// and pushes the whole struct through one C API call; the rest of this crate
+/// only ever reads these fields.
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub debug: bool,
+    pub disable_pipeline_cache: bool,
+    pub profile: bool,
+    /// `None` = platform default (mapped on desktop, write_buffer on Android).
+    /// `Some(true)` forces mapped-at-creation, `Some(false)` forces write_buffer.
+    pub mapped_at_creation: Option<bool>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            debug: false,
+            disable_pipeline_cache: false,
+            profile: false,
+            mapped_at_creation: None,
+        }
+    }
+}
+
+static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
+
+/// Store the config. Only the first call takes effect: the value is written
+/// once from `c2me_wgpu_update_config` before any GPU work starts, and is
+/// read-only afterwards, so an uncontended `OnceLock` load is all a getter
+/// costs. Hot-reload will need this replaced with something mutable.
+pub(crate) fn set_config(c: Config) {
+    let _ = CONFIG.set(c);
+}
+
+pub(crate) fn config() -> &'static Config {
+    CONFIG.get_or_init(Config::default)
+}
+
 /// Whether verbose GPU/codegen diagnostics are enabled.
 ///
-/// Gated by the `C2ME_WGPU_DEBUG` environment variable (any non-empty value).
+/// Enabled by the `debug_verbose_logging` config field.
 /// Used by the `wgpu_debug!` macro for shader-compile / pipeline-cache logs
 /// that would otherwise spam the game log on every launch.
 pub(crate) fn debug_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var_os("C2ME_WGPU_DEBUG").is_some_and(|v| !v.is_empty())
-    })
+    config().debug
 }
 
 /// Whether to bypass wgpu's `PipelineCache` entirely.
 ///
-/// Set `C2ME_WGPU_NO_PIPELINE_CACHE=1` to disable the on-disk/in-memory
-/// `wgpu::PipelineCache` and skip requesting `Features::PIPELINE_CACHE`.
+/// Set `disable_pipeline_cache` in the config file to disable the on-disk
+/// and in-memory `wgpu::PipelineCache` and skip requesting `Features::PIPELINE_CACHE`.
 /// Some Vulkan drivers (observed on Mali-G610 / Dimensity 8100) report the
 /// feature but abort inside `create_pipeline_cache` or the subsequent
 /// `create_compute_pipeline`, so this switch lets such devices still run
 /// (at the cost of recompiling the shader each launch).
 pub(crate) fn no_pipeline_cache() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var_os("C2ME_WGPU_NO_PIPELINE_CACHE").is_some_and(|v| !v.is_empty())
-    })
+    config().disable_pipeline_cache
 }
 
 /// Installs a panic hook that writes the panic message to the "black box" log
@@ -132,66 +168,26 @@ pub(crate) fn debug_log_line(msg: &str) {
     }
 }
 
-/// Whether to substitute a minimal bring-up shader for the real one.
-///
-/// Set `C2ME_WGPU_MINIMAL_SHADER=1` to emit a tiny compute shader that keeps
-/// the exact same bind group layout + entry point signature but does almost
-/// nothing. Used to tell "the driver cannot handle our 5k-line shader" apart
-/// from "the driver cannot run wgpu compute shaders at all".
-pub(crate) fn minimal_shader() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var_os("C2ME_WGPU_MINIMAL_SHADER").is_some_and(|v| !v.is_empty())
-    })
-}
-
-/// Force single-shader (pre-split) mode. Set `C2ME_WGPU_FORCE_SINGLE=1`
-/// to compile one `main_entry` shader over all channels instead of the
-/// A/B/C shard split. Benchmarking switch + emergency fallback.
-pub(crate) fn force_single() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var_os("C2ME_WGPU_FORCE_SINGLE").is_some_and(|v| !v.is_empty())
-    })
-}
-
 /// Whether to emit per-stage execution timing (encode / submit / fence /
-/// map / decode). Gated by `C2ME_WGPU_PROFILE` (any non-empty value).
-/// Separate from `C2ME_WGPU_DEBUG` so profiling can be turned on without
+/// map / decode). Enabled by the `debug_stage_timing` config field.
+/// Separate from `debug_verbose_logging` so profiling can be turned on without
 /// the compile-time / cache log noise.
 pub(crate) fn profile_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var_os("C2ME_WGPU_PROFILE").is_some_and(|v| !v.is_empty())
-    })
+    config().profile
 }
 
 /// Print a profiling line to stderr AND the debug log file. Unlike
-/// `wgpu_debug!` this does NOT require `C2ME_WGPU_DEBUG`; the caller gates
-/// it on `profile_enabled()`.
+/// `wgpu_debug!` this does NOT require `debug_verbose_logging`; the caller
+/// gates it on `profile_enabled()`.
 pub(crate) fn profile_log(msg: &str) {
     eprintln!("{msg}");
     debug_log_line(msg);
 }
 
-/// Test-only: limit how many router channels are emitted (0 = all).
+/// `eprintln!` that only prints when `debug_verbose_logging` is set.
 ///
-/// Set `C2ME_WGPU_MAX_CHANNELS=N` to emit only the first N channels. Used to
-/// measure how shader-compile cost scales with shader size.
-pub(crate) fn max_channels() -> usize {
-    static FLAG: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("C2ME_WGPU_MAX_CHANNELS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
-    })
-}
-
-/// `eprintln!` that only prints when `C2ME_WGPU_DEBUG` is set.
-///
-/// Set `C2ME_WGPU_DEBUG=1` to see shader-compile timings, pipeline-cache
-/// hits/misses and other codegen diagnostics. Silent by default.
+/// Enable it to see shader-compile timings, pipeline-cache hits/misses and
+/// other codegen diagnostics. Silent by default.
 /// Every line is also appended to the Rust log file (see
 /// [`debug_log_line`]), whose path Java supplies at startup.
 #[macro_export]

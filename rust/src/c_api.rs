@@ -122,12 +122,37 @@ pub unsafe extern "C" fn c2me_wgpu_setup_panic_hook() {
     crate::setup_panic_hook();
 }
 
+/// Push the user's config to Rust. Must be called before `create_instance`;
+/// called again by the hot-reload path when a save is switched.
+///
+/// Booleans are passed as `u32` (FFM has no bool layout). `mapped_at_creation`
+/// is `i32`: -1 = platform default, 0 = force write_buffer, 1 = force mapped.
+#[unsafe(no_mangle)]
+pub extern "C" fn c2me_wgpu_update_config(
+    debug: u32,
+    disable_pipeline_cache: u32,
+    profile: u32,
+    mapped_at_creation: i32,
+) -> i32 {
+    let cfg = crate::Config {
+        debug: debug != 0,
+        disable_pipeline_cache: disable_pipeline_cache != 0,
+        profile: profile != 0,
+        mapped_at_creation: match mapped_at_creation {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        },
+    };
+    crate::set_config(cfg);
+    0
+}
+
 /// # Safety
 /// `err_buf` must be valid for writes of `err_buf_len` bytes (or null with
 /// `err_buf_len == 0`). It is only touched on the failure path.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn c2me_wgpu_create_instance(
-    _features_mask: u64,
     err_buf: *mut c_char,
     err_buf_len: usize,
 ) -> i64 {

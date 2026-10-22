@@ -111,8 +111,8 @@ impl Default for AquiferMode {
 /// path and abort the process, while Mali-G76 (Kirin 980) accepts it. The
 /// write_buffer path costs one extra copy, but only once at init time.
 ///
-/// Override with `C2ME_WGPU_MAPPED_AT_CREATION=1` (force mapped) or `=0`
-/// (force write_buffer) for debugging.
+/// Override with `debug_mapped_at_creation` in the config (true = mapped,
+/// false = write_buffer) for debugging.
 fn create_init_buffer(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -120,13 +120,8 @@ fn create_init_buffer(
     contents: &[u8],
     usage: wgpu::BufferUsages,
 ) -> wgpu::Buffer {
-    let use_mapped = std::env::var("C2ME_WGPU_MAPPED_AT_CREATION")
-        .ok()
-        .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        })
+    let use_mapped = crate::config()
+        .mapped_at_creation
         .unwrap_or(!cfg!(target_os = "android"));
 
     if use_mapped {
@@ -196,16 +191,7 @@ impl WorldContext {
             AstNode::Root(chs) => chs.len(),
             _ => 0,
         };
-        let shards = if crate::force_single() {
-            crate::wgpu_debug!("[codegen] FORCE_SINGLE: one shader over all channels");
-            if channel_count > 0 {
-                vec![wgsl_gen::Shard { pass: wgsl_gen::Pass::Single, start: 0, end: channel_count }]
-            } else {
-                Vec::new()
-            }
-        } else {
-            wgsl_gen::plan_shards(channel_count)
-        };
+        let shards = wgsl_gen::plan_shards(channel_count);
         let mut shader_srcs: Vec<String> = Vec::with_capacity(shards.len());
         for shard in &shards {
             let src = wgsl_gen::emit_shader_for_shard(&ast_root, *shard, &density_inners, density_outer.as_ref(), barrier_noise.as_ref())?;

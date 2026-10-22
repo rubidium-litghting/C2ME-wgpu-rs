@@ -110,7 +110,7 @@ pub fn get_or_compile(
 
     // Build the compute pipeline. The `wgpu::PipelineCache` is optional:
     // some Vulkan drivers (Mali-G610) abort inside it, so
-    // `C2ME_WGPU_NO_PIPELINE_CACHE=1` skips it entirely.
+    // `disable_pipeline_cache` in the config skips it entirely.
     let t_pipe0 = std::time::Instant::now();
     let pipeline = if crate::no_pipeline_cache() {
         crate::wgpu_debug!("[compile] pipeline cache disabled; compiling without it");

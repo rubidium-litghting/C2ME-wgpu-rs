@@ -102,6 +102,60 @@
 
 ---
 
+## 配置文件
+
+用户设置在 `config/c2me-wgpu.json`。首次启动时自动生成，修改后**重启游戏**生效。
+
+如果文件写坏了（JSON 语法错误），模组会把它改名为 `c2me-wgpu.json.broken` 保留下来，然后生成一份新的默认配置；超出范围的值会被自动修正并回写。
+
+```json
+{
+  "gpu_index": -1,
+  "disable_pipeline_cache": false,
+  "debug_verbose_logging": false,
+  "debug_stage_timing": false,
+  "mapped_at_creation": null,
+  "debug_vanilla_ref": false,
+  "debug_dump_chunk": "",
+  "debug_dump_dir": "",
+  "debug_dump_blocks": false,
+  "debug_dump_aquifer": false,
+  "debug_dump_beard": false,
+  "debug_dump_blob": ""
+}
+```
+
+### 常规设置
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `gpu_index` | `-1` | **尚未实现。** 预留的 GPU 序号选择，目前会被忽略。 |
+| `disable_pipeline_cache` | `false` | 绕过磁盘上的着色器管线缓存。仅在驱动于管线缓存处崩溃时才需要开启，代价是每次启动重新编译着色器。 |
+| `mapped_at_creation` | `null` | `null` = 平台默认（桌面用映射路径，Android 用 write_buffer）。`true` / `false` 强制指定。这是兼容性选项而非调试开关：某些 Mali 驱动在映射路径上会崩溃。 |
+
+### 调试（`debug_` 前缀）
+
+以下选项用于排查问题，正常游玩时保持默认即可。
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `debug_verbose_logging` | `false` | 启用详细诊断日志：着色器编译耗时、管线缓存命中、适配器 workaround，以及定期的每秒区块数（`CPS=`）统计（同时打印到聊天栏）。 |
+| `debug_stage_timing` | `false` | 将分阶段计时写入日志：GPU 侧（encode / submit / readback / decode）和 CPU 侧（方块写回区块）。 |
+
+### 离线诊断
+
+用于和原版输出做离线对比，正常游玩时全部保持默认，不会写任何文件。
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `debug_vanilla_ref` | `false` | 完全跳过 GPU，让原版生成，再 dump 方块用于对比。 |
+| `debug_dump_chunk` | `""` | 目标区块：`"x,z"` 或 `"x1,z1,x2,z2"`。留空则其余 `debug_dump_*` 全部不生效。 |
+| `debug_dump_dir` | `""` | dump 文件写入目录。留空 = 平台临时目录。 |
+| `debug_dump_blocks` | `false` | dump 目标区块的方块状态。 |
+| `debug_dump_aquifer` | `false` | dump 含水层 cell 表。 |
+| `debug_dump_beard` | `false` | dump Beardifier 结构与逐方块参考值。 |
+| `debug_dump_blob` | `""` | 将序列化的 NoiseRouter blob 写到该路径（`src/test/resources/real_router.bin` 即由此生成）。 |
+
 ## 环境变量
 
 ### GPU 选择（标准 wgpu 变量）
@@ -115,38 +169,16 @@
 
 如果不使用这些变量，模组会使用 Vulkan / Metal / DX12（取决于操作系统提供的），并优先选择**集成显卡**，从而让独立显卡空闲以用于渲染。
 
-### 诊断与调试导出
+### 本模组不再读取环境变量
 
-仅在排查故障时设置这些变量。它们都在启动时读取一次。
-
-| 变量 | 值 | 效果 |
-|---|---|---|
-| `C2ME_WGPU_DEBUG` | `1` | 启用详细日志和定期的每秒区块数（`CPS=`）统计。同时将 CPS 打印到聊天 HUD。写入 `<gameDir>/logs/c2me-wgpu.log`。 |
-| `C2ME_WGPU_PROFILE` | `1` | 将分阶段的 GPU 批处理计时（encode / submit / readback / decode）写入日志。 |
-| `C2ME_WGPU_ASYNC_SCHED` | `0` | 禁用 C2ME worker 池上的异步写回。便于 A/B 基准测试。 |
-| `C2ME_WGPU_MAPPED_AT_CREATION` | `0` / `1` | 覆盖缓冲区上传方法。桌面端默认 `1`，Android 端默认 `0`（Mali 驱动拒绝映射路径）。 |
-| `C2ME_VANILLA_REF` | `1` | 完全跳过 GPU，让原版生成，然后 dump 方块以供离线对比。 |
-| `C2ME_DUMP_BLOCKS` | `1` | 为目标区块 dump 方块状态以供离线对比。 |
-| `C2ME_DUMP_BLOB` | 文件路径 | 将序列化的 NoiseRouter blob dump 到指定路径。 |
-| `C2ME_DUMP_DIR` | 目录 | dump 文件写入的目录。默认为平台临时目录。 |
-| `C2ME_DUMP_CHUNK` | `x,z` 或 `x1,z1,x2,z2` | `C2ME_DUMP_*` 诊断的目标区块。 |
-| `C2ME_DUMP_AQUIFER` | `1` | dump 含水层 cell 表。 |
-| `C2ME_DUMP_AQ_BLOCKS` | `1` | dump 逐方块含水层参考数据。 |
-| `C2ME_DUMP_DENSITY` | `1` | dump GPU 密度值。 |
-| `C2ME_DUMP_BEARD` | `1` | dump Beardifier 结构地基数据。 |
-| `C2ME_WGPU_FORCE_SINGLE` | `1` | 仅开发用：强制使用单 shard 全通道着色器进行调试。 |
-| `C2ME_WGPU_MINIMAL_SHADER` | `1` | 仅开发用：使用最小占位着色器进行启动测试。 |
-| `C2ME_WGPU_MAX_CHANNELS` | 整数 | 仅开发用：限制发出的通道数量。 |
-| `C2ME_WGPU_FAKE_GPU_MS` | 整数 | 仅开发用：通过注入延迟来模拟较慢的 GPU。 |
-| `C2ME_WGPU_NO_PIPELINE_CACHE` | `1` | 仅开发用：绕过磁盘上的着色器管线缓存。 |
-
-blob dump 也可以通过 JVM 属性 `-Dc2me.dumpBlob=<path>` 设置；当该属性未设置时，环境变量仅作为回退。
+所有设置已并入配置文件，见上文"配置文件"一节。本节只涉及 wgpu 库自身的
+标准变量。
 
 **原生库解压位置排查**：
 默认情况下，模组会将 jar 包内的 `.so` 或 `.dll` 解压到游戏根目录下的 `c2me-wgpu-natives/` 文件夹中。如果该目录无法写入或加载（如遇到 `noexec` 权限限制），模组会自动回退解压到操作系统的临时目录（如 Linux 的 `/tmp`）。
 如果你需要排查底层库加载失败的问题，可以在 JVM 启动参数中添加 `-Dc2me.wgpu.preserveNative=true`，模组将把原生库直接解压到游戏当前的工作目录中。
 
-> **注意：** 以 `C2ME_DUMP_` 为前缀的变量以及标记为“仅开发用”的变量严格用于故障排查，正常游玩时无需设置。
+> **注意：** 标记为“仅开发用”的配置项以及离线诊断开关严格用于故障排查，正常游玩时无需设置。
 
 > **Rust 侧日志文件：** 原生库将其诊断信息写入 `<gameDir>/logs/c2me-wgpu.log`（路径由 Java 在启动时传入）。这独立于 Minecraft 自身的 `logs/latest.log`，后者仅捕获 Java 日志。
 

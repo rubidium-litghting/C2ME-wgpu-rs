@@ -24,6 +24,8 @@
 
 package com.rubidiumlighting.c2me.opts.accel.wgpu;
 
+import com.rubidiumlighting.c2me.opts.accel.wgpu.config.Config;
+
 import com.rubidiumlighting.c2me.opts.accel.wgpu.mixin.AquiferImplAccessor;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.mixin.ChunkNoiseSamplerAccessor;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.mixin.XoroshiroSplitterAccessor;
@@ -41,8 +43,8 @@ import org.slf4j.LoggerFactory;
 /**
  * Offline diagnostic dumps, moved out of {@link MixinChunkGenerator}.
  *
- * <p>Everything here is gated on an env var ({@code C2ME_DUMP_*}) and writes
- * files for GPU-vs-vanilla comparison. None of it runs in a normal session,
+ * <p>Everything here is gated on the {@code debug_dump_*} config fields and
+ * writes files for GPU-vs-vanilla comparison. None of it runs in a normal session,
  * so it lives in its own class to keep the mixin readable.
  *
  * <p>These writers are the source of the fixtures committed under
@@ -53,21 +55,21 @@ public final class ChunkDumper {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu");
 
-    /** Target chunk(s) for block dumping. Default (0,0). Override with
-     *  C2ME_DUMP_CHUNK=x,z (or x1,z1,x2,z2 for a rectangle, inclusive). */
+    /** Target chunk(s) for block dumping, parsed once from config.
+     *  Defaults to {0,0,0,0} when debug_dump_chunk is empty. */
     public static final int[] DUMP_CHUNK = parseDumpChunk();
 
     /** True only when the user explicitly asked for a chunk dump. All the
-     *  diagnostic writers below are gated on this (or on their own DUMP_*
-     *  flag), so a normal session never touches the filesystem. */
-    public static final boolean DUMP_ENABLED = parseDumpEnabled();
+     *  diagnostic writers below are gated on this (or on their own config
+     *  switch), so a normal session never touches the filesystem. */
+    public static final boolean DUMP_ENABLED = !Config.get().debugDumpChunk.isBlank();
 
     /** Dump the block states of the target chunk(s) (CPU or GPU result). */
-    public static final boolean DUMP_BLOCKS = "1".equals(System.getenv("C2ME_DUMP_BLOCKS"));
+    public static final boolean DUMP_BLOCKS = Config.get().debugDumpBlocks;
     /** Dump the per-cell aquifer table for the target chunk(s). */
-    public static final boolean DUMP_AQUIFER = "1".equals(System.getenv("C2ME_DUMP_AQUIFER"));
+    public static final boolean DUMP_AQUIFER = Config.get().debugDumpAquifer;
     /** §23: dump Beardifier pieces/junctions + per-block beard reference. */
-    public static final boolean DUMP_BEARD = "1".equals(System.getenv("C2ME_DUMP_BEARD"));
+    public static final boolean DUMP_BEARD = Config.get().debugDumpBeard;
     /** §23: dump only the FIRST structure-bearing chunk encountered. */
     private static final java.util.concurrent.atomic.AtomicBoolean BEARD_DUMPED =
             new java.util.concurrent.atomic.AtomicBoolean(false);
@@ -75,14 +77,10 @@ public final class ChunkDumper {
     private static final java.util.concurrent.atomic.AtomicBoolean CHUNK_REF_DUMPED =
             new java.util.concurrent.atomic.AtomicBoolean(false);
 
-    static boolean parseDumpEnabled() {
-        String v = System.getenv("C2ME_DUMP_CHUNK");
-        return v != null && !v.isBlank();
-    }
     /** Directory for diagnostic dumps. `/tmp` does not exist on Android, so
-     *  default to the platform temp dir; `C2ME_DUMP_DIR` overrides. */
+     *  default to the platform temp dir; the config field overrides. */
     static String dumpDir() {
-        String d = System.getenv("C2ME_DUMP_DIR");
+        String d = Config.get().debugDumpDir;
         if (d != null && !d.isBlank()) return d;
         String t = System.getProperty("java.io.tmpdir");
         if (t == null || t.isBlank()) t = ".";
@@ -92,9 +90,10 @@ public final class ChunkDumper {
         }
         return t;
     }
+
     static int[] parseDumpChunk() {
-        String v = System.getenv("C2ME_DUMP_CHUNK");
-        if (v == null || v.isBlank()) return new int[]{98, -47, 98, -47}; // FORCED
+        String v = Config.get().debugDumpChunk;
+        if (v == null || v.isBlank()) return new int[]{0, 0, 0, 0};
         try {
             String[] p = v.split(",");
             if (p.length == 2) {
@@ -601,11 +600,8 @@ public final class ChunkDumper {
                                             Chunk chunk, ByteBuffer blob,
                                             int minY, int height, int cellW, int cellH,
                                             int gx, int gy, int gz) {
-        String dumpPath = System.getProperty("c2me.dumpBlob");
-        if (dumpPath == null || dumpPath.isEmpty()) {
-            dumpPath = System.getenv("C2ME_DUMP_BLOB");
-        }
-        if (dumpPath == null || dumpPath.isEmpty()) {
+        String dumpPath = Config.get().debugDumpBlob;
+        if (dumpPath.isBlank()) {
             return;
         }
         // Per-dimension suffix so the three dimensions don't overwrite each

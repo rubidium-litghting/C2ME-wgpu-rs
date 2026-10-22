@@ -802,7 +802,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
 /// §20 block-output smoke: run the real executor (which now dispatches
 /// the BlockOut shard + copies block_buf) on the real router blob. Run
-/// with C2ME_WGPU_BLOCK_OUT=1. Used to reproduce the in-game native
+/// Used to reproduce the in-game native
 /// abort offline where Rust panics/signals are visible.
 #[test]
 #[ignore]
@@ -916,7 +916,7 @@ fn gpu_performance_benchmark() {
     use std::time::Instant;
 
     // Prefer a REAL router blob dumped from the game. To produce it:
-    //   1) run the game with  -Dc2me.dumpBlob=/tmp/real_router.bin
+    //   1) set debug_dump_blob in the config file, run the game once
     //   2) cp /tmp/real_router.bin src/test/resources/real_router.bin
     // Falls back to the hand-made minimal blob when the file is absent.
     let real_path = concat!(

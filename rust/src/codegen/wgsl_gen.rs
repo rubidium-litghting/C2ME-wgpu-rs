@@ -542,16 +542,6 @@ fn emit_shader_inner(root: &AstNode, mut ctx: GenCtx) -> Result<String> {
         ));
     };
 
-    // Bring-up: emit the tiny shader for *every* pass, so the diagnostic
-    // keeps working now that WorldContext emits per-shard modules.
-    if crate::minimal_shader() {
-        crate::wgpu_debug!("[codegen] MINIMAL shader requested");
-        let mut out = String::with_capacity(2048);
-        out.push_str(BINDINGS_HEADER);
-        out.push_str(MINIMAL_ENTRY);
-        return Ok(out);
-    }
-
     // Phase A — emit entry-point body.
     emitters::root::emit(root, &mut ctx)?;
 
@@ -603,7 +593,7 @@ pub fn emit_shader(root: &AstNode) -> Result<String> {
     emit_shader_for_pass(root, Pass::Single)
 }
 
-/// Minimal `main_entry` used by `C2ME_WGPU_MINIMAL_SHADER=1` (bring-up test).
+/// Minimal `main_entry` (bring-up test, no longer wired to any config).
 ///
 /// Keeps the same bind group layout and entry signature; body just writes a
 /// deterministic value into `out_buf`. If a device compiles+runs this but
@@ -615,22 +605,6 @@ pub fn emit_shader(root: &AstNode) -> Result<String> {
 /// This is the "GPU outputs block states" path; Java only writes the palette.
 /// (Aquifer/vein/beard are NOT applied here yet — this is the minimal loop.)
 const BLOCK_OUT_ENTRY: &str = include_str!("block_out.wgsl");
-
-
-const MINIMAL_ENTRY: &str = r#"
-@compute @workgroup_size(4, 4, 4)
-fn main_entry(
-  @builtin(global_invocation_id) gid: vec3<u32>,
-  @builtin(local_invocation_id)  lid: vec3<u32>,
-) {
-  let idx: u32 = gid.x + gid.y * 4u + gid.z * 16u;
-  if (idx < arrayLength(&out_buf)) {
-    out_buf[idx] = f32(gid.x) + f32(gid.y) * 0.5 + f32(gid.z) * 0.25
-                 + f32(lid.x) * 0.0;
-  }
-}
-"#;
-
 /// Storage bindings — one-to-one with `world/bind_group.rs::create_layout`
 /// and `world/constants.rs::WorldgenParams` field order/offsets.
 const BINDINGS_HEADER: &str = r#"

@@ -5,13 +5,10 @@ use anyhow::{Result, anyhow};
 pub fn emit(root: &AstNode, ctx: &mut GenCtx) -> Result<()> {
     match root {
         AstNode::Root(channels) => {
-            // Diagnostic cap: emit only the first N channels overall.
-            let limit = crate::max_channels();
-            let global_cap = if limit == 0 { channels.len() } else { limit.min(channels.len()) };
             // Shard window [start, end) from the GenCtx (single-pass => [0, MAX)).
             let (shard_start, shard_end) = ctx.channel_range;
-            let start = shard_start.min(global_cap);
-            let end = shard_end.min(global_cap);
+            let start = shard_start.min(channels.len());
+            let end = shard_end.min(channels.len());
             for i in start..end {
                 let ch = &channels[i];
                 let var = super::emit_node(ch, ctx)?;

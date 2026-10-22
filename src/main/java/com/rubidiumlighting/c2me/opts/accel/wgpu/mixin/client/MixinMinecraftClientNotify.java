@@ -57,8 +57,8 @@ public class MixinMinecraftClientNotify {
             chat.addMessage(Text.translatable(n.key(), n.args()).formatted(Formatting.YELLOW));
         }
 
-        // Throughput stats. These are only produced when C2ME_WGPU_DEBUG is
-        // set, so the "spam" is confined to debug sessions; no throttle here.
+        // Throughput stats. These are only produced when debug_verbose_logging
+        // is on, so the "spam" is confined to debug sessions; no throttle here.
         String m;
         while ((m = WgpuFallbackNotice.pollStats()) != null) {
             chat.addMessage(Text.literal(m).formatted(Formatting.GRAY));

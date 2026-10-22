@@ -147,6 +147,63 @@ it would exclude most mobile GPUs.
 
 ---
 
+## Configuration
+
+User settings live in `config/c2me-wgpu.json`. The file is created on first
+launch; **restart the game** after editing it.
+
+If the file is malformed (invalid JSON) the mod renames it to
+`c2me-wgpu.json.broken` for inspection and writes a fresh default; out-of-range values are corrected and written back.
+
+```json
+{
+  "gpu_index": -1,
+  "disable_pipeline_cache": false,
+  "debug_verbose_logging": false,
+  "debug_stage_timing": false,
+  "mapped_at_creation": null,
+  "debug_vanilla_ref": false,
+  "debug_dump_chunk": "",
+  "debug_dump_dir": "",
+  "debug_dump_blocks": false,
+  "debug_dump_aquifer": false,
+  "debug_dump_beard": false,
+  "debug_dump_blob": ""
+}
+```
+
+### General
+
+| Field | Default | Description |
+|---|---|---|
+| `gpu_index` | `-1` | **Not implemented yet.** Reserved for GPU selection and currently ignored. |
+| `disable_pipeline_cache` | `false` | Bypass the on-disk shader pipeline cache. Only needed if a driver crashes inside the pipeline cache; the cost is recompiling shaders every launch. |
+| `mapped_at_creation` | `null` | `null` = platform default (mapped on desktop, write_buffer on Android). `true` / `false` forces the path. A compatibility setting, not a diagnostic: some Mali drivers abort on the mapped path. |
+
+### Debugging (`debug_` prefix)
+
+For troubleshooting; leave at their defaults during normal play.
+
+| Field | Default | Description |
+|---|---|---|
+| `debug_verbose_logging` | `false` | Verbose diagnostic logging: shader compile timings, pipeline-cache hits, adapter workarounds, plus periodic chunk-per-second (`CPS=`) stats (also printed to the chat HUD). |
+| `debug_stage_timing` | `false` | Emit per-stage timing to the log: GPU side (encode / submit / readback / decode) and CPU side (block write-back into the chunk). |
+
+### Offline diagnostics
+
+For comparing against vanilla output offline. All default to off; a normal
+session writes nothing.
+
+| Field | Default | Description |
+|---|---|---|
+| `debug_vanilla_ref` | `false` | Skip the GPU entirely, let vanilla generate, then dump blocks for comparison. |
+| `debug_dump_chunk` | `""` | Target chunk(s): `"x,z"` or `"x1,z1,x2,z2"`. Empty disables every other `debug_dump_*` switch. |
+| `debug_dump_dir` | `""` | Where dump files go. Empty = platform temp dir. |
+| `debug_dump_blocks` | `false` | Dump block states of the target chunk(s). |
+| `debug_dump_aquifer` | `false` | Dump the aquifer cell table. |
+| `debug_dump_beard` | `false` | Dump Beardifier structure data and per-block reference values. |
+| `debug_dump_blob` | `""` | Write the serialized NoiseRouter blob here (this is how `src/test/resources/real_router.bin` is produced). |
+
 ## Environment variables
 
 ### GPU selection (standard wgpu variables)
@@ -163,41 +220,18 @@ Without any of these, the mod uses Vulkan / Metal / DX12 (whichever the OS
 provides) and prefers the **integrated GPU**, so the discrete GPU stays free
 for rendering.
 
-### Diagnostics and debug exports
+### The mod reads no environment variables
 
-Set these only when troubleshooting. All of them are read once at startup.
-
-| Variable | Value | Effect |
-|---|---|---|
-| `C2ME_WGPU_DEBUG` | `1` | Enables verbose logging and periodic chunk-per-second (`CPS=`) stats. Also prints CPS to the chat HUD. Written to `<gameDir>/logs/c2me-wgpu.log`. |
-| `C2ME_WGPU_PROFILE` | `1` | Emits per-stage GPU batch timing (encode / submit / readback / decode) to the log. |
-| `C2ME_WGPU_ASYNC_SCHED` | `0` | Disables async write-back on C2ME's worker pool. Useful for A/B benchmarking. |
-| `C2ME_WGPU_MAPPED_AT_CREATION` | `0` / `1` | Override buffer upload method. Default `1` on desktop, `0` on Android (Mali rejects mapped path). |
-| `C2ME_VANILLA_REF` | `1` | Skip GPU entirely, let vanilla generate, then dump blocks for offline comparison. |
-| `C2ME_DUMP_BLOCKS` | `1` | Dump block states for the target chunk for offline comparison. |
-| `C2ME_DUMP_BLOB` | file path | Dump the serialized NoiseRouter blob to the given path. |
-| `C2ME_DUMP_DIR` | directory | Where dump files are written. Defaults to platform temp dir. |
-| `C2ME_DUMP_CHUNK` | `x,z` or `x1,z1,x2,z2` | Target chunk(s) for the `C2ME_DUMP_*` diagnostics. |
-| `C2ME_DUMP_AQUIFER` | `1` | Dump the aquifer cell table. |
-| `C2ME_DUMP_AQ_BLOCKS` | `1` | Dump per-block aquifer reference data. |
-| `C2ME_DUMP_DENSITY` | `1` | Dump GPU density values. |
-| `C2ME_DUMP_BEARD` | `1` | Dump Beardifier structure shaping data. |
-| `C2ME_WGPU_FORCE_SINGLE` | `1` | Development only: forces a single-shard all-channel shader for debugging. |
-| `C2ME_WGPU_MINIMAL_SHADER` | `1` | Development only: uses a minimal stub shader for bring-up testing. |
-| `C2ME_WGPU_MAX_CHANNELS` | integer | Development only: caps the number of emitted channels. |
-| `C2ME_WGPU_FAKE_GPU_MS` | integer | Development only: simulates a slower GPU by injecting delay. |
-| `C2ME_WGPU_NO_PIPELINE_CACHE` | `1` | Development only: bypasses the on-disk shader pipeline cache. |
-
-The blob dump can also be set with the JVM property `-Dc2me.dumpBlob=<path>`;
-the environment variable is only a fallback when the property is unset.
+Every setting lives in the config file; see "Configuration" above. This
+section covers only wgpu's own standard variables.
 
 **Native extraction location**:
 By default, the mod extracts the `.so` or `.dll` from the jar into a `c2me-wgpu-natives/` folder in the game root directory. If that directory is not writable or loading fails (e.g., `noexec` mount), it automatically falls back to the OS temporary directory (e.g., `/tmp` on Linux).
 If you need to debug native library loading failures, you can add `-Dc2me.wgpu.preserveNative=true` to your JVM launch arguments. The mod will extract the native library directly to the game's working directory instead.
 
-> **Note:** variables prefixed with `C2ME_DUMP_` and those marked "Development
-> only" are strictly for troubleshooting and do not need to be set during
-> normal gameplay.
+> **Note:** configuration fields marked "Development only", and the offline
+> diagnostics group, are strictly for troubleshooting and do not need to be
+> set during normal gameplay.
 
 > **Rust-side log file:** the native library writes its diagnostics to
 > `<gameDir>/logs/c2me-wgpu.log` (the path is passed from Java at startup).

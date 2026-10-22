@@ -38,26 +38,6 @@ pub const MAX_INNER_COUNT: usize = 128;
 /// Block height in blocks for this world's shape (16*H*16 blocks/chunk).
 fn shape_height(world: &WorldContext) -> u32 { world.shape().height.max(1) as u32 }
 
-/// Diagnostic probe: artificially delay each completed batch by N ms, to
-/// measure how sensitive end-to-end throughput is to "GPU residency time"
-/// (which bounds how long C2ME's position lock is held). Set
-/// `C2ME_WGPU_FAKE_GPU_MS=<n>`. 0 (default) = off. Pure sleep; results and
-/// correctness are unaffected.
-fn fake_gpu_delay() -> Duration {
-    use std::sync::OnceLock;
-    static D: OnceLock<Duration> = OnceLock::new();
-    *D.get_or_init(|| {
-        let ms = std::env::var("C2ME_WGPU_FAKE_GPU_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(0);
-        if ms > 0 {
-            crate::wgpu_debug!("[probe] fake GPU delay = {} ms/batch", ms);
-        }
-        Duration::from_millis(ms)
-    })
-}
-
 /// 执行器配置。
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
@@ -479,13 +459,6 @@ impl SingleBatchExecutor {
 
         self.staging.consume(slot_handle);
 
-        // Diagnostic probe: simulate a longer GPU residency so we can measure
-        // how it affects end-to-end throughput (see fake_gpu_delay).
-        let fake = fake_gpu_delay();
-        if !fake.is_zero() {
-            std::thread::sleep(fake);
-        }
-
         let dispatch_time = t0.elapsed();
 
         if prof {
@@ -855,7 +828,7 @@ fn profile_accumulate(chunks: u64, enc: f64, sub: f64, rb: f64, dec: f64, tot: f
     if n >= N {
         let bn = n as f64;
         crate::profile_log(&format!(
-            "[profile] avg over {} batches ({} chunks): encode={:.2} submit={:.2} readback={:.2} decode={:.2} total={:.2} ms/batch",
+            "[batch-stage-timing] avg over {} batches ({} chunks): encode={:.2} submit={:.2} readback={:.2} decode={:.2} total={:.2} ms/batch",
             n, P_CHUNKS.load(Relaxed),
             P_ENC.load(Relaxed) as f64 / 1000.0 / bn,
             P_SUB.load(Relaxed) as f64 / 1000.0 / bn,
