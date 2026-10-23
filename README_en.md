@@ -106,12 +106,21 @@ That is the **inherent limit of fp32**, not a bug. Terrain thresholds are insens
 
 ## Configuration
 
-User settings live in `config/c2me-wgpu.json`. The file is created on first launch; **restart the game** after editing it.
+User settings live in `config/c2me-wgpu.json`. The file is created on first launch.
+
+**When changes apply:** `debug_*` options take effect the next time you enter a world. Options
+that affect the GPU device (`gpu_index`, `disable_pipeline_cache`, `mapped_at_creation`) take
+effect when you **leave the save and re-enter**, because they require rebuilding the whole wgpu
+instance. Neither requires restarting the game.
 
 If the file is malformed (invalid JSON) the mod renames it to `c2me-wgpu.json.broken` for inspection and writes a fresh default; out-of-range values are corrected and written back.
 
-```json
+Whole-line `//` comments are ignored. The mod writes a list of available GPUs above `gpu_index`:
+
+```jsonc
 {
+  // Available GPUs (use one as gpu_index; -1 = automatic):
+  //   0: AMD Radeon Graphics (RADV RENOIR) [Vulkan]
   "gpu_index": -1,
   "disable_pipeline_cache": false,
   "debug_verbose_logging": false,
@@ -131,7 +140,7 @@ If the file is malformed (invalid JSON) the mod renames it to `c2me-wgpu.json.br
 
 | Field | Default | Description |
 |---|---|---|
-| `gpu_index` | `-1` | **Not implemented yet.** Reserved for GPU selection and currently ignored. |
+| `gpu_index` | `-1` | Which GPU generates terrain. `-1` = automatic (integrated first). The index refers to the list written as a comment in this file; ModMenu offers the same choice as a dropdown. An out-of-range or unsuitable index falls back to automatic selection and says why in the log. |
 | `disable_pipeline_cache` | `false` | Bypass the on-disk shader pipeline cache. Only needed if a driver crashes inside the pipeline cache; the cost is recompiling shaders every launch. |
 | `mapped_at_creation` | `null` | `null` = platform default (mapped on desktop, write_buffer on Android). `true` / `false` forces the path. A compatibility setting, not a diagnostic: some Mali drivers abort on the mapped path. |
 
@@ -157,6 +166,18 @@ For comparing against vanilla output offline. All default to off; a normal sessi
 | `debug_dump_aquifer` | `false` | Dump the aquifer cell table. |
 | `debug_dump_beard` | `false` | Dump Beardifier structure data and per-block reference values. |
 | `debug_dump_blob` | `""` | Write the serialised NoiseRouter blob here (this is how `src/test/resources/real_router.bin` is produced). |
+
+## Settings screen (ModMenu)
+
+With [ModMenu](https://modrinth.com/mod/modmenu) installed, this mod gets a **Settings** button
+in the mod list, where `gpu_index`, the pipeline cache, the buffer upload path and both debug
+switches can be changed without editing JSON by hand.
+
+- ModMenu is a **soft dependency**: without it the config file alone is fully functional.
+- The screen is generated from annotations on the `Config` fields, so it cannot drift out of
+  sync with the file.
+- Changes are written when you press "Done". `debug_*` applies immediately; device-related
+  options apply the next time you enter a world.
 
 ## Environment variables
 

@@ -55,11 +55,13 @@ public final class Config {
     /** Selected GPU index, as returned by {@code c2me_wgpu_list_gpus}.
      *  -1 means "automatic" (integrated GPU first). Not implemented yet. */
     @SerializedName("gpu_index")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.gpu", kind = ConfigOption.Kind.GPU_INDEX, order = 10)
     public int gpuIndex = -1;
 
     /** Disable wgpu's pipeline cache. Only useful when a driver aborts inside
      *  it. */
     @SerializedName("disable_pipeline_cache")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.pipeline_cache", order = 20)
     public boolean disablePipelineCache = false;
 
     // ── debug ──────────────────────────────────────────────────────────
@@ -70,11 +72,13 @@ public final class Config {
     /** Verbose diagnostics: shader compile timings, pipeline-cache hits,
      *  adapter workarounds, plus the periodic CPS throughput line. */
     @SerializedName("debug_verbose_logging")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.verbose", order = 50)
     public boolean debugVerboseLogging = false;
 
     /** Emit per-stage timing to the log: GPU side (encode / submit /
      *  readback / decode) and CPU side (block write-back into the chunk). */
     @SerializedName("debug_stage_timing")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.stage_timing", order = 60)
     public boolean debugStageTiming = false;
 
     /** Override the buffer-upload path. null = platform default (mapped on
@@ -82,37 +86,45 @@ public final class Config {
      *  mapped path). This is a compatibility setting, not a diagnostic: it is
      *  what gets a crashing device running at all. */
     @SerializedName("mapped_at_creation")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.mapped", kind = ConfigOption.Kind.TRI_STATE, order = 30)
     public Boolean mappedAtCreation = null;
 
     /** Skip the GPU entirely, let vanilla generate, then dump blocks. */
     @SerializedName("debug_vanilla_ref")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.vanilla_ref", order = 70)
     public boolean debugVanillaRef = false;
 
     /** Target chunk(s) for the dump writers: "x,z" or "x1,z1,x2,z2".
      *  Empty disables every {@code debug_dump_*} switch below. */
     @SerializedName("debug_dump_chunk")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.dump_chunk", kind = ConfigOption.Kind.STRING, order = 80)
     public String debugDumpChunk = "";
 
     /** Where dump files go. Empty = platform temp dir. */
     @SerializedName("debug_dump_dir")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.dump_dir", kind = ConfigOption.Kind.STRING, order = 90)
     public String debugDumpDir = "";
 
     /** Dump block states of the target chunk(s). */
     @SerializedName("debug_dump_blocks")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.dump_blocks", order = 100)
     public boolean debugDumpBlocks = false;
 
     /** Dump the per-cell aquifer table. */
     @SerializedName("debug_dump_aquifer")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.dump_aquifer", order = 110)
     public boolean debugDumpAquifer = false;
 
     /** Dump Beardifier pieces/junctions plus per-block reference values. */
     @SerializedName("debug_dump_beard")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.dump_beard", order = 120)
     public boolean debugDumpBeard = false;
 
     /** Write the serialized NoiseRouter blob (+ corner reference) here.
      *  Empty = do not dump. This is how src/test/resources/real_router.bin
      *  is produced. */
     @SerializedName("debug_dump_blob")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.dump_blob", kind = ConfigOption.Kind.STRING, order = 130)
     public String debugDumpBlob = "";
 
     // ── transient state ────────────────────────────────────────────────
@@ -127,11 +139,40 @@ public final class Config {
         return INSTANCE;
     }
 
+    /** Re-read the file from disk, replacing the cached instance.
+     *
+     *  <p>Called on save switch so edits made while the game was running take
+     *  effect on the next load. A file that is missing or unparsable keeps the
+     *  current settings: silently reverting the player's configuration because
+     *  they were mid-edit would be worse than ignoring the change. */
+    public static synchronized Config reload() {
+        Path path = configPath();
+        if (!Files.exists(path)) {
+            return get();
+        }
+        try {
+            String json = stripComments(Files.readString(path, StandardCharsets.UTF_8));
+            Config cfg = GSON.fromJson(json, Config.class);
+            if (cfg != null) {
+                cfg.clamp();
+                INSTANCE = cfg;
+                LOGGER.info("[c2me-wgpu] reloaded {}", path);
+                return cfg;
+            }
+            LOGGER.warn("[c2me-wgpu] {} parsed to null; keeping current settings", path);
+        } catch (JsonSyntaxException e) {
+            LOGGER.warn("[c2me-wgpu] {} is not valid JSON ({}); keeping current settings", path, e.getMessage());
+        } catch (IOException e) {
+            LOGGER.warn("[c2me-wgpu] could not re-read {}; keeping current settings", path, e);
+        }
+        return get();
+    }
+
     private static Config load() {
         Path path = configPath();
         if (Files.exists(path)) {
             try {
-                String json = Files.readString(path, StandardCharsets.UTF_8);
+                String json = stripComments(Files.readString(path, StandardCharsets.UTF_8));
                 Config cfg = GSON.fromJson(json, Config.class);
                 if (cfg != null) {
                     if (cfg.clamp()) {
@@ -191,7 +232,7 @@ public final class Config {
         Path path = configPath();
         try {
             Files.createDirectories(path.getParent());
-            Files.writeString(path, GSON.toJson(this), StandardCharsets.UTF_8);
+            Files.writeString(path, withGpuComment(GSON.toJson(this)), StandardCharsets.UTF_8);
         } catch (IOException e) {
             LOGGER.error("[c2me-wgpu] failed to write {}", path, e);
         }
@@ -199,5 +240,99 @@ public final class Config {
 
     private static Path configPath() {
         return FabricLoader.getInstance().getConfigDir().resolve(FILE_NAME);
+    }
+
+    private static volatile String gpuComment = "";
+
+    /**
+     * Refresh the GPU listing written into the config file as a comment.
+     *
+     * <p>Players without ModMenu have no other way to learn which index maps
+     * to which adapter, so the list belongs next to the field that consumes it.
+     *
+     * @param json the array produced by {@code c2me_wgpu_list_gpus}, or
+     *             {@code null} if it could not be queried.
+     */
+    public static synchronized void updateGpuListing(String json) {
+        String rendered = renderGpuComment(json);
+        if (rendered.equals(gpuComment)) {
+            return;
+        }
+        gpuComment = rendered;
+        Config inst = INSTANCE;
+        if (inst != null) {
+            // Rewrite now rather than at the next save: the player may be
+            // reading the file precisely to find out what to put in it.
+            inst.save();
+        }
+    }
+
+    private static String renderGpuComment(String json) {
+        if (json == null || json.isBlank()) {
+            return "";
+        }
+        try {
+            var arr = com.google.gson.JsonParser.parseString(json).getAsJsonArray();
+            if (arr.isEmpty()) {
+                return "";
+            }
+            StringBuilder sb = new StringBuilder();
+            for (var el : arr) {
+                var o = el.getAsJsonObject();
+                if (sb.length() > 0) {
+                    sb.append('\n');
+                }
+                sb.append(o.get("index").getAsInt())
+                  .append(": ")
+                  .append(o.get("name").getAsString())
+                  .append(" [")
+                  .append(o.get("backend").getAsString())
+                  .append(']');
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            // A malformed listing only costs the comment, never the config.
+            return "";
+        }
+    }
+
+    /** Insert {@link #gpuComment} above the {@code gpu_index} field. */
+    private static String withGpuComment(String json) {
+        String comment = gpuComment;
+        if (comment.isEmpty()) {
+            return json;
+        }
+        int idx = json.indexOf("\"gpu_index\"");
+        if (idx < 0) {
+            return json;
+        }
+        int lineStart = json.lastIndexOf('\n', idx) + 1;
+        String pad = json.substring(lineStart, idx);
+        StringBuilder sb = new StringBuilder(json.length() + comment.length() + 64);
+        sb.append(json, 0, lineStart);
+        sb.append(pad).append("// Available GPUs (use one as gpu_index; -1 = automatic):\n");
+        for (String line : comment.split("\n")) {
+            sb.append(pad).append("//   ").append(line).append('\n');
+        }
+        sb.append(json.substring(lineStart));
+        return sb.toString();
+    }
+
+    /**
+     * Drop whole-line {@code //} comments before handing the text to Gson.
+     *
+     * <p>Only lines whose first non-space characters are {@code //} are
+     * removed. A comment marker inside a string value must survive, which is
+     * why this does not scan for {@code //} anywhere in the line.
+     */
+    private static String stripComments(String raw) {
+        StringBuilder sb = new StringBuilder(raw.length());
+        for (String line : raw.split("\n", -1)) {
+            if (line.trim().startsWith("//")) {
+                continue;
+            }
+            sb.append(line).append('\n');
+        }
+        return sb.toString();
     }
 }

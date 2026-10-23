@@ -26,46 +26,49 @@ pub mod result;
 
 pub use error::{C2meError, Result};
 
-/// Runtime configuration, supplied by the Java side from `config/c2me-wgpu.json`.
+/// "Cold" configuration: values that can only change by rebuilding the wgpu
+/// instance (and therefore only take effect on save reload / restart).
 ///
-/// Previously each of these was an independent `C2ME_WGPU_*` environment
-/// variable, read once into a `OnceLock`. That made hot-reload impossible and
-/// spread the schema across two languages. Now the Java side parses the file
-/// and pushes the whole struct through one C API call; the rest of this crate
-/// only ever reads these fields.
+/// These used to live in a global `Config` behind a `OnceLock`. They are now
+/// carried on the [`WgpuInstance`](crate::instance::WgpuInstance) itself: the
+/// instance owns its adapter/device/queue, so its upload and pipeline-cache
+/// policy logically belongs to it. Rebuilding the instance replaces all three
+/// at once, which is exactly the "switch GPU / reapply config" operation.
 #[derive(Clone, Debug)]
-pub struct Config {
-    pub debug: bool,
+pub struct ColdConfig {
+    /// Selected GPU index from `list_gpus`, or -1 for automatic
+    /// (IntegratedGpu > DiscreteGpu > VirtualGpu).
+    pub gpu_index: i32,
+    /// Bypass wgpu's `PipelineCache` entirely (some Mali drivers abort in it).
     pub disable_pipeline_cache: bool,
-    pub profile: bool,
     /// `None` = platform default (mapped on desktop, write_buffer on Android).
     /// `Some(true)` forces mapped-at-creation, `Some(false)` forces write_buffer.
     pub mapped_at_creation: Option<bool>,
 }
 
-impl Default for Config {
+impl Default for ColdConfig {
     fn default() -> Self {
         Self {
-            debug: false,
+            gpu_index: -1,
             disable_pipeline_cache: false,
-            profile: false,
             mapped_at_creation: None,
         }
     }
 }
 
-static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
+/// "Hot" flags: read on hot paths (every batch, every debug macro) and
+/// written only when the user reloads the config. Two relaxed atomics cost a
+/// plain load at each use, which is why they are not behind a lock: the hot
+/// path must not pay for a lock it can never contend on anyway.
+static DEBUG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PROFILE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Store the config. Only the first call takes effect: the value is written
-/// once from `c2me_wgpu_update_config` before any GPU work starts, and is
-/// read-only afterwards, so an uncontended `OnceLock` load is all a getter
-/// costs. Hot-reload will need this replaced with something mutable.
-pub(crate) fn set_config(c: Config) {
-    let _ = CONFIG.set(c);
-}
-
-pub(crate) fn config() -> &'static Config {
-    CONFIG.get_or_init(Config::default)
+/// Update the hot-reloadable flags. Safe to call at any time from the Java
+/// side (e.g. when the config file is re-read on save switch).
+pub(crate) fn set_hot_flags(debug: bool, profile: bool) {
+    use std::sync::atomic::Ordering;
+    DEBUG_ENABLED.store(debug, Ordering::Relaxed);
+    PROFILE_ENABLED.store(profile, Ordering::Relaxed);
 }
 
 /// Whether verbose GPU/codegen diagnostics are enabled.
@@ -74,19 +77,7 @@ pub(crate) fn config() -> &'static Config {
 /// Used by the `wgpu_debug!` macro for shader-compile / pipeline-cache logs
 /// that would otherwise spam the game log on every launch.
 pub(crate) fn debug_enabled() -> bool {
-    config().debug
-}
-
-/// Whether to bypass wgpu's `PipelineCache` entirely.
-///
-/// Set `disable_pipeline_cache` in the config file to disable the on-disk
-/// and in-memory `wgpu::PipelineCache` and skip requesting `Features::PIPELINE_CACHE`.
-/// Some Vulkan drivers (observed on Mali-G610 / Dimensity 8100) report the
-/// feature but abort inside `create_pipeline_cache` or the subsequent
-/// `create_compute_pipeline`, so this switch lets such devices still run
-/// (at the cost of recompiling the shader each launch).
-pub(crate) fn no_pipeline_cache() -> bool {
-    config().disable_pipeline_cache
+    DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Installs a panic hook that writes the panic message to the "black box" log
@@ -173,7 +164,7 @@ pub(crate) fn debug_log_line(msg: &str) {
 /// Separate from `debug_verbose_logging` so profiling can be turned on without
 /// the compile-time / cache log noise.
 pub(crate) fn profile_enabled() -> bool {
-    config().profile
+    PROFILE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Print a profiling line to stderr AND the debug log file. Unlike

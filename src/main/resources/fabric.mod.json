@@ -18,6 +18,9 @@
   "entrypoints": {
     "main": [
       "com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuModInitializer"
+    ],
+    "modmenu": [
+      "com.rubidiumlighting.c2me.opts.accel.wgpu.client.WgpuModMenuApi"
     ]
   },
   "mixins": [
@@ -29,5 +32,8 @@
     "java": ">=25",
     "c2me": "*"
   },
-  "accessWidener": "c2me-opts-accel-wgpu.accesswidener"
+  "accessWidener": "c2me-opts-accel-wgpu.accesswidener",
+  "suggests": {
+    "modmenu": "*"
+  }
 }

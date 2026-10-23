@@ -2,6 +2,8 @@
 
 > 最后更新：2026-10-24
 > 状态：**0.1.5 发布版**。完整实现 Pass E、GPU 矿脉、100% 对齐原版的 AquiferSampler 逻辑，并重构了 FFM 日志架构与底层防死锁机制。实机验证兼容 Epic Terrain 与 Tectonic。
+> 用户侧已落地：GPU 选择（能力优先，越界自动回退）、切存档热重载配置（冷/热两级，零锁）、
+> 聊天栏状态提示、由注解自动生成的 ModMenu 设置界面。
 > 移动端实测：Chunky A/B 测试在 Mali-G610 平板上，端到端总耗时从 3m12s 缩短至 2m19s（+61%）；纯地形生成实时吞吐从 23.52 CPS 提升至 30.65 CPS（+30.3%）。
 > 服务端实测 (Headless，无渲染干扰)：Chunky r=500 跑纯原版地形，纯 CPU 耗时 27s (平均 121.1 cps)，GPU 加速耗时 21s (平均 143.6 cps，峰值 215.7 cps)。端到端提速 22%，峰值提速 44.7%。注：纯 CPU 模式下主线程排队（Amdahl 定律）会锁死并发上限，CPU 占用率通常只能达到 70-80%。
 > 桌面端到端反超纯 CPU（Chunky r=500，RADV RENOIR：**18 s vs 23 s**，流水线化后本机实测）。
@@ -76,9 +78,14 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 25. **死锁下 `System.exit` 无效**：当主线程死锁时，`System.exit` 的 Shutdown Hook 会被卡死。必须调用 `LogManager.shutdown()` 刷盘后，使用 `Runtime.getRuntime().halt(1)` 强杀进程。
 26. **FFM 导出的符号必须带 `#[unsafe(no_mangle)]`**：即便是 `extern "C"` 函数，如果漏掉了这个宏，Rust 编译器依然会改写符号名，导致 Java 端调用 `lookup.find()` 时抛出 `NoSuchElementException`。清理代码时绝不能误删。
 
-27. **低频偶发失败先抓证据，别倒推**：`world::tests` 里 9 个 GPU 测试各自 `ExecutorThread::spawn` 一套约 600 MB buffer，16 线程并行时资源叠加，集显上约 1/5~1/8 概率偶发失败，且无固定 panic 原文。曾误判为显存 OOM——实际 `vulkaninfo` 显示 device-local budget 4.86 GiB、`dmesg` 无 amdgpu OOM 记录，10 次连跑不复现。生产路径 `get_or_create_executor()` 是 `OnceLock<ExecutorThread>` 单 executor（已去掉 Mutex，也早已不是串行），**游戏运行不受影响**。修复方向（暂缓）：测试改用小 `ExecutorConfig`（batch 实际只有 1~3 个 chunk，却按 64 预分配），或加全局 GPU 锁。复现时务必保留完整 stderr + `free -h` + `mem_info_gtt_used` + `dmesg | tail`。
+27. **能力优先，别信 adapter 的自述**：llvmpipe 会把自己标成普通 GPU，靠 `DeviceType`
+    过滤挡不住它，结果是一路通过选卡、直到 `check_required` 才失败，并让整个会话掉到
+    CPU。正解是每个候选都跑一遍能力检查，只有真正能用的才进选择池；类型只用于排序。
+    另外，显式指定的 `gpu_index` 也必须过检查——坏配置应当回退，不该让 instance 创建失败。
 
-28. **动地形正确性必须跑 `real_router_vs_vanilla`**：它是唯一对照真实 Minecraft 输出（`src/test/resources/real_router.ref.txt`）的测试，因耗时约 2s 已默认 `#[ignore]`。改动 emitter / aquifer / beard / 矿脉 / 反序列化，或任何会改变 WGSL 数值输出的代码后，必须手动跑 `cd rust && cargo test --lib -- --ignored real_router_vs_vanilla`。其余 84 个测试全绿**不能**替代这一步——它们只验证"CPU 参考实现与 GPU 一致"，不验证"GPU 与 vanilla 一致"（见教训 #20）。
+28. **低频偶发失败先抓证据，别倒推**：`world::tests` 里 9 个 GPU 测试各自 `ExecutorThread::spawn` 一套约 600 MB buffer，16 线程并行时资源叠加，集显上约 1/5~1/8 概率偶发失败，且无固定 panic 原文。曾误判为显存 OOM——实际 `vulkaninfo` 显示 device-local budget 4.86 GiB、`dmesg` 无 amdgpu OOM 记录，10 次连跑不复现。生产路径 `get_or_create_executor()` 是单个 executor（现已从 `OnceLock` 改为可重置的 `RwLock<Option<Arc<..>>>`，以便换卡时重建；无 Mutex 争用，也早已不是串行），**游戏运行不受影响**。修复方向（暂缓）：测试改用小 `ExecutorConfig`（batch 实际只有 1~3 个 chunk，却按 64 预分配），或加全局 GPU 锁。复现时务必保留完整 stderr + `free -h` + `mem_info_gtt_used` + `dmesg | tail`。
+
+29. **动地形正确性必须跑 `real_router_vs_vanilla`**：它是唯一对照真实 Minecraft 输出（`src/test/resources/real_router.ref.txt`）的测试，因耗时约 2s 已默认 `#[ignore]`。改动 emitter / aquifer / beard / 矿脉 / 反序列化，或任何会改变 WGSL 数值输出的代码后，必须手动跑 `cd rust && cargo test --lib -- --ignored real_router_vs_vanilla`。其余 84 个测试全绿**不能**替代这一步——它们只验证"CPU 参考实现与 GPU 一致"，不验证"GPU 与 vanilla 一致"（见教训 #20）。
 
 ### 待办与 0.1.5 规划（2026-10-18 更新）
 
@@ -101,36 +108,44 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     库。损坏的 JSON 备份为 `.broken` 后重建，越界值 clamp 并回写。本模组已不读取任何
     `C2ME_*` 环境变量。
   - [x] **聊天栏提示**：GPU 回退原因、GC 建议已有。
-  - [ ] **GPU 选择**（唯一未落地的功能项）：
-    `gpu_index` 字段已存在但未被读取，`create_instance` 也不接收它。需要：
-      1. Rust 提供 `c2me_wgpu_list_gpus`，用临时 instance 枚举 adapter，返回带序号的列表。
-      2. Java 首次生成配置时把列表以注释形式写进 JSON（仅供人读）。
-      3. `create_instance` 接收 `gpu_index`；Rust 按序号选卡，越界或 feature 不足时回退
-         默认逻辑（优先集成显卡）。
-    - `WgpuInstance` 目前是 `OnceLock` 单例，换卡需要重建 instance——这正好也是热重载
-      的前置（见下一条）。
-  - [ ] **切换存档时热重载配置**：
-    目前配置是启动时读一次，改完必须重启。存档切换是天然的重置点：所有维度都会销毁重建。
+  - [x] **GPU 选择**：
+    - Rust 提供 `c2me_wgpu_list_gpus`，用临时 instance 枚举 adapter，返回
+      `[{index,name,type,backend,selected?}]` JSON；`DeviceType::Cpu`（llvmpipe 等
+      软件光栅化器）在 `enumerate` 阶段就被过滤，不占索引。
+    - Java 首次启动时把列表以 `//` 注释形式写进 JSON 的 `gpu_index` 上方，不装
+      ModMenu 也能看到序号与卡名。读回时 `stripComments` 只删整行注释，字符串里的
+      `//` 原样保留。
+    - `create_instance` / `rebuild_instance` 接收 `gpu_index`。选卡是**能力优先**
+      而非名字/类型优先：每个候选都过一遍 `features::check_required`，只有真正
+      能跑 shader 的才参与选择。越界或不达标都会打日志并回退到自动顺序，坏配置
+      不会让整个会话掉到 CPU。
+  - [x] **切换存档时热重载配置**：
     - 配置分三类：A 类影响 instance（`gpu_index`、`disable_pipeline_cache`）、
       B 类影响 world 创建（`mapped_at_creation`）、C 类只影响行为（`debug_*`）。
-    - C 类只需重读配置；B 类要销毁 `DimState`；A 类要重建整个 instance。
-    - 关键顺序：`shutdown()` 全部 coordinator → 排空 inflight → `world_destroy` →
-      清 `DIM_STATES` →（必要时）重建 instance。
-    - **前置**：`shutdown()` 已会 join 两个线程并排空 inflight（本轮已做），
-      所以同步销毁是安全的，不再需要 5 秒延迟。
-    - 风险：重建期间完全无 GPU 能力，必须保证 C2ME 走 CPU 路径。
-  - [ ] **状态展示（三项合并做）**：
-    - 加载界面提示（正在编译着色器 / 已启用 GPU 名称 / 已回退及原因）
-    - 展示当前 GPU 名称与硬件状态（`get_gpu_name` 之前删掉了，需要重新加回，但这次
-      不要泄漏 `CString`）
-    - F3 调试屏扩展，显示当前 CPS
-  - [ ] **ModMenu GUI（软依赖）**：
-    - 绝不可将 ModMenu / Cloth Config 设为强制依赖，仅 `modCompileOnly`。
-    - **不引入第三方 GUI 库**，用 MC 自带的 `GridWidget` / `DirectionalLayoutWidget` /
-      `ScrollableLayout` 手搓。封装 `WgpuRowHelper` 提供 `addBoolean()` / `addIntSlider()`。
-    - 翻页式或原生滚动条，防溢出。
-    - 没装 ModMenu 时，手改 JSON 必须功能完整。
-    - 优先级最低：纯便利性，JSON 已经能用。
+    - 实现上没有引入任何锁：`debug` / `profile` 是两条 `AtomicBool`（热路径零开销）；
+      A/B 两类在重建 instance 时作为 `ColdConfig` 一并替换，因此不存在"全局可变
+      配置"这一概念。
+    - `WgpuInstance` 从 `OnceLock` 单例改为 `RwLock<Option<Arc<..>>>`，新增
+      `rebuild` / `shutdown`；executor 同样可重置。
+    - 关键顺序由 `WgpuDimensionRegistry.onSaveSwitch()` 统一执行：
+      `destroyAll()`（shutdown 全部 coordinator → world_destroy → 清表）→
+      `rebuildFromConfig()`。冷配置没变时只刷新热标志，零成本。
+    - 触发点是 `MinecraftClient.joinWorld` 的 HEAD，因此"游戏运行时改配置、
+      进存档"也能生效，不必退回标题界面。
+  - [x] **状态展示**：
+    - 聊天栏：`GPU 加速已启用：<卡名>` / 回退原因，走 `Text.translatable`。
+    - 卡名通过 `WgpuStatus` 解析 `list_gpus` 结果里 `selected:true` 的那一项，
+      实例重建时失效重取。
+    - F3 行**已移除**：聊天栏已经覆盖同样信息，CPS 需要时开
+      `debug_verbose_logging` 看日志或聊天栏即可。
+  - [x] **ModMenu GUI（软依赖）**：
+    - 仅 `modCompileOnly`，`fabric.mod.json` 用独立的 `modmenu` entrypoint +
+      `suggests`，没装 ModMenu 时完全不影响。
+    - 不引入第三方 GUI 库，全部用原生 widget。
+    - **界面由注解反射生成**：`Config` 字段上标 `@ConfigOption(label, kind, order)`，
+      屏幕遍历这些字段建控件。加一个设置 = 加一个带注解的字段，GUI 不会与文件
+      脱节。`Kind` 支持 `BOOL` / `TRI_STATE`（如 `mapped_at_creation` 的三态）/
+      `GPU_INDEX`（自动 + 每张卡的列表）。
 
 - [x] **健壮性**：
   - 增加更多边缘平台（如未测试的 macOS Metal）的预防性回退逻辑。
@@ -147,7 +162,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 | 变量 | 值 | 效果 |
 |---|---|---|
 | `WGPU_BACKEND` | 后端名，逗号分隔 | 限制尝试的图形后端 |
-| `WGPU_ADAPTER_NAME` | 子串 | 按名称选 GPU（GPU 选择功能落地前的过渡手段） |
+| `WGPU_ADAPTER_NAME` | 子串 | 按名称选 GPU。`gpu_index` 现在是首选方式；此变量保留给按名字而非序号选择的场景，且只会匹配能通过能力检查的 adapter |
 
 ---
 

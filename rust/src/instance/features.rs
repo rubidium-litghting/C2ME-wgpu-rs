@@ -14,7 +14,7 @@ use crate::Result;
 
 /// Run all 4 mandatory capability checks against an adapter.
 /// Returns Ok on pass, Err(MissingCapability(name)) on first failure.
-pub fn check_required(adapter: &wgpu::Adapter) -> Result<()> {
+pub fn check_required(adapter: &wgpu::Adapter, disable_pipeline_cache: bool) -> Result<()> {
     if adapter.limits().max_compute_workgroups_per_dimension < 65535 {
         return Err(anyhow::anyhow!("max_compute_workgroups_per_dimension < 65535"));
     }
@@ -24,7 +24,7 @@ pub fn check_required(adapter: &wgpu::Adapter) -> Result<()> {
     // PIPELINE_CACHE is only required when we actually use it. With
     // `disable_pipeline_cache` in the config we skip it, so adapters that lack the
     // feature can still run.
-    if !crate::no_pipeline_cache() && !adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
+    if !disable_pipeline_cache && !adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
         return Err(anyhow::anyhow!("Features::PIPELINE_CACHE not present"));
     }
     Ok(())

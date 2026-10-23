@@ -55,8 +55,11 @@ public class WgpuThinBinding {
     public static final int STATUS_ERROR = 2;
     public static final int STATUS_INVALID_HANDLE = -1;
 
-    private static MethodHandle MH_update_config;
+    private static MethodHandle MH_set_hot_flags;
     private static MethodHandle MH_create_instance;
+    private static MethodHandle MH_rebuild_instance;
+    private static MethodHandle MH_shutdown_instance;
+    private static MethodHandle MH_list_gpus;
     private static MethodHandle MH_world_new;
     private static MethodHandle MH_world_destroy;
     private static MethodHandle MH_request_chunks;
@@ -82,26 +85,60 @@ public class WgpuThinBinding {
     /** True only if the native lib linked AND a wgpu instance was created. */
     private static boolean available;
 
+    /** True once every downcall symbol resolved. Set in the static block. */
+    private static boolean linked = true;
+
     static {
-        boolean linked = true;
         try {
-            MH_update_config = NativeLoader.linker.downcallHandle(
-                    NativeLoader.lookup.find("c2me_wgpu_update_config").orElseThrow(),
+            MH_set_hot_flags = NativeLoader.linker.downcallHandle(
+                    NativeLoader.lookup.find("c2me_wgpu_set_hot_flags").orElseThrow(),
                     FunctionDescriptor.of(
                             ValueLayout.JAVA_INT,        // -> i32 (0 = ok)
                             ValueLayout.JAVA_INT,        // debug: u32
-                            ValueLayout.JAVA_INT,        // disable_pipeline_cache: u32
-                            ValueLayout.JAVA_INT,        // profile: u32
-                            ValueLayout.JAVA_INT         // mapped_at_creation: i32
+                            ValueLayout.JAVA_INT         // profile: u32
                     )
             );
 
+            // create / rebuild share the same C signature: the three cold
+            // settings (gpu_index, disable_pipeline_cache, mapped_at_creation)
+            // travel with the call, because they belong to the device being
+            // built and only take effect by building a new one.
             MH_create_instance = NativeLoader.linker.downcallHandle(
                     NativeLoader.lookup.find("c2me_wgpu_create_instance").orElseThrow(),
                     FunctionDescriptor.of(
-                            ValueLayout.JAVA_LONG,       // -> i64 instance_handle (0 on error)
+                            ValueLayout.JAVA_LONG,       // -> 1 ok / 0 error
+                            ValueLayout.JAVA_INT,        // gpu_index: i32
+                            ValueLayout.JAVA_INT,        // disable_pipeline_cache: u32
+                            ValueLayout.JAVA_INT,        // mapped_at_creation: i32
                             ValueLayout.ADDRESS,         // err_buf: *mut c_char
                             ValueLayout.JAVA_LONG        // err_buf_len: usize
+                    )
+            );
+
+            MH_rebuild_instance = NativeLoader.linker.downcallHandle(
+                    NativeLoader.lookup.find("c2me_wgpu_rebuild_instance").orElseThrow(),
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_LONG,       // -> 1 ok / 0 error
+                            ValueLayout.JAVA_INT,        // gpu_index: i32
+                            ValueLayout.JAVA_INT,        // disable_pipeline_cache: u32
+                            ValueLayout.JAVA_INT,        // mapped_at_creation: i32
+                            ValueLayout.ADDRESS,         // err_buf: *mut c_char
+                            ValueLayout.JAVA_LONG        // err_buf_len: usize
+                    )
+            );
+
+            MH_shutdown_instance = NativeLoader.linker.downcallHandle(
+                    NativeLoader.lookup.find("c2me_wgpu_shutdown_instance").orElseThrow(),
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT)
+            );
+
+            MH_list_gpus = NativeLoader.linker.downcallHandle(
+                    NativeLoader.lookup.find("c2me_wgpu_list_gpus").orElseThrow(),
+                    FunctionDescriptor.of(
+                            ValueLayout.JAVA_LONG,       // -> bytes written, or < 0
+                            ValueLayout.ADDRESS,         // buf: *mut c_char
+                            ValueLayout.JAVA_LONG,       // buf_len: usize
+                            ValueLayout.ADDRESS          // out_len: *mut usize
                     )
             );
 
@@ -241,53 +278,158 @@ public class WgpuThinBinding {
         }
 
         if (linked) {
-            try (Arena errArena = Arena.ofConfined()) {
-                MemorySegment errBuf = errArena.allocate(1024);
-                var cfg = Config.get();
-                // invokeExact infers the call site's type from how the result
-                // is used. Discarding it would make the site (...)void while
-                // the handle is (...)int, throwing WrongMethodTypeException.
-                int cfgStatus = (int) MH_update_config.invokeExact(
-                        cfg.debugVerboseLogging ? 1 : 0,
-                        cfg.disablePipelineCache ? 1 : 0,
-                        cfg.debugStageTiming ? 1 : 0,
-                        cfg.mappedAtCreation == null
-                                ? -1 : (cfg.mappedAtCreation ? 1 : 0)
-                );
-                if (cfgStatus != 0) {
-                    LOGGER.warn("[c2me-wgpu] update_config returned {}", cfgStatus);
-                }
-                long h = (long) MH_create_instance.invokeExact(
-                        errBuf,
-                        errBuf.byteSize()
-                );
-                if (h == 0) {
-                    System.err.println("[c2me-wgpu] Failed to create wgpu instance: " + errBuf.getString(0));
-                } else {
-                    instanceHandle = h;
-                    available = true;
-                    
-                    MH_setup_panic_hook.invokeExact();
-                    
-                    // Register Rust log callback using global Arena (lifetime = JVM)
-                    try {
-                        MethodHandle target = MethodHandles.lookup().findStatic(
-                                WgpuThinBinding.class, "onRustLog",
-                                MethodType.methodType(void.class, MemorySegment.class, long.class));
-                        MemorySegment upcall = NativeLoader.linker.upcallStub(
-                                target, FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG),
-                                Arena.global());
-                        MH_set_log_callback = NativeLoader.linker.downcallHandle(
-                                NativeLoader.lookup.find("c2me_wgpu_set_log_callback").orElseThrow(),
-                                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
-                        MH_set_log_callback.invokeExact(upcall);
-                    } catch (Throwable t) {
-                        System.err.println("[c2me-wgpu] Failed to register Rust log callback: " + t);
-                    }
-                }
+            // Registration of the panic hook and the log callback happens
+            // exactly once per JVM, even though the instance itself can be
+            // rebuilt later: both are process-level hooks on the Rust side.
+            try {
+                MH_setup_panic_hook.invokeExact();
+            } catch (Throwable t) {
+                System.err.println("[c2me-wgpu] setup_panic_hook failed: " + t);
+            }
+            try {
+                MethodHandle target = MethodHandles.lookup().findStatic(
+                        WgpuThinBinding.class, "onRustLog",
+                        MethodType.methodType(void.class, MemorySegment.class, long.class));
+                MemorySegment upcall = NativeLoader.linker.upcallStub(
+                        target, FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG),
+                        Arena.global());
+                MH_set_log_callback = NativeLoader.linker.downcallHandle(
+                        NativeLoader.lookup.find("c2me_wgpu_set_log_callback").orElseThrow(),
+                        FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+                MH_set_log_callback.invokeExact(upcall);
+            } catch (Throwable t) {
+                System.err.println("[c2me-wgpu] Failed to register Rust log callback: " + t);
+            }
+
+            // Build the first instance from the config on disk.
+            try {
+                pushHotFlags();
+                ensureInstance();
             } catch (Throwable t) {
                 System.err.println("[c2me-wgpu] create_instance failed: " + t);
             }
+        }
+    }
+
+    /** Push the hot-reloadable flags (debug / profiling). Safe at any time. */
+    public static void pushHotFlags() throws Throwable {
+        if (!linked) return;
+        var cfg = Config.get();
+        int st = (int) MH_set_hot_flags.invokeExact(
+                cfg.debugVerboseLogging ? 1 : 0,
+                cfg.debugStageTiming ? 1 : 0);
+        if (st != 0) {
+            LOGGER.warn("[c2me-wgpu] set_hot_flags returned {}", st);
+        }
+    }
+
+    /**
+     * Create the wgpu instance if it does not exist yet, using the cold
+     * settings currently on disk. A no-op when an instance is already live.
+     *
+     * @return true if an instance is available afterwards.
+     */
+    public static synchronized boolean ensureInstance() throws Throwable {
+        if (!linked) return false;
+        if (available) return true;
+        var cfg = Config.get();
+        try (Arena errArena = Arena.ofConfined()) {
+            MemorySegment errBuf = errArena.allocate(1024);
+            long r = (long) MH_create_instance.invokeExact(
+                    cfg.gpuIndex,
+                    cfg.disablePipelineCache ? 1 : 0,
+                    cfg.mappedAtCreation == null ? -1 : (cfg.mappedAtCreation ? 1 : 0),
+                    errBuf,
+                    errBuf.byteSize());
+            if (r == 0) {
+                LOGGER.warn("[c2me-wgpu] Failed to create wgpu instance: {}", errBuf.getString(0));
+                return false;
+            }
+        }
+        available = true;
+        instanceHandle = 1L;
+        return true;
+    }
+
+    /**
+     * Tear down the instance and rebuild it from the current config.
+     *
+     * MUST only be called when no world handle is alive and no batch is in
+     * flight: the Rust side stops the executor, but worlds hold pipelines
+     * bound to the old device. The save-switch path guarantees this.
+     *
+     * @return true if a usable instance exists afterwards.
+     */
+    public static synchronized boolean rebuildFromConfig() throws Throwable {
+        if (!linked) return false;
+        var cfg = Config.get();
+        try (Arena errArena = Arena.ofConfined()) {
+            MemorySegment errBuf = errArena.allocate(1024);
+            long r = (long) MH_rebuild_instance.invokeExact(
+                    cfg.gpuIndex,
+                    cfg.disablePipelineCache ? 1 : 0,
+                    cfg.mappedAtCreation == null ? -1 : (cfg.mappedAtCreation ? 1 : 0),
+                    errBuf,
+                    errBuf.byteSize());
+            if (r == 0) {
+                // The previous instance is left in place by Rust, so we keep
+                // reporting whatever availability we had rather than dropping
+                // GPU acceleration for the rest of the session.
+                LOGGER.warn("[c2me-wgpu] Failed to rebuild wgpu instance: {}", errBuf.getString(0));
+                return available;
+            }
+        }
+        available = true;
+        instanceHandle = 1L;
+        pushHotFlags();
+        // The adapter may have changed, so the cached name is stale.
+        WgpuStatus.invalidate();
+        return true;
+    }
+
+    /** Drop the instance and its executor. Idempotent. */
+    public static synchronized void shutdownInstance() {
+        if (!linked || !available) return;
+        try {
+            int st = (int) MH_shutdown_instance.invokeExact();
+            if (st != 0) {
+                LOGGER.warn("[c2me-wgpu] shutdown_instance returned {}", st);
+            }
+        } catch (Throwable t) {
+            LOGGER.warn("[c2me-wgpu] shutdown_instance failed", t);
+        } finally {
+            available = false;
+            instanceHandle = 0L;
+        }
+    }
+
+    /**
+     * Enumerate the GPUs visible to the backend as a JSON array.
+     *
+     * @return the JSON text, or {@code null} if the query failed.
+     */
+    public static String listGpus() {
+        if (!linked) return null;
+        try (Arena arena = Arena.ofConfined()) {
+            // First call with a small buffer tells us the required size via
+            // out_len; then retry with exactly that. Two calls avoid guessing
+            // a fixed cap that a machine with many adapters could exceed.
+            MemorySegment outLen = arena.allocate(ValueLayout.JAVA_LONG);
+            MemorySegment small = arena.allocate(64);
+            long r = (long) MH_list_gpus.invokeExact(small, small.byteSize(), outLen);
+            if (r >= 0) {
+                return small.getString(0);
+            }
+            long need = outLen.get(ValueLayout.JAVA_LONG, 0);
+            if (r != -2 || need <= 0 || need > 1 << 20) {
+                return null;
+            }
+            MemorySegment buf = arena.allocate(need);
+            r = (long) MH_list_gpus.invokeExact(buf, buf.byteSize(), outLen);
+            return r >= 0 ? buf.getString(0) : null;
+        } catch (Throwable t) {
+            LOGGER.warn("[c2me-wgpu] list_gpus failed", t);
+            return null;
         }
     }
 

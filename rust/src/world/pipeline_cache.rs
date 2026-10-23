@@ -112,7 +112,10 @@ pub fn get_or_compile(
     // some Vulkan drivers (Mali-G610) abort inside it, so
     // `disable_pipeline_cache` in the config skips it entirely.
     let t_pipe0 = std::time::Instant::now();
-    let pipeline = if crate::no_pipeline_cache() {
+    let no_cache = crate::instance::WgpuInstance::instance()
+        .map(|i| i.cold.disable_pipeline_cache)
+        .unwrap_or(false);
+    let pipeline = if no_cache {
         crate::wgpu_debug!("[compile] pipeline cache disabled; compiling without it");
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(&format!("c2me_wgpu_pipeline_{fingerprint:08x}_p{}", pass_id(pass))),

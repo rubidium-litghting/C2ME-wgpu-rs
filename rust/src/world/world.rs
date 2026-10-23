@@ -119,11 +119,8 @@ fn create_init_buffer(
     label: &str,
     contents: &[u8],
     usage: wgpu::BufferUsages,
+    use_mapped: bool,
 ) -> wgpu::Buffer {
-    let use_mapped = crate::config()
-        .mapped_at_creation
-        .unwrap_or(!cfg!(target_os = "android"));
-
     if use_mapped {
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(label),
@@ -258,9 +255,15 @@ impl WorldContext {
         if !self.pipelines.is_empty() {
             return Ok(());
         }
-        // The queue comes from the same global `WgpuInstance` as `device`,
-        // so there is no need to thread it through every caller.
-        let queue = &crate::instance::WgpuInstance::instance()?.queue;
+        // The queue and upload policy both come from the `WgpuInstance` that
+        // owns `device`. Upload policy is cold config: it is fixed for the
+        // lifetime of the device it was chosen for.
+        let inst = crate::instance::WgpuInstance::instance()?;
+        let queue = &inst.queue;
+        let use_mapped = inst
+            .cold
+            .mapped_at_creation
+            .unwrap_or(!cfg!(target_os = "android"));
         crate::wgpu_debug!("[compile] compile_pipeline start");
 
         crate::wgpu_debug!("[compile] creating bind group layout...");
@@ -312,6 +315,7 @@ impl WorldContext {
                 device, queue, "c2me_wgpu_permutations",
                 bytemuck::cast_slice(&buffer_data),
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                use_mapped,
             );
             crate::wgpu_debug!("[compile] perm buffer ok");
             self.perm_buffer = Some(perm_buffer);
@@ -329,6 +333,7 @@ impl WorldContext {
                 device, queue, "c2me_wgpu_perm_origins",
                 bytemuck::cast_slice(&origin_data),
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                use_mapped,
             );
             crate::wgpu_debug!("[compile] origin buffer ok");
             self.origin_buffer = Some(ob);
@@ -347,6 +352,7 @@ impl WorldContext {
                 device, queue, "c2me_wgpu_simplex",
                 bytemuck::cast_slice(&data),
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                use_mapped,
             );
             crate::wgpu_debug!("[compile] simplex buffer ok");
             self.simplex_buffer = Some(sb);
@@ -359,6 +365,7 @@ impl WorldContext {
                 device, queue, "c2me_wgpu_beard_weight",
                 bytemuck::cast_slice(&table),
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                use_mapped,
             );
             self.beard_weight_buffer = Some(bb);
         }

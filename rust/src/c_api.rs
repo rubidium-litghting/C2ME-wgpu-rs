@@ -52,25 +52,51 @@ fn get_pending_queue() -> &'static Mutex<PendingQueue> {
 /// channel, so it needs no lock of its own: `submit_async` takes `&self` and
 /// the channel serialises everything. The previous `Mutex<ExecutorThread>`
 /// made every batch contend for a lock whose critical section was one send.
-fn get_or_create_executor() -> Result<&'static ExecutorThread, String> {
-    use std::sync::OnceLock;
-    static EXECUTOR: OnceLock<ExecutorThread> = OnceLock::new();
+/// The executor owns the device/queue it was spawned with, so it must be
+/// rebuilt whenever the wgpu instance is replaced. `RwLock<Option<..>>` rather
+/// than `OnceLock` gives us that reset; the steady state is one read acquire.
+static EXECUTOR: parking_lot::RwLock<Option<Arc<ExecutorThread>>> =
+    parking_lot::RwLock::new(None);
 
-    if let Some(e) = EXECUTOR.get() {
-        return Ok(e);
+fn get_or_create_executor() -> Result<Arc<ExecutorThread>, String> {
+    if let Some(e) = EXECUTOR.read().as_ref() {
+        return Ok(Arc::clone(e));
     }
 
-    // Try to initialize
     let instance = WgpuInstance::instance().map_err(|e| format!("WgpuInstance not initialised: {e}"))?;
     let device = Arc::new(instance.device.clone());
     let queue = Arc::new(instance.queue.clone());
     let config = ExecutorConfig::default();
 
-    let executor = ExecutorThread::spawn(device, queue, config)
-        .map_err(|e| format!("executor spawn failed: {e}"))?;
+    let executor = Arc::new(
+        ExecutorThread::spawn(device, queue, config)
+            .map_err(|e| format!("executor spawn failed: {e}"))?,
+    );
 
-    let _ = EXECUTOR.set(executor);
-    Ok(EXECUTOR.get().unwrap())
+    let mut guard = EXECUTOR.write();
+    if let Some(existing) = guard.as_ref() {
+        return Ok(Arc::clone(existing));
+    }
+    *guard = Some(Arc::clone(&executor));
+    Ok(executor)
+}
+
+/// Stop the executor and wait for its thread to exit.
+///
+/// Must run before the device is replaced: the worker holds `Arc<Device>` /
+/// `Arc<Queue>` clones, and its `shutdown()` drains in-flight batches so no
+/// request handle is left dangling. Idempotent.
+fn shutdown_executor() {
+    let taken = EXECUTOR.write().take();
+    if let Some(mut e) = taken {
+        // `Arc::get_mut` fails if a batch is still in flight holding a clone.
+        // In that case dropping our handle is enough: `ExecutorThread::drop`
+        // calls `shutdown()`, which sends the message and joins the thread
+        // once the last reference goes away.
+        if let Some(inner) = Arc::get_mut(&mut e) {
+            inner.shutdown();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -119,61 +145,213 @@ pub unsafe extern "C" fn c2me_wgpu_setup_panic_hook() {
     crate::setup_panic_hook();
 }
 
-/// Push the user's config to Rust. Must be called before `create_instance`;
-/// called again by the hot-reload path when a save is switched.
+/// Push the hot-reloadable flags (debug / profiling) to Rust.
 ///
-/// Booleans are passed as `u32` (FFM has no bool layout). `mapped_at_creation`
-/// is `i32`: -1 = platform default, 0 = force write_buffer, 1 = force mapped.
+/// These are read on hot paths (every batch, every `wgpu_debug!`), so they are
+/// plain atomics: callable at any time, no restart required. The cold settings
+/// (`gpu_index`, `disable_pipeline_cache`, `mapped_at_creation`) travel through
+/// [`c2me_wgpu_create_instance`] instead, because they only take effect when
+/// the device is rebuilt.
 #[unsafe(no_mangle)]
-pub extern "C" fn c2me_wgpu_update_config(
-    debug: u32,
-    disable_pipeline_cache: u32,
-    profile: u32,
-    mapped_at_creation: i32,
-) -> i32 {
-    let cfg = crate::Config {
-        debug: debug != 0,
-        disable_pipeline_cache: disable_pipeline_cache != 0,
-        profile: profile != 0,
-        mapped_at_creation: match mapped_at_creation {
-            0 => Some(false),
-            1 => Some(true),
-            _ => None,
-        },
-    };
-    crate::set_config(cfg);
+pub extern "C" fn c2me_wgpu_set_hot_flags(debug: u32, profile: u32) -> i32 {
+    crate::set_hot_flags(debug != 0, profile != 0);
     0
 }
 
+/// Map the FFM `i32` encoding of `mapped_at_creation` to the Rust option:
+/// -1 = platform default, 0 = force write_buffer, 1 = force mapped.
+fn decode_mapped_at_creation(v: i32) -> Option<bool> {
+    match v {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+/// Create the wgpu instance (adapter pick + feature check + device).
+///
+/// `gpu_index` is the adapter position from [`c2me_wgpu_list_gpus`], or -1 for
+/// automatic selection. `disable_pipeline_cache` and `mapped_at_creation` are
+/// the other cold settings: they belong to the device being created, so they
+/// are passed here rather than through a separate config call.
+///
+/// Returns 1 on success, 0 on failure. Calling this when an instance already
+/// exists is a no-op that returns 1: use [`c2me_wgpu_rebuild_instance`] to
+/// apply new cold settings.
+///
 /// # Safety
 /// `err_buf` must be valid for writes of `err_buf_len` bytes (or null with
 /// `err_buf_len == 0`). It is only touched on the failure path.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn c2me_wgpu_create_instance(
+    gpu_index: i32,
+    disable_pipeline_cache: u32,
+    mapped_at_creation: i32,
     err_buf: *mut c_char,
     err_buf_len: usize,
 ) -> i64 {
-    let result = std::panic::catch_unwind(|| {
-
-    match WgpuInstance::instance() {
+    let cold = crate::ColdConfig {
+        gpu_index,
+        disable_pipeline_cache: disable_pipeline_cache != 0,
+        mapped_at_creation: decode_mapped_at_creation(mapped_at_creation),
+    };
+    match std::panic::catch_unwind(|| match WgpuInstance::instance_with(cold) {
         Ok(_) => 1,
         Err(e) => {
-            let msg = format!("{}", e);
+            let msg = format!("{e}");
             unsafe { write_err(err_buf, err_buf_len, &msg) };
             0
         }
-    }
-
-    });
-    match result {
+    }) {
         Ok(res) => res,
         Err(e) => {
-            let msg = format!("Rust panicked during GPU instance creation (e.g. EGL BadAccess): {:?}", e);
+            let msg = format!("Rust panicked during GPU instance creation (e.g. EGL BadAccess): {e:?}");
             crate::debug_log_line(&msg);
             unsafe { write_err(err_buf, err_buf_len, "Rust panicked during GPU instance creation") };
             0
         }
     }
+}
+
+/// Replace the wgpu instance using new cold settings.
+///
+/// The caller MUST have torn down dependents first: all world handles
+/// destroyed and the executor stopped (`c2me_wgpu_shutdown_instance` does the
+/// latter for you). This only swaps the GPU objects, so any world or pipeline
+/// object still alive is bound to a dead device.
+///
+/// Returns 1 on success, 0 on failure. On failure the previous instance is
+/// left in place, so the mod keeps working with the old GPU rather than dying.
+///
+/// # Safety
+/// `err_buf` must be valid for writes of `err_buf_len` bytes (or null with
+/// `err_buf_len == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn c2me_wgpu_rebuild_instance(
+    gpu_index: i32,
+    disable_pipeline_cache: u32,
+    mapped_at_creation: i32,
+    err_buf: *mut c_char,
+    err_buf_len: usize,
+) -> i64 {
+    let cold = crate::ColdConfig {
+        gpu_index,
+        disable_pipeline_cache: disable_pipeline_cache != 0,
+        mapped_at_creation: decode_mapped_at_creation(mapped_at_creation),
+    };
+    // The worker holds device/queue clones; stop it before the device dies.
+    shutdown_executor();
+    match std::panic::catch_unwind(|| match WgpuInstance::rebuild(cold) {
+        Ok(_) => 1,
+        Err(e) => {
+            let msg = format!("{e}");
+            unsafe { write_err(err_buf, err_buf_len, &msg) };
+            0
+        }
+    }) {
+        Ok(res) => res,
+        Err(e) => {
+            let msg = format!("Rust panicked during GPU instance rebuild: {e:?}");
+            crate::debug_log_line(&msg);
+            unsafe { write_err(err_buf, err_buf_len, "Rust panicked during GPU instance rebuild") };
+            0
+        }
+    }
+}
+
+/// Tear down the executor and the wgpu instance.
+///
+/// Called on save switch / shutdown, before re-reading the config. World
+/// handles must already be destroyed. Idempotent.
+#[unsafe(no_mangle)]
+pub extern "C" fn c2me_wgpu_shutdown_instance() -> i32 {
+    shutdown_executor();
+    WgpuInstance::shutdown();
+    0
+}
+
+/// Write a JSON array describing every GPU the backend can see.
+///
+/// Shape (one object per adapter, order == `gpu_index`):
+/// `[{"index":0,"name":"...","type":"IntegratedGpu","backend":"Vulkan"}, ...]`
+///
+/// When an instance already exists, its adapter is marked `"selected":true`,
+/// so the Java side can show the effective choice even in automatic mode
+/// without a second call.
+///
+/// Returns the number of bytes written (excluding NUL) on success, or a
+/// negative value on error: -1 bad arguments, -2 buffer too small (the needed
+/// size is then written to `out_len`). `buf` is always NUL-terminated when the
+/// return is >= 0.
+///
+/// # Safety
+/// `buf` must be valid for writes of `buf_len` bytes; `out_len` must be valid
+/// for one write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2me_wgpu_list_gpus(
+    buf: *mut c_char,
+    buf_len: usize,
+    out_len: *mut usize,
+) -> i64 {
+    if buf.is_null() || out_len.is_null() || buf_len == 0 {
+        return -1;
+    }
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY.with_env(),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapters = crate::instance::adapter_pick::enumerate(&instance);
+    let selected = WgpuInstance::instance()
+        .ok()
+        .map(|i| (i.adapter_info.name.clone(), i.adapter_info.backend));
+    let mut json = String::from("[");
+    for (idx, a) in adapters.iter().enumerate() {
+        let info = a.get_info();
+        if idx > 0 {
+            json.push(',');
+        }
+        let is_selected = matches!(&selected, Some((n, b)) if *n == info.name && *b == info.backend);
+        json.push_str(&format!(
+            "{{\"index\":{idx},\"name\":{},\"type\":\"{:?}\",\"backend\":\"{:?}\"{}}}",
+            json_escape(&info.name),
+            info.device_type,
+            info.backend,
+            if is_selected { ",\"selected\":true" } else { "" },
+        ));
+    }
+    json.push(']');
+    let bytes = json.as_bytes();
+    let need = bytes.len() + 1; // + NUL
+    unsafe { *out_len = need };
+    if need > buf_len {
+        return -2;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, bytes.len());
+        *buf.add(bytes.len()) = 0;
+    }
+    bytes.len() as i64
+}
+
+/// Minimal JSON string escaping for adapter names (backslash, quote, and
+/// control characters). Adapter names are vendor strings; they can contain
+/// quotes in theory, and emitting raw ones would produce invalid JSON.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 // ---------------------------------------------------------------------------

@@ -45,5 +45,18 @@ public class WgpuModInitializer implements ModInitializer {
     public void onInitialize() {
         Config.get();
         LOGGER.info("[c2me-wgpu] config loaded");
+
+        // Write the GPU list into the config file as a comment. Done here (not
+        // when the instance is created) so the comment is present even for
+        // players who never load a world, and so the file on disk explains its
+        // own `gpu_index` field. `listGpus` only enumerates adapters via a
+        // throwaway instance; it does not create a device, so this does not
+        // start any GPU work early.
+        try {
+            Config.updateGpuListing(WgpuThinBinding.listGpus());
+        } catch (Throwable t) {
+            // Purely cosmetic: the mod works without the comment.
+            LOGGER.debug("[c2me-wgpu] could not write GPU listing comment", t);
+        }
     }
 }

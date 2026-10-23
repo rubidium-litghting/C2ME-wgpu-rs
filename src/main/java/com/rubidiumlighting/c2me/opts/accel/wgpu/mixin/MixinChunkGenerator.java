@@ -30,6 +30,7 @@ import com.rubidiumlighting.c2me.opts.accel.wgpu.DimState;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.ModuleEntryPoint;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.NoiseRouterBlobifier;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuBatchCoordinator;
+import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuDimensionRegistry;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuFallbackNotice;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuThinBinding;
 import net.minecraft.block.BlockState;
@@ -59,18 +60,9 @@ import java.util.concurrent.CompletableFuture;
 public abstract class MixinChunkGenerator {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu");
-    /** Per-dimension state, keyed by the dimension's noise-settings singleton.
-     *  Each distinct settings (Overworld / LargeBiomes / Amplified / Nether /
-     *  End / …) has its own NoiseRouter + shape → its own WorldContext. This
-     *  also fixes a latent bug: previously the first-loaded dimension's context
-     *  was reused for any later, differently-shaped dimension. */
-    private static final java.util.concurrent.ConcurrentHashMap<ChunkGeneratorSettings, DimState>
-            DIM_STATES = new java.util.concurrent.ConcurrentHashMap<>();
-    /** Dimensions whose GPU init already failed. Once here we stay on the
-     *  vanilla CPU path and never retry: re-running blobify + shader compile
-     *  for every chunk would flood the log and waste CPU. */
-    private static final java.util.Set<ChunkGeneratorSettings> FAILED_DIMS =
-            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    // Per-dimension state now lives in WgpuDimensionRegistry: the save-switch
+    // teardown has to iterate and destroy all of it from outside the mixin,
+    // which is impossible for fields declared here.
 
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
     private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,
@@ -210,7 +202,7 @@ public abstract class MixinChunkGenerator {
                                 // deliberately not here, because this callback
                                 // runs on the completion thread and
                                 // shutdown() would join it.
-                                FAILED_DIMS.add(settings);
+                                WgpuDimensionRegistry.markFailed(settings);
                                 CompletableFuture<Chunk> vanilla;
                                 try {
                                     vanilla = gen.populateNoise(
@@ -299,12 +291,12 @@ public abstract class MixinChunkGenerator {
         // No cleanup here: shutdown() joins the batch thread, and the failure
         // callback runs on the completion thread that would be joined. The
         // stale state is released on the next seed change instead.
-        if (FAILED_DIMS.contains(settings)) {
+        if (WgpuDimensionRegistry.hasFailed(settings)) {
             return null;
         }
-        DimState ds = DIM_STATES.get(settings);
+        DimState ds = WgpuDimensionRegistry.get(settings);
         if (ds != null && ds.seed != currentSeed) {
-            DIM_STATES.remove(settings);
+            WgpuDimensionRegistry.remove(settings);
             // Stop the batch coordinator before the world handle goes away:
             // its threads still reference that handle, and any queued job must
             // have its future completed so C2ME can release the position lock.
@@ -331,20 +323,20 @@ public abstract class MixinChunkGenerator {
         if (ds != null) {
             return ds;
         }
-        synchronized (DIM_STATES) {
-            ds = DIM_STATES.get(settings);
+        synchronized (WgpuDimensionRegistry.creationLock()) {
+            ds = WgpuDimensionRegistry.get(settings);
             if (ds != null) {
                 return ds;
             }
-            if (FAILED_DIMS.contains(settings)) {
+            if (WgpuDimensionRegistry.hasFailed(settings)) {
                 return null;
             }
             ds = initDimState(settings, noiseConfig, chunk, currentSeed);
             if (ds != null) {
-                DIM_STATES.put(settings, ds);
+                WgpuDimensionRegistry.put(settings, ds);
             } else {
                 // Remember the failure so later chunks don't retry.
-                FAILED_DIMS.add(settings);
+                WgpuDimensionRegistry.markFailed(settings);
             }
             return ds;
         }

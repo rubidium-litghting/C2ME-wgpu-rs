@@ -65,8 +65,33 @@ public class MixinMinecraftClientNotify {
         }
     }
 
+    @Inject(method = "joinWorld", at = @At("HEAD"))
+    private void c2me$onSaveSwitch(net.minecraft.client.world.ClientWorld world,
+                                   net.minecraft.client.gui.screen.DownloadingTerrainScreen.WorldEntryReason reason,
+                                   CallbackInfo ci) {
+        // Fires before the new world's chunks start generating. That is the
+        // one moment where no GPU batch can be in flight, so the instance may
+        // be rebuilt safely.
+        //
+        // This also covers the very first join: a world that was loaded before
+        // (previous session) may have left a config on disk that the JVM read
+        // at startup, but a player who edited the file while the title screen
+        // was up expects it to apply here. `onSaveSwitch` is cheap when the
+        // cold settings are unchanged (it only re-reads the file and refreshes
+        // the hot flags), so running it unconditionally is simpler and more
+        // predictable than special-casing the first join.
+        try {
+            com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuDimensionRegistry.onSaveSwitch();
+        } catch (Throwable t) {
+            org.slf4j.LoggerFactory.getLogger("c2me-wgpu")
+                    .warn("[c2me-wgpu] save-switch reload failed", t);
+        }
+    }
+
     @Inject(method = "joinWorld", at = @At("RETURN"))
-    private void c2me$notifyOnJoin(CallbackInfo ci) {
+    private void c2me$notifyOnJoin(net.minecraft.client.world.ClientWorld world,
+                                   net.minecraft.client.gui.screen.DownloadingTerrainScreen.WorldEntryReason reason,
+                                   CallbackInfo ci) {
         MinecraftClient mc = (MinecraftClient) (Object) this;
         if (mc.inGameHud == null) return;
         ChatHud chat = mc.inGameHud.getChatHud();
@@ -83,6 +108,10 @@ public class MixinMinecraftClientNotify {
             case INIT_FAILED -> prefix()
                     .append(Text.translatable("c2me-opts-accel-wgpu.notify.init_failed",
                             String.valueOf(ModuleEntryPoint.getDetail())).formatted(Formatting.YELLOW));
+            case OK -> prefix()
+                    .append(Text.translatable("c2me-opts-accel-wgpu.notify.enabled",
+                            com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuStatus.gpuName())
+                            .formatted(Formatting.GREEN));
             default -> null;
         };
         if (msg != null) chat.addMessage(msg);

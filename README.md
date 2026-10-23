@@ -106,12 +106,20 @@
 
 ## 配置文件
 
-用户设置在 `config/c2me-wgpu.json`。首次启动时自动生成，修改后**重启游戏**生效。
+用户设置在 `config/c2me-wgpu.json`。首次启动时自动生成。
+
+**生效时机**：`debug_*` 开头的选项在下次进入世界时即生效；影响 GPU 设备的选项（`gpu_index`、
+`disable_pipeline_cache`、`mapped_at_creation`）在**退出存档再进入**时生效，因为那需要重建
+整个 wgpu 实例。两者都不需要重启游戏。
 
 如果文件写坏了（JSON 语法错误），模组会把它改名为 `c2me-wgpu.json.broken` 保留下来，然后生成一份新的默认配置；超出范围的值会被自动修正并回写。
 
-```json
+文件里的 `//` 整行注释会被忽略。模组会自动在 `gpu_index` 上方写入一份可用 GPU 清单：
+
+```jsonc
 {
+  // Available GPUs (use one as gpu_index; -1 = automatic):
+  //   0: AMD Radeon Graphics (RADV RENOIR) [Vulkan]
   "gpu_index": -1,
   "disable_pipeline_cache": false,
   "debug_verbose_logging": false,
@@ -131,7 +139,7 @@
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `gpu_index` | `-1` | **尚未实现。** 预留的 GPU 序号选择，目前会被忽略。 |
+| `gpu_index` | `-1` | 用哪块 GPU 生成地形。`-1` = 自动（核显优先）。序号对应配置文件注释里列出的清单，也可以用 ModMenu 的设置界面选择。越界或该卡不满足要求时会自动回退到自动选择，并在日志里说明原因。 |
 | `disable_pipeline_cache` | `false` | 绕过磁盘上的着色器管线缓存。仅在驱动于管线缓存处崩溃时才需要开启，代价是每次启动重新编译着色器。 |
 | `mapped_at_creation` | `null` | `null` = 平台默认（桌面用映射路径，Android 用 write_buffer）。`true` / `false` 强制指定。这是兼容性选项而非调试开关：某些 Mali 驱动在映射路径上会崩溃。 |
 
@@ -158,6 +166,15 @@
 | `debug_dump_beard` | `false` | dump Beardifier 结构与逐方块参考值。 |
 | `debug_dump_blob` | `""` | 将序列化的 NoiseRouter blob 写到该路径（`src/test/resources/real_router.bin` 即由此生成）。 |
 
+## 设置界面（ModMenu）
+
+装了 [ModMenu](https://modrinth.com/mod/modmenu) 的话，模组列表里本模组会有一个**设置**按钮，
+可以直接改 `gpu_index`、管线缓存、缓冲上传方式以及两个调试开关，不需要手改 JSON。
+
+- ModMenu 是**软依赖**：没装就只按配置文件来，功能完全不受影响。
+- 界面完全由 `Config` 字段上的注解生成，不存在"界面和配置文件不同步"的问题。
+- 修改后点「完成」即写回文件。`debug_*` 立刻生效，设备相关选项在下一次进入世界时生效。
+
 ## 环境变量
 
 本模组自己的所有开关都在配置文件里，不读取任何 `C2ME_*` 环境变量。本节只涉及
@@ -170,7 +187,7 @@
 | 变量 | 值 | 效果 |
 |---|---|---|
 | `WGPU_BACKEND` | `vulkan`, `dx12`, `metal`, `gl`, `webgpu` (逗号分隔) | 限制尝试的图形后端。在某个后端损坏时很有用。注意：`gl` 后端需要 OpenGL 4.3+ 才能支持通用计算 (Compute Shader)。 |
-| `WGPU_ADAPTER_NAME` | 子串 (不区分大小写) | 按名称强制指定特定的 GPU，例如 `WGPU_ADAPTER_NAME=radeon`。如果没有匹配项，模组会记录一条警告并回退到其默认选择。 |
+| `WGPU_ADAPTER_NAME` | 子串 (不区分大小写) | 按名称强制指定 GPU，例如 `WGPU_ADAPTER_NAME=radeon`。`gpu_index` 是首选方式；此变量留给按名字选择的场景，且只会匹配能通过能力检查的卡。没有匹配项时会记录警告并回退到默认选择。 |
 
 如果不使用这些变量，模组会使用 Vulkan / Metal / DX12（取决于操作系统提供的），并优先选择**集成显卡**，从而让独立显卡空闲以用于渲染。
 
