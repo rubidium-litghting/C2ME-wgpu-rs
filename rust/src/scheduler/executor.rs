@@ -47,6 +47,11 @@ pub struct ExecutorConfig {
     pub flush_timeout_ms: u64,
     /// Maximum number of staging buffers for triple buffering.
     pub staging_capacity: usize,
+    /// How many batches may hold a set of input buffers at once. Must be at
+    /// least the Java-side queue depth or acquiring a set would block; each
+    /// set costs a few MB (params/positions/aquifer/beard/external), not the
+    /// hundreds the output buffers would.
+    pub pipeline_depth: usize,
 }
 
 impl Default for ExecutorConfig {
@@ -55,6 +60,9 @@ impl Default for ExecutorConfig {
             max_batch_size: 64,
             flush_timeout_ms: 50,
             staging_capacity: 3,
+            // Same as the staging depth: the pool must be able to serve every
+            // batch the staging chain can hold.
+            pipeline_depth: 3,
         }
     }
 }
@@ -69,6 +77,64 @@ pub struct ExecutedBatch {
     pub block_data: Vec<u32>,
 }
 
+/// A submitted batch whose output is being mapped asynchronously.
+///
+/// Produced by [`SingleBatchExecutor::prepare_batch`], consumed by
+/// [`SingleBatchExecutor::finish_batch`]. Carries the read-back parameters so
+/// `finish_batch` does not have to re-derive them from `world`.
+struct PreparedBatch {
+    batch: Batch,
+    /// Index into BufferPool.sets, returned on finish_batch.
+    buf_set: usize,
+    slot_handle: SlotHandle,
+    out_channels: usize,
+    density_bytes: usize,
+    block_bytes: usize,
+    has_block: bool,
+    prof: bool,
+    t0: std::time::Instant,
+    t_submit: std::time::Instant,
+    encode_ms: f64,
+    submit_ms: f64,
+}
+
+/// One set of per-batch input buffers.
+///
+/// Everything the GPU reads while a batch is in flight lives here. Pooling
+/// these is what makes pipelining possible: with a single set, preparing the
+/// next batch would overwrite the buffers the current one is still reading.
+/// `output_buf` and `block_buf` are deliberately not here — they are written
+/// and copied to staging inside the same command buffer, so the GPU's own
+/// ordering protects them.
+struct InputBufferSet {
+    params: wgpu::Buffer,
+    positions: wgpu::Buffer,
+    aquifer: wgpu::Buffer,
+    beard: wgpu::Buffer,
+    external: Option<wgpu::Buffer>,
+}
+
+/// Round-robin pool of [`InputBufferSet`]s.
+///
+/// Depth should match the maximum number of batches that can be in flight,
+/// which is the smaller of the Java-side queue depth and the staging chain
+/// capacity. Acquire before writing, release once the batch's output has been
+/// read back.
+struct BufferPool {
+    sets: Vec<InputBufferSet>,
+    free: std::collections::VecDeque<usize>,
+}
+
+impl BufferPool {
+    fn acquire(&mut self) -> Option<usize> {
+        self.free.pop_front()
+    }
+
+    fn release(&mut self, idx: usize) {
+        self.free.push_back(idx);
+    }
+}
+
 /// 负责单次 GPU 命令提交的执行器。
 pub struct SingleBatchExecutor {
     device: Arc<wgpu::Device>,
@@ -78,21 +144,12 @@ pub struct SingleBatchExecutor {
     /// batch leaked: wgpu defers buffer destruction until in-flight work
     /// completes, so on slow GPUs (Mali) the un-reclaimed buffers piled up and
     /// OOM'd. Sizes are fixed by max_batch_size, so one set suffices.
-    params_buf: wgpu::Buffer,
-    positions_buf: wgpu::Buffer,
+    pool: BufferPool,
     output_buf: wgpu::Buffer,
     /// §20 block-state output (binding 7): u32 per block, for the BlockOut
     /// shard. Sized for the max batch; the block count per chunk is
     /// 16 * height * 16 (up to 16*512*16 = 131072).
     block_buf: wgpu::Buffer,
-    /// External-input values (binding 6), lazily (re)created to fit the batch.
-    external_buf: Option<wgpu::Buffer>,
-    /// §22: aquifer cells, binding 8. Layout: [ aq_p (N vec4) | aq_s (N vec4) ];
-    /// only `.x` of the aq_s half carries the fluid state.
-    aquifer_buf: wgpu::Buffer,
-    /// §23: Beardifier data, binding 9. Layout:
-    /// [ weight table (13824 u32, bitcast f32) | per-chunk pj (4096 u32/chunk) ].
-    beard_buf: wgpu::Buffer,
     #[allow(dead_code)]
     bind_group_layout: wgpu::BindGroupLayout,
     /// §22: separate layout for the BlockOut shard (6 storage buffers).
@@ -133,20 +190,10 @@ impl SingleBatchExecutor {
         let staging_size = max_buffer_size + block_max;
         let staging = StagingChain::new(&device, config.staging_capacity, staging_size);
 
-        // Persistent buffers (see struct doc). output_buf is sized for the
-        // max batch; smaller batches use a prefix.
-        let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("c2me_wgpu_params"),
-            size: std::mem::size_of::<WorldgenParams>() as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let positions_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("c2me_wgpu_positions"),
-            size: (config.max_batch_size.max(1) * 2 * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // Persistent output buffers. These are NOT pooled: each batch writes
+        // them and copies the result to staging inside one command buffer, so
+        // the GPU's ordering already prevents a later batch from overwriting
+        // data an earlier one still needs.
         let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("c2me_wgpu_out_buf"),
             size: max_buffer_size as u64,
@@ -164,21 +211,50 @@ impl SingleBatchExecutor {
         // height=512, cell_height=4; round to 1200. vec4<i32>/cell + u32/cell.
         const MAX_AQ_CELLS: usize = 1200;
         let aq_stride = MAX_AQ_CELLS * config.max_batch_size.max(1);
-        // aq_p half + aq_s half; aq_s is padded to vec4 so one array type works.
-        let aquifer_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("c2me_wgpu_aquifer"),
-            size: (aq_stride * 16 * 2) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         // §23: 24^3 weight table (13824 u32) followed by 4096-u32/chunk pj.
         const BEARD_W_LEN: usize = 24 * 24 * 24;
-        let beard_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("c2me_wgpu_beard"),
-            size: ((BEARD_W_LEN + 4096 * config.max_batch_size.max(1)) * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let beard_size = ((BEARD_W_LEN + 4096 * config.max_batch_size.max(1)) * 4) as u64;
+
+        // Static Beardifier weight table, written once per set. Identical in
+        // every set; the per-batch upload only touches the pj section after it.
+        let weight_table: Vec<u32> = crate::world::beard::build_weight_table()
+            .iter().map(|f| f.to_bits()).collect();
+
+        let depth = config.pipeline_depth.max(1);
+        let mut sets = Vec::with_capacity(depth);
+        for i in 0..depth {
+            let params = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("c2me_wgpu_params_{i}")),
+                size: std::mem::size_of::<WorldgenParams>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let positions = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("c2me_wgpu_positions_{i}")),
+                size: (config.max_batch_size.max(1) * 2 * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            // aq_p half + aq_s half; aq_s is padded to vec4 so one array type works.
+            let aquifer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("c2me_wgpu_aquifer_{i}")),
+                size: (aq_stride * 16 * 2) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let beard = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("c2me_wgpu_beard_{i}")),
+                size: beard_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&beard, 0, bytemuck::cast_slice(&weight_table));
+            sets.push(InputBufferSet { params, positions, aquifer, beard, external: None });
+        }
+        let pool = BufferPool {
+            sets,
+            free: (0..depth).collect(),
+        };
 
         let bind_group_layout = bind_group::create_layout(&device)
             .map_err(|e| format!("bind group layout: {e}"))?;
@@ -187,25 +263,13 @@ impl SingleBatchExecutor {
         let pipeline_layout = bind_group::create_pipeline_layout(&device, &bind_group_layout)
             .map_err(|e| format!("pipeline layout: {e}"))?;
 
-        // Write the static Beardifier weight table into the front of beard_buf
-        // once; per-batch uploads only touch the pj section after it.
-        {
-            let w: Vec<u32> = crate::world::beard::build_weight_table()
-                .iter().map(|f| f.to_bits()).collect();
-            queue.write_buffer(&beard_buf, 0, bytemuck::cast_slice(&w));
-        }
-
         Ok(Self {
             device,
             queue,
             staging,
-            params_buf,
-            positions_buf,
+            pool,
             output_buf,
             block_buf,
-            external_buf: None,
-            aquifer_buf,
-            beard_buf,
             bind_group_layout,
             block_out_bg_layout,
             pipeline_layout,
@@ -214,12 +278,45 @@ impl SingleBatchExecutor {
     }
 
     /// 执行一个 batch：编码 + 提交 + 回读。
+    /// Run one batch end to end, blocking until it completes.
+    ///
+    /// Serial convenience path used by tests and [`Self::request_chunks`].
     pub fn execute_batch(
         &mut self,
         world: &WorldContext,
         batch: &Batch,
     ) -> Result<Arc<ExecutedBatch>, String> {
-        
+        let prepared = self.prepare_batch(world, batch)?;
+        self.wait_for_batch(&prepared);
+        self.finish_batch(prepared)
+    }
+
+    /// Block until the batch's mapping completes. `try_finish_map` checks the
+    /// callback once; between checks `PollType::Wait` parks until work finishes
+    /// or the timeout elapses, so no CPU is burned spinning.
+    fn wait_for_batch(&mut self, prepared: &PreparedBatch) {
+        while !self.staging.try_finish_map(prepared.slot_handle, &self.device) {
+            let _ = self.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_millis(50)),
+            });
+        }
+    }
+
+    /// Prepare one batch: upload input buffers, encode, submit, and start an
+    /// asynchronous mapping of the output.
+    ///
+    /// Returns without waiting for the GPU. Callers must drive the mapping to
+    /// completion before calling [`Self::finish_batch`].
+    ///
+    /// Only one prepared batch may be outstanding: the input buffers written
+    /// here are shared, so a second prepare would overwrite them while the
+    /// first batch's GPU work is still reading.
+    fn prepare_batch(
+        &mut self,
+        world: &WorldContext,
+        batch: &Batch,
+    ) -> Result<PreparedBatch, String> {
         if batch.positions.is_empty() {
             return Err("empty batch".into());
         }
@@ -235,6 +332,10 @@ impl SingleBatchExecutor {
                 "batch size {} exceeds max_batch_size {}",
                 batch.positions.len(), self.config.max_batch_size));
         }
+        // Take a buffer set before touching any inputs. Blocking here is the
+        // backpressure that keeps pipeline_depth batches at most in flight.
+        let buf_set = self.pool.acquire()
+            .ok_or_else(|| "no free input buffer set".to_string())?;
         let num_chunks = batch.positions.len() as u32;
         // Cells per chunk is shape-dependent (e.g. 5×49×5 vanilla, 5×65×5
         // with taller datapacks) — must match the shader's grid exactly, or
@@ -261,14 +362,17 @@ impl SingleBatchExecutor {
         // aquifer upload fills in below), upload the three side tables
         // (external inputs / aquifer / beard), then write params ONCE.
         let mut params = Self::build_params(world, batch, num_chunks, shape);
-        let ext_buf = self.ensure_external_buffer(world);
-        if let Some(aq_n) = self.upload_aquifer_tables(world, batch, shape) {
+        let ext_buf = Self::ensure_external_buffer(
+            &self.device, &self.queue, &mut self.pool.sets[buf_set], world);
+        if let Some(aq_n) = Self::upload_aquifer_tables(
+            &self.queue, &mut self.pool.sets[buf_set], world, batch, shape) {
             // aq_s half-offset: only the first `aq_n` vec4 entries were
             // written, so the state half starts at index `aq_n`.
             params._pad[10] = aq_n as u32;
         }
-        self.upload_beard_data(world, batch);
-        self.queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&params));
+        Self::upload_beard_data(&self.queue, &mut self.pool.sets[buf_set], world, batch);
+        self.queue.write_buffer(
+            &self.pool.sets[buf_set].params, 0, bytemuck::bytes_of(&params));
 
         // Packed chunk positions [cx,cz,...] for the shader (binding 4).
         // Sorted + deduped by PendingQueue::flush, matching the output order.
@@ -277,7 +381,9 @@ impl SingleBatchExecutor {
             packed_positions.push(cx);
             packed_positions.push(cz);
         }
-        self.queue.write_buffer(&self.positions_buf, 0, bytemuck::cast_slice(&packed_positions));
+        self.queue.write_buffer(
+            &self.pool.sets[buf_set].positions, 0,
+            bytemuck::cast_slice(&packed_positions));
 
         // Get or create perm buffer (binding 1)
         let perm_buf = world.perm_buffer()
@@ -303,7 +409,7 @@ impl SingleBatchExecutor {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.params_buf.as_entire_binding(),
+                    resource: self.pool.sets[buf_set].params.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -319,7 +425,7 @@ impl SingleBatchExecutor {
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: self.positions_buf.as_entire_binding(),
+                    resource: self.pool.sets[buf_set].positions.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
@@ -341,12 +447,12 @@ impl SingleBatchExecutor {
             label: Some("c2me_wgpu_block_out_bg"),
             layout: &self.block_out_bg_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: self.pool.sets[buf_set].params.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.output_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.positions_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.pool.sets[buf_set].positions.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: self.block_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: self.aquifer_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: self.beard_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: self.pool.sets[buf_set].aquifer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: self.pool.sets[buf_set].beard.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: perm_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: origin_buf.as_entire_binding() },
             ],
@@ -435,14 +541,38 @@ impl SingleBatchExecutor {
         self.queue.submit(Some(encoder.finish()));
         let submit_ms = t_submit0.elapsed().as_secs_f64() * 1e3;
 
-        // Mark staging as ready (copies GPU data to CPU)
-        let t_readback0 = std::time::Instant::now();
-        self.staging.mark_ready(slot_handle, &self.device, total_bytes);
-        let readback_ms = t_readback0.elapsed().as_secs_f64() * 1e3;
+        let t_submit = std::time::Instant::now();
+        // Start the async map now. The serial path waits on it immediately;
+        // pipelined mode can let it run while the next batch is prepared.
+        self.staging.begin_map(slot_handle, &self.device, total_bytes);
+
+        Ok(PreparedBatch {
+            batch: batch.clone(),
+            buf_set,
+            slot_handle,
+            out_channels,
+            density_bytes,
+            block_bytes,
+            has_block,
+            prof,
+            t0,
+            t_submit,
+            encode_ms,
+            submit_ms,
+        })
+    }
+    /// Read back a batch prepared by [`Self::prepare_batch`]. The caller must
+    /// have driven its mapping to completion first.
+    fn finish_batch(&mut self, prepared: PreparedBatch) -> Result<Arc<ExecutedBatch>, String> {
+        let PreparedBatch {
+            batch, buf_set, slot_handle, out_channels, density_bytes,
+            block_bytes, has_block, prof, t0, t_submit, encode_ms, submit_ms,
+        } = prepared;
+        let readback_ms = t_submit.elapsed().as_secs_f64() * 1e3;
 
         // Read results from staging buffer
         let t_decode0 = std::time::Instant::now();
-        let result_map = self.read_results(batch, slot_handle, out_channels)?;
+        let result_map = self.read_results(&batch, slot_handle, out_channels)?;
         let decode_ms = t_decode0.elapsed().as_secs_f64() * 1e3;
 
         // §20: extract the per-block state bytes (chunk-major) for Java.
@@ -458,6 +588,9 @@ impl SingleBatchExecutor {
         } else { Vec::new() };
 
         self.staging.consume(slot_handle);
+        // The GPU work for this batch is complete (its output has been read
+        // back), so its input buffers are free for the next prepare.
+        self.pool.release(buf_set);
 
         let dispatch_time = t0.elapsed();
 
@@ -468,7 +601,7 @@ impl SingleBatchExecutor {
         }
 
         Ok(Arc::new(ExecutedBatch {
-            batch: batch.clone(),
+            batch,
             results: result_map,
             dispatch_time,
             block_data,
@@ -524,42 +657,49 @@ impl SingleBatchExecutor {
         params
     }
 
-    /// Return the external-inputs buffer (binding 6), (re)creating it if the
-    /// current CPU-side payload needs more room. Returns an `Arc` clone so the
-    /// caller can keep touching other `self` fields while holding it.
-    fn ensure_external_buffer(&mut self, world: &WorldContext) -> wgpu::Buffer {
+    /// Return the external-inputs buffer (binding 6), (re)creating it in the
+    /// set if the current CPU-side payload needs more room.
+    ///
+    /// Takes the buffer set rather than `&mut self` so the caller can hold the
+    /// set borrow while writing other buffers.
+    fn ensure_external_buffer(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        set: &mut InputBufferSet,
+        world: &WorldContext,
+    ) -> wgpu::Buffer {
         let ext_count = world.external_count();
         let ext_data = world.external_data();
         let ext_bytes = (ext_data.len() * 4).max(4);
         if ext_count > 0 {
-            let need_recreate = match &self.external_buf {
+            let need_recreate = match &set.external {
                 Some(b) => b.size() < ext_bytes as u64 || b.size() < 4,
                 None => true,
             };
             if need_recreate {
-                self.external_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                set.external = Some(device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("c2me_wgpu_external_inputs"),
                     size: ext_bytes as u64,
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }));
             }
-            let buf = self.external_buf.as_ref().unwrap();
-            self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&ext_data));
+            let buf = set.external.as_ref().unwrap();
+            queue.write_buffer(buf, 0, bytemuck::cast_slice(&ext_data));
             buf.clone()
         } else {
             // No external inputs: bind a dedicated 4-byte dummy so binding 6
             // stays valid. (Reusing output_buf here would alias binding 2's
             // read-write storage and can trip wgpu validation.)
-            if self.external_buf.is_none() {
-                self.external_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            if set.external.is_none() {
+                set.external = Some(device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("c2me_wgpu_external_dummy"),
                     size: 4,
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }));
             }
-            self.external_buf.as_ref().unwrap().clone()
+            set.external.as_ref().unwrap().clone()
         }
     }
 
@@ -567,7 +707,8 @@ impl SingleBatchExecutor {
     /// `Some(n)` with the `aq_p` cell count written, or `None` if no table was
     /// staged for any chunk in the batch.
     fn upload_aquifer_tables(
-        &mut self,
+        queue: &wgpu::Queue,
+        set: &mut InputBufferSet,
         world: &WorldContext,
         batch: &Batch,
         shape: &ShapeConfig,
@@ -626,14 +767,19 @@ impl SingleBatchExecutor {
         let mut merged: Vec<[i32; 4]> = Vec::with_capacity(n * 2);
         merged.extend_from_slice(&aq_p);
         merged.extend(aq_s.iter().map(|&st| [st as i32, 0, 0, 0]));
-        self.queue.write_buffer(&self.aquifer_buf, 0, bytemuck::cast_slice(&merged));
+        queue.write_buffer(&set.aquifer, 0, bytemuck::cast_slice(&merged));
         Some(n)
     }
 
     /// Pack and upload the per-chunk Beardifier data (binding 9). Each chunk
     /// gets a fixed `STRIDE`-u32 slot; empty chunks get a zeroed stride so
     /// `beard_pj[base] == 0` disables beard.
-    fn upload_beard_data(&mut self, world: &WorldContext, batch: &Batch) {
+    fn upload_beard_data(
+        queue: &wgpu::Queue,
+        set: &mut InputBufferSet,
+        world: &WorldContext,
+        batch: &Batch,
+    ) {
         const STRIDE: usize = 4096;
         const BEARD_W_BYTES: u64 = (24 * 24 * 24) as u64 * 4;
         let mut pj = vec![0u32; STRIDE * batch.positions.len()];
@@ -651,7 +797,7 @@ impl SingleBatchExecutor {
         }
         // Weight table is written once at construction; only pj changes per
         // batch, so write straight past it.
-        self.queue.write_buffer(&self.beard_buf, BEARD_W_BYTES, bytemuck::cast_slice(&pj));
+        queue.write_buffer(&set.beard, BEARD_W_BYTES, bytemuck::cast_slice(&pj));
     }
 
     fn read_results(
@@ -804,18 +950,84 @@ impl ExecutorThread {
         }
     }
 
+    /// How long to wait for a batch's mapping before giving up. Matches the
+    /// Java-side request timeout, so if the GPU genuinely wedges both sides
+    /// report it rather than one hanging silently.
+    const BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    /// How long to park between mapping checks. Short enough to notice a
+    /// `Shutdown` promptly, long enough not to spin.
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+
     fn run_loop(
         executor: &mut SingleBatchExecutor,
         receiver: &channel::Receiver<ExecutorMessage>,
     ) {
+        // Batches in flight, oldest first. The callback travels with its batch
+        // here rather than inside PreparedBatch: finish_batch consumes the
+        // batch, and the callback must survive that move to be invoked after.
+        let mut in_flight: std::collections::VecDeque<
+            (PreparedBatch, Box<dyn FnOnce(Result<Arc<ExecutedBatch>, String>) + Send>)
+        > = std::collections::VecDeque::new();
+
         loop {
-            match receiver.recv() {
-                Ok(ExecutorMessage::SubmitBatch { world, batch, on_done }) => {
-                    let result = executor.execute_batch(&world, &batch);
-                    on_done(result);
+            // 1. Publish everything the GPU has finished. Checked before
+            //    accepting new work so the read-back gap stays short.
+            loop {
+                let ready = match in_flight.front() {
+                    Some((front, _)) => executor
+                        .staging
+                        .try_finish_map(front.slot_handle, &executor.device),
+                    None => false,
+                };
+                if !ready {
+                    break;
                 }
-                Ok(ExecutorMessage::Shutdown) | Err(_) => break,
+                let (prepared, on_done) = in_flight.pop_front().unwrap();
+                let result = executor.finish_batch(prepared);
+                on_done(result);
             }
+
+            // 2. Accept one new batch. The timeout doubles as the mapping
+            //    re-check interval, so a busy executor still polls often.
+            match receiver.recv_timeout(Self::POLL_INTERVAL) {
+                Ok(ExecutorMessage::SubmitBatch { world, batch, on_done }) => {
+                    if in_flight.len() >= executor.config.pipeline_depth {
+                        // The caller went past the agreed depth. Failing is
+                        // safer than growing the pool on demand.
+                        on_done(Err("pipeline depth exceeded".to_string()));
+                        continue;
+                    }
+                    match executor.prepare_batch(&world, &batch) {
+                        Ok(prepared) => in_flight.push_back((prepared, on_done)),
+                        Err(e) => on_done(Err(e)),
+                    }
+                }
+                Ok(ExecutorMessage::Shutdown) => break,
+                Err(channel::RecvTimeoutError::Disconnected) => break,
+                Err(channel::RecvTimeoutError::Timeout) => {}
+            }
+
+            // 3. Nudge the mapping in case the Java-side heartbeat stalled.
+            let _ = executor.device.poll(wgpu::PollType::Poll);
+        }
+
+        // Shutdown: drain in flight so no Rust-side request handle leaks.
+        while let Some((prepared, on_done)) = in_flight.pop_front() {
+            let deadline = std::time::Instant::now() + Self::BATCH_TIMEOUT;
+            while !executor
+                .staging
+                .try_finish_map(prepared.slot_handle, &executor.device)
+            {
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+                let _ = executor.device.poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(Self::POLL_INTERVAL),
+                });
+            }
+            let result = executor.finish_batch(prepared);
+            on_done(result);
         }
     }
 }

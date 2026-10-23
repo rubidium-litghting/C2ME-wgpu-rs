@@ -131,6 +131,18 @@ public final class WgpuBatchCoordinator {
     /** Submitted-but-not-completed batches. Bounded => backpressure (the
      *  submit loop blocks here instead of overflowing anything). */
     private final BlockingQueue<Inflight> inflight = new LinkedBlockingQueue<>(STAGING);
+
+    /**
+     * Acquired before handing a batch to Rust, released once its result has
+     * been taken. The `inflight` queue alone is not enough: it is filled
+     * *after* `requestChunks` has already sent the batch to the native side,
+     * so with STAGING=1 a second batch could still reach Rust while the first
+     * was in flight. The executor can only hold one prepared batch until input
+     * buffers are pooled, and a second one there fails with
+     * "another batch is already in flight".
+     */
+    private final java.util.concurrent.Semaphore submitPermits =
+            new java.util.concurrent.Semaphore(STAGING);
     /** Pipelining is safe only when there are no CPU-evaluated external
      *  inputs, because those share one Rust buffer (binding 6) that a later
      *  batch would overwrite. With externals we fall back to serial. */
@@ -360,10 +372,20 @@ public final class WgpuBatchCoordinator {
      *  Blocks on `inflight` when STAGING batches are already in flight
      *  (backpressure). */
     private void submit(List<Job> batch, int[] positions) throws InterruptedException {
-        Inflight ib = submitRequest(batch, positions);
-        if (ib != null) {
-            inflight.put(ib);
+        // Wait for a free slot before submitting, not after: see submitPermits.
+        submitPermits.acquire();
+        Inflight ib;
+        try {
+            ib = submitRequest(batch, positions);
+        } catch (Throwable t) {
+            submitPermits.release();
+            throw t;
         }
+        if (ib == null) {
+            submitPermits.release();
+            return;
+        }
+        inflight.put(ib);
     }
 
     /** Serial mode (external inputs present): submit then wait inline. */
@@ -434,6 +456,7 @@ public final class WgpuBatchCoordinator {
             // releases it. Its return value is meaningless here.
             try { WgpuThinBinding.takeResultBlob(req); } catch (Throwable ignored) {}
             failAll(ib.batch, new RuntimeException("GPU batch failed (STATUS_ERROR)"));
+            submitPermits.release();
             return;
         }
         if (st != WgpuThinBinding.STATUS_DONE) {
@@ -458,6 +481,7 @@ public final class WgpuBatchCoordinator {
             seg = WgpuThinBinding.takeResultBlob(req);
         } catch (Throwable t) {
             failAll(ib.batch, t);
+            submitPermits.release();
             return;
         }
 
@@ -465,6 +489,7 @@ public final class WgpuBatchCoordinator {
         for (int i = 0; i < n; i++) {
             ib.batch.get(i).future.complete(new GpuChunk(seg, i, blockSeg));
         }
+        submitPermits.release();
         recordStats(n, t0, System.nanoTime());
     }
 

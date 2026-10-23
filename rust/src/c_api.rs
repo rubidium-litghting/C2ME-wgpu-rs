@@ -449,6 +449,14 @@ pub extern "C" fn c2me_wgpu_poll_status(request_h: i64) -> i32 {
     if request_h == 0 {
         return STATUS_INVALID_HANDLE;
     }
+    // This is the heartbeat that drives wgpu's mapping callbacks. PollType::
+    // Poll is explicitly non-blocking and does nothing on its own; a mapping
+    // started by map_async only resolves when something polls the device.
+    // Java calls this every 50us-2ms while a batch is in flight, which is a
+    // convenient cadence — no timer of our own is needed.
+    if let Ok(inst) = WgpuInstance::instance() {
+        let _ = inst.device.poll(wgpu::PollType::Poll);
+    }
     let req = unsafe { &*(request_h as *const BatchRequest) };
     req.status.load(Ordering::Acquire)
 }

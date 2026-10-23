@@ -25,6 +25,15 @@ struct StagingSlot {
     buffer: wgpu::Buffer,
     phase: StagingPhase,
     cpu_data: Option<Vec<u8>>,
+    /// Set by `begin_map`, cleared by `try_finish_map`. Holding the receiver
+    /// here is what lets the mapping be polled from an event loop instead of
+    /// blocking until the GPU is done.
+    pending_map: Option<PendingMap>,
+}
+
+struct PendingMap {
+    rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    size: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +59,7 @@ impl StagingChain {
                 buffer,
                 phase: StagingPhase::Free,
                 cpu_data: None,
+                pending_map: None,
             });
             free_queue.push_back(i);
         }
@@ -70,6 +80,83 @@ impl StagingChain {
         self.inflight_count += 1;
         let handle = SlotHandle { index: idx };
         Some((slot.buffer.clone(), handle))
+    }
+
+    /// Start an asynchronous map of `byte_count` bytes. Returns immediately;
+    /// the mapping is driven by `try_finish_map`, which the caller polls.
+    ///
+    /// This is the pipelining half of the readback: the GPU keeps computing
+    /// the next batch while this one is being mapped, instead of the executor
+    /// thread sitting in `poll(Wait)` for the whole round trip.
+    pub fn begin_map(&mut self, handle: SlotHandle, device: &wgpu::Device, byte_count: usize) {
+        let slot = &mut self.slots[handle.index];
+        debug_assert!(slot.phase == StagingPhase::InFlight,
+            "begin_map on non-InFlight slot (phase = {:?})", slot.phase);
+        let size = byte_count.min(slot.buffer.size() as usize);
+        let slice = slot.buffer.slice(..size as u64);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        slot.pending_map = Some(PendingMap { rx, size });
+        // Drive one poll so the callback is queued.
+        let _ = device.poll(wgpu::PollType::Poll);
+    }
+
+    /// Non-blocking check for a completed mapping. Returns true once the CPU
+    /// copy is ready and the slot has moved to ReadyForRead.
+    pub fn try_finish_map(&mut self, handle: SlotHandle, device: &wgpu::Device) -> bool {
+        let idx = handle.index;
+        if self.slots[idx].pending_map.is_none() {
+            return false;
+        }
+        let _ = device.poll(wgpu::PollType::Poll);
+
+        let size = {
+            let pm = self.slots[idx].pending_map.as_ref().unwrap();
+            match pm.rx.try_recv() {
+                Ok(Ok(())) => pm.size,
+                Ok(Err(e)) => panic!("map_async error: {:?}", e),
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("map_async channel disconnected");
+                }
+            }
+        };
+
+        let slot = &mut self.slots[idx];
+        slot.pending_map = None;
+        let slice = slot.buffer.slice(..size as u64);
+        let mapped = slice.get_mapped_range().unwrap();
+        let cpu_copy = mapped.as_ref().to_vec();
+        drop(mapped);
+        slot.buffer.unmap();
+        slot.cpu_data = Some(cpu_copy);
+        slot.phase = StagingPhase::ReadyForRead;
+        self.inflight_count = self.inflight_count.saturating_sub(1);
+        self.ready_count += 1;
+        true
+    }
+
+    /// Drive the device once and finish any mapping that has completed.
+    /// Returns the slots that became ready, so the caller can publish their
+    /// results.
+    ///
+    /// The device poll happens here rather than on a timer because wgpu only
+    /// resolves `map_async` callbacks when someone polls; Java's status
+    /// polling is the heartbeat that makes this happen often enough.
+    pub fn poll_pending(&mut self, device: &wgpu::Device) -> Vec<SlotHandle> {
+        let _ = device.poll(wgpu::PollType::Poll);
+        let mut done = Vec::new();
+        for i in 0..self.slots.len() {
+            if self.slots[i].pending_map.is_some() {
+                let h = SlotHandle { index: i };
+                if self.try_finish_map(h, device) {
+                    done.push(h);
+                }
+            }
+        }
+        done
     }
 
     pub fn mark_ready(&mut self, handle: SlotHandle, device: &wgpu::Device, byte_count: usize) {
