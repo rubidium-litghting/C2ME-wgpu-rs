@@ -705,7 +705,13 @@ enum ExecutorMessage {
     SubmitBatch {
         world: Arc<WorldContext>,
         batch: Batch,
-        reply: channel::Sender<Result<Arc<ExecutedBatch>, String>>,
+        /// Called once the batch finishes, on the executor thread. The caller
+        /// supplies whatever it needs to publish the result (the C API uses
+        /// this to fill its BatchRequest). Passing a callback instead of a
+        /// reply channel lets `submit_async` return without a second thread:
+        /// the old design spawned one thread per batch just to block on the
+        /// reply and copy it elsewhere.
+        on_done: Box<dyn FnOnce(Result<Arc<ExecutedBatch>, String>) + Send>,
     },
     Shutdown,
 }
@@ -766,11 +772,29 @@ impl ExecutorThread {
         self.sender.send(ExecutorMessage::SubmitBatch {
             world,
             batch,
-            reply: reply_tx,
+            on_done: Box::new(move |r| {
+                let _ = reply_tx.send(r);
+            }),
         }).map_err(|_| "executor channel closed".to_string())?;
 
         reply_rx.recv()
             .map_err(|_| "executor reply channel closed".to_string())?
+    }
+
+    /// Enqueue a batch without waiting for it. `on_done` runs on the executor
+    /// thread when the batch completes. This is the production path: the
+    /// caller returns immediately and publishes the result from the callback.
+    pub fn submit_async(
+        &self,
+        world: Arc<WorldContext>,
+        batch: Batch,
+        on_done: impl FnOnce(Result<Arc<ExecutedBatch>, String>) + Send + 'static,
+    ) -> Result<(), String> {
+        self.sender.send(ExecutorMessage::SubmitBatch {
+            world,
+            batch,
+            on_done: Box::new(on_done),
+        }).map_err(|_| "executor channel closed".to_string())
     }
 
     pub fn shutdown(&mut self) {
@@ -786,9 +810,9 @@ impl ExecutorThread {
     ) {
         loop {
             match receiver.recv() {
-                Ok(ExecutorMessage::SubmitBatch { world, batch, reply }) => {
+                Ok(ExecutorMessage::SubmitBatch { world, batch, on_done }) => {
                     let result = executor.execute_batch(&world, &batch);
-                    let _ = reply.send(result);
+                    on_done(result);
                 }
                 Ok(ExecutorMessage::Shutdown) | Err(_) => break,
             }

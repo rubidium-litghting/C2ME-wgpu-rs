@@ -62,6 +62,13 @@ public final class WgpuBatchCoordinator {
     private static final int MAX_BATCH = 64;
     /** Max time (ms) to wait for more requests before flushing a short batch. */
     private static final long MAX_WAIT_MS = 5L;
+    /** Poll backoff. The first few polls are cheap (the batch may already be
+     *  done), then the interval doubles up to POLL_MAX_NS. A 30ms batch needs
+     *  roughly 25 wakeups instead of 300 at a fixed 100µs, and each wakeup is
+     *  a cross-FFM call. */
+    private static final long POLL_INITIAL_NS = 50_000L;   // 50µs
+    private static final long POLL_MAX_NS = 2_000_000L;    // 2ms
+
     /** Abandon a GPU request after this long. */
     private static final long REQUEST_TIMEOUT_NS = 30_000_000_000L;
 
@@ -89,12 +96,33 @@ public final class WgpuBatchCoordinator {
 
     private final BlockingQueue<Job> queue = new LinkedBlockingQueue<>();
     private final long worldHandle;
+    /** Kept so shutdown() can join them. Null in serial (non-pipeline) mode,
+     *  where run() does the completion inline and no second thread exists. */
+    private final Thread batchThread;
+    private final Thread completeThread;
     private volatile boolean running = true;
     /** Set by {@link #run} when its loop exits. Lets {@link #completeLoop}
      *  distinguish "inflight is momentarily empty" from "no more batches can
      *  arrive" — otherwise it could exit in the window between the submit
      *  thread polling a batch and enqueuing it, stranding that batch. */
     private volatile boolean runDone = false;
+
+    /** Set once a batch comes back STATUS_ERROR. From then on this dimension
+     *  stops using the GPU: the batch coordinator cannot tell an execution
+     *  failure (a poisoned mutex, an oversized batch, a Rust-side panic in one
+     *  dispatch) from a device-level fault, and continuing to submit would
+     *  just repeat the failure. The mixin checks this before submitting and
+     *  falls back to vanilla CPU generation.
+     *
+     *  <p>Unlike a timeout — which means the native worker is unresponsive and
+     *  halts the JVM — this is a recoverable condition: the failed futures are
+     *  completed exceptionally, C2ME releases the chunk locks, and the chunks
+     *  are regenerated on the CPU. */
+    private volatile boolean gpuFailed = false;
+
+    public boolean hasFailed() {
+        return gpuFailed;
+    }
 
     /** Number of batches allowed in flight (submitted to Rust, not yet
      *  completed). Matches the Rust staging chain depth so the GPU side can
@@ -147,13 +175,15 @@ public final class WgpuBatchCoordinator {
         this.cellW = cellW; this.cellH = cellH;
         this.minY = minY;
         this.pipeline = externalNodes.isEmpty();
-        Thread t = new Thread(this::run, "c2me-wgpu-batch");
-        t.setDaemon(true);
-        t.start();
+        this.batchThread = new Thread(this::run, "c2me-wgpu-batch");
+        this.batchThread.setDaemon(true);
+        this.batchThread.start();
         if (pipeline) {
-            Thread c = new Thread(this::completeLoop, "c2me-wgpu-complete");
-            c.setDaemon(true);
-            c.start();
+            this.completeThread = new Thread(this::completeLoop, "c2me-wgpu-complete");
+            this.completeThread.setDaemon(true);
+            this.completeThread.start();
+        } else {
+            this.completeThread = null;
         }
     }
 
@@ -192,6 +222,30 @@ public final class WgpuBatchCoordinator {
         queue.drainTo(queued);
         if (!queued.isEmpty()) {
             failAll(queued, new RuntimeException("WgpuBatchCoordinator shut down"));
+        }
+        // Wait for both threads to actually exit before returning. Without
+        // this the caller has no idea when the in-flight Rust handles have
+        // been consumed, and has to guess with a delay before destroying the
+        // world — a guess that is both too long on fast machines and possibly
+        // too short on slow ones.
+        //
+        // The batch thread exits as soon as it notices `running == false`; the
+        // completion thread then drains whatever is still in `inflight` and
+        // exits once both the queue is empty and runDone is set.
+        joinQuietly(batchThread);
+        joinQuietly(completeThread);
+    }
+
+    /** Join {@code t}, ignoring interrupts and refusing to join ourselves
+     *  (which would deadlock). */
+    private static void joinQuietly(Thread t) {
+        if (t == null || t == Thread.currentThread()) {
+            return;
+        }
+        try {
+            t.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -349,21 +403,37 @@ public final class WgpuBatchCoordinator {
         long deadline = System.nanoTime() + REQUEST_TIMEOUT_NS;
         int st;
         try {
+            long backoff = POLL_INITIAL_NS;
             while ((st = WgpuThinBinding.pollStatus(req)) == WgpuThinBinding.STATUS_PENDING) {
                 if (System.nanoTime() > deadline) {
                     LOGGER.error("[c2me-wgpu] FATAL: GPU request timed out after 30s. The native worker is likely deadlocked. Terminating JVM.");
                     Runtime.getRuntime().halt(1);
                     return;
                 }
-                java.util.concurrent.locks.LockSupport.parkNanos(100_000L);
+                java.util.concurrent.locks.LockSupport.parkNanos(backoff);
+                if (backoff < POLL_MAX_NS) {
+                    backoff = Math.min(backoff * 2, POLL_MAX_NS);
+                }
             }
         } catch (Throwable t) {
             LOGGER.error("[c2me-wgpu] FATAL: Exception while polling GPU status.", t);
             Runtime.getRuntime().halt(1);
             return;
         }
+        if (st == WgpuThinBinding.STATUS_ERROR) {
+            // Recoverable: mark this dimension as GPU-incapable and fail the
+            // batch so C2ME releases the chunk locks. Later chunks go through
+            // vanilla CPU generation.
+            LOGGER.error("[c2me-wgpu] GPU batch failed (status={}); this dimension falls back to CPU", st);
+            gpuFailed = true;
+            // The Rust side consumed the handle regardless of status, so this
+            // releases it. Its return value is meaningless here.
+            try { WgpuThinBinding.takeResultBlob(req); } catch (Throwable ignored) {}
+            failAll(ib.batch, new RuntimeException("GPU batch failed (STATUS_ERROR)"));
+            return;
+        }
         if (st != WgpuThinBinding.STATUS_DONE) {
-            LOGGER.error("[c2me-wgpu] FATAL: GPU request returned status=" + st + ". Terminating JVM to prevent deadlock.");
+            LOGGER.error("[c2me-wgpu] FATAL: GPU request returned unexpected status=" + st + ". Terminating JVM to prevent deadlock.");
             try { org.apache.logging.log4j.LogManager.shutdown(); } catch (Throwable ignored) {}
             Runtime.getRuntime().halt(1);
             return;

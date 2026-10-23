@@ -48,13 +48,16 @@ fn get_pending_queue() -> &'static Mutex<PendingQueue> {
     })
 }
 
-fn get_or_create_executor() -> Result<&'static Mutex<ExecutorThread>, String> {
+/// The executor owns a single worker thread and hands work to it over a
+/// channel, so it needs no lock of its own: `submit_async` takes `&self` and
+/// the channel serialises everything. The previous `Mutex<ExecutorThread>`
+/// made every batch contend for a lock whose critical section was one send.
+fn get_or_create_executor() -> Result<&'static ExecutorThread, String> {
     use std::sync::OnceLock;
-    static EXECUTOR_LOCK: OnceLock<Mutex<ExecutorThread>> = OnceLock::new();
+    static EXECUTOR: OnceLock<ExecutorThread> = OnceLock::new();
 
-    // Check if already initialized
-    if let Some(lock) = EXECUTOR_LOCK.get() {
-        return Ok(lock);
+    if let Some(e) = EXECUTOR.get() {
+        return Ok(e);
     }
 
     // Try to initialize
@@ -66,14 +69,8 @@ fn get_or_create_executor() -> Result<&'static Mutex<ExecutorThread>, String> {
     let executor = ExecutorThread::spawn(device, queue, config)
         .map_err(|e| format!("executor spawn failed: {e}"))?;
 
-    match EXECUTOR_LOCK.set(Mutex::new(executor)) {
-        Ok(()) => {}
-        Err(_) => {
-            // Race: another thread initialized it, just return the existing one
-        }
-    }
-
-    Ok(EXECUTOR_LOCK.get().unwrap())
+    let _ = EXECUTOR.set(executor);
+    Ok(EXECUTOR.get().unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -362,84 +359,85 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
         result: Mutex::new(None),
         block: Mutex::new(None),
     });
-    let req_bg = Arc::clone(&req);
     // Shape-dependent per-chunk cell count, computed before the move.
     let cells_per_channel_units: u64 = world_arc.cells_per_chunk() as u64;
 
-    std::thread::spawn(move || {
-        let executor = match get_or_create_executor() {
+    let executor = match get_or_create_executor() {
+        Ok(e) => e,
+        Err(_e) => {
+            req.status.store(STATUS_ERROR, Ordering::Release);
+            return Arc::into_raw(req) as i64;
+        }
+    };
+
+    let req_bg = Arc::clone(&req);
+    let submitted = executor.submit_async(world_arc, batch, move |executor_result| {
+        let executed = match executor_result {
             Ok(e) => e,
             Err(_e) => {
+                // Cannot use err_buf from here; signal via status.
                 req_bg.status.store(STATUS_ERROR, Ordering::Release);
                 return;
             }
         };
-        let executor_result = match executor.lock() {
-            Ok(g) => g.request_chunks(world_arc, batch),
-            Err(_e) => Err("executor lock poisoned".to_string()),
-        };
-        match executor_result {
-            Ok(executed) => {
-            // Merge all per-chunk results into one combined blob.
-            // Each per-chunk blob now carries only the 2 consumed channels
-            // (finalDensity, veinToggle) — see executor.rs OUT_CHANNELS.
-            const OUT_CHANNELS: u64 = 2;
-            let mut all_f32s: Vec<f32> = Vec::new();
-            let mut combined_offsets = [0u64; 16];
-            for ch in 0..OUT_CHANNELS as usize {
-                combined_offsets[ch] = (ch as u64) * cells_per_channel_units * 4;
-            }
-            let mut chunk_idx = 0u16;
 
-            // Emit chunks in the SAME order as batch.positions (sorted,
-            // deduped). The previous FxHashMap iteration order was
-            // non-deterministic, so multi-chunk blobs could not be mapped
-            // back to chunk coords by the caller. Batching depends on this.
-            for &(cx, cz) in &executed.batch.positions {
-                let key = ((cx as i64) << 32) | (cz as i64 & 0xFFFFFFFF);
-                let blob = match executed.results.get(&key) {
-                    Some(b) => b,
-                    None => continue,
-                };
-                let chunk_f32s = decode_blob_f32s(blob);
-                if chunk_f32s.is_empty() { continue; }
-                all_f32s.extend_from_slice(&chunk_f32s);
-                chunk_idx += 1;
-            }
+        // Merge all per-chunk results into one combined blob.
+        // Each per-chunk blob now carries only the 2 consumed channels
+        // (finalDensity, veinToggle) — see executor.rs OUT_CHANNELS.
+        const OUT_CHANNELS: u64 = 2;
+        let mut all_f32s: Vec<f32> = Vec::new();
+        let mut combined_offsets = [0u64; 16];
+        for ch in 0..OUT_CHANNELS as usize {
+            combined_offsets[ch] = (ch as u64) * cells_per_channel_units * 4;
+        }
+        let mut chunk_idx = 0u16;
 
-            let result_blob = if all_f32s.is_empty() {
-                ResultBlob::new_empty()
-            } else {
-                ResultBlob::from_f32_data(&all_f32s, combined_offsets, chunk_idx)
+        // Emit chunks in the SAME order as batch.positions (sorted, deduped).
+        // The previous FxHashMap iteration order was non-deterministic, so
+        // multi-chunk blobs could not be mapped back to chunk coords.
+        for &(cx, cz) in &executed.batch.positions {
+            let key = ((cx as i64) << 32) | (cz as i64 & 0xFFFFFFFF);
+            let blob = match executed.results.get(&key) {
+                Some(b) => b,
+                None => continue,
             };
-            match req_bg.result.lock() {
-                Ok(mut slot) => *slot = Some(result_blob),
+            let chunk_f32s = decode_blob_f32s(blob);
+            if chunk_f32s.is_empty() { continue; }
+            all_f32s.extend_from_slice(&chunk_f32s);
+            chunk_idx += 1;
+        }
+
+        let result_blob = if all_f32s.is_empty() {
+            ResultBlob::new_empty()
+        } else {
+            ResultBlob::from_f32_data(&all_f32s, combined_offsets, chunk_idx)
+        };
+        match req_bg.result.lock() {
+            Ok(mut slot) => *slot = Some(result_blob),
+            Err(_) => {
+                req_bg.status.store(STATUS_ERROR, Ordering::Release);
+                return;
+            }
+        }
+        // §20 block-state bytes as a separate blob (raw u32, no CRC needed
+        // by Java's reader — reuse ResultBlob only as a byte container).
+        if !executed.block_data.is_empty() {
+            let bytes: Vec<u8> = executed.block_data.iter()
+                .flat_map(|v| v.to_le_bytes()).collect();
+            match req_bg.block.lock() {
+                Ok(mut slot) => *slot = Some(ResultBlob::from_bytes(bytes)),
                 Err(_) => {
                     req_bg.status.store(STATUS_ERROR, Ordering::Release);
                     return;
                 }
             }
-            // §20 block-state bytes as a separate blob (raw u32, no CRC needed
-            // by Java's reader — reuse ResultBlob only as a byte container).
-            if !executed.block_data.is_empty() {
-                let bytes: Vec<u8> = executed.block_data.iter()
-                    .flat_map(|v| v.to_le_bytes()).collect();
-                match req_bg.block.lock() {
-                    Ok(mut slot) => *slot = Some(ResultBlob::from_bytes(bytes)),
-                    Err(_) => {
-                        req_bg.status.store(STATUS_ERROR, Ordering::Release);
-                        return;
-                    }
-                }
-            }
-            req_bg.status.store(STATUS_DONE, Ordering::Release);
         }
-        Err(_e) => {
-            // Cannot use err_buf from the worker thread; signal via status.
-            req_bg.status.store(STATUS_ERROR, Ordering::Release);
-        }
-    }
+        req_bg.status.store(STATUS_DONE, Ordering::Release);
     });
+
+    if submitted.is_err() {
+        req.status.store(STATUS_ERROR, Ordering::Release);
+    }
 
     Arc::into_raw(req) as i64
 }

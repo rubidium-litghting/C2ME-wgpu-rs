@@ -103,6 +103,32 @@ public abstract class MixinChunkGenerator {
             if (ds == null) {
                 return; // already failed, or init failed -> vanilla CPU path
             }
+            if (ds.coordinator.hasFailed()) {
+                // A previous batch on this dimension returned STATUS_ERROR.
+                // The coordinator cannot tell an execution failure from a
+                // device fault, so the whole dimension stays on the CPU for
+                // the rest of the session.
+                //
+                // Tear the state down rather than just marking the settings:
+                // shutdown() stops the two coordinator threads and drains
+                // in-flight handles, and removing the entry lets a later
+                // dimension with the same settings start clean instead of
+                // reusing a dead coordinator.
+                LOGGER.warn("[c2me-wgpu] GPU failed for this dimension; "
+                        + "switching to CPU generation for the rest of the session");
+                FAILED_DIMS.add(settings);
+                DIM_STATES.remove(settings);
+                ds.coordinator.shutdown();
+                long h = ds.worldHandle;
+                if (h != 0L) {
+                    try {
+                        WgpuThinBinding.worldDestroy(h);
+                    } catch (Throwable t) {
+                        LOGGER.warn("[c2me-wgpu] world_destroy failed after GPU failure", t);
+                    }
+                }
+                return;
+            }
 
             // ── GPU compute via the batch coordinator ────────────
             // Setup (synchronous): sampler + aquifer + ore-vein. Reuse MC's
@@ -263,14 +289,22 @@ public abstract class MixinChunkGenerator {
             // its threads still reference that handle, and any queued job must
             // have its future completed so C2ME can release the position lock.
             ds.coordinator.shutdown();
+            // shutdown() blocks until both coordinator threads have exited
+            // and every in-flight Rust request handle has been consumed, so
+            // the world can be destroyed synchronously. The previous code
+            // guessed "5 seconds should be enough", which was both needlessly
+            // long on fast machines and not guaranteed on slow ones.
+            //
+            // Blocking here is fine: this runs on the save-switch path, where
+            // a pause is expected. If the GPU is genuinely wedged the
+            // completion thread's own 30s timeout halts the JVM first.
             long oldHandle = ds.worldHandle;
             if (oldHandle != 0L) {
-                java.util.concurrent.CompletableFuture
-                        .delayedExecutor(5, java.util.concurrent.TimeUnit.SECONDS)
-                        .execute(() -> {
-                            try { WgpuThinBinding.worldDestroy(oldHandle); }
-                            catch (Throwable ignored) {}
-                        });
+                try {
+                    WgpuThinBinding.worldDestroy(oldHandle);
+                } catch (Throwable t) {
+                    LOGGER.warn("[c2me-wgpu] world_destroy failed for old handle", t);
+                }
             }
             ds = null;
         }
