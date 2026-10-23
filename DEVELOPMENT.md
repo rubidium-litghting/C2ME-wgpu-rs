@@ -93,31 +93,44 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   - 审查并移除重复的 `c2me_wgpu.log` 日志写入逻辑（如果有）。
   - 修复项目内大量的 cargo `unused` 警告。
 - [ ] **用户友好化（UX）**：
-  - **国际化/本地化 (i18n)**：将目前聊天栏硬编码的中文提示（如 ZGC 警告、GPU 回退原因等）全部迁移到 Minecraft 的 `lang/en_us.json` 和 `lang/zh_cn.json` 中，根据玩家语言自动切换，避免英文用户看到中文。
-  - **全新的配置文件系统（替代环境变量）**：
-    - 彻底淘汰环境变量。已完成：全部开关迁入 `config/c2me-wgpu.json`。
-    - 必须自己手写配置文件的读写逻辑（`config/c2me-wgpu.json`），不引入第三方配置库。
-    - **GPU 选择定稿流程**：
-      1. **C API 列举**：Rust 提供 `c2me_wgpu_list_gpus` 接口，利用临时 `wgpu::Instance` 枚举所有可用 GPU，返回带序号的列表，Java 端将其缓存在内存中。
-      2. **生成配置与注释**：Java 首次生成配置文件时，将内存中的 GPU 列表以注释形式写入 `config/c2me-wgpu.json`（纯供人阅读参考，程序解析不依赖注释）。
-      3. **FFM 传参**：创建世界时，Java 呼叫 `c2me_wgpu_create_instance` 并传入选定的 `gpu_index`。
-      4. **Rust 按序号选择**：Rust 内部根据 `gpu_index` 选定设备；若越界或该 GPU 不达标（如缺少必要 feature），则自动回退到默认选卡逻辑（优先集成显卡）。
-      5. **ModMenu GUI**：直接读取 Java 内存中缓存的 GPU 列表，通过按钮循环切换 `gpu_index`，无需解析配置文件或注释。
-  - **ModMenu 可选支持（软依赖）与零 GUI 依赖**：
-    - 绝不可将 ModMenu、Cloth Config 或其它 GUI 库设为强制依赖（Hard Dependency）。
-    - 仅通过 `modCompileOnly` 引入 ModMenu API。
-    - **不引入任何第三方 GUI 库**。核心界面完全利用 MC 1.20+ 自带的布局系统（`GridWidget`、`DirectionalLayoutWidget`、`ScrollableLayout`）手搓实现。
-    - 封装一个极简的 `WgpuRowHelper`，提供 `addBoolean()`、`addIntSlider()` 等 Builder 方法，供数据驱动动态生成。
-    - 采用“翻页式（Pagination）”或原生滚动条，防止配置项过多溢出屏幕。
-    - 如果玩家装了 ModMenu，则提供图形界面；如果没装，玩家直接修改 `config/c2me-wgpu.json`，功能必须正常运作。
-  - **加载界面状态提示（Loading Screen）**：
-    - 在方块加载/世界生成界面，通过 Mixin 注入文字提示，告诉玩家当前状态：
-      - `[C2ME-wgpu] 正在编译着色器...`
-      - `[C2ME-wgpu] GPU 加速已启用 (AMD Radeon)`
-      - `[C2ME-wgpu] GPU 初始化失败，已回退至 CPU`
-  - **聊天栏提示**：初次进入世界时友好提示“GPU 加速已启用/回退原因”，避免玩家在不知情的情况下吃 CPU 帧数。
-  - **在模组图标或配置里展示当前运行的 GPU 名称和硬件状态**。
-  - 如果可能，提供对 F3 调试屏幕的自定义扩展，显示当前 GPU 生成的 CPS。
+  - [x] **国际化/本地化 (i18n)**：聊天栏提示已全部迁入 `lang/en_us.json` /
+    `lang/zh_cn.json`，通知走 `Text.translatable`。`WgpuFallbackNotice` 队列里存的是
+    key + 参数而非拼好的字符串——worker 线程不知道客户端语言。
+  - [x] **配置文件系统（替代环境变量）**：`config/c2me-wgpu.json`，手写读写、无第三方
+    库。损坏的 JSON 备份为 `.broken` 后重建，越界值 clamp 并回写。本模组已不读取任何
+    `C2ME_*` 环境变量。
+  - [x] **聊天栏提示**：GPU 回退原因、GC 建议已有。
+  - [ ] **GPU 选择**（唯一未落地的功能项）：
+    `gpu_index` 字段已存在但未被读取，`create_instance` 也不接收它。需要：
+      1. Rust 提供 `c2me_wgpu_list_gpus`，用临时 instance 枚举 adapter，返回带序号的列表。
+      2. Java 首次生成配置时把列表以注释形式写进 JSON（仅供人读）。
+      3. `create_instance` 接收 `gpu_index`；Rust 按序号选卡，越界或 feature 不足时回退
+         默认逻辑（优先集成显卡）。
+    - `WgpuInstance` 目前是 `OnceLock` 单例，换卡需要重建 instance——这正好也是热重载
+      的前置（见下一条）。
+  - [ ] **切换存档时热重载配置**：
+    目前配置是启动时读一次，改完必须重启。存档切换是天然的重置点：所有维度都会销毁重建。
+    - 配置分三类：A 类影响 instance（`gpu_index`、`disable_pipeline_cache`）、
+      B 类影响 world 创建（`mapped_at_creation`）、C 类只影响行为（`debug_*`）。
+    - C 类只需重读配置；B 类要销毁 `DimState`；A 类要重建整个 instance。
+    - 关键顺序：`shutdown()` 全部 coordinator → 排空 inflight → `world_destroy` →
+      清 `DIM_STATES` →（必要时）重建 instance。
+    - **前置**：`shutdown()` 已会 join 两个线程并排空 inflight（本轮已做），
+      所以同步销毁是安全的，不再需要 5 秒延迟。
+    - 风险：重建期间完全无 GPU 能力，必须保证 C2ME 走 CPU 路径。
+  - [ ] **状态展示（三项合并做）**：
+    - 加载界面提示（正在编译着色器 / 已启用 GPU 名称 / 已回退及原因）
+    - 展示当前 GPU 名称与硬件状态（`get_gpu_name` 之前删掉了，需要重新加回，但这次
+      不要泄漏 `CString`）
+    - F3 调试屏扩展，显示当前 CPS
+  - [ ] **ModMenu GUI（软依赖）**：
+    - 绝不可将 ModMenu / Cloth Config 设为强制依赖，仅 `modCompileOnly`。
+    - **不引入第三方 GUI 库**，用 MC 自带的 `GridWidget` / `DirectionalLayoutWidget` /
+      `ScrollableLayout` 手搓。封装 `WgpuRowHelper` 提供 `addBoolean()` / `addIntSlider()`。
+    - 翻页式或原生滚动条，防溢出。
+    - 没装 ModMenu 时，手改 JSON 必须功能完整。
+    - 优先级最低：纯便利性，JSON 已经能用。
+
 - [x] **健壮性**：
   - 增加更多边缘平台（如未测试的 macOS Metal）的预防性回退逻辑。
   - 统一处理未捕获的 GPU DeviceLost，确保游戏不会因为驱动崩溃而卡死。
