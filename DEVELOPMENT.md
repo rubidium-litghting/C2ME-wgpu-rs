@@ -5,6 +5,9 @@
 > 移动端实测：Chunky A/B 测试在 Mali-G610 平板上，端到端总耗时从 3m12s 缩短至 2m19s（+61%）；纯地形生成实时吞吐从 23.52 CPS 提升至 30.65 CPS（+30.3%）。
 > 服务端实测 (Headless，无渲染干扰)：Chunky r=500 跑纯原版地形，纯 CPU 耗时 27s (平均 121.1 cps)，GPU 加速耗时 21s (平均 143.6 cps，峰值 215.7 cps)。端到端提速 22%，峰值提速 44.7%。注：纯 CPU 模式下主线程排队（Amdahl 定律）会锁死并发上限，CPU 占用率通常只能达到 70-80%。
 > 桌面端到端反超纯 CPU（Chunky r=500：15 s vs 23 s）。GPU 直接输出 per-block 方块状态，CPU 只写 palette。
+> 流水线化 A/B（Chunky r=500，原版地形，同一台 RADV RENOIR 核显）：executor 串行 20 s / CPU ~70%；
+> 池化输入 buffer + 多批次在途 18 s / CPU ~50%。CPS 中位持平（188），p90 238→254。
+> **结论：流水线化省的是 CPU 等待与端到端时间，不是稳定态 CPS**——GPU 执行（readback）仍是瓶颈。
 > 历史细节见文末「附录：开发历程」。
 
 ---
@@ -92,7 +95,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 - [ ] **用户友好化（UX）**：
   - **国际化/本地化 (i18n)**：将目前聊天栏硬编码的中文提示（如 ZGC 警告、GPU 回退原因等）全部迁移到 Minecraft 的 `lang/en_us.json` 和 `lang/zh_cn.json` 中，根据玩家语言自动切换，避免英文用户看到中文。
   - **全新的配置文件系统（替代环境变量）**：
-    - 彻底淘汰环境变量（诊断用的 `C2ME_DUMP_*` 除外）。
+    - 彻底淘汰环境变量。已完成：全部开关迁入 `config/c2me-wgpu.json`。
     - 必须自己手写配置文件的读写逻辑（`config/c2me-wgpu.json`），不引入第三方配置库。
     - **GPU 选择定稿流程**：
       1. **C API 列举**：Rust 提供 `c2me_wgpu_list_gpus` 接口，利用临时 `wgpu::Instance` 枚举所有可用 GPU，返回带序号的列表，Java 端将其缓存在内存中。
@@ -126,11 +129,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
 | 变量 | 值 | 效果 |
 |---|---|---|
-| `C2ME_WGPU_DEBUG` | `1` | 详细日志 → `logs/c2me-wgpu.log` |
-| `C2ME_WGPU_PROFILE` | `1` | 分阶段 GPU 计时 |
-| `C2ME_WGPU_SKIP_AQUIFER` / `MIN_STAGE` | `0` | 诊断快捷路径（产错地形，仅计时） |
-| `C2ME_DUMP_*` | — | 各种离线参考 dump（测完关掉）；需同时设 `C2ME_DUMP_CHUNK` 才生效 |
-| `C2ME_DUMP_DIR` | 路径 | dump 目录，默认平台临时目录（Android 无 `/tmp`） |
+已全部迁移到 `config/c2me-wgpu.json`，见 §12。本模组不再读取任何 `C2ME_*` 变量。
 | `WGPU_BACKEND` / `WGPU_ADAPTER_NAME` | — | 标准 wgpu GPU 选择变量 |
 
 ---
@@ -242,9 +241,12 @@ Rust 不认识的密度节点（地形 mod）在 CPU 按同一角点网格求值
 ## §12 诊断基础设施
 
 - Rust 日志写 `<gameDir>/logs/c2me-wgpu.log`（Java 启动时传路径）。
-- `C2ME_WGPU_DEBUG`：shader 编译计时、缓存命中、CPS 统计。
-- `C2ME_WGPU_PROFILE`：分阶段 GPU 计时（encode/submit/readback/decode）。
-- `C2ME_DUMP_*`：离线参考 dump（密度/方块/blob/beard/aquifer 表）。
+所有开关都在 `config/c2me-wgpu.json`，本模组不再读取任何 `C2ME_*` 环境变量：
+
+- `debug_verbose_logging`：shader 编译计时、缓存命中、CPS 统计。
+- `debug_stage_timing`：分阶段计时，GPU 侧 `[batch-stage-timing]`（encode/submit/
+  readback/decode）与 CPU 侧 `[writeback-timing]`。两组要一起读才有意义。
+- `debug_dump_*`：离线参考 dump（密度/方块/blob/beard/aquifer 表）。
 
 ## §5 附录：开发历程
 
@@ -334,6 +336,40 @@ lost` 和 wgpu 内部断言失败——那两类表现为 panic，最终仍会�
 要覆盖这条需要在 `submit_async` 的回调外再包一层 `catch_unwind`，并引入
 `STATUS_PANICKED`。`setup_panic_hook` 已经把堆栈 `sync_all()` 写进
 `c2me-wgpu.log`，所以即使走到 halt，崩溃原因也不会丢。
+
+### §23 执行器流水线化（0.1.5）
+
+**问题**：`run_loop` 是 `prepare → submit → poll(Wait) → 读回 → 下一批`。GPU 算的
+时候 CPU 在干等，且 `poll(Wait)` 直接挂起线程。
+
+**两处改动**：
+
+1. **poll 驱动**。wgpu 的 `PollType::Poll` 是非阻塞单次检查，且**只有被调用时**
+   `map_async` 的回调才会完成。Java 的 `pollStatus` 每 50µs–2ms 调一次，正好可以
+   充当心跳——`c2me_wgpu_poll_status` 里顺带 `device.poll(Poll)`，Rust 侧不再需要
+   自己阻塞等待。executor 兜底再加一次 `poll(Poll)`，防止 Java 心跳停摆。
+2. **输入 buffer 池化**。这是流水线的前提：`params`/`positions`/`aquifer`/`beard`/
+   `external` 若是单份，准备批次 N+1 会覆盖批次 N 仍在读的数据。现按
+   `ExecutorConfig::pipeline_depth`（默认 3）分配多套，`prepare` 时 acquire、
+   `finish` 时归还。
+   `output_buf`/`block_buf` **刻意不池化**：每批写入后在同一 command buffer 内
+   copy 到 staging，GPU 的提交顺序本身就保证了安全。
+
+**实测（Chunky r=500，原版地形，RADV RENOIR）**：
+
+| | 串行 | 流水线化 |
+|---|---|---|
+| 端到端 | 20 s | **18 s** |
+| CPU 占用 | ~70% | **~50%** |
+| CPS 中位 | 188.5 | 188.4 |
+| CPS p90 | 238.1 | **254.2** |
+
+**教训**：`batchMs` 在两种模式下口径不同，不可直接对比——串行时它只计 map 段，
+流水线化后包含完整在途时间。只有端到端和 CPU 占用是可比的。
+
+**瓶颈仍是 GPU**：`readback` 占每批 90%，是 compute + 拷贝的真实时间，批次再多
+也无法重叠。想再提 CPS 只能减少 GPU 工作量（降分辨率、减 shard），代价是地形质量
+与移动端兼容性。
 
 ### §19–§22 核心结论（近期）
 
