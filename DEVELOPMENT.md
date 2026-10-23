@@ -282,7 +282,7 @@ Rust 不认识的密度节点（地形 mod）在 CPU 按同一角点网格求值
 
 - **FFM Upcall 日志回传**：Rust 侧不再直接向 `STDERR` 打印调试信息。所有的 `wgpu_debug!` 调用会通过 Panama FFM 的回调函数（`upcallStub`）直接传给 Java 端的 SLF4J `LOGGER`，完美合并进 `latest.log`，且格式统一。
 - **黑匣子防崩溃日志**：Rust 侧独立保留了对 `c2me-wgpu.log` 的写入。每次写入后执行 `f.flush()`，并在 `setup_panic_hook` 中执行 `f.sync_all()`，确保即便发生 `SIGABRT`（如 `panic=abort` 或 Android 驱动崩溃），底层原因依然能落盘。
-- **强制退出防死锁**：当 GPU 发生 `DeviceLost` 或底层线程崩溃时，主线程会卡死在 C2ME 的 Future 上。此时 `WgpuBatchCoordinator` 会主动调用 `LogManager.shutdown()` 刷出 Java 日志，然后调用 `Runtime.getRuntime().halt(1)` 物理断电，彻底避免加载界面无限卡死。
+- **强制退出防死锁**：`pollStatus` 超时（原生 worker 无响应）时，主线程会永久卡在 C2ME 的 Future 上。此时 `WgpuBatchCoordinator` 调用 `LogManager.shutdown()` 刷出 Java 日志，然后 `Runtime.getRuntime().halt(1)` 强杀进程。批次级失败不走这条路径，见下节。
 - **原生库解压策略**：默认将 `.so`/`.dll` 解压到 `<gameDir>/c2me-wgpu-natives/`，避开系统临时目录可能存在的 `noexec` 权限限制。若游戏目录不可写或 `dlopen` 失败，自动清理并回退到系统临时目录（`/tmp`）。同时，解压后自动追加可执行权限，确保 Android 等严格沙箱能正常加载。
 - **FFI 边界护甲**：`c2me_wgpu_create_instance` 使用 `extern "C-unwind"`，并用 `std::panic::catch_unwind` 包裹。若 wgpu 底层在初始化时 panic（典型场景：强制指定 `WGPU_BACKEND=gl` 但 EGL 返回 `BadAccess`），可以安全地捕获并回退到 CPU。
 - **⚠️ 跨平台崩溃行为差异（重要）**：
@@ -290,26 +290,50 @@ Rust 不认识的密度节点（地形 mod）在 CPU 按同一角点网格求值
   - **Android 端**：交叉编译默认 `panic=abort`，`catch_unwind` 失效。wgpu 的 panic 会触发 `SIGABRT`，**JVM 会被瞬间强杀**，游戏直接闪退。此时唯一可依赖的是提前注册的 `setup_panic_hook`，它会在 `abort` 前执行 `sync_all()`，把 panic 堆栈强行写入黑匣子 `c2me-wgpu.log`。
   - **结论**：Android 用户如果设置了不兼容的 `WGPU_BACKEND` 环境变量（如 `gl`），游戏会闪退，但不会丢失崩溃原因。桌面端用户可以放心随意切换后端。
 
-### 运行期错误处理的分层设计（为什么 panic 后不降级 CPU）
+### 运行期错误处理的分层设计
 
-初始化失败和运行期失败走两条完全不同的路径，这是刻意的：
+失败按"能否确定状态"分三层处理，不是一刀切：
 
-- **初始化失败 → 回退 CPU**。`c2me_wgpu_create_instance` 是 `extern "C-unwind"` 且被 `catch_unwind` 包裹，adapter 选择、feature 检查、shader 编译失败都能捕获，Java 侧得到 `STATUS_INIT_FAILED`，`ModuleEntryPoint` 记录原因并让该维度走 vanilla/C2ME CPU 生成。这条路径是安全的，因为此时还没分配任何 GPU 资源。
-- **运行期失败 → halt**。`WgpuBatchCoordinator.complete()` 在 `pollStatus` 超时、抛异常、或返回 `STATUS_ERROR` 时直接 `LogManager.shutdown()` + `Runtime.getRuntime().halt(1)`。
+- **初始化失败 → 回退 CPU**。`c2me_wgpu_create_instance` 是 `extern "C-unwind"` 且被
+  `catch_unwind` 包裹，adapter 选择、feature 检查、shader 编译失败都能捕获，Java 侧
+  得到 `STATUS_INIT_FAILED`，`ModuleEntryPoint` 记录原因并让该维度走 vanilla/C2ME
+  CPU 生成。此时还没分配任何 GPU 资源，回退是干净的。
 
-**为什么运行期不也回退 CPU？** 因为此时状态已经不可信，具体有五个障碍：
+- **批次失败 → 该维度降级 CPU**。`execute_batch` 返回 `Err`（executor 获取失败、锁
+  中毒、单次提交出错）时 `status = STATUS_ERROR`。这是可恢复条件：`complete()` 取走
+  handle、标记 `gpuFailed`、把失败批次的 future 全部异常完成。
 
-1. **后台线程没有 `catch_unwind`**。`c2me_wgpu_request_chunks` 把工作丢进 `std::thread::spawn`，里面只处理 `Result::Err`。若 `execute_batch` panic（wgpu 内部断言、驱动返回意外状态），桌面端线程展开退出时 `status` 停在 `STATUS_PENDING`（因为 panic 发生在 `store(DONE/ERROR)` 之前），Java 侧只能等 30 秒超时；移动端 `panic=abort` 直接带走进程。
-2. **`BatchRequest` 引用计数未知**。panic 时 `req_bg` 的 Arc 被 drop，但 Java 侧还持有 `Arc::into_raw` 的指针。若它永远不调 `take_result_blob`，那个 Arc 永不释放；若 Rust 侧 panic 发生在持锁期间，`Mutex<Option<ResultBlob>>` 还会中毒。
-3. **无法区分「可恢复错误」与「device lost」**。`execute_batch` 返回 `Err` 可能是提交阶段的问题，也可能是 device lost 的前兆。现在完全没有监听 `device.lost()` 的 future。
-4. **锁中毒会传染**。若 panic 时持有 `HANDLE_TABLE` 或 `PENDING_QUEUE` 锁，后续所有 FFI 调用都会因 `lock()` 失败而返回错误——这时候"降级"已无从谈起。
-5. **静默降级会掩盖 bug**。地形突然变成 CPU 生成的慢速版本，但没人知道为什么，比直接崩溃更难排查。
+  但仅仅完成异常 future 是不够的——C2ME 会释放位置锁（`ScheduledTask` 的
+  `whenComplete` 对异常完成同样执行），然后**放弃这个 chunk**，它永远停在
+  "upgrade to noise" 状态，依赖它的东西全部等死。所以失败回调必须自己把 chunk
+  用 vanilla 重新生成：置 `FAILED_DIMS`，再调一次 `populateNoise`，重入时
+  `acquireDimState` 看到标记直接返回、不 cancel，vanilla 正常生成。
 
-**`on_uncaptured_error` 覆盖到哪一层？** wgpu 的 validation error 和 OOM 已被它拦截，只记日志不 panic，`execute_batch` 会返回 `Err` 走 `STATUS_ERROR` 路径。但它**覆盖不到** `device lost` 和 wgpu 内部断言失败——那两类仍然是 panic。
+  `FAILED_DIMS` 的检查必须在 `acquireDimState` **最开头**、缓存查找之前。放在之后
+  是初版的 bug：失败回调重入时先拿到缓存里的死 `DimState`，继续往已死的 coordinator
+  提交，实测刷了 16 万行错误且地形完全不生成。
 
-**如果将来要做「运行期 panic 降级 CPU」**，按依赖顺序需要：① 后台线程加 `catch_unwind` 并引入 `STATUS_PANICKED`；② 审计 panic 路径的 Arc 计数与锁中毒；③ Java 侧区分「可降级」和「必须 halt」；④ 监听 `device.lost()`；⑤ 解决锁中毒问题（换成不中毒的锁或保证 panic 前释放）。其中 ⑤ 在 ① 落地前无法完全保证，所以这是个渐进式工程，不是一次改动。
+  清理有意不做。`shutdown()` 会 join 批处理线程，而失败回调跑在完成线程上——在那里
+  调 `shutdown()` 两者互等。失败维度的 GPU 资源留到下次切存档时释放，代价是
+  有界的（一个维度的 buffer），优于挂起。
 
-**当前结论**：halt 是保守但正确的选择。`setup_panic_hook` 会把堆栈 `sync_all()` 写进 `c2me-wgpu.log`，崩溃原因不会丢。
+- **超时 / 未知状态 → halt**。`pollStatus` 超过 30 秒仍 PENDING，或返回既非 DONE 也
+  非 ERROR 的状态，说明原生 worker 已经不响应了。此时 Java 侧无从判断 device 是否
+  还能用，`LogManager.shutdown()` 刷盘后 `Runtime.getRuntime().halt(1)`。
+
+**为什么超时不能降级？** 降级需要能保证"这个 chunk 会被重新生成"。但超时意味着 Rust
+侧的 `BatchRequest` 可能永远不完成，Java 侧持有的 handle 无法释放，对应的 chunk 永远
+等不到结果。这与批次失败不同——批次失败至少 Rust 侧返回了确定的状态。
+
+**`on_uncaptured_error` 覆盖到哪一层？** wgpu 的 validation error 和 OOM 被它拦截，
+只记日志不 panic，`execute_batch` 会返回 `Err` 走降级路径。它**覆盖不到** `device
+lost` 和 wgpu 内部断言失败——那两类表现为 panic，最终仍会走到 halt。
+
+**已知未覆盖**：如果 `execute_batch` 内部 panic（而非返回 Err），`status` 停在
+`STATUS_PENDING`（panic 发生在 `store` 之前），Java 侧只能等 30 秒超时后 halt。
+要覆盖这条需要在 `submit_async` 的回调外再包一层 `catch_unwind`，并引入
+`STATUS_PANICKED`。`setup_panic_hook` 已经把堆栈 `sync_all()` 写进
+`c2me-wgpu.log`，所以即使走到 halt，崩溃原因也不会丢。
 
 ### §19–§22 核心结论（近期）
 

@@ -98,36 +98,10 @@ public abstract class MixinChunkGenerator {
         try {
             // ── per-dimension state (context + coordinator + grid) ──
             NoiseChunkGenerator selfGen = (NoiseChunkGenerator) (Object) this;
-            ChunkGeneratorSettings settings = selfGen.getSettings().value();
+            final ChunkGeneratorSettings settings = selfGen.getSettings().value();
             final DimState ds = acquireDimState(settings, noiseConfig, chunk, currentSeed);
             if (ds == null) {
                 return; // already failed, or init failed -> vanilla CPU path
-            }
-            if (ds.coordinator.hasFailed()) {
-                // A previous batch on this dimension returned STATUS_ERROR.
-                // The coordinator cannot tell an execution failure from a
-                // device fault, so the whole dimension stays on the CPU for
-                // the rest of the session.
-                //
-                // Tear the state down rather than just marking the settings:
-                // shutdown() stops the two coordinator threads and drains
-                // in-flight handles, and removing the entry lets a later
-                // dimension with the same settings start clean instead of
-                // reusing a dead coordinator.
-                LOGGER.warn("[c2me-wgpu] GPU failed for this dimension; "
-                        + "switching to CPU generation for the rest of the session");
-                FAILED_DIMS.add(settings);
-                DIM_STATES.remove(settings);
-                ds.coordinator.shutdown();
-                long h = ds.worldHandle;
-                if (h != 0L) {
-                    try {
-                        WgpuThinBinding.worldDestroy(h);
-                    } catch (Throwable t) {
-                        LOGGER.warn("[c2me-wgpu] world_destroy failed after GPU failure", t);
-                    }
-                }
-                return;
             }
 
             // ── GPU compute via the batch coordinator ────────────
@@ -216,13 +190,48 @@ public abstract class MixinChunkGenerator {
                 ds.coordinator.requestAsync(chunk.getPos().x, chunk.getPos().z)
                         .whenComplete((gpu, err) -> {
                             if (err != null) {
-                                LOGGER.error("[c2me-wgpu] Async GPU request failed! This usually means the GPU crashed or the native library panicked.", err);
-                                // First, try to complete the result exceptionally so C2ME's future chain unwinds.
-                                result.completeExceptionally(err);
-                                
-                                // If C2ME swallows the exception and deadlocks, this will forcibly terminate the game.
-                                // We use Error to bypass C2ME's normal Exception catching.
-                                throw new Error("C2ME-wgpu GPU Crash: " + err.getMessage(), err);
+                                // GPU failed. Completing `result` exceptionally
+                                // is not enough: C2ME logs the failure and
+                                // abandons the chunk, leaving it stuck in the
+                                // "upgrade to noise" state forever — which
+                                // deadlocks anything waiting on it.
+                                //
+                                // So regenerate this chunk with vanilla
+                                // instead. Calling populateNoise again
+                                // re-enters our HEAD injection, where
+                                // acquireDimState sees the dimension marked
+                                // failed and returns without cancelling, so
+                                // vanilla runs normally.
+                                LOGGER.error("[c2me-wgpu] GPU batch failed; regenerating chunk {} {} on the CPU",
+                                        fChunk.getPos().x, fChunk.getPos().z, err);
+                                // Mark before re-entering, so the nested
+                                // onPopulateNoise takes the CPU path. Cleanup
+                                // of the coordinator happens there too —
+                                // deliberately not here, because this callback
+                                // runs on the completion thread and
+                                // shutdown() would join it.
+                                FAILED_DIMS.add(settings);
+                                CompletableFuture<Chunk> vanilla;
+                                try {
+                                    vanilla = gen.populateNoise(
+                                            fBlender, fNc, fSa, fChunk);
+                                } catch (Throwable t) {
+                                    result.completeExceptionally(t);
+                                    return;
+                                }
+                                if (vanilla == null) {
+                                    result.completeExceptionally(
+                                            new IllegalStateException("vanilla populateNoise returned null"));
+                                    return;
+                                }
+                                vanilla.whenComplete((c, e2) -> {
+                                    if (e2 != null) {
+                                        result.completeExceptionally(e2);
+                                    } else {
+                                        result.complete(c);
+                                    }
+                                });
+                                return;
                             }
                             // Enqueue write-back onto C2ME's worker pool. The
                             // chunk's position lock is held by C2ME's
@@ -282,6 +291,17 @@ public abstract class MixinChunkGenerator {
     private static DimState acquireDimState(ChunkGeneratorSettings settings,
                                             NoiseConfig noiseConfig, Chunk chunk,
                                             long currentSeed) {
+        // This must run BEFORE the cached-state lookup. The failure callback
+        // re-enters this method to regenerate a chunk on the CPU; if the
+        // cached (dead) DimState were returned first, the caller would keep
+        // submitting to a coordinator that has already failed.
+        //
+        // No cleanup here: shutdown() joins the batch thread, and the failure
+        // callback runs on the completion thread that would be joined. The
+        // stale state is released on the next seed change instead.
+        if (FAILED_DIMS.contains(settings)) {
+            return null;
+        }
         DimState ds = DIM_STATES.get(settings);
         if (ds != null && ds.seed != currentSeed) {
             DIM_STATES.remove(settings);
@@ -310,9 +330,6 @@ public abstract class MixinChunkGenerator {
         }
         if (ds != null) {
             return ds;
-        }
-        if (FAILED_DIMS.contains(settings)) {
-            return null;
         }
         synchronized (DIM_STATES) {
             ds = DIM_STATES.get(settings);

@@ -29,7 +29,7 @@ onto the GPU.
 
 ---
 
-> 💡 **Resilience note**: If the GPU driver crashes or the device is lost, the game will safely halt to prevent deadlocks, and will log the detailed cause to `logs/c2me-wgpu.log` for offline diagnostics.
+> 💡 **Resilience note**: If the GPU fails during generation, the affected dimension falls back to CPU generation and the game keeps running; the cause is written to `logs/c2me-wgpu.log`. The game only halts to prevent a deadlock when the GPU stops responding entirely (30 seconds with no result for a submitted batch), logging the reason to the same file.
 >
 > ⚠️ **Cross-platform behavior**:
 > - **Desktop**: If an incompatible backend is forced (e.g. `WGPU_BACKEND=gl`), the wgpu panic is safely caught and the game **silently falls back to CPU** without crashing.
