@@ -1,10 +1,11 @@
 # C2ME WGPU 加速模块 — 开发文档
 
-> 最后更新：2026-10-17
+> 最后更新：2026-10-24
 > 状态：**0.1.5 发布版**。完整实现 Pass E、GPU 矿脉、100% 对齐原版的 AquiferSampler 逻辑，并重构了 FFM 日志架构与底层防死锁机制。实机验证兼容 Epic Terrain 与 Tectonic。
 > 移动端实测：Chunky A/B 测试在 Mali-G610 平板上，端到端总耗时从 3m12s 缩短至 2m19s（+61%）；纯地形生成实时吞吐从 23.52 CPS 提升至 30.65 CPS（+30.3%）。
 > 服务端实测 (Headless，无渲染干扰)：Chunky r=500 跑纯原版地形，纯 CPU 耗时 27s (平均 121.1 cps)，GPU 加速耗时 21s (平均 143.6 cps，峰值 215.7 cps)。端到端提速 22%，峰值提速 44.7%。注：纯 CPU 模式下主线程排队（Amdahl 定律）会锁死并发上限，CPU 占用率通常只能达到 70-80%。
-> 桌面端到端反超纯 CPU（Chunky r=500：15 s vs 23 s）。GPU 直接输出 per-block 方块状态，CPU 只写 palette。
+> 桌面端到端反超纯 CPU（Chunky r=500，RADV RENOIR：**18 s vs 23 s**，流水线化后本机实测）。
+> 更早一次桌面实测为 15 s，机器不同，不作为当前基准。GPU 直接输出 per-block 方块状态，CPU 只写 palette。
 > 流水线化 A/B（Chunky r=500，原版地形，同一台 RADV RENOIR 核显）：executor 串行 20 s / CPU ~70%；
 > 池化输入 buffer + 多批次在途 18 s / CPU ~50%。CPS 中位持平（188），p90 238→254。
 > **结论：流水线化省的是 CPU 等待与端到端时间，不是稳定态 CPS**——GPU 执行（readback）仍是瓶颈。
@@ -32,8 +33,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 | **aquifer 全 GPU（水/岩浆/石分类）** | ✅ 100%（完整 barrier 与 calculateDensity） |
 | **Beardifier（结构地基）GPU** | ✅ bit-exact |
 | 矿脉 | ✅ 全 GPU（RNG 与方块替换） |
-| **端到端反超纯 CPU** | ✅ 15 s vs 23 s (桌面) |
-| **移动端端到端提速** | ✅ 34.8 cps vs 21.5 cps (+61%) |
+| **端到端反超纯 CPU** | ✅ 18 s vs 23 s (RADV RENOIR，见 §23) |
+| **移动端端到端提速** | ✅ 3m12s→2m19s；CPS 23.52→30.65 (+30.3%) |
 | 史诗地形/构造地形兼容 | ✅ Epic Terrain, Tectonic |
 | WeirdScaledSampler | ✅ 完整实现 |
 
@@ -70,12 +71,12 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 20. **"CPU 解释器一致" ≠ "对 vanilla 正确"**：测试要对照 MC 原版 dump。
 21. **先数消费者，再决定算多少**：16 通道里只有 2 个被读，别默认全算。
 22. **假通过的测试比没测试更危险**：`eprintln` 而非 `assert` 的判据会沉默。
-23. **热路径加原子操作会拖垮性能**：计数用纯 `incrementAndGet`。
+23. **热路径别用 CAS 循环**：计数直接用 `incrementAndGet`，不要自己写 compare-and-swap 重试。
 24. **跨语言日志需防截断**：Rust 的 `panic` 若触发 `abort`，JVM 会被瞬间带走。务必在 FFI 边界拦截，并用 `sync_all()` 强刷黑匣子文件。
 25. **死锁下 `System.exit` 无效**：当主线程死锁时，`System.exit` 的 Shutdown Hook 会被卡死。必须调用 `LogManager.shutdown()` 刷盘后，使用 `Runtime.getRuntime().halt(1)` 强杀进程。
 26. **FFM 导出的符号必须带 `#[unsafe(no_mangle)]`**：即便是 `extern "C"` 函数，如果漏掉了这个宏，Rust 编译器依然会改写符号名，导致 Java 端调用 `lookup.find()` 时抛出 `NoSuchElementException`。清理代码时绝不能误删。
 
-27. **低频偶发失败先抓证据，别倒推**：`world::tests` 里 9 个 GPU 测试各自 `ExecutorThread::spawn` 一套约 600 MB buffer，16 线程并行时资源叠加，集显上约 1/5~1/8 概率偶发失败，且无固定 panic 原文。曾误判为显存 OOM——实际 `vulkaninfo` 显示 device-local budget 4.86 GiB、`dmesg` 无 amdgpu OOM 记录，10 次连跑不复现。生产路径 `get_or_create_executor()` 是 `OnceLock<Mutex<>>` 单 executor + 串行，**游戏运行不受影响**。修复方向（暂缓）：测试改用小 `ExecutorConfig`（batch 实际只有 1~3 个 chunk，却按 64 预分配），或加全局 GPU 锁。复现时务必保留完整 stderr + `free -h` + `mem_info_gtt_used` + `dmesg | tail`。
+27. **低频偶发失败先抓证据，别倒推**：`world::tests` 里 9 个 GPU 测试各自 `ExecutorThread::spawn` 一套约 600 MB buffer，16 线程并行时资源叠加，集显上约 1/5~1/8 概率偶发失败，且无固定 panic 原文。曾误判为显存 OOM——实际 `vulkaninfo` 显示 device-local budget 4.86 GiB、`dmesg` 无 amdgpu OOM 记录，10 次连跑不复现。生产路径 `get_or_create_executor()` 是 `OnceLock<ExecutorThread>` 单 executor（已去掉 Mutex，也早已不是串行），**游戏运行不受影响**。修复方向（暂缓）：测试改用小 `ExecutorConfig`（batch 实际只有 1~3 个 chunk，却按 64 预分配），或加全局 GPU 锁。复现时务必保留完整 stderr + `free -h` + `mem_info_gtt_used` + `dmesg | tail`。
 
 28. **动地形正确性必须跑 `real_router_vs_vanilla`**：它是唯一对照真实 Minecraft 输出（`src/test/resources/real_router.ref.txt`）的测试，因耗时约 2s 已默认 `#[ignore]`。改动 emitter / aquifer / beard / 矿脉 / 反序列化，或任何会改变 WGSL 数值输出的代码后，必须手动跑 `cd rust && cargo test --lib -- --ignored real_router_vs_vanilla`。其余 84 个测试全绿**不能**替代这一步——它们只验证"CPU 参考实现与 GPU 一致"，不验证"GPU 与 vanilla 一致"（见教训 #20）。
 
@@ -140,10 +141,13 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
 ### 环境变量速查
 
+本模组自己的开关已全部迁移到 `config/c2me-wgpu.json`（见 §12），不再读取任何
+`C2ME_*` 环境变量。仅剩 wgpu 库自身的标准变量：
+
 | 变量 | 值 | 效果 |
 |---|---|---|
-已全部迁移到 `config/c2me-wgpu.json`，见 §12。本模组不再读取任何 `C2ME_*` 变量。
-| `WGPU_BACKEND` / `WGPU_ADAPTER_NAME` | — | 标准 wgpu GPU 选择变量 |
+| `WGPU_BACKEND` | 后端名，逗号分隔 | 限制尝试的图形后端 |
+| `WGPU_ADAPTER_NAME` | 子串 | 按名称选 GPU（GPU 选择功能落地前的过渡手段） |
 
 ---
 
@@ -164,7 +168,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
 为 **C2ME** 提供 **WGPU** GPU 加速区块生成模块。
 - 将 MC 1.21.1 `NoiseRouter` 密度函数在 GPU 计算。
-- Java 通过 **Panama FFM** 调用 Rust cdylib，下行 C 函数 + 轮询模型，无上行回调。
+- Java 通过 **Panama FFM** 调用 Rust cdylib，下行 C 函数 + 轮询模型。唯一的
+  上行回调用于把 Rust 日志转发到 Java 的 SLF4J（`c2me_wgpu_set_log_callback`）。
 
 ---
 
@@ -174,7 +179,9 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 > （提供 GPU 批处理赖以吞吐的多线程并行度）。
 
 ### 2.1 构建
-曾用 Gradle `includeBuild` 引入 C2ME 复合构建，**现已移除**（代码零 C2ME 引用）。
+曾用 Gradle `includeBuild` 引入 C2ME 复合构建，**现已移除**。改为在 `src/stub`
+提供 `SchedulingManager` / `IVanillaChunkManager` 的接口签名（`compileOnly`，不打进
+jar），Java 代码直接引用这些类。详见 §10。
 
 ### 2.2 版本对齐
 
@@ -212,10 +219,15 @@ MC 构造完 Perlin 后丢 seed，只剩 `perm[256]+origin`，必须传表本身
 ### 3.4 结果 blob（GPU → Java）
 
 ```
-[HEADER 8B] magic WG00 + version u16 + chunk_count u16
-[offsets 128B] 16 channels payload offsets (u64 LE)
-[payload] 16 channels x cells x f32
+[HEADER 8B]    magic "WG00" + version u16 + chunk_count u16
+[offsets 128B] 16 个通道的 payload 偏移 (u64 LE)；未回读的通道为 0
+[payload]      仅被回读的通道 × cells × f32
 [CRC32 4B]
+
+回读哪些通道由 `WorldContext::readback_channels()` 从 shard 布局推出，实际是
+finalDensity(ch11) 与 vein 三通道(ch12–14)。16 通道只是偏移表的上限宽度。
+
+per-block 方块状态走独立的 `block_buf`（u32/block），不经过这个 blob。
 ```
 
 ### 3.5 区块写回（当前架构）
@@ -228,8 +240,9 @@ MixinChunkGenerator.populateNoise：
    aquifer + 矿脉"路径已按 §20 的测量结论删除（CPU 写回把 CPS 钉在 ~150，移动端 ~6）。
    三个相关开关（`C2ME_WGPU_BLOCK_OUT/AQUIFER/BEARD`）也随之取消——它们已是正确性的
    必要条件，关掉只会产生错地形。
-6. **已知缺口**：矿脉（`OreVeinSampler`，连片大矿脉）尚未在 GPU 上实现。
-   普通矿石（煤/铁/金等）由 biome feature 阶段放置，不经过这条路径，不受影响。
+6. 矿脉（`OreVeinSampler`，连片大矿脉）已在 GPU 上实现：`block_out.wgsl` 里的
+   `vein_state()` 复刻了 MC 的采样器，RNG 种子由 `c2me_wgpu_set_ore_seed` 传入。
+   普通矿石（煤/铁/金等）仍由 biome feature 阶段放置，不经过这条路径。
 
 ---
 
@@ -254,6 +267,7 @@ Rust 不认识的密度节点（地形 mod）在 CPU 按同一角点网格求值
 ## §12 诊断基础设施
 
 - Rust 日志写 `<gameDir>/logs/c2me-wgpu.log`（Java 启动时传路径）。
+
 所有开关都在 `config/c2me-wgpu.json`，本模组不再读取任何 `C2ME_*` 环境变量：
 
 - `debug_verbose_logging`：shader 编译计时、缓存命中、CPS 统计。
@@ -350,6 +364,32 @@ lost` 和 wgpu 内部断言失败——那两类表现为 panic，最终仍会�
 `STATUS_PANICKED`。`setup_panic_hook` 已经把堆栈 `sync_all()` 写进
 `c2me-wgpu.log`，所以即使走到 halt，崩溃原因也不会丢。
 
+### §19–§22 核心结论（近期）
+
+**§19 端到端 A/B（异步调度裁定）**：桌面异步调度曾净负（30 vs 纯 CPU 23s），
+根因是 GPU 往返固定延迟落在关键路径。**教训：端到端指标才是判据。**
+
+**§20 写回天花板实测**：MIN_STAGE（跳全部写回）11s ≪ 纯 CPU 23s，证明
+**净负全部来自 CPU 写回留在关键路径**，GPU 密度管线本身很快。
+
+**§21 最小闭环**：BlockOut shard 首次跑通（GPU 输出 per-block 状态字节），16s。
+
+**§22 aquifer + Beardifier 全 GPU（当前）**：
+- aquifer：Java warmup 惰性表（315 cell ~0ms）+ compact 序列化（2544B）→
+  Rust 现算 blockPositions（种子来自表头）→ GPU 12-cell 扫描 + 分类。99.97%。
+- beard：静态 24³ 权重表（每 world 一次）+ per-chunk pieces（固定 stride）。
+  bit-exact。**必须 f32**（WGSL 无 f64）。
+- **端到端反超纯 CPU，功能完整，地形正确**（当前基准见 §23：18 s vs 23 s）。
+- 遗留 0.03% = 过渡带 `calculateDensity`（barrier 噪声）分支未实现。
+- 验证链全离线：CPU-f32 / blockPositions / WGSL / e2e / beard，5 个测试。
+- shard B 瘦身（2026-10-17）：`spline_seg` + `octave_stack` 两个 WGSL helper 替换
+  高频内联展开，3084→1771 行（重回 Mali ~2100 安全区），bit-identical。
+- Spline n==1 修复（2026-10-17）：单点 spline 漏了 `outside()` 外推 → 嵌套 values 全错
+  → depth 偏差 ~0.08 → 海底 y≈43–55 误判 stone（chunk 50,50 diff 8.88%）。改
+  `spline.rs`/`world.rs` 两处 n==1 分支 + bump `LAYOUT_VERSION` 4→5。验证：逐通道
+  bad=0/1225、逐格 diff 归零（回退复现 +0.08~0.098）、GPU rms 2.5e-5/5.7e-5、84 测试
+  全过、实机 Tectonic 与 Epic 滴水石锥均消失；怪坑（§14 非线性外层）仍独立存在。
+
 ### §23 执行器流水线化（0.1.5）
 
 **问题**：`run_loop` 是 `prepare → submit → poll(Wait) → 读回 → 下一批`。GPU 算的
@@ -383,32 +423,6 @@ lost` 和 wgpu 内部断言失败——那两类表现为 panic，最终仍会�
 **瓶颈仍是 GPU**：`readback` 占每批 90%，是 compute + 拷贝的真实时间，批次再多
 也无法重叠。想再提 CPS 只能减少 GPU 工作量（降分辨率、减 shard），代价是地形质量
 与移动端兼容性。
-
-### §19–§22 核心结论（近期）
-
-**§19 端到端 A/B（异步调度裁定）**：桌面异步调度曾净负（30 vs 纯 CPU 23s），
-根因是 GPU 往返固定延迟落在关键路径。**教训：端到端指标才是判据。**
-
-**§20 写回天花板实测**：MIN_STAGE（跳全部写回）11s ≪ 纯 CPU 23s，证明
-**净负全部来自 CPU 写回留在关键路径**，GPU 密度管线本身很快。
-
-**§21 最小闭环**：BlockOut shard 首次跑通（GPU 输出 per-block 状态字节），16s。
-
-**§22 aquifer + Beardifier 全 GPU（当前）**：
-- aquifer：Java warmup 惰性表（315 cell ~0ms）+ compact 序列化（2544B）→
-  Rust 现算 blockPositions（种子来自表头）→ GPU 12-cell 扫描 + 分类。99.97%。
-- beard：静态 24³ 权重表（每 world 一次）+ per-chunk pieces（固定 stride）。
-  bit-exact。**必须 f32**（WGSL 无 f64）。
-- **端到端 15s vs 纯 CPU 23s（反超 35%），功能完整，地形正确。**
-- 遗留 0.03% = 过渡带 `calculateDensity`（barrier 噪声）分支未实现。
-- 验证链全离线：CPU-f32 / blockPositions / WGSL / e2e / beard，5 个测试。
-- shard B 瘦身（2026-10-17）：`spline_seg` + `octave_stack` 两个 WGSL helper 替换
-  高频内联展开，3084→1771 行（重回 Mali ~2100 安全区），bit-identical。
-- Spline n==1 修复（2026-10-17）：单点 spline 漏了 `outside()` 外推 → 嵌套 values 全错
-  → depth 偏差 ~0.08 → 海底 y≈43–55 误判 stone（chunk 50,50 diff 8.88%）。改
-  `spline.rs`/`world.rs` 两处 n==1 分支 + bump `LAYOUT_VERSION` 4→5。验证：逐通道
-  bad=0/1225、逐格 diff 归零（回退复现 +0.08~0.098）、GPU rms 2.5e-5/5.7e-5、84 测试
-  全过、实机 Tectonic 与 Epic 滴水石锥均消失；怪坑（§14 非线性外层）仍独立存在。
 
 ### 关键文件
 
