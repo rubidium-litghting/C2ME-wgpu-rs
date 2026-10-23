@@ -13,7 +13,7 @@ onto the GPU.
 > whole density pipeline (noise, aquifer, structure shaping) to the GPU and
 > emits block states directly; the CPU only writes the chunk palette. On a
 > desktop AMD iGPU (RADV), an end-to-end Chunky run (r=500, 4225 chunks)
-> finishes in ~15 s vs ~23 s for plain C2ME on the CPU. On a mobile GPU
+> finishes in ~18 s vs ~23 s for plain C2ME on the CPU. On a mobile GPU
 > (Mali-G610), the same workload completes in 2m19s vs 3m12s on the CPU
 > (a **61% end-to-end speedup**). Analyzing Chunky's continuous generation
 > rate shows a **+30.3% throughput increase** (30.65 CPS vs 23.52 CPS).
