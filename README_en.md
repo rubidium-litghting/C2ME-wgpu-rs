@@ -1,39 +1,30 @@
-> **English** | [简体中文](README.md)
-
 # C2ME-wgpu-rs
 
-GPU-accelerated world generation for Minecraft, powered by
-[wgpu](https://wgpu.rs/) (Vulkan / Metal / DX12 / WebGPU).
+GPU-accelerated world generation for Minecraft, powered by [wgpu](https://wgpu.rs/) (Vulkan / Metal / DX12 / WebGPU).
 
-A companion mod for [C2ME](https://modrinth.com/mod/c2me-fabric)
-that offloads the heavy noise / density-function pipeline of chunk generation
-onto the GPU.
+This is a companion mod for [C2ME](https://modrinth.com/mod/c2me-fabric). It offloads the heavy noise / density-function pipeline of chunk generation to the GPU.
 
-> ⚠️ **Experimental — read before installing.** The mod now offloads the
-> whole density pipeline (noise, aquifer, structure shaping) to the GPU and
-> emits block states directly; the CPU only writes the chunk palette. On a
-> desktop AMD iGPU (RADV), an end-to-end Chunky run (r=500, 4225 chunks)
-> finishes in ~18 s vs ~23 s for plain C2ME on the CPU. On a mobile GPU
-> (Mali-G610), the same workload completes in 2m19s vs 3m12s on the CPU
-> (a **61% end-to-end speedup**). Analyzing Chunky's continuous generation
-> rate shows a **+30.3% throughput increase** (30.65 CPS vs 23.52 CPS).
-> The old "weak-GPU can be slower" caveat no longer applies.
+> [简体中文](README.md) | **English**
 
-> **Compatibility-first.** This mod is deliberately built on **fp32** so it can
-> run on the *widest possible range of GPUs* — including integrated graphics
-> and mobile SoCs. The official C2ME OpenCL accelerator targets `fp64` (available
-> on newer Minecraft versions); this mod complements it by covering 1.21.1 and
-> devices that `fp64` (and `shader-f64`) cannot reach. Higher precision here is
-> only ever obtained through fp32-internal compensation; `f64` is intentionally
-> never used, because it would exclude most mobile GPUs.
+> ⚠️ **Experimental — read before installing.**
+> The mod offloads the entire density pipeline (noise, aquifers, structure shaping) to the GPU and emits block states directly; the CPU only writes the chunk palette.
+> On a desktop AMD integrated GPU (RADV), an end-to-end Chunky run (r=500, 4225 chunks) takes about 18 seconds, versus roughly 23 seconds for plain C2ME on the CPU.
+> On a mobile GPU (Mali-G610) the same test takes 2m 19s versus 3m 12s on the CPU (**61% end-to-end speed-up**).
+> Analysing Chunky's continuous generation rate shows a **+30.3%** terrain-generation throughput gain (30.65 CPS vs 23.52 CPS).
+> The old "weak GPUs may be slower" warning no longer applies.
+
+> **Compatibility first.**
+> The mod is deliberately built on **fp32** so it runs on *as many GPUs as possible* — integrated GPUs and mobile SoCs included.
+> The official C2ME OpenCL accelerator uses `fp64` (available only on newer Minecraft versions); this mod complements it by covering 1.21.1 and every device where `fp64` (and `shader-f64`) is unavailable.
+> Precision here is recovered through fp32 internal compensation only; `f64` is deliberately never used, because it would lock out most mobile GPUs.
 
 ---
 
-> 💡 **Resilience note**: If the GPU fails during generation, the affected dimension falls back to CPU generation and the game keeps running; the cause is written to `logs/c2me-wgpu.log`. The game only halts to prevent a deadlock when the GPU stops responding entirely (30 seconds with no result for a submitted batch), logging the reason to the same file.
+> 💡 **Resilience note**: if the GPU fails during generation, the affected dimension falls back to CPU generation and the game keeps running; the cause is written to `logs/c2me-wgpu.log`. The game only halts to prevent a deadlock when the GPU stops responding entirely (30 seconds with no result for a submitted batch), logging the reason to the same file.
 >
-> ⚠️ **Cross-platform behavior**:
-> - **Desktop**: If an incompatible backend is forced (e.g. `WGPU_BACKEND=gl`), the wgpu panic is safely caught and the game **silently falls back to CPU** without crashing.
-> - **Android**: Since cross-compilation defaults to `panic=abort`, the same situation causes an **immediate crash**. However, the panic reason will be written to `logs/c2me-wgpu.log`. Please do not force `WGPU_BACKEND` on mobile devices.
+> ⚠️ **Cross-platform behaviour**:
+> - **Desktop**: if an incompatible backend is forced (e.g. `WGPU_BACKEND=gl`), the wgpu panic is caught and the game **silently falls back to CPU** without crashing.
+> - **Android**: because cross-compilation defaults to `panic=abort`, the same situation makes the **game crash**. The reason is still written to `logs/c2me-wgpu.log`. Do not force `WGPU_BACKEND` on mobile devices.
 
 ## Requirements
 
@@ -41,47 +32,33 @@ onto the GPU.
 |---|---|
 | Minecraft | 1.21.1 (Fabric) |
 | Fabric Loader | >= 0.17.2 |
-| **C2ME** | **required** (this is a companion module, not standalone) |
-| Java | 25+ (the mod is built against Java 25 and uses the Panama FFM API) |
-| GPU | Any GPU with a working wgpu backend |
+| **C2ME** | **Required** (this is a companion mod and cannot run standalone) |
+| Java | 25+ (built against Java 25, using the Panama FFM API) |
+| GPU | Any GPU with a wgpu backend |
 
-Java 25 or newer is required: the mod is compiled for Java 25 (and talks to
-its Rust core through the Panama FFM API, which is stable from Java 24).
+Java 25 or newer is required: the mod is compiled for Java 25 and talks to its Rust core through the Panama FFM API, stable since Java 24.
 
-> **Why still named "C2ME-wgpu-rs"?** This mod ships its own access widener
-> and requires C2ME. 
-> 
-> **At build time**, the Java code directly references C2ME classes (like
-> `SchedulingManager`). To avoid pulling the entire C2ME source, we provide
-> a small **compile-only stub** (`src/stub`, `compileOnly` — not packaged
-> into the jar). This means no C2ME jar is needed to compile, and no C2ME
-> version is pinned.
-> 
-> **At runtime**, it strongly depends on C2ME for two things:
-> 1. The multi-threaded chunk generation that keeps the GPU batch pipeline fed
->    (with C2ME, desktop throughput reaches ~144 chunks/s; without it, the GPU
->    starves and collapses to ~13).
-> 2. The asynchronous write-back architecture heavily relies on C2ME's
->    `SchedulingManager.positionedExecutor()` to run CPU tasks on its worker
->    pool. If this API is unavailable, GPU acceleration is completely disabled
->    for that run, and plain C2ME generates terrain on the CPU (there is no
->    synchronous GPU fallback).
-> 
-> So it remains a **C2ME companion module** — C2ME supplies the parallelism and
-> the scheduler, this mod supplies the GPU compute — and keeps the name.
+> **Why is it still called "C2ME-wgpu-rs"?**
+> The mod ships its own access widener and requires C2ME.
+>
+> **At build time**, the Java code references C2ME classes directly (e.g. `SchedulingManager`). To avoid pulling in the whole C2ME source, a small **compile-only stub** is provided (`src/stub`, `compileOnly` — not packaged into the jar). Building therefore needs no C2ME jar and does not pin any specific C2ME version.
+>
+> **At runtime**, it hard-depends on C2ME for two things:
+> 1. Multi-threaded chunk generation, to keep the GPU batch pipeline full (with C2ME, desktop throughput reaches ~144 chunks/s; without it the GPU starves and drops to ~13).
+> 2. The async write-back architecture relies on C2ME's `SchedulingManager.positionedExecutor()` to run CPU tasks on its worker pool. If that API is unavailable, GPU acceleration is disabled for the run and generation falls back to plain C2ME on the CPU (there is no synchronous GPU fallback).
+>
+> It therefore remains a **C2ME companion module** — C2ME provides the parallelism and the scheduler, this mod provides the GPU — and the name stays.
 
 ---
 
 ## Installation
 
 1. Install Fabric Loader for Minecraft 1.21.1.
-2. Put **C2ME** and **C2ME-wgpu-rs** into your `mods/` folder.
-3. Launch the game.
+2. Put **C2ME** and **C2ME-wgpu-rs** into the `mods/` folder.
+3. Start the game.
 
-No configuration is needed. If a compatible GPU is found **and** C2ME's
-scheduling API is available, terrain generation is offloaded automatically;
-otherwise the mod stays silent and plain C2ME generates terrain on the CPU,
-exactly as usual.
+It works out of the box; the default configuration needs no changes. If a compatible GPU **and** C2ME's scheduling API are available, terrain generation is offloaded to the GPU automatically; otherwise the mod stays silent and plain C2ME generates terrain on the CPU as usual.
+To tune anything, edit `config/c2me-wgpu.json` — see below.
 
 ---
 
@@ -89,71 +66,49 @@ exactly as usual.
 
 | Platform | Status |
 |---|---|
-| Linux x86_64 | ✅ tested |
-| Android aarch64 (custom JVM) | ✅ tested (Mali-G610 / Dimensity) |
-| Windows x86_64 | ✅ tested (AMD, mingw DLL) |
-| macOS (Metal) | ⚠️ wgpu backend available, not officially tested |
+| Linux x86_64 | ✅ Tested |
+| Android aarch64 (custom JVM) | ✅ Tested (Mali-G610 / Dimensity) |
+| Windows x86_64 | ✅ Tested (AMD, mingw DLL) |
+| macOS (Metal) | ⚠️ wgpu backend exists, not officially tested |
 
-On Android, `-XX:+UseZGC` is **not** supported by the custom JVM and the mod
-will not suggest it there.
+On Android, the custom JVM does **not** support `-XX:+UseZGC`, and the mod does not suggest it there.
 
 ---
 
 ## How it works
 
-1. **Serialize** — the vanilla `NoiseRouter` (the density-function tree that
-   drives terrain) is serialized into a compact binary blob on the Java side.
-2. **Hand off** — the blob is passed to a Rust `cdylib` through the Panama FFM
-   API (no callbacks, a simple poll model).
-3. **Compile** — Rust deserializes the tree, runs optimization passes, and
-   generates a WGSL compute shader, which is compiled to a GPU pipeline
-   (and cached on disk).
-4. **Dispatch** — the GPU evaluates the density field for a whole batch of
-   chunks. To correctly handle modded non-linear density functions (e.g.,
-   `squeeze`), the final density tree is split (the "Pass E" architecture):
-   interpolated subtrees are evaluated at cell corners, while non-linear wrappers
-   are applied per-block during the final classification.
-5. **Block states** — the GPU classifies every block (air / stone / water /
-   lava) itself, applying the aquifer, the Beardifier (structure shaping), and
-   the **Ore Vein sampler** (using a native GPU Xoroshiro RNG) on the GPU.
-   Java only writes the resulting per-block state bytes into the chunk's palette.
+1. **Serialisation** — the vanilla `NoiseRouter` (the density-function tree that drives terrain) is serialised on the Java side into a compact binary blob.
+2. **Hand-off** — the blob crosses the Panama FFM API into the Rust `cdylib`. Calls are downcall C functions with a polling model; the single upcall exists only to forward Rust log lines to Java's SLF4J.
+3. **Compilation** — Rust deserialises the tree, runs the optimisation passes, emits WGSL compute shaders and compiles them into GPU pipelines (cached on disk).
+4. **Dispatch** — one GPU dispatch evaluates the density field for a whole batch of chunks. To handle non-linear density functions from mods correctly (e.g. `squeeze`), the final tree is split (the "Pass E" architecture): interpolated subtrees are evaluated on the corner grid, while the non-linear outer tree is applied per block during the final classification.
+5. **Block states** — the GPU classifies every block itself (air / stone / water / lava), applying aquifers, Beardifier structure shaping and the **ore-vein sampler** (with a native GPU Xoroshiro RNG). Java only writes the resulting per-block state bytes into the chunk palette.
 
 ---
 
 ## Accuracy
 
-The mod computes in **fp32**. Compared to Minecraft's `double` reference:
+The mod computes in **fp32**. Compared with Minecraft's `double` reference:
 
 - shallow expressions agree to about **1e-6**;
-- deep expressions (thousands of noise samples) can drift up to about **1e-2**.
+- deep expressions (thousands of noise samples) drift by up to about **1e-2**.
 
-This is the **inherent limit of fp32**, not a bug. Terrain thresholds are not
-sensitive to differences of this magnitude, and the generated terrain is
-visually indistinguishable from vanilla. Higher precision is only ever obtained
-through fp32-internal compensation — `f64` is intentionally never used, because
-it would exclude most mobile GPUs.
+That is the **inherent limit of fp32**, not a bug. Terrain thresholds are insensitive to differences of that size, and the generated terrain is visually indistinguishable from vanilla.
 
 ---
 
 ## Known limitations
 
-- At extremely far End coordinates (~370k blocks), a partial NaN fallback is
-  used to reproduce vanilla's void bands.
-- **Modded density functions**: a custom density node the GPU serializer does
-  not natively understand (e.g. from a terrain mod) is evaluated on the CPU at
-  the same corner grid and fed to the GPU as an "external input". The rest of
-  the tree still runs on the GPU, so modded worldgen keeps working — only the
-  unsupported subtree pays a CPU cost.
+- At extreme End coordinates (around 370,000 blocks) a partial NaN fallback is used to reproduce vanilla's void band.
+- **Modded density functions**: custom density nodes the GPU serialiser cannot understand natively (e.g. from terrain mods) are evaluated on the CPU over the same corner grid and fed to the GPU as "external inputs". The rest of the tree still runs on the GPU, so modded world generation keeps working — only the unsupported subtrees pay a CPU cost.
+- **No on-disk pipeline cache on Windows / macOS**: the cache directory follows the XDG convention (`$XDG_CACHE_HOME`, falling back to `$HOME/.cache`). Those variables are usually unset on Windows and macOS, so the disk cache is effectively disabled there — shaders are recompiled on every launch. This does not affect correctness, only start-up time.
 
 ---
 
 ## Configuration
 
-User settings live in `config/c2me-wgpu.json`. The file is created on first
-launch; **restart the game** after editing it.
+User settings live in `config/c2me-wgpu.json`. The file is created on first launch; **restart the game** after editing it.
 
-If the file is malformed (invalid JSON) the mod renames it to
-`c2me-wgpu.json.broken` for inspection and writes a fresh default; out-of-range values are corrected and written back.
+If the file is malformed (invalid JSON) the mod renames it to `c2me-wgpu.json.broken` for inspection and writes a fresh default; out-of-range values are corrected and written back.
 
 ```json
 {
@@ -191,8 +146,7 @@ For troubleshooting; leave at their defaults during normal play.
 
 ### Offline diagnostics
 
-For comparing against vanilla output offline. All default to off; a normal
-session writes nothing.
+For comparing against vanilla output offline. All default to off; a normal session writes nothing.
 
 | Field | Default | Description |
 |---|---|---|
@@ -202,59 +156,38 @@ session writes nothing.
 | `debug_dump_blocks` | `false` | Dump block states of the target chunk(s). |
 | `debug_dump_aquifer` | `false` | Dump the aquifer cell table. |
 | `debug_dump_beard` | `false` | Dump Beardifier structure data and per-block reference values. |
-| `debug_dump_blob` | `""` | Write the serialized NoiseRouter blob here (this is how `src/test/resources/real_router.bin` is produced). |
+| `debug_dump_blob` | `""` | Write the serialised NoiseRouter blob here (this is how `src/test/resources/real_router.bin` is produced). |
 
 ## Environment variables
 
+Every switch of this mod lives in the config file; it reads no `C2ME_*` environment variables. This section covers only the standard variables read by **wgpu itself**.
+
 ### GPU selection (standard wgpu variables)
 
-The mod honours wgpu's own environment variables, so they behave the same as
-in any other wgpu application:
+The mod honours wgpu's own environment variables, so they behave the same as in any other wgpu application:
 
 | Variable | Values | Effect |
 |---|---|---|
-| `WGPU_BACKEND` | `vulkan`, `dx12`, `metal`, `gl`, `webgpu` (comma-separated) | Restrict the graphics backends tried. Useful when one backend is broken. Note: The `gl` backend requires OpenGL 4.3+ for compute shader support. |
+| `WGPU_BACKEND` | `vulkan`, `dx12`, `metal`, `gl`, `webgpu` (comma-separated) | Restrict the graphics backends tried. Useful when one backend is broken. Note: the `gl` backend requires OpenGL 4.3+ for compute shader support. |
 | `WGPU_ADAPTER_NAME` | substring (case-insensitive) | Force a specific GPU by name, e.g. `WGPU_ADAPTER_NAME=radeon`. If nothing matches, the mod logs a warning and falls back to its default choice. |
 
-Without any of these, the mod uses Vulkan / Metal / DX12 (whichever the OS
-provides) and prefers the **integrated GPU**, so the discrete GPU stays free
-for rendering.
+Without any of these, the mod uses Vulkan / Metal / DX12 (whichever the OS provides) and prefers the **integrated GPU**, so the discrete GPU stays free for rendering.
 
-### The mod reads no environment variables
+### Native library and logs
 
-Every setting lives in the config file; see "Configuration" above. This
-section covers only wgpu's own standard variables.
+**Troubleshooting native extraction**:
+By default the mod extracts the `.so` or `.dll` from the jar into a `c2me-wgpu-natives/` folder in the game root directory. If that directory is not writable or loading fails (e.g. a `noexec` mount), it falls back to the OS temporary directory (e.g. `/tmp` on Linux).
+If you need to debug native library loading failures, add `-Dc2me.wgpu.preserveNative=true` to your JVM arguments; the mod will extract the native library directly into the game's working directory.
 
-**Native extraction location**:
-By default, the mod extracts the `.so` or `.dll` from the jar into a `c2me-wgpu-natives/` folder in the game root directory. If that directory is not writable or loading fails (e.g., `noexec` mount), it automatically falls back to the OS temporary directory (e.g., `/tmp` on Linux).
-If you need to debug native library loading failures, you can add `-Dc2me.wgpu.preserveNative=true` to your JVM launch arguments. The mod will extract the native library directly to the game's working directory instead.
+> **Note:** configuration fields marked "Development only", and the offline diagnostics group, are strictly for troubleshooting and do not need to be set during normal gameplay.
 
-> **Note:** configuration fields marked "Development only", and the offline
-> diagnostics group, are strictly for troubleshooting and do not need to be
-> set during normal gameplay.
-
-> **Rust-side log file:** the native library writes its diagnostics to
-> `<gameDir>/logs/c2me-wgpu.log` (the path is passed from Java at startup).
-> This is separate from Minecraft's own `logs/latest.log`, which only captures
-> Java logging.
-
-### Cache location
-
-| Variable | Effect |
-|---|---|
-| `XDG_CACHE_HOME` | Base directory for the on-disk shader pipeline cache (`$XDG_CACHE_HOME/c2me/wgpu_pipelines/`). |
-| `HOME` | Fallback when `XDG_CACHE_HOME` is unset (`$HOME/.cache`). |
-
-> **Note:** the cache path follows the XDG convention, which is native to Linux
-> only. On Windows and macOS these variables are usually unset or non-standard,
-> so the on-disk pipeline cache is effectively disabled there. This costs a
-> one-off shader recompile per launch and does not affect correctness.
+> **Rust-side log file:** the native library writes its diagnostics to `<gameDir>/logs/c2me-wgpu.log` (the path is passed from Java at startup). This is separate from Minecraft's own `logs/latest.log`, which only captures Java logging.
 
 ### Build-time only
 
 | Variable | Effect |
 |---|---|
-| `ANDROID_NDK_HOME` | When present, the build **automatically** cross-compiles the native library for Android (aarch64) and stages it into the jar under `natives/android-aarch64/`. Unset it (or pass `-PskipAndroid`) to skip. |
+| `ANDROID_NDK_HOME` | When set, the build **automatically** cross-compiles the native library for Android (aarch64) and stages it under `natives/android-aarch64/` inside the jar. Unset it (or pass `-PskipAndroid`) to skip. |
 
 ---
 
@@ -264,44 +197,39 @@ If you need to debug native library loading failures, you can add `-Dc2me.wgpu.p
 ./gradlew build
 ```
 
-The built mod jar is written to `build/libs/`.
+The mod jar is written to `build/libs/`.
 
 Building requires:
 - JDK 25 (for the Java toolchain) and JDK 21 (for the Gradle JVM);
 - a Rust toolchain (the native library is compiled as part of the build);
-- **`cargo-ndk`** *only if* you build for Android
-  (`cargo install cargo-ndk`, plus an Android NDK; the Android build is
-  skipped automatically when `ANDROID_NDK_HOME` is not set,
-  or forced off with `-PskipAndroid`).
+- **`cargo-ndk`** *only* when building for Android
+  (`cargo install cargo-ndk`, plus an Android NDK; with `ANDROID_NDK_HOME` unset the Android build is skipped automatically, or force it off with `-PskipAndroid`).
 
 ---
 
 ## Development note
 
-This mod was developed with heavy **AI assistance** — the code, documentation
-and tests were largely AI-generated under maintainer review. Treat it
-accordingly: verify behaviour on your own hardware before relying on it.
-Bug reports and pull requests are welcome.
+This mod was developed with **extensive AI assistance** — the code, documentation and tests are largely AI-generated under maintainer review. Treat it with that in mind: verify behaviour on your own hardware before relying on it. Bug reports and pull requests are welcome.
+
+### Notes on running the tests
+
+**After touching anything terrain-related, run the comparison test.** `real_router_vs_vanilla` is the only test that checks GPU output against real Minecraft; it takes about 2 seconds and is therefore ignored by default. After changing an emitter, aquifer, beard, ore veins or deserialisation, run:
+
+```
+cd rust && cargo test --lib -- --ignored real_router_vs_vanilla
+```
+
+`cargo test` can occasionally fail a GPU test on integrated graphics (roughly once every 5–8 runs). Each test case creates its own executor (~600 MB of GPU buffers), and running them in parallel stacks those allocations; this is a test-architecture issue unrelated to the in-game path, where a single executor runs with bounded concurrency set by `pipeline_depth`. If it reproduces, please attach the full `cargo test` output.
 
 ---
 
 ## Provenance
 
-This project is an independent, clean-room reimplementation. It was written
-against Minecraft's **runtime behaviour** (dumped noise data and sampled
-reference values), not against any third-party mod's source code.
+This project is an independent, clean-room reimplementation. It was written against Minecraft's **runtime behaviour** (exported noise data and sampled reference values), not against the source of any third-party mod.
 
-A code-origin review compared this mod's aquifer and Beardifier implementation
-against [C2ME](https://modrinth.com/mod/c2me-fabric)'s OpenCL accelerator:
-no shared identifiers, no copied functions, and a different architecture
-(C2ME mirrors Minecraft function-by-function; this mod uses a
-precomputed-table + GPU-scan design). Where the two look similar
-(e.g. `fastInverseSqrt`, `getStructureWeight`), the common source is
-Minecraft's own vanilla code, which both projects independently reproduce.
+A code-provenance review compared this mod's aquifer and Beardifier implementations with [C2ME](https://modrinth.com/mod/c2me-fabric)'s OpenCL accelerator: no shared identifiers, no copied functions, and different architectures (C2ME mirrors Minecraft function by function; this mod uses precomputed tables plus GPU scan designs). Where the two look similar (e.g. `fastInverseSqrt`, `getStructureWeight`), the common source is Minecraft's own vanilla code, which both projects reimplemented independently.
 
-Scope note: the review was at the feature/architecture level, not a
-character-by-character diff. Minecraft itself is not redistributed; only
-original code is shipped. See `LICENSE`.
+Scope note: the review was done at the feature/architecture level, not as a character-by-character diff. Minecraft itself is not redistributed; only original code is provided. See `LICENSE`.
 
 ---
 
