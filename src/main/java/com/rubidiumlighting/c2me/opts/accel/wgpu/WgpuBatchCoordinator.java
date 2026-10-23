@@ -485,11 +485,15 @@ public final class WgpuBatchCoordinator {
             return;
         }
 
+        // Release as soon as the Rust-side handle is consumed: from here on
+        // the permit no longer guards native resources, only the Java-side
+        // fan-out below, so the submit chain can start the next batch while
+        // this one is still distributing results.
+        submitPermits.release();
         int n = ib.batch.size();
         for (int i = 0; i < n; i++) {
             ib.batch.get(i).future.complete(new GpuChunk(seg, i, blockSeg));
         }
-        submitPermits.release();
         recordStats(n, t0, System.nanoTime());
     }
 
