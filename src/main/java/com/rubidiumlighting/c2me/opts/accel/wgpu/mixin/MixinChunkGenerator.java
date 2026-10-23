@@ -457,16 +457,20 @@ public abstract class MixinChunkGenerator {
         //   4=granite 5=tuff 6=copper_ore 7=raw_copper_block
         //   8=deepslate_iron_ore 9=raw_iron_block
         // 4..9 are ore-vein outputs (OreVeinSampler.VeinType).
-        BlockState water = Blocks.WATER.getDefaultState();
-        BlockState lava = Blocks.LAVA.getDefaultState();
-        BlockState granite = Blocks.GRANITE.getDefaultState();
-        BlockState tuff = Blocks.TUFF.getDefaultState();
-        BlockState copperOre = Blocks.COPPER_ORE.getDefaultState();
-        BlockState rawCopper = Blocks.RAW_COPPER_BLOCK.getDefaultState();
-        BlockState ironOre = Blocks.DEEPSLATE_IRON_ORE.getDefaultState();
-        BlockState rawIron = Blocks.RAW_IRON_BLOCK.getDefaultState();
-        Heightmap oceanFloorWg = chunk.getHeightmap(Heightmap.Type.OCEAN_FLOOR_WG);
-        Heightmap worldSurfaceWg = chunk.getHeightmap(Heightmap.Type.WORLD_SURFACE_WG);
+        // State code -> BlockState. Index 0 is air (skipped); anything past
+        // the table falls back to the dimension's solid block.
+        final BlockState[] states = {
+                Blocks.AIR.getDefaultState(),
+                stone,
+                Blocks.WATER.getDefaultState(),
+                Blocks.LAVA.getDefaultState(),
+                Blocks.GRANITE.getDefaultState(),
+                Blocks.TUFF.getDefaultState(),
+                Blocks.COPPER_ORE.getDefaultState(),
+                Blocks.RAW_COPPER_BLOCK.getDefaultState(),
+                Blocks.DEEPSLATE_IRON_ORE.getDefaultState(),
+                Blocks.RAW_IRON_BLOCK.getDefaultState(),
+        };
         java.nio.ByteBuffer bb = blockSeg.asByteBuffer();
         bb.order(java.nio.ByteOrder.LITTLE_ENDIAN);
         long base = (long) batchIndex * BLOCKS_PER_CHUNK * 4;
@@ -485,23 +489,17 @@ public abstract class MixinChunkGenerator {
                     int idx = bx + bz * 16 + by * 256;
                     int v = bb.getInt((int) (base + (long) idx * 4));
                     if (v == 0) continue;           // air
-                    BlockState bs = switch (v) {
-                        case 2 -> water;
-                        case 3 -> lava;
-                        case 4 -> granite;
-                        case 5 -> tuff;
-                        case 6 -> copperOre;
-                        case 7 -> rawCopper;
-                        case 8 -> ironOre;
-                        case 9 -> rawIron;
-                        default -> stone;
-                    };
+                    BlockState bs = v < states.length ? states[v] : stone;
                     sec.setBlockState(bx, ly, bz, bs);
-                    oceanFloorWg.trackUpdate(bx, globalY, bz, bs);
-                    worldSurfaceWg.trackUpdate(bx, globalY, bz, bs);
                 }
             }
         }
+        // Rebuild both heightmaps in one pass instead of two trackUpdate calls
+        // per non-air block (~67k calls for a typical chunk). The vanilla
+        // helper walks the sections column-wise, which is far cheaper.
+        Heightmap.populateHeightmaps(chunk,
+                java.util.Set.of(Heightmap.Type.OCEAN_FLOOR_WG,
+                                 Heightmap.Type.WORLD_SURFACE_WG));
     }
 
     /** §20: the ONLY GPU write-back path. The GPU emits one block-state

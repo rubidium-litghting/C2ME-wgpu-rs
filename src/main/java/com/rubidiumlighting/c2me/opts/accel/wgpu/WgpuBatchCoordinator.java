@@ -127,7 +127,7 @@ public final class WgpuBatchCoordinator {
     /** Number of batches allowed in flight (submitted to Rust, not yet
      *  completed). Matches the Rust staging chain depth so the GPU side can
      *  stay busy while Java assembles the next batch. */
-    private static final int STAGING = 3;
+    private static final int STAGING = 2;
     /** Submitted-but-not-completed batches. Bounded => backpressure (the
      *  submit loop blocks here instead of overflowing anything). */
     private final BlockingQueue<Inflight> inflight = new LinkedBlockingQueue<>(STAGING);
@@ -164,6 +164,10 @@ public final class WgpuBatchCoordinator {
     private final AtomicLong statBatches = new AtomicLong();
     private final AtomicLong statChunks = new AtomicLong();
     private final AtomicLong statGpuNanos = new AtomicLong();
+    /** Same as statGpuNanos but each batch's contribution is clipped to the
+     *  current window. `inflight` is "average batches occupying the pipeline",
+     *  which must not count time a batch spent in a previous window. */
+    private final AtomicLong statInflightNanos = new AtomicLong();
     private volatile long statsWindowStart = System.nanoTime();
 
     public WgpuBatchCoordinator(long worldHandle,
@@ -461,20 +465,35 @@ public final class WgpuBatchCoordinator {
         for (int i = 0; i < n; i++) {
             ib.batch.get(i).future.complete(new GpuChunk(seg, i, blockSeg));
         }
-        recordStats(n, System.nanoTime() - t0);
+        recordStats(n, t0, System.nanoTime());
     }
 
-    private void recordStats(int chunks, long gpuNanos) {
+    /**
+     * Runs on several C2ME worker threads at once. The window bookkeeping
+     * (statsWindowStart plus the counters) is a multi-field update: without a
+     * lock two threads can both decide the window has elapsed, and the second
+     * one computes `now - statsWindowStart` against a value the first has
+     * already moved, producing an inflight ratio above the real queue depth.
+     * Called once per batch (~100ms apart), so contention is irrelevant.
+     */
+    private synchronized void recordStats(int chunks, long submitT0, long now) {
+        long gpuNanos = now - submitT0;
         statBatches.incrementAndGet();
         statChunks.addAndGet(chunks);
         statGpuNanos.addAndGet(gpuNanos);
+        // Clip to the current window. A batch submitted before this window
+        // began still occupies the pipeline now, so only the part of its
+        // lifetime inside the window counts — otherwise a batch straddling the
+        // boundary is counted in full in both windows and inflight reads high.
+        long clippedStart = Math.max(submitT0, statsWindowStart);
+        statInflightNanos.addAndGet(Math.max(0, now - clippedStart));
         if (!Config.get().debugVerboseLogging) return;
-        long now = System.nanoTime();
         long win = now - statsWindowStart;
         if (win < STATS_INTERVAL_NS) return;
         long b = statBatches.getAndSet(0);
         long c = statChunks.getAndSet(0);
         long g = statGpuNanos.getAndSet(0);
+        long gi = statInflightNanos.getAndSet(0);
         statsWindowStart = now;
         if (b == 0) return;
         double sec = win / 1e9;
@@ -494,10 +513,11 @@ public final class WgpuBatchCoordinator {
         // queued (GPU-bound); well below means it was starved waiting for
         // chunks (CPU/C2ME-bound). Note the cast — `g / win` on two longs is
         // integer division and truncates to 0, 1, 2, ...
-        double inflight = (double) g / (win > 0 ? win : 1);
-        // A batch counts as in flight from submit until its blob is taken, so
-        // at most STAGING are queued plus the one completeLoop is draining.
-        final int maxInflight = STAGING + 1;
+        double inflight = (double) gi / (win > 0 ? win : 1);
+        // In-flight spans three places: batches sitting in the queue, the one
+        // completeLoop is draining, and the one submit() has handed to Rust but
+        // not yet put() into the queue. Hence STAGING + 2, not + 1.
+        final int maxInflight = STAGING + 2;
         String line = String.format(
                 "CPS=%.1f  batches=%d  chunks=%d  batchMs=%.2f  chunkMs=%.2f  "
                 + "inflight=%.2f/%d  (window=%.2fs)",

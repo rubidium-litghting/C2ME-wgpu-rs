@@ -81,14 +81,27 @@ public final class ChunkDumper {
      *  default to the platform temp dir; the config field overrides. */
     static String dumpDir() {
         String d = Config.get().debugDumpDir;
-        if (d != null && !d.isBlank()) return d;
-        String t = System.getProperty("java.io.tmpdir");
-        if (t == null || t.isBlank()) t = ".";
-        // Trailing separators would double up in the concatenations below.
-        while (t.length() > 1 && (t.endsWith("/") || t.endsWith("\\"))) {
-            t = t.substring(0, t.length() - 1);
+        String dir;
+        if (d != null && !d.isBlank()) {
+            dir = d;
+        } else {
+            String t = System.getProperty("java.io.tmpdir");
+            if (t == null || t.isBlank()) t = ".";
+            // Trailing separators would double up in the concatenations below.
+            while (t.length() > 1 && (t.endsWith("/") || t.endsWith("\\"))) {
+                t = t.substring(0, t.length() - 1);
+            }
+            dir = t;
         }
-        return t;
+        // Files.writeString/write do not create parent directories: a
+        // user-configured path that does not exist yet fails with
+        // NoSuchFileException. Create it here, once, for every writer.
+        try {
+            java.nio.file.Files.createDirectories(java.nio.file.Path.of(dir));
+        } catch (Throwable t) {
+            LOGGER.warn("[c2me-wgpu] could not create dump dir {}", dir, t);
+        }
+        return dir;
     }
 
     static int[] parseDumpChunk() {
