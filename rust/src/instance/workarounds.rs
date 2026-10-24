@@ -6,7 +6,6 @@
 //!   - Intel UHD 620 on Mesa: fma(a,b,c) != a*b+c，会导致 Perlin 噪声漂移
 //!   - Mesa RADV (AMD): storage buffer 大小未对齐 256 字节时偶发读到上一次
 //!     dispatch 的脏数据
-//!   - Apple Metal 老款独显: 单 buffer 绑定上限可能 < 256 MiB
 //!   - 部分 NVIDIA Windows 驱动: dispatch 间未显式 clear_buffer 会读到脏数据
 
 use wgpu::AdapterInfo;
@@ -18,8 +17,6 @@ pub struct Workarounds {
     pub disable_storage_fma: bool,
     /// Mesa RADV (AMD Vulkan): resources 分配 buffer 时把 size 向上对齐到 256 字节。
     pub radv_round_buf_256: bool,
-    /// Apple Metal 独显: 当单个 storage buffer 需求超过设备上限时自动拆分绑定。
-    pub metal_split_large_buffers: bool,
     /// 部分 NVIDIA 驱动: scheduler 每次 dispatch 前必须 `clear_buffer`。
     pub force_clear_between_dispatches: bool,
 }
@@ -43,7 +40,6 @@ impl Workarounds {
         let driver_info_lower = info.driver_info.to_lowercase();
         let is_mesa = driver_lower.contains("mesa") || driver_info_lower.contains("mesa");
         let is_radv = driver_lower.contains("radv") || driver_info_lower.contains("radv");
-        let is_metal = info.backend == wgpu::Backend::Metal;
 
         Self {
             // 精确匹配 Intel UHD 620 + Mesa（不波及 Intel 其它型号）
@@ -53,10 +49,6 @@ impl Workarounds {
 
             // RADV = AMD Vulkan Mesa driver
             radv_round_buf_256: info.vendor == Self::VENDOR_AMD && is_radv,
-
-            // Metal backend 在老款 Intel Mac 独显上单 binding 上限可能 < 256 MiB
-            metal_split_large_buffers: is_metal
-                && info.device_type == wgpu::DeviceType::DiscreteGpu,
 
             // 保守策略：NVIDIA + Vulkan/DX12 都启用，实测问题在 535-545 驱动版本
             force_clear_between_dispatches: info.vendor == Self::VENDOR_NVIDIA
@@ -68,7 +60,6 @@ impl Workarounds {
     pub fn any(&self) -> bool {
         self.disable_storage_fma
             || self.radv_round_buf_256
-            || self.metal_split_large_buffers
             || self.force_clear_between_dispatches
     }
 }

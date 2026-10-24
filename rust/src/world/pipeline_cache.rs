@@ -178,6 +178,19 @@ pub fn get_or_compile(
 
 /// Directory holding on-disk pipeline caches.
 fn cache_dir() -> Option<std::path::PathBuf> {
+    // macOS does not use the XDG layout: `$XDG_CACHE_HOME` is normally unset
+    // and `~/.cache` does not exist, so the XDG-only lookup below silently
+    // disabled the on-disk cache there and recompiled shaders every launch.
+    // The platform-conventional location is `~/Library/Caches`.
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return Some(std::path::PathBuf::from(home)
+            .join("Library")
+            .join("Caches")
+            .join("c2me")
+            .join("wgpu_pipelines"));
+    }
+
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;

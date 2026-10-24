@@ -69,7 +69,8 @@
 | Linux x86_64 | ✅ 已测试 |
 | Android aarch64 (自定义 JVM) | ✅ 已测试 (Mali-G610 / 天玑) |
 | Windows x86_64 | ✅ 已测试 (AMD, mingw DLL) |
-| macOS (Metal) | ⚠️ 有 wgpu 后端，未官方测试 |
+| macOS arm64 (Metal) | ⚠️ 可交叉编译并已提供原生库，尚未在真机验证。仅支持 Apple Silicon，不支持 Intel Mac |
+| OpenHarmony aarch64 | ⚠️ 可交叉编译并已提供原生库，尚未在真机验证。原生库未签名，需自行处理签名后才能加载 |
 
 在 Android 上，自定义 JVM **不支持** `-XX:+UseZGC`，模组也不会在那里给出该建议。
 
@@ -100,7 +101,8 @@
 
 - 在末地极远坐标（约 37 万格）处，使用部分 NaN 回退机制来复现原版的虚空带。
 - **模组密度函数**：GPU 序列化器无法原生理解的定制密度节点（例如来自地形模组的节点）会在 CPU 上以相同的角点网格计算，并作为“外部输入”喂给 GPU。树的其他部分依然在 GPU 上运行，因此模组世界生成保持工作 —— 只有不受支持的子树会承担 CPU 开销。
-- **Windows / macOS 没有磁盘管线缓存**：缓存目录按 XDG 约定推导（`$XDG_CACHE_HOME`，回退 `$HOME/.cache`）。这两个变量在 Windows 和 macOS 上通常不存在，因此那边的磁盘缓存实际被禁用——每次启动都要重新编译一次着色器。不影响正确性，只影响启动耗时。
+- **Windows 没有磁盘管线缓存**：缓存目录按 XDG 约定推导（`$XDG_CACHE_HOME`，回退 `$HOME/.cache`），这两个变量在 Windows 上通常不存在，因此那边的磁盘缓存实际被禁用——每次启动都要重新编译一次着色器。不影响正确性，只影响启动耗时。
+- **Intel Mac 不支持**：原生库只提供 `macos-aarch64`。Intel Mac 会因找不到对应库而回退 CPU 生成。
 
 ---
 

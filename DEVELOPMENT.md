@@ -207,6 +207,32 @@ jar），Java 代码直接引用这些类。详见 §10。
 | Fabric Loader | 0.17.2 / Loom 1.13-SNAPSHOT |
 | Java | toolchain 25（运行要求 ≥25）/ Gradle JVM 21 |
 
+### 2.2b 交叉编译 native
+
+`build.gradle` 会按环境自动尝试各平台，缺工具链则跳过并打日志：
+
+| 平台 | 触发条件 | 关闭开关 |
+|---|---|---|
+| 宿主平台 | 始终（`cargo build --release`） | `-PskipRust` |
+| Windows | `rustup` 里装了 `*-pc-windows-*` target | 无（自动检测） |
+| Android | `ANDROID_NDK_HOME` 已设置 + `cargo-ndk` | `-PskipAndroid` |
+| OpenHarmony | `cargo-ohos` 可用 | `-PskipOhos` |
+| macOS | `OSXCROSS_ROOT` 指向有效 osxcross，且其 `bin/` 有 `*-apple-darwin*-clang`、`SDK/` 有 `MacOSX*.sdk` | `-PskipMacOS` |
+
+**macOS 交叉编译**：链接 Metal / Foundation 等系统框架必须有 macOS SDK，所以用
+[osxcross](https://github.com/tpoechtrager/osxcross)。构建步骤：
+
+1. 拿 SDK 放进 `osxcross/tarballs/`（文件名须是 `MacOSX*.sdk.tar.xz`）
+2. `BUILD_FLAVOR=llvm UNATTENDED=1 ENABLE_ARCHS="arm64" ./build.sh`
+   —— 选 `llvm` flavor 是为了绕开 Arch 上没有的 `libtapi`
+3. `export OSXCROSS_ROOT=$HOME/osxcross/target`
+
+产物落在 `natives/macos-aarch64/libc2me_wgpu.dylib`。**只支持 Apple Silicon**：
+默认 target 是 `aarch64-apple-darwin`，Intel Mac 会找不到库而回退 CPU。
+
+注意 Gradle 的 `env` 是 `HashMap<String, String>`，拼接字符串必须显式 `.toString()`，
+否则 Groovy 的 `GString` 会抛 `ClassCastException`。
+
 ### 2.3 C2ME 依赖方式
 - **编译期**：无。**运行时**：`fabric.mod.json` 声明 `"c2me": "*"` 硬依赖。
   实测（§10）：无 C2ME 时桌面 CPS ~144→~13（批攒不满）。C2ME 是性能硬需求。

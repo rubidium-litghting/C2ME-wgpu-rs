@@ -69,7 +69,8 @@ To tune anything, edit `config/c2me-wgpu.json` — see below.
 | Linux x86_64 | ✅ Tested |
 | Android aarch64 (custom JVM) | ✅ Tested (Mali-G610 / Dimensity) |
 | Windows x86_64 | ✅ Tested (AMD, mingw DLL) |
-| macOS (Metal) | ⚠️ wgpu backend exists, not officially tested |
+| macOS arm64 (Metal) | ⚠️ Cross-compilable; native library is shipped, not yet verified on real hardware. Apple Silicon only, Intel Macs unsupported |
+| OpenHarmony aarch64 | ⚠️ Cross-compilable; native library is shipped, not yet verified on real hardware. The library is unsigned and must be signed before it can be loaded |
 
 On Android, the custom JVM does **not** support `-XX:+UseZGC`, and the mod does not suggest it there.
 
@@ -100,7 +101,8 @@ That is the **inherent limit of fp32**, not a bug. Terrain thresholds are insens
 
 - At extreme End coordinates (around 370,000 blocks) a partial NaN fallback is used to reproduce vanilla's void band.
 - **Modded density functions**: custom density nodes the GPU serialiser cannot understand natively (e.g. from terrain mods) are evaluated on the CPU over the same corner grid and fed to the GPU as "external inputs". The rest of the tree still runs on the GPU, so modded world generation keeps working — only the unsupported subtrees pay a CPU cost.
-- **No on-disk pipeline cache on Windows / macOS**: the cache directory follows the XDG convention (`$XDG_CACHE_HOME`, falling back to `$HOME/.cache`). Those variables are usually unset on Windows and macOS, so the disk cache is effectively disabled there — shaders are recompiled on every launch. This does not affect correctness, only start-up time.
+- **No on-disk pipeline cache on Windows**: the cache directory follows the XDG convention (`$XDG_CACHE_HOME`, falling back to `$HOME/.cache`). Those variables are usually unset on Windows, so the disk cache is effectively disabled there — shaders are recompiled on every launch. This does not affect correctness, only start-up time.
+- **Intel Macs are unsupported**: only a `macos-aarch64` native is shipped. An Intel Mac fails to find a matching library and falls back to CPU generation.
 
 ---
 

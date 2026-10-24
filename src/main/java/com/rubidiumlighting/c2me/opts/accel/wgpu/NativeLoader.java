@@ -209,7 +209,11 @@ public class NativeLoader {
         if (value.matches("^(x8632|x86|i[3-6]86|ia32|x32)$")) {
             return "x86_32";
         }
-        if ("aarch64".equals(value)) {
+        // "arm64" is what some Apple JDKs report on Apple Silicon; aarch64 is
+        // the canonical directory name. Bare "arm" is deliberately NOT mapped:
+        // that means 32-bit ARMv7, and "unknown" produces a clearer "no native
+        // library" message than a mis-mapped dlopen failure would.
+        if ("aarch64".equals(value) || "arm64".equals(value)) {
             return "aarch64";
         }
         if (value.matches("^(armv7l|armv7|armeabi|armeabiv7a)$")) {
