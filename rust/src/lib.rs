@@ -44,6 +44,13 @@ pub struct ColdConfig {
     /// `None` = platform default (mapped on desktop, write_buffer on Android).
     /// `Some(true)` forces mapped-at-creation, `Some(false)` forces write_buffer.
     pub mapped_at_creation: Option<bool>,
+    /// Graphics backends to enable, as the `wgpu::Backends` bitflags value.
+    /// -1 = automatic (`Backends::PRIMARY`, i.e. everything but GL).
+    ///
+    /// This replaces wgpu's `WGPU_BACKEND` environment variable: the value is
+    /// part of the config file so it can be set from the GUI and reloaded on a
+    /// save switch, neither of which an environment variable supports.
+    pub backend: i32,
 }
 
 impl Default for ColdConfig {
@@ -52,7 +59,32 @@ impl Default for ColdConfig {
             gpu_index: -1,
             disable_pipeline_cache: false,
             mapped_at_creation: None,
+            backend: -1,
         }
+    }
+}
+
+impl ColdConfig {
+    /// Resolve the configured backend value to `wgpu::Backends`.
+    ///
+    /// -1 (or anything that is not a valid flag combination) means automatic,
+    /// which is `PRIMARY`: Vulkan/Metal/DX12/WebGPU but not GL. GL is opt-in
+    /// because on most systems it resolves to a software rasterizer.
+    pub fn resolved_backends(&self) -> wgpu::Backends {
+        let requested = if self.backend < 0 {
+            wgpu::Backends::PRIMARY
+        } else {
+            wgpu::Backends::from_bits(self.backend as u32)
+                .unwrap_or(wgpu::Backends::PRIMARY)
+        };
+        // Every backend the platform can offer is allowed here. GL is best
+        // effort in wgpu (see its platform table) and has been observed to
+        // panic inside EGL context creation on some drivers, including a
+        // Mali-G610 where the hang took down the whole OS. That is a driver
+        // problem, not a reason to remove the option everywhere: the caller
+        // reports the failure and keeps the previous device, and users who
+        // cannot use GL simply pick another backend.
+        requested
     }
 }
 

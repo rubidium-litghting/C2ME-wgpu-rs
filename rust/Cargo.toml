@@ -23,6 +23,13 @@ bytemuck = { version = "1", features = ["derive"] }
 crossbeam = "0.8"
 parking_lot = "0.12"
 
+# Windows: one call to GlobalMemoryStatusEx, used only to decide whether two
+# GPU instances can safely coexist during a rebuild. wgpu-hal already pulls
+# windows-sys in on this target, so pinning the same major version adds no new
+# build graph.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+
 [dev-dependencies]
 rand = "0.10"
 

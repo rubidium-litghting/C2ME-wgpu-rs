@@ -137,15 +137,13 @@ public final class WgpuDimensionRegistry {
      * @return true if a usable GPU instance exists afterwards.
      */
     public static synchronized boolean onSaveSwitch() {
-        Config old = Config.get();
-        int oldIndex = old.gpuIndex;
-        boolean oldNoCache = old.disablePipelineCache;
-        Boolean oldMapped = old.mappedAtCreation;
-
+        // The file is the single source of truth for "what the user wants",
+        // and `appliedCold` for "what the device is running". Comparing those
+        // two avoids the cached Config singleton entirely: the GUI edits that
+        // object in place, so using it as either side of the comparison would
+        // report "unchanged" no matter what the user picked.
         Config cfg = Config.reload();
-        boolean coldChanged = cfg.gpuIndex != oldIndex
-                || cfg.disablePipelineCache != oldNoCache
-                || !java.util.Objects.equals(cfg.mappedAtCreation, oldMapped);
+        boolean coldChanged = WgpuThinBinding.coldConfigChanged(cfg);
 
         if (!coldChanged) {
             try {
@@ -157,8 +155,8 @@ public final class WgpuDimensionRegistry {
         }
 
         LOGGER.info("[c2me-wgpu] GPU config changed; rebuilding instance "
-                + "(gpu_index={}, disable_pipeline_cache={}, mapped_at_creation={})",
-                cfg.gpuIndex, cfg.disablePipelineCache, cfg.mappedAtCreation);
+                + "(gpu_index={}, backend={}, disable_pipeline_cache={}, mapped_at_creation={})",
+                cfg.gpuIndex, cfg.backend, cfg.disablePipelineCache, cfg.mappedAtCreation);
         destroyAll();
         try {
             boolean ok = WgpuThinBinding.rebuildFromConfig();

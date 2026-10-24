@@ -86,6 +86,21 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 28. **低频偶发失败先抓证据，别倒推**：`world::tests` 里 9 个 GPU 测试各自 `ExecutorThread::spawn` 一套约 600 MB buffer，16 线程并行时资源叠加，集显上约 1/5~1/8 概率偶发失败，且无固定 panic 原文。曾误判为显存 OOM——实际 `vulkaninfo` 显示 device-local budget 4.86 GiB、`dmesg` 无 amdgpu OOM 记录，10 次连跑不复现。生产路径 `get_or_create_executor()` 是单个 executor（现已从 `OnceLock` 改为可重置的 `RwLock<Option<Arc<..>>>`，以便换卡时重建；无 Mutex 争用，也早已不是串行），**游戏运行不受影响**。修复方向（暂缓）：测试改用小 `ExecutorConfig`（batch 实际只有 1~3 个 chunk，却按 64 预分配），或加全局 GPU 锁。复现时务必保留完整 stderr + `free -h` + `mem_info_gtt_used` + `dmesg | tail`。
 
 29. **动地形正确性必须跑 `real_router_vs_vanilla`**：它是唯一对照真实 Minecraft 输出（`src/test/resources/real_router.ref.txt`）的测试，因耗时约 2s 已默认 `#[ignore]`。改动 emitter / aquifer / beard / 矿脉 / 反序列化，或任何会改变 WGSL 数值输出的代码后，必须手动跑 `cd rust && cargo test --lib -- --ignored real_router_vs_vanilla`。其余 84 个测试全绿**不能**替代这一步——它们只验证"CPU 参考实现与 GPU 一致"，不验证"GPU 与 vanilla 一致"（见教训 #20）。
+30. **重建实例时新旧两份会同时存在**：`rebuild` 先建新的、成功才替换，
+    这在桌面端换来"失败可回退"的好处，但在内存紧张的 Android 上两份 GPU 资源
+    叠加会顶到 lmkd。实测 12 GB 平板切 GL 后端时系统级挂死，而内存充裕时
+    同一操作只是回退。现在按 `MemAvailable` 分流：低于 2 GiB 先释放旧实例再建
+    （失败则用默认配置兜底重试），充裕时保留旧实例。Windows 用
+    `GlobalMemoryStatusEx`，Linux/Android 读 `/proc/meminfo`，macOS 暂无廉价
+    信号、按"紧张"处理。
+
+31. **GL 后端与 `PIPELINE_CACHE` 互斥**：wgpu 的 GLES 后端不提供
+    `Features::PIPELINE_CACHE`，而 `check_required` 默认要求它。所以 Android
+    上选 GL 必须同时开 `disable_pipeline_cache`，否则会在能力检查处被拒。
+    曾把"被拒"误读成"GL 不可用"，实际上打开该开关后 GL 在 Mali-G610 上
+    正常出块（CPS 22–29）。能力检查失败时先确认是哪个 feature 缺失，再判断
+    后端是否真的不可用。
+
 
 ### 待办与 0.1.5 规划（2026-10-18 更新）
 
@@ -120,8 +135,9 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
       能跑 shader 的才参与选择。越界或不达标都会打日志并回退到自动顺序，坏配置
       不会让整个会话掉到 CPU。
   - [x] **切换存档时热重载配置**：
-    - 配置分三类：A 类影响 instance（`gpu_index`、`disable_pipeline_cache`）、
-      B 类影响 world 创建（`mapped_at_creation`）、C 类只影响行为（`debug_*`）。
+    - 配置分三类：A 类影响 instance（`gpu_index`、`backend`、
+      `disable_pipeline_cache`）、B 类影响 world 创建（`mapped_at_creation`）、
+      C 类只影响行为（`debug_*`）。
     - 实现上没有引入任何锁：`debug` / `profile` 是两条 `AtomicBool`（热路径零开销）；
       A/B 两类在重建 instance 时作为 `ColdConfig` 一并替换，因此不存在"全局可变
       配置"这一概念。
@@ -132,6 +148,12 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
       `rebuildFromConfig()`。冷配置没变时只刷新热标志，零成本。
     - 触发点是 `MinecraftClient.joinWorld` 的 HEAD，因此"游戏运行时改配置、
       进存档"也能生效，不必退回标题界面。
+    - 变化检测的基准是**磁盘文件**对 `appliedCold`（实际建成的设备用的配置），
+      不涉及内存里的 `Config` 单例。GUI 直接改那个单例，拿它当基准会永远
+      得出"没变化"。
+    - 重建失败时把 `backend` 重置为 `-1`（自动）再回写文件。不复制当前生效
+      的后端：那会把会话钉死在某一个具体后端上，而某些机器上它并非最优
+      （例如只有 DX12 没有 Vulkan 的 HD 4000）。
   - [x] **状态展示**：
     - 聊天栏：`GPU 加速已启用：<卡名>` / 回退原因，走 `Text.translatable`。
     - 卡名通过 `WgpuStatus` 解析 `list_gpus` 结果里 `selected:true` 的那一项，

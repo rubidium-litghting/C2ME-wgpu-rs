@@ -64,6 +64,8 @@ public @interface ConfigOption {
         /** {@code null} / true / false, e.g. {@code mapped_at_creation}. */
         TRI_STATE,
         /** Free-form text, rendered as a text field. */
-        STRING
+        STRING,
+        /** Graphics backend, from the list of usable ones. */
+        BACKEND
     }
 }

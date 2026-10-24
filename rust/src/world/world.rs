@@ -105,14 +105,18 @@ impl Default for AquiferMode {
 /// Create a GPU buffer pre-filled with `contents`.
 ///
 /// Default path is `create_buffer_init` (`mapped_at_creation`), which is the
-/// fastest way to upload and is used on desktop. On **Android** we instead
-/// default to `create_buffer` + `queue.write_buffer`: some Mali drivers
-/// (observed on Mali-G610 / Dimensity 8100) reject the mapped-at-creation
-/// path and abort the process, while Mali-G76 (Kirin 980) accepts it. The
-/// write_buffer path costs one extra copy, but only once at init time.
+/// fastest way to upload and is used on desktop. On **Android** we default to
+/// `create_buffer` + `queue.write_buffer` instead.
 ///
-/// Override with `debug_mapped_at_creation` in the config (true = mapped,
-/// false = write_buffer) for debugging.
+/// The Android default dates from reports of Mali drivers aborting on the
+/// mapped path. That has not reproduced here: a Mali-G610 MC6 (Dimensity 8100,
+/// driver r38p1) runs the mapped path fine, as does Mali-G76 per earlier
+/// notes. The default is kept because the write_buffer path costs only one
+/// extra copy at init time and is the strictly safer of the two — not because
+/// mapped is known to fail.
+///
+/// Override with `mapped_at_creation` in the config: `true` forces mapped,
+/// `false` forces write_buffer, `null` keeps the platform default.
 fn create_init_buffer(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

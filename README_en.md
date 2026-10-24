@@ -143,8 +143,9 @@ Whole-line `//` comments are ignored. The mod writes a list of available GPUs ab
 | Field | Default | Description |
 |---|---|---|
 | `gpu_index` | `-1` | Which GPU generates terrain. `-1` = automatic (integrated first). The index refers to the list written as a comment in this file; ModMenu offers the same choice as a dropdown. An out-of-range or unsuitable index falls back to automatic selection and says why in the log. |
+| `backend` | `-1` | Graphics backend. `-1` = automatic (Vulkan/DX12/Metal, excluding GL). The available values depend on the platform and are listed as a comment in the config file. Switching backends rebuilds the wgpu instance, so it takes effect after **leaving the save and re-entering**. Note that wgpu's GL backend does not provide a pipeline cache, so choosing GL requires enabling `disable_pipeline_cache` as well. |
 | `disable_pipeline_cache` | `false` | Bypass the on-disk shader pipeline cache. Only needed if a driver crashes inside the pipeline cache; the cost is recompiling shaders every launch. |
-| `mapped_at_creation` | `null` | `null` = platform default (mapped on desktop, write_buffer on Android). `true` / `false` forces the path. A compatibility setting, not a diagnostic: some Mali drivers abort on the mapped path. |
+| `mapped_at_creation` | `null` | How buffers are uploaded. `null` = platform default (mapped on desktop, write_buffer on Android); `true` / `false` forces the path. write_buffer costs one extra copy but is the more conservative choice, which is why Android defaults to it; the mapped path also works on the Mali-G610 tested here, so both are usable. |
 
 ### Debugging (`debug_` prefix)
 

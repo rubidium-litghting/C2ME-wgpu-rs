@@ -17,7 +17,7 @@
   "c2me-opts-accel-wgpu.config.tristate.auto": "自动",
   "c2me-opts-accel-wgpu.config.tristate.on": "开",
   "c2me-opts-accel-wgpu.config.tristate.off": "关",
-  "c2me-opts-accel-wgpu.config.hint": "设备相关设置将在下次加载世界时生效",
+  "c2me-opts-accel-wgpu.config.hint": "立即保存；设备相关设置在切换存档时热重载",
   "c2me-opts-accel-wgpu.config.debug_button": "调试选项…",
   "c2me-opts-accel-wgpu.config.debug_title": "C2ME-wgpu-rs — 调试选项",
   "c2me-opts-accel-wgpu.config.debug_hint": "仅供排查问题；除非有人要求，否则保持留空。",
@@ -27,5 +27,8 @@
   "c2me-opts-accel-wgpu.config.dump_blocks": "导出方块",
   "c2me-opts-accel-wgpu.config.dump_aquifer": "导出含水层",
   "c2me-opts-accel-wgpu.config.dump_beard": "导出结构地基",
-  "c2me-opts-accel-wgpu.config.dump_blob": "导出 Router blob"
+  "c2me-opts-accel-wgpu.config.dump_blob": "导出 Router blob",
+  "c2me-opts-accel-wgpu.config.backend": "图形后端",
+  "c2me-opts-accel-wgpu.config.backend.auto": "自动",
+  "c2me-opts-accel-wgpu.notify.rebuild_failed": "无法使用 %s 后端，已改为自动选择（%s）"
 }

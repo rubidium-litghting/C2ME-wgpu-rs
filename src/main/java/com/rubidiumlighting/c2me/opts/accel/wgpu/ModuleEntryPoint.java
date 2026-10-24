@@ -88,12 +88,38 @@ public class ModuleEntryPoint {
         detail = dt;
     }
 
+    /**
+     * Whether GPU generation can be used <em>right now</em>.
+     *
+     * <p>The {@link #status} captured at class-load time is the *start-up*
+     * result and never changes. That is fine for reporting why the mod started
+     * on the CPU path, but wrong as a gate: the instance can be rebuilt later
+     * (a save switch after the user picks a different backend, for example),
+     * and a start-up failure would otherwise disable GPU generation for the
+     * rest of the session even though the device is now healthy.
+     *
+     * <p>So the live availability of the native binding decides. The start-up
+     * status still short-circuits the two cases a rebuild cannot fix: no
+     * native library for this platform, and FFM being disabled.
+     */
     public static boolean isEnabled() {
-        return status == Status.OK;
+        if (status == Status.NATIVE_UNAVAILABLE || status == Status.FFM_DISABLED) {
+            return false;
+        }
+        return WgpuThinBinding.isAvailable();
     }
 
+    /**
+     * Current status, recomputed from live availability.
+     *
+     * <p>Differs from the start-up snapshot only when a rebuild changed the
+     * outcome, which is exactly the case the UI needs to reflect.
+     */
     public static Status getStatus() {
-        return status;
+        if (status == Status.NATIVE_UNAVAILABLE || status == Status.FFM_DISABLED) {
+            return status;
+        }
+        return WgpuThinBinding.isAvailable() ? Status.OK : status;
     }
 
     public static String getDetail() {

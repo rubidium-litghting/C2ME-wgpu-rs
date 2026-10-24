@@ -142,8 +142,9 @@
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `gpu_index` | `-1` | 用哪块 GPU 生成地形。`-1` = 自动（核显优先）。序号对应配置文件注释里列出的清单，也可以用 ModMenu 的设置界面选择。越界或该卡不满足要求时会自动回退到自动选择，并在日志里说明原因。 |
+| `backend` | `-1` | 图形后端。`-1` = 自动（Vulkan/DX12/Metal，不含 GL）。可选值与当前平台有关，配置文件里会有注释列出。切换后端需要重建 wgpu 实例，因此**退出存档再进入**才生效。注意 wgpu 的 GL 后端不提供管线缓存功能，选 GL 时需要同时开启 `disable_pipeline_cache`。 |
 | `disable_pipeline_cache` | `false` | 绕过磁盘上的着色器管线缓存。仅在驱动于管线缓存处崩溃时才需要开启，代价是每次启动重新编译着色器。 |
-| `mapped_at_creation` | `null` | `null` = 平台默认（桌面用映射路径，Android 用 write_buffer）。`true` / `false` 强制指定。这是兼容性选项而非调试开关：某些 Mali 驱动在映射路径上会崩溃。 |
+| `mapped_at_creation` | `null` | 缓冲区的上传方式。`null` = 平台默认（桌面用映射路径，Android 用 write_buffer），`true` / `false` 强制指定。写缓冲区多一次拷贝但更保守，这也是 Android 默认走它的原因；映射路径在实测的 Mali-G610 上同样可用，两条路径都能工作。 |
 
 ### 调试（`debug_` 前缀）
 

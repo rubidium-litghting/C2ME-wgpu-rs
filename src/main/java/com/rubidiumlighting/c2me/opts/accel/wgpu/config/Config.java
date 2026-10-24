@@ -60,6 +60,15 @@ public final class Config {
 
     /** Disable wgpu's pipeline cache. Only useful when a driver aborts inside
      *  it. */
+    /** Graphics backend, as a {@code wgpu::Backends} bit; see
+     *  {@link Backends} for the platform table. -1 = automatic (everything but
+     *  GL). Replaces wgpu's {@code WGPU_BACKEND} environment variable so the
+     *  choice can be made in the GUI and survive a save switch. */
+    @SerializedName("backend")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.backend",
+            kind = ConfigOption.Kind.BACKEND, order = 15)
+    public int backend = -1;
+
     @SerializedName("disable_pipeline_cache")
     @ConfigOption(label = "c2me-opts-accel-wgpu.config.pipeline_cache", order = 20)
     public boolean disablePipelineCache = false;
@@ -224,6 +233,10 @@ public final class Config {
             gpuIndex = -1;
             changed = true;
         }
+        if (backend < -1) {
+            backend = -1;
+            changed = true;
+        }
         return changed;
     }
 
@@ -296,22 +309,51 @@ public final class Config {
         }
     }
 
-    /** Insert {@link #gpuComment} above the {@code gpu_index} field. */
+    /**
+     * Insert the explanatory comments above the fields they describe.
+     *
+     * <p>Both lists are written as whole-line {@code //} comments, which
+     * {@link #stripComments} drops again on read, so the file stays valid for
+     * anyone editing it by hand while still explaining the two numeric fields
+     * that have no self-evident meaning.
+     */
     private static String withGpuComment(String json) {
-        String comment = gpuComment;
-        if (comment.isEmpty()) {
-            return json;
+        String out = json;
+
+        if (!gpuComment.isEmpty()) {
+            out = insertComment(out, "\"gpu_index\"",
+                    "// Available GPUs (use one as gpu_index; -1 = automatic):",
+                    gpuComment.split("\n"));
         }
-        int idx = json.indexOf("\"gpu_index\"");
+
+        // Backend bits are meaningless without the mapping, and a player
+        // without ModMenu has no other way to look it up.
+        var entries = com.rubidiumlighting.c2me.opts.accel.wgpu.config.Backends.available();
+        if (!entries.isEmpty()) {
+            String[] lines = new String[entries.size()];
+            for (int i = 0; i < entries.size(); i++) {
+                var e = entries.get(i);
+                lines[i] = e.bits() + " = " + e.label();
+            }
+            out = insertComment(out, "\"backend\"",
+                    "// Graphics backend (backend; -1 = automatic):", lines);
+        }
+
+        return out;
+    }
+
+    /** Put {@code lines} above the given JSON field, padded to its indentation. */
+    private static String insertComment(String json, String field, String header, String[] lines) {
+        int idx = json.indexOf(field);
         if (idx < 0) {
             return json;
         }
         int lineStart = json.lastIndexOf('\n', idx) + 1;
         String pad = json.substring(lineStart, idx);
-        StringBuilder sb = new StringBuilder(json.length() + comment.length() + 64);
+        StringBuilder sb = new StringBuilder(json.length() + header.length() + 64);
         sb.append(json, 0, lineStart);
-        sb.append(pad).append("// Available GPUs (use one as gpu_index; -1 = automatic):\n");
-        for (String line : comment.split("\n")) {
+        sb.append(pad).append(header).append('\n');
+        for (String line : lines) {
             sb.append(pad).append("//   ").append(line).append('\n');
         }
         sb.append(json.substring(lineStart));

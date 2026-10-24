@@ -17,7 +17,7 @@
   "c2me-opts-accel-wgpu.config.tristate.auto": "Automatic",
   "c2me-opts-accel-wgpu.config.tristate.on": "On",
   "c2me-opts-accel-wgpu.config.tristate.off": "Off",
-  "c2me-opts-accel-wgpu.config.hint": "Device settings apply on the next world load",
+  "c2me-opts-accel-wgpu.config.hint": "Saved immediately; device settings reload when you switch saves",
   "c2me-opts-accel-wgpu.config.debug_button": "Debug options…",
   "c2me-opts-accel-wgpu.config.debug_title": "C2ME-wgpu-rs — debug options",
   "c2me-opts-accel-wgpu.config.debug_hint": "For troubleshooting. Leave the dumps empty unless asked.",
@@ -27,5 +27,8 @@
   "c2me-opts-accel-wgpu.config.dump_blocks": "Dump blocks",
   "c2me-opts-accel-wgpu.config.dump_aquifer": "Dump aquifer",
   "c2me-opts-accel-wgpu.config.dump_beard": "Dump beardifier",
-  "c2me-opts-accel-wgpu.config.dump_blob": "Dump router blob"
+  "c2me-opts-accel-wgpu.config.dump_blob": "Dump router blob",
+  "c2me-opts-accel-wgpu.config.backend": "Graphics backend",
+  "c2me-opts-accel-wgpu.config.backend.auto": "Automatic",
+  "c2me-opts-accel-wgpu.notify.rebuild_failed": "The %s backend is unavailable; falling back to automatic selection (%s)"
 }

@@ -185,6 +185,7 @@ fn decode_mapped_at_creation(v: i32) -> Option<bool> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn c2me_wgpu_create_instance(
     gpu_index: i32,
+    backend: i32,
     disable_pipeline_cache: u32,
     mapped_at_creation: i32,
     err_buf: *mut c_char,
@@ -194,6 +195,7 @@ pub unsafe extern "C-unwind" fn c2me_wgpu_create_instance(
         gpu_index,
         disable_pipeline_cache: disable_pipeline_cache != 0,
         mapped_at_creation: decode_mapped_at_creation(mapped_at_creation),
+        backend,
     };
     match std::panic::catch_unwind(|| match WgpuInstance::instance_with(cold) {
         Ok(_) => 1,
@@ -229,6 +231,7 @@ pub unsafe extern "C-unwind" fn c2me_wgpu_create_instance(
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn c2me_wgpu_rebuild_instance(
     gpu_index: i32,
+    backend: i32,
     disable_pipeline_cache: u32,
     mapped_at_creation: i32,
     err_buf: *mut c_char,
@@ -238,6 +241,7 @@ pub unsafe extern "C-unwind" fn c2me_wgpu_rebuild_instance(
         gpu_index,
         disable_pipeline_cache: disable_pipeline_cache != 0,
         mapped_at_creation: decode_mapped_at_creation(mapped_at_creation),
+        backend,
     };
     // The worker holds device/queue clones; stop it before the device dies.
     shutdown_executor();
@@ -289,6 +293,7 @@ pub extern "C" fn c2me_wgpu_shutdown_instance() -> i32 {
 /// for one write.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_list_gpus(
+    backend: i32,
     buf: *mut c_char,
     buf_len: usize,
     out_len: *mut usize,
@@ -296,13 +301,44 @@ pub unsafe extern "C" fn c2me_wgpu_list_gpus(
     if buf.is_null() || out_len.is_null() || buf_len == 0 {
         return -1;
     }
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY.with_env(),
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    // Enumerate exactly the backends the instance will be built with, not
+    // `all()`. `gpu_index` is a position in this listing, and `pick_best`
+    // indexes the adapters of the *instance*, which only exposes its enabled
+    // backends. Enumerating more here than there would shift every index and
+    // make the selection point at the wrong adapter. It also keeps duplicate
+    // entries (the same GPU exposed through both Vulkan and GL) out of the
+    // list unless the user explicitly asked for GL.
+    let backends = if backend < 0 {
+        wgpu::Backends::PRIMARY
+    } else {
+        wgpu::Backends::from_bits(backend as u32).unwrap_or(wgpu::Backends::PRIMARY)
+    };
+    // Creating an instance can panic inside wgpu-hal: the GL backend unwraps
+    // a failed EGL context creation (egl.rs `make_current().unwrap()`). Letting
+    // that unwind across the FFI boundary aborts the JVM, so the whole
+    // enumeration runs inside catch_unwind. On failure we report an empty list
+    // — the UI then shows only "automatic", which is the safe choice.
+    let enumerated = std::panic::catch_unwind(|| {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        crate::instance::adapter_pick::enumerate(&instance)
     });
-    let adapters = crate::instance::adapter_pick::enumerate(&instance);
-    let selected = WgpuInstance::instance()
-        .ok()
+    let adapters = match enumerated {
+        Ok(a) => a,
+        Err(e) => {
+            let msg = format!(
+                "[c2me-wgpu-rs] enumerating adapters for backend bits {backends:?} panicked: {e:?}");
+            crate::debug_log_line(&msg);
+            Vec::new()
+        }
+    };
+    // `peek`, not `instance`: the listing is informational and must never
+    // create a device as a side effect. Doing so previously masked a failed
+    // create_instance — Java reported "no GPU", Rust had one, and the two
+    // disagreed for the rest of the session.
+    let selected = WgpuInstance::peek()
         .map(|i| (i.adapter_info.name.clone(), i.adapter_info.backend));
     let mut json = String::from("[");
     for (idx, a) in adapters.iter().enumerate() {

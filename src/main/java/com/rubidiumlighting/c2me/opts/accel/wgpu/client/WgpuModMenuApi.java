@@ -80,7 +80,7 @@ public class WgpuModMenuApi implements ModMenuApi {
     private abstract static class WgpuOptionScreen extends Screen {
 
         protected final Screen parent;
-        protected final Config cfg = Config.get();
+        protected final Config cfg;
 
         protected static final int ROW_H = 20;
         protected static final int ROW_GAP = 6;
@@ -92,6 +92,13 @@ public class WgpuModMenuApi implements ModMenuApi {
         protected WgpuOptionScreen(Text title, Screen parent) {
             super(title);
             this.parent = parent;
+            // Re-read the file every time the screen opens. The config is
+            // cached at startup, so a file edited while the game is running
+            // would otherwise show stale values here — confusing in itself,
+            // and it would also make the "did the device settings change"
+            // comparison use the wrong baseline.
+            Config.reload();
+            this.cfg = Config.get();
         }
 
         /** @return true for fields that belong on this screen. */
@@ -179,6 +186,7 @@ public class WgpuModMenuApi implements ModMenuApi {
                                         (btn, v) -> setField(f, v == -1 ? null : (v == 1)));
                     }
                     case GPU_INDEX -> buildGpuWidget(f, ctrlX, y, ctrlW);
+                    case BACKEND -> buildBackendWidget(f, ctrlX, y, ctrlW);
                     case STRING -> new TextFieldWidget(this.textRenderer, ctrlX, y, ctrlW, ROW_H,
                             Text.empty()) {{
                         setMaxLength(512);
@@ -199,7 +207,7 @@ public class WgpuModMenuApi implements ModMenuApi {
             List<String> names = new ArrayList<>();
             indices.add(-1);
             names.add(Text.translatable("c2me-opts-accel-wgpu.config.gpu.auto").getString());
-            String json = WgpuThinBinding.listGpus();
+            String json = WgpuThinBinding.listGpusCached(cfg.backend);
             if (json != null) {
                 try {
                     JsonArray arr = JsonParser.parseString(json).getAsJsonArray();
@@ -218,6 +226,35 @@ public class WgpuModMenuApi implements ModMenuApi {
             return CyclingButtonWidget.<Integer>builder(
                             v -> Text.literal(names.get(Math.max(0, indices.indexOf(v)))))
                     .values(indices)
+                    .initially(pos >= 0 ? cur : -1)
+                    .omitKeyText()
+                    .build(x, y, w, ROW_H, Text.empty(),
+                            (btn, v) -> setField(f, v));
+        }
+
+        /**
+         * Backend picker: automatic plus every backend that actually has an
+         * adapter. Listing only usable ones mirrors the GPU list — offering a
+         * backend the machine cannot run would just fail on rebuild.
+         */
+        private ClickableWidget buildBackendWidget(Field f, int x, int y, int w)
+                throws ReflectiveOperationException {
+            List<Integer> values = new ArrayList<>();
+            List<String> names = new ArrayList<>();
+            values.add(-1);
+            names.add(Text.translatable("c2me-opts-accel-wgpu.config.backend.auto").getString());
+            // Static per-platform list: querying wgpu would have to build a
+            // real GL context inside the game process, which can wedge the
+            // driver. See Backends for the details.
+            for (var e : com.rubidiumlighting.c2me.opts.accel.wgpu.config.Backends.available()) {
+                values.add(e.bits());
+                names.add(e.label());
+            }
+            int cur = f.getInt(cfg);
+            int pos = values.indexOf(cur);
+            return CyclingButtonWidget.<Integer>builder(
+                            v -> Text.literal(names.get(Math.max(0, values.indexOf(v)))))
+                    .values(values)
                     .initially(pos >= 0 ? cur : -1)
                     .omitKeyText()
                     .build(x, y, w, ROW_H, Text.empty(),
@@ -318,6 +355,19 @@ public class WgpuModMenuApi implements ModMenuApi {
             if (this.client != null) {
                 this.client.setScreen(parent);
             }
+        }
+
+        @Override
+        public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
+            super.render(ctx, mouseX, mouseY, delta);
+            // Settings are split by when they apply, and the difference is not
+            // guessable from the controls: debug flags take effect now, while
+            // device settings need the instance rebuilt, which happens when a
+            // save is reloaded. Saying so here is cheaper than a bug report
+            // asking why the GPU choice did nothing.
+            ctx.drawCenteredTextWithShadow(this.textRenderer,
+                    Text.translatable("c2me-opts-accel-wgpu.config.hint"),
+                    this.width / 2, this.height - 44, 0x808080);
         }
     }
 

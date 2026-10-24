@@ -33,7 +33,7 @@ import com.google.gson.JsonParser;
  * Read-only view of what the GPU backend is currently doing: which adapter was
  * selected and how fast it is generating.
  *
- * <p>The adapter list comes from {@link WgpuThinBinding#listGpus()}, which
+ * <p>The adapter list comes from {@link WgpuThinBinding#listGpusCached(int)}, which
  * marks the effective adapter. Cached because it changes only when the
  * instance is rebuilt.
  */
@@ -69,7 +69,8 @@ public final class WgpuStatus {
     }
 
     private static String resolveName() {
-        String json = WgpuThinBinding.listGpus();
+        String json = WgpuThinBinding.listGpusCached(
+                com.rubidiumlighting.c2me.opts.accel.wgpu.config.Config.get().backend);
         if (json == null) {
             return "unknown";
         }

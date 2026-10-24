@@ -53,7 +53,11 @@ public class WgpuModInitializer implements ModInitializer {
         // throwaway instance; it does not create a device, so this does not
         // start any GPU work early.
         try {
-            Config.updateGpuListing(WgpuThinBinding.listGpus());
+            // Populate the cached listing here, off the render thread, so
+            // opening the config screen later never has to enumerate adapters
+            // mid-frame. Both calls touch the same throwaway instance, so the
+            // backend listing is warmed right after the GPU one.
+            Config.updateGpuListing(WgpuThinBinding.listGpusCached(Config.get().backend));
         } catch (Throwable t) {
             // Purely cosmetic: the mod works without the comment.
             LOGGER.debug("[c2me-wgpu] could not write GPU listing comment", t);
