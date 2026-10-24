@@ -226,10 +226,22 @@ If you need to debug native library loading failures, add `-Dc2me.wgpu.preserveN
 The mod jar is written to `build/libs/`.
 
 Building requires:
-- JDK 25 (for the Java toolchain) and JDK 21 (for the Gradle JVM);
-- a Rust toolchain (the native library is compiled as part of the build);
-- **`cargo-ndk`** *only* when building for Android
-  (`cargo install cargo-ndk`, plus an Android NDK; with `ANDROID_NDK_HOME` unset the Android build is skipped automatically, or force it off with `-PskipAndroid`).
+- **JDK 25** (Java toolchain) and **JDK 21** (Gradle JVM) — both are hard requirements;
+- **Rust 1.85+** (the crate uses edition 2024);
+- a native C toolchain for the host platform (gcc/clang on Linux, MSVC or mingw on Windows).
+
+The following platforms are built **on demand and skipped with a log line when their toolchain is absent**, without failing the build:
+
+| Platform | Trigger | Disable with |
+|---|---|---|
+| Windows | a `x86_64-pc-windows-gnu` or `*-msvc` target installed in `rustup` | — |
+| Android | `ANDROID_NDK_HOME` set and `cargo-ndk` installed | `-PskipAndroid` |
+| OpenHarmony | `OHOS_SDK_NATIVE` set and `cargo-ohos` installed | `-PskipOhos` |
+| macOS | `OSXCROSS_ROOT` pointing at a valid osxcross (`*-apple-darwin*-clang` plus `MacOSX*.sdk`) | `-PskipMacOS` |
+
+A clone therefore builds successfully on a machine with only JDK and Rust; the resulting jar contains just the host platform's native. Packaging every platform requires setting up the toolchains above.
+
+`-PskipRust` skips native compilation entirely (e.g. CI without a Rust toolchain).
 
 ---
 

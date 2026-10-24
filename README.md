@@ -223,10 +223,22 @@
 构建出的模组 jar 会写入 `build/libs/`。
 
 构建需要：
-- JDK 25（用于 Java 工具链）和 JDK 21（用于 Gradle JVM）；
-- Rust 工具链（原生库作为构建的一部分进行编译）；
-- **`cargo-ndk`** *仅当*您为 Android 构建时
-  （`cargo install cargo-ndk`，外加一个 Android NDK；当 `ANDROID_NDK_HOME` 未设置时，Android 构建会自动跳过，或通过 `-PskipAndroid` 强制关闭）。
+- **JDK 25**（Java 工具链）和 **JDK 21**（Gradle JVM）——这两个是硬性要求，缺失会直接失败；
+- **Rust 1.85+**（crate 使用 edition 2024）；
+- 宿主平台的原生 C 工具链（Linux 上 gcc/clang，Windows 上 MSVC 或 mingw）。
+
+以下平台**按需构建，工具链缺失时自动跳过并打一条日志**，不会导致构建失败：
+
+| 平台 | 触发条件 | 关闭开关 |
+|---|---|---|
+| Windows | `rustup` 里装有 `x86_64-pc-windows-gnu` 或 `*-msvc` target | — |
+| Android | `ANDROID_NDK_HOME` 已设置，且装有 `cargo-ndk` | `-PskipAndroid` |
+| OpenHarmony | `OHOS_SDK_NATIVE` 已设置，且装有 `cargo-ohos` | `-PskipOhos` |
+| macOS | `OSXCROSS_ROOT` 指向有效的 osxcross（含 `*-apple-darwin*-clang` 与 `MacOSX*.sdk`） | `-PskipMacOS` |
+
+因此一份克隆在只有 JDK + Rust 的机器上也能构建成功，产出的 jar 只含宿主平台的 native。想打包全平台需要自行准备上表中的工具链。
+
+`-PskipRust` 可以完全跳过原生库编译（例如没有 Rust 工具链的 CI）。
 
 ---
 

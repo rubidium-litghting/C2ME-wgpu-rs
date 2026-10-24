@@ -336,10 +336,16 @@ if (!project.hasProperty('skipRust') || !project.property('skipRust').toBoolean(
     }
 
     // ── OpenHarmony build ──
-    // Attempt to use `cargo-ohos build` to compile for aarch64-unknown-linux-ohos.
-    // If cargo-ohos is not installed or OHOS NDK is not found, we gracefully skip.
+    // Cross-compiles for aarch64-unknown-linux-ohos with `cargo-ohos`.
+    //
+    // Both the cargo subcommand and the OHOS SDK are required. Checking only
+    // the subcommand is not enough: a developer who happens to have cargo-ohos
+    // installed for another project would get a hard build failure here,
+    // because `cargo ohos build` cannot work without the SDK. That is exactly
+    // what a fresh clone on such a machine used to do.
     boolean buildOhos = !(project.hasProperty('skipOhos') && project.property('skipOhos').toBoolean())
-    
+            && System.getenv('OHOS_SDK_NATIVE') != null
+
     if (buildOhos) {
         // Check if cargo-ohos is available
         try {
@@ -393,7 +399,10 @@ if (!project.hasProperty('skipRust') || !project.property('skipRust').toBoolean(
         sourcesJar.dependsOn rustBuildOhos
         checkLicenseMain.dependsOn rustBuildOhos
     } else {
-        logger.lifecycle("[c2me-wgpu] OHOS build skipped (cargo-ohos not found or -PskipOhos)")
+        def reason = System.getenv('OHOS_SDK_NATIVE') == null
+                ? "OHOS_SDK_NATIVE unset"
+                : "cargo-ohos not found"
+        logger.lifecycle("[c2me-wgpu] OHOS build skipped (${reason})")
     }
 
 
