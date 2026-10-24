@@ -101,6 +101,35 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     正常出块（CPS 22–29）。能力检查失败时先确认是哪个 feature 缺失，再判断
     后端是否真的不可用。
 
+32. **"释放旧实例"要清三层，少一层就泄漏**：重建 device 时旧资源被三个
+    地方持有，逐一验证过才收敛：(a) `ExecutorThread` 持有 `Arc<Device>`
+    克隆——原实现用 `Arc::get_mut` 才 shutdown，有在飞批次时返回 `None`
+    直接跳过，worker 继续跑；改为 `shutdown(&self)`（`JoinHandle` 包
+    `Mutex`）后无条件生效。(b) `pipeline_cache::IN_MEMORY_CACHE` 是进程级
+    静态表，存着 `wgpu::ComputePipeline`，每个都引用它创建时的 device；
+    该缓存此前从不清理，所以旧 device 的引用计数永远不归零。注意它的键是
+    `(fingerprint, pass)`，不含 device 标识，不清理还会跨 device 误用。
+    (c) `WgpuInstance` 自身。加了 `[mem]` 诊断日志后才看清：(a)(b) 修好后
+    Vulkan 设备 drop 能释放 645 MiB。
+
+33. **drop 不等于归还**：GL 后端创建的设备在 Android 上 drop 时只释放
+    15 MiB（同一次测量中 Vulkan 是 645 MiB）。`dropping WgpuInstance`
+    正常打印，引用也确实清零，但 EGL context、glow 资源等没有回到系统。
+    因此"热切换后端"在 Android 上不可行：新旧两套叠加必然耗尽 12 GB 内存，
+    表现为整个平板卡死。现在 Android 上切换后端只提示重启，桌面端照常热切。
+    判断依据不能只看"对象是否 drop"，要看进程 RSS。
+
+34. **枚举 adapter 会创建真实上下文，不是只读操作**：`enumerate_adapters`
+    在 GLES 后端要 `eglMakeCurrent` 并加载 GL 函数指针。GUI 打开时按配置
+    backend 枚举一次，就等于在活设备旁边再造一个实例——Android 上直接冻住
+    渲染器（画面静止但操作有响应）。修法：设备创建时把 adapter 列表序列化
+    存在 `WgpuInstance` 里，GUI 只读这份缓存，永不触发枚举。
+
+35. **Android 上 `/proc/meminfo` 对应用不可读**：`adb shell` 能读，但应用
+    进程内被 SELinux 挡住，`MemAvailable` 恒为 `?`。于是内存感知重建在
+    Android 上永远走"先删旧实例"的安全分支——方向正确，但失去了"内存充裕
+    时保留回退能力"的一半逻辑。桌面端能读到真实值，两个分支都验证过。
+
 
 ### 待办与 0.1.5 规划（2026-10-18 更新）
 

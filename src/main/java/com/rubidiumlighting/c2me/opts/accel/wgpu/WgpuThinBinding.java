@@ -145,6 +145,31 @@ public class WgpuThinBinding {
      *         device was built with, i.e. a rebuild is required for them to
      *         take effect. False when no device has been created yet.
      */
+    /**
+     * Whether the graphics backend differs from the one the live device was
+     * built with.
+     *
+     * <p>Only meaningful on Android, where a GLES device does not release its
+     * native resources on drop (measured 15 MiB freed out of ~4 GB RSS,
+     * against 645 MiB for a Vulkan device), so tearing one down while building
+     * another exhausts memory. There a backend change requires a restart.
+     *
+     * <p>On desktop the same measurement shows no such retention, and the
+     * hot-swap path is useful, so this always returns {@code false} there. The
+     * platform check lives here rather than at the call site so the two
+     * behaviours cannot drift apart.
+     */
+    public static boolean backendChanged(Config cfg) {
+        if (!NativeLoader.IS_ANDROID) {
+            return false;
+        }
+        AppliedCold applied = appliedCold;
+        if (applied == null) {
+            return false;
+        }
+        return applied.backend() != cfg.backend;
+    }
+
     public static boolean coldConfigChanged(Config cfg) {
         AppliedCold applied = appliedCold;
         if (applied == null) {

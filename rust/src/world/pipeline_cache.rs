@@ -62,6 +62,21 @@ fn cache() -> &'static Mutex<FxHashMap<(u32, u8), wgpu::ComputePipeline>> {
     IN_MEMORY_CACHE.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
+/// Drop every cached pipeline.
+///
+/// **Must** be called whenever the GPU device is replaced. Each
+/// `wgpu::ComputePipeline` holds a reference to the device it was created on,
+/// so leaving them cached keeps the entire old device — and every buffer bound
+/// to it — alive alongside the new one. On a 12 GB device that overlap was
+/// measured to exhaust memory.
+///
+/// The cache key is `(fingerprint, pass)` and says nothing about the device,
+/// so a stale entry would also be handed out for the new device, which wgpu
+/// rejects. Clearing solves both.
+pub fn clear() {
+    cache().lock().expect("pipeline cache mutex poisoned").clear();
+}
+
 /// Look up an existing pipeline by (fingerprint, pass); on miss, compile
 /// a new one from `shader_src` and insert it into the cache.
 ///

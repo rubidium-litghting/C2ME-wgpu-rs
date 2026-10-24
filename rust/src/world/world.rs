@@ -148,6 +148,14 @@ fn create_init_buffer(
     }
 }
 
+impl Drop for WorldContext {
+    fn drop(&mut self) {
+        // WorldContext owns the pipelines and buffers for one dimension. A
+        // rebuild is only safe once every one of these has been dropped.
+        crate::debug_log_line("[mem] dropping WorldContext");
+    }
+}
+
 impl WorldContext {
     /// Parse the Java-side blob, run AST opto passes, compute fingerprint,
     /// emit WGSL, and **smoke-test validate** the shader via naga (pure CPU).

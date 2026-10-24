@@ -88,14 +88,14 @@ fn get_or_create_executor() -> Result<Arc<ExecutorThread>, String> {
 /// request handle is left dangling. Idempotent.
 fn shutdown_executor() {
     let taken = EXECUTOR.write().take();
-    if let Some(mut e) = taken {
-        // `Arc::get_mut` fails if a batch is still in flight holding a clone.
-        // In that case dropping our handle is enough: `ExecutorThread::drop`
-        // calls `shutdown()`, which sends the message and joins the thread
-        // once the last reference goes away.
-        if let Some(inner) = Arc::get_mut(&mut e) {
-            inner.shutdown();
-        }
+    if let Some(e) = taken {
+        // Stop the worker unconditionally. Relying on `Drop` (via
+        // `Arc::get_mut`) does not work here: a batch in flight holds its own
+        // `Arc<ExecutorThread>`, so the last reference only drops when that
+        // batch finishes — possibly long after the caller expects the device
+        // to be released. The worker holds an `Arc<Device>`, so leaving it
+        // running keeps the entire old device and its buffer pool alive.
+        e.shutdown();
     }
 }
 
@@ -308,6 +308,17 @@ pub unsafe extern "C" fn c2me_wgpu_list_gpus(
     // make the selection point at the wrong adapter. It also keeps duplicate
     // entries (the same GPU exposed through both Vulkan and GL) out of the
     // list unless the user explicitly asked for GL.
+    // If a device is already live, answer from its cached listing and never
+    // touch a driver. Enumerating adapters creates a real backend instance;
+    // doing that while another device is live froze the renderer on Android
+    // (the GLES path builds an EGL context and competes with the running one).
+    // The listing is also the only meaningful one: a backend change requires a
+    // restart, so previewing a different backend's adapters is no longer a
+    // scenario the GUI has to support.
+    if let Some(inst) = WgpuInstance::peek() {
+        return unsafe { write_json(&inst.adapter_listing, buf, buf_len, out_len) };
+    }
+
     let backends = if backend < 0 {
         wgpu::Backends::PRIMARY
     } else {
@@ -369,10 +380,36 @@ pub unsafe extern "C" fn c2me_wgpu_list_gpus(
     bytes.len() as i64
 }
 
+/// Copy a JSON string into the caller's buffer, reporting the required size.
+///
+/// Returns the byte count excluding the NUL on success, -2 when the buffer is
+/// too small (the needed size is still written to `out_len`).
+///
+/// # Safety
+/// `buf` must be valid for `buf_len` writes; `out_len` for one write.
+unsafe fn write_json(
+    json: &str,
+    buf: *mut c_char,
+    buf_len: usize,
+    out_len: *mut usize,
+) -> i64 {
+    let bytes = json.as_bytes();
+    let need = bytes.len() + 1;
+    unsafe { *out_len = need };
+    if need > buf_len {
+        return -2;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, bytes.len());
+        *buf.add(bytes.len()) = 0;
+    }
+    bytes.len() as i64
+}
+
 /// Minimal JSON string escaping for adapter names (backslash, quote, and
 /// control characters). Adapter names are vendor strings; they can contain
 /// quotes in theory, and emitting raw ones would produce invalid JSON.
-fn json_escape(s: &str) -> String {
+pub(crate) fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

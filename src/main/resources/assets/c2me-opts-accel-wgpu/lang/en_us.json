@@ -30,5 +30,6 @@
   "c2me-opts-accel-wgpu.config.dump_blob": "Dump router blob",
   "c2me-opts-accel-wgpu.config.backend": "Graphics backend",
   "c2me-opts-accel-wgpu.config.backend.auto": "Automatic",
-  "c2me-opts-accel-wgpu.notify.rebuild_failed": "The %s backend is unavailable; falling back to automatic selection (%s)"
+  "c2me-opts-accel-wgpu.notify.rebuild_failed": "The %s backend is unavailable; falling back to automatic selection (%s)",
+  "c2me-opts-accel-wgpu.notify.backend_restart": "The graphics backend change takes effect after restarting the game"
 }

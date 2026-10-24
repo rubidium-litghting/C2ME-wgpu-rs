@@ -843,7 +843,10 @@ impl SingleBatchExecutor {
 
 /// 执行器线程 - 独占一个线程处理所有 GPU 提交 (避免 driver 竞态)。
 pub struct ExecutorThread {
-    handle: Option<JoinHandle<()>>,
+    /// Wrapped in a `Mutex` so `shutdown` can take `&self`: the executor is
+    /// shared through `Arc` with in-flight callers, so a `&mut self` shutdown
+    /// would be unavailable exactly when it is needed most.
+    handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     sender: channel::Sender<ExecutorMessage>,
 }
 
@@ -896,7 +899,7 @@ impl ExecutorThread {
             .map_err(|e| format!("failed to spawn executor thread: {e}"))?;
 
         match init_rx.recv() {
-            Ok(Ok(())) => Ok(Self { handle: Some(handle), sender }),
+            Ok(Ok(())) => Ok(Self { handle: std::sync::Mutex::new(Some(handle)), sender }),
             Ok(Err(e)) => {
                 let _ = handle.join();
                 Err(format!("executor init failed: {e}"))
@@ -943,8 +946,20 @@ impl ExecutorThread {
         }).map_err(|_| "executor channel closed".to_string())
     }
 
-    pub fn shutdown(&mut self) {
-        if let Some(h) = self.handle.take() {
+    /// Stop the worker and wait for it to exit.
+    ///
+    /// Takes `&self` rather than `&mut self` so callers sharing the executor
+    /// through `Arc` can stop it without owning the only reference. This
+    /// matters when rebuilding the GPU device: the worker holds an
+    /// `Arc<Device>`, and if it is not stopped the old device stays alive
+    /// alongside the new one — two full buffer pools resident at once, which
+    /// on a 12 GB Android device is enough to exhaust memory.
+    ///
+    /// Idempotent: the `JoinHandle` is taken under the lock, so a second call
+    /// finds `None` and returns immediately.
+    pub fn shutdown(&self) {
+        let mut slot = self.handle.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = slot.take() {
             let _ = self.sender.send(ExecutorMessage::Shutdown);
             let _ = h.join();
         }

@@ -34,6 +34,14 @@ pub struct WgpuInstance {
     pub queue: wgpu::Queue,
     pub adapter_info: wgpu::AdapterInfo,
     pub workarounds: workarounds::Workarounds,
+    /// JSON listing of the adapters this instance was created with.
+    ///
+    /// Computed once at creation so that the GUI can display it without
+    /// touching a driver. Building a throwaway instance to enumerate adapters
+    /// on demand was observed to wedge Android devices: the enumeration has to
+    /// create a real EGL context, and doing that while another device is live
+    /// is exactly the situation this project already avoids elsewhere.
+    pub adapter_listing: String,
     /// The cold config this instance was built from. Upload path and
     /// pipeline-cache policy are read from here, so they always match the
     /// device they run on.
@@ -55,7 +63,7 @@ const REBUILD_MEMORY_HEADROOM_MB: u64 = 2048;
 /// page cache, which is what actually determines whether an allocation will
 /// trigger the low-memory killer.
 #[cfg(target_os = "linux")]
-fn available_memory_mb() -> Option<u64> {
+pub(crate) fn available_memory_mb() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {
@@ -70,7 +78,7 @@ fn available_memory_mb() -> Option<u64> {
 /// analogue of Linux's `MemAvailable` (free physical memory plus the standby
 /// list, i.e. what can be handed out without paging).
 #[cfg(target_os = "windows")]
-fn available_memory_mb() -> Option<u64> {
+pub(crate) fn available_memory_mb() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
     // SAFETY: `status` is a fully initialised MEMORYSTATUSEX whose `dwLength`
@@ -90,8 +98,18 @@ fn available_memory_mb() -> Option<u64> {
 /// the fallback. Worth implementing once macOS has been tested for real;
 /// adding it blind would be unverifiable code.
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn available_memory_mb() -> Option<u64> {
+pub(crate) fn available_memory_mb() -> Option<u64> {
     None
+}
+
+impl Drop for WgpuInstance {
+    fn drop(&mut self) {
+        // Emitted when the last Arc goes away. If this line does not appear
+        // after a rebuild, something still holds a reference and the whole
+        // device stays resident.
+        crate::debug_log_line(&format!(
+            "[mem] dropping WgpuInstance (adapter={})", self.adapter_info.name));
+    }
 }
 
 impl WgpuInstance {
@@ -164,6 +182,7 @@ impl WgpuInstance {
     /// `/proc/meminfo` means an unusual environment, and the safe assumption
     /// there is "not much headroom".
     pub fn rebuild(cold: ColdConfig) -> Result<Arc<Self>> {
+        crate::log_memory("before rebuild");
         let available = available_memory_mb();
         let tight = available.map_or(true, |mb| mb < REBUILD_MEMORY_HEADROOM_MB);
 
@@ -180,11 +199,16 @@ impl WgpuInstance {
 
         if tight {
             Self::shutdown();
+            crate::log_memory("after shutdown, before init");
         }
 
         match Self::init(cold) {
             Ok(inst) => {
                 let inst = Arc::new(inst);
+                // The old instance may still be installed (comfortable path),
+                // but its cached pipelines belong to the old device and must
+                // not be reused with the new one.
+                crate::world::pipeline_cache::clear();
                 *INSTANCE.write() = Some(Arc::clone(&inst));
                 Ok(inst)
             }
@@ -196,6 +220,7 @@ impl WgpuInstance {
                 crate::debug_log_line(&format!(
                     "[c2me-wgpu-rs] rebuild failed ({e}); retrying with default settings"));
                 let inst = Arc::new(Self::init(ColdConfig::default())?);
+                crate::world::pipeline_cache::clear();
                 *INSTANCE.write() = Some(Arc::clone(&inst));
                 Ok(inst)
             }
@@ -211,6 +236,9 @@ impl WgpuInstance {
     /// [`instance()`](Self::instance) builds a fresh one.
     pub fn shutdown() {
         *INSTANCE.write() = None;
+        // Pipelines hold a device reference; clearing them is what actually
+        // lets the old device be freed.
+        crate::world::pipeline_cache::clear();
     }
 
     fn init(cold: ColdConfig) -> Result<Self> {
@@ -253,6 +281,17 @@ impl WgpuInstance {
         }));
         crate::wgpu_debug!("[c2me-wgpu-rs] device created, uncaptured-error handler installed");
 
+        // Built once here, with the chosen adapter marked, so the GUI never
+        // has to enumerate adapters itself: doing that creates a temporary
+        // device, and on Android creating one while another is live is what
+        // froze the renderer.
+        let adapter_listing = format!(
+            "[{{\"index\":0,\"name\":{},\"type\":\"{:?}\",\"backend\":\"{:?}\",\"selected\":true}}]",
+            crate::c_api::json_escape(&adapter_info.name),
+            adapter_info.device_type,
+            adapter_info.backend,
+        );
+
         Ok(Self {
             instance,
             adapter,
@@ -260,6 +299,7 @@ impl WgpuInstance {
             queue,
             adapter_info,
             workarounds,
+            adapter_listing,
             cold,
         })
     }

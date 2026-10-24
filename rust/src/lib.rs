@@ -103,6 +103,24 @@ pub(crate) fn set_hot_flags(debug: bool, profile: bool) {
     PROFILE_ENABLED.store(profile, Ordering::Relaxed);
 }
 
+/// Log current process memory in one line, for tracking device lifetimes.
+///
+/// Reports RSS and, where available, the system's available memory. Used
+/// around rebuilds: two GPU devices resident at once is the failure mode this
+/// is meant to make visible.
+pub(crate) fn log_memory(tag: &str) {
+    let rss = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|t| t.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map(|pages| pages * 4096 / (1024 * 1024));
+    let avail = crate::instance::available_memory_mb();
+    debug_log_line(&format!(
+        "[mem] {tag}: rss={} MiB, available={} MiB",
+        rss.map_or_else(|| "?".into(), |v| v.to_string()),
+        avail.map_or_else(|| "?".into(), |v| v.to_string()),
+    ));
+}
+
 /// Whether verbose GPU/codegen diagnostics are enabled.
 ///
 /// Enabled by the `debug_verbose_logging` config field.

@@ -143,6 +143,28 @@ public final class WgpuDimensionRegistry {
         // object in place, so using it as either side of the comparison would
         // report "unchanged" no matter what the user picked.
         Config cfg = Config.reload();
+
+        // A backend switch needs a restart rather than a rebuild. Measured on
+        // Android, a GLES device frees almost nothing on drop (15 MiB of a
+        // ~4 GB RSS) while a Vulkan device frees ~645 MiB, so building the new
+        // device before the old one's memory is back exhausts the system.
+        // Telling the player to restart is honest; a hot swap that wedges the
+        // device is not.
+        if (WgpuThinBinding.backendChanged(cfg)) {
+            LOGGER.info("[c2me-wgpu] backend changed to {}; a restart is required",
+                    cfg.backend);
+            WgpuFallbackNotice.report("backend-restart",
+                    "c2me-opts-accel-wgpu.notify.backend_restart");
+            // Keep applying the hot flags: debug toggles changed in the same
+            // edit should not have to wait for the restart.
+            try {
+                WgpuThinBinding.pushHotFlags();
+            } catch (Throwable t) {
+                LOGGER.warn("[c2me-wgpu] pushing hot flags failed", t);
+            }
+            return WgpuThinBinding.isAvailable();
+        }
+
         boolean coldChanged = WgpuThinBinding.coldConfigChanged(cfg);
 
         if (!coldChanged) {
