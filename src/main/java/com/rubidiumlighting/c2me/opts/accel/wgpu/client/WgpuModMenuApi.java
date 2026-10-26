@@ -92,12 +92,12 @@ public class WgpuModMenuApi implements ModMenuApi {
         protected WgpuOptionScreen(Text title, Screen parent) {
             super(title);
             this.parent = parent;
-            // Re-read the file every time the screen opens. The config is
-            // cached at startup, so a file edited while the game is running
-            // would otherwise show stale values here — confusing in itself,
-            // and it would also make the "did the device settings change"
-            // comparison use the wrong baseline.
-            Config.reload();
+            // Use the singleton directly. Calling Config.reload() here would
+            // create a fresh object every time a screen is constructed, so
+            // the Main screen and the Debug screen would end up editing
+            // different instances: changes made in Debug would be discarded
+            // when Main saves its own (stale) copy. Reloading from disk is
+            // the save-switch path's job, not the GUI's.
             this.cfg = Config.get();
         }
 
