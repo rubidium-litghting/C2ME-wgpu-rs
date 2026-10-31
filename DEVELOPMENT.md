@@ -62,14 +62,27 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
 **GPU 架构**
 13. **多 pass 是硬约束**：每类 shard 用独立 bind group layout，只含它实际用的 binding（≤8 storage buffer）。
-14. **pipeline 缓存键不含代码生成**：磁盘缓存键 = AST 哈希 + pass，**既不含 layout 版本，也不含 WGSL 生成逻辑**。改 binding **或任何会改变 WGSL 输出的代码**（哪怕只动函数体）都必须 bump `LAYOUT_VERSION`，否则旧 pipeline 被复用 → `ComputePipeline invalid`。
-15. **shader 编译成本超线性**：拆小是唯一可靠解法（安全区 ~2100 行，Mali 单 shader 过大会设备丢失）。
+14. **pipeline 缓存键必须跟着代码走**：磁盘缓存键 = AST 哈希 + pass。历史上这里靠手写 `LAYOUT_VERSION` 兜底，**两次都忘了 bump**，且忘记是静默的（旧 pipeline 被复用 → 地形悄悄错）。现已改为把 **WGSL 源码 + `bind_group.rs`** 一起哈希进指纹：改任何影响 shader 或 layout 的代码，key 自动变。新增 codegen 时无需再记得手动改版本号，但**别把动态内容（如时间戳）混进哈希**，那会让缓存永远失效。
+15. **shader 编译成本超线性**：拆小是唯一可靠解法（经验安全区 ~2100 行，Mali 单 shader 过大会设备丢失）。
+    **2100 行只是经验值，不是保证**：实际复杂度更关键。实测**天玑 8100 的
+    Mali 驱动是问题最多的设备**，会对规模/复杂度超限的 shader 直接拒绝编译；
+    而**麒麟 980（Mali-G76）在拆分 pass 之前的单体大 shader 上仍能正常工作**，
+    说明不同 Mali 世代/驱动版本的容忍度差异极大，不能拿一个行数一刀切。
+    行数只能当粗略预警，真实上限只能靠实测。好消息是 lesson #36 的 error
+    scope 让这类"驱动拒绝编译"变成可捕获的 `Err` → 该维度回退 CPU，而不是
+    死锁或设备丢失。
 16. **惰性缓存可预计算**：MC 的惰性表（aquifer waterLevels）在 GPU 上必须整表预计算（Java warmup ~0ms）。
 17. **内存泄漏**：共享 map 要 remove-on-consume，不能只 insert。
 18. **诊断代码放对位置**：别放在会被短路的分支后（否则是死代码）。
 
 **方法论（最重要）**
 19. **端到端指标才是判据**：Chunky 总时间，不看内部 batch 吞吐（§19 教训）。
+    **"测试全绿" ≠ "实机可用"**：单元/离线测试只覆盖它断言的那条链路。本次
+    "全虚空"事故中 89 个 Rust 测试 + `real_router_vs_vanilla` 全部通过，但游戏
+    里一个方块都没有——因为没有任何测试覆盖"GPU 算完 → Java 写回 chunk"这一
+    段。凡是改动跨语言边界（Rust 产出 → Java 消费）或涉及驱动行为（shader
+    编译上限、后端能力），**必须实机跑一遍再下结论**。旧经验（如"2100 行
+    安全"）也只能当假设，芯片/驱动世代不同结论会翻转。
 20. **"CPU 解释器一致" ≠ "对 vanilla 正确"**：测试要对照 MC 原版 dump。
 21. **先数消费者，再决定算多少**：16 通道里只有 2 个被读，别默认全算。
 22. **假通过的测试比没测试更危险**：`eprintln` 而非 `assert` 的判据会沉默。
