@@ -185,6 +185,36 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     对比必须用同一种子、同视距，否则结论不可靠。视距也是强变量，A/B 测试
     要一起控制。
 
+41. **跨线程交接的队列必须有界，背压落在生产者身上**：`requestAsync` 曾往无界
+    `LinkedBlockingQueue` 里 `add`，而 C2ME 提交 chunk 的速度远高于 GPU 退役
+    速度（末地 radius 11820 是 ~2.2M chunk），于是几十万个 `Job` 堆在队列里，
+    内存单调上涨、GC 压力饿死完成线程，GPU 反而空转等活，吞吐从 ~500 CPS 塌到
+    个位数——而且是在跑到百分之几的时候就塌，远早于任务结束。
+    修复是 `LinkedBlockingQueue(4096)`（远大于 `MAX_BATCH`，批次仍能瞬间凑满）
+    + `offer(job, 50ms)` 轮询循环。要点：
+    - **背压该落在提交的 C2ME worker 线程**，不是 GPU 侧；GPU 保持忙碌、内存保持平。
+    - **用 `offer` 不用 `put`**：`put` 阻塞在满队列上无法被 `running = false` 唤醒，
+      会让 teardown 永久挂起。超时轮询循环才能同时满足"等空位"和"能收摊"。
+    - **收摊或中断时要异常完成 future**，让 C2ME 在 CPU 上重新生成这个 chunk，
+      而不是让它永远等下去。
+    - **判据是规模**：4225 chunk 的测试根本暴露不出来（还没来得及堆积就结束了），
+      至少要 6 万+ chunk 才有压力。小规模全绿不能证明队列没问题。
+    推广：凡是在线程之间交接请求/任务的容器，都该先问一句"上限是多少、满了谁等"。
+
+42. **部署的 jar 必须晚于修复源码，且要让日志能自证**：本轮出现过一次惊魂——
+    0.1.6 的 jar 构建于 02:38，而队列修复的**提交**时间是 02:53，看上去像是
+    "号称含修复的实机数据其实不含修复"。真相是源码改于 02:37、构建于 02:38、
+    提交于 02:53（本项目一贯"先实机验证，再提交"），jar 里确实有
+    `QUEUE_CAPACITY = 4096`。但**光看 git 提交时间会得出相反结论**。
+    因此定两条规矩：
+    - **核对顺序**：`stat 源文件 mtime` → `stat jar mtime` → `git log` 提交时间。
+      构建必须晚于源码改动；提交时间与构建时间的前后关系**不构成判据**。
+    - **验证要落到字节码**：`unzip` 出 `WgpuBatchCoordinator.class` 后
+      `javap -c -p -constants` 查 `4096` / `offer` / 退场字符串，比看版本号可靠。
+    - **日志要能自证**：启动横幅里打 mod 版本（`c2me-opts-accel-wgpu 0.1.6` 已有），
+      但队列上限这类修复参数目前不打日志，导致无法从 `latest.log` 反推。重要修复
+      应在初始化时打一行"bounded queue, capacity=N"。
+
 
 
 
@@ -277,6 +307,26 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   `max_storage_buffer_binding_size` 并拖垮 CPU 采样。
 - ✅ **pipeline 缓存键改为哈希 WGSL 源码 + `bind_group.rs`**，废弃手写的
   `LAYOUT_VERSION`（曾两次忘记 bump 且失败是静默的）。
+- ✅ **无界队列泄漏**：`requestAsync` 的队列从无界改为 4096 上限 + 带超时
+  `offer` 背压（详见教训 #41）。大规模预生成时内存不再单调上涨，shutdown
+  不再超时失败。
+
+**0.1.6 实测数据（同种子，Chunky，原版地形）**
+
+| 组 | 实例 | 地形 | 规模 | 耗时 | CPS 中位 | shutdown 失败 | 含队列修复 |
+|---|---|---|---|---|---|---|---|
+| A-3/A-4 | Fabric | 原版 | 4225 | 18 s | — | — | ❌ |
+| A-5 | Fabric | 原版 | 4225 | **15 s** | 206.8（p90 282.2） | **0** | ✅ |
+| B-2 | Fabric | 原版 | 4225 | 17 s（wgpu 禁用） | — | — | — |
+| A-1/A-2 | Fabric | Tectonic | 4225 | 26–33 s | — | — | ❌ |
+| NF-2 | NeoForge | 原版（末地） | 63001 | 1m49s | 516–695 | 0 | ❌ |
+| NF-3 | NeoForge | 原版（末地） | 160801 | 4m31s | **599.8**（p90 649.9） | **0** | ✅ |
+| NF-1 | NeoForge | Tectonic+Connector | — | 回退 CPU | — | — | — | 732 external |
+
+> 注：A-5 的 jar 构建于 02:38、源码改于 02:37、提交于 02:53，字节码已确认含
+> `QUEUE_CAPACITY = 4096`（见教训 #42）。4225 chunk 规模太小，无法暴露队列问题，
+> 含修复的真正压力验证是 NF-3。大规模 GPU vs CPU 对照（B-5，同 4225/400c 口径）
+> 尚未跑。
 
 **0.1.7+ 待办**
 - [ ] **让 external payload 随批次携带**（而非走进程级 `world.external_data`）。
