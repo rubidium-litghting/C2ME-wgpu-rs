@@ -190,6 +190,16 @@ public final class WgpuBatchCoordinator {
         this.gx = gx; this.gy = gy; this.gz = gz;
         this.cellW = cellW; this.cellH = cellH;
         this.minY = minY;
+        // External inputs force serial submission. This is a correctness
+        // requirement, not just a memory one: the payload travels through the
+        // process-global `world.external_data`, and `submit_async` returns as
+        // soon as the batch is queued — the executor reads that global later,
+        // during prepare. With several batches in flight the next batch's
+        // upload would overwrite the data a queued batch has not consumed yet.
+        // Serial mode blocks until each batch completes, so the global can only
+        // be rewritten after its contents are safely on the GPU.
+        // Fixing this properly means carrying the payload per batch instead of
+        // through shared mutable state; until then, keep modded worlds serial.
         this.pipeline = externalNodes.isEmpty();
         this.batchThread = new Thread(this::run, "c2me-wgpu-batch");
         this.batchThread.setDaemon(true);
