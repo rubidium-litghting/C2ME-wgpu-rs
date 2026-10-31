@@ -31,5 +31,12 @@
   "c2me-opts-accel-wgpu.config.backend": "图形后端",
   "c2me-opts-accel-wgpu.config.backend.auto": "自动",
   "c2me-opts-accel-wgpu.notify.rebuild_failed": "无法使用 %s 后端，已改为自动选择（%s）",
-  "c2me-opts-accel-wgpu.notify.backend_restart": "图形后端的更改将在重启游戏后生效"
+  "c2me-opts-accel-wgpu.notify.backend_restart": "图形后端的更改将在重启游戏后生效",
+  "c2me-opts-accel-wgpu.error.pipeline_cache": "显卡驱动不支持管线缓存。请尝试在配置文件中开启 \"disable_pipeline_cache\": true。",
+  "c2me-opts-accel-wgpu.error.gpu_too_weak": "显卡性能不足（不支持 256MB 大缓冲区），已回退 CPU。",
+  "c2me-opts-accel-wgpu.error.driver_panic": "显卡驱动在初始化时崩溃。请尝试在配置中切换图形后端。",
+  "c2me-opts-accel-wgpu.error.no_adapter": "未找到可用的显卡适配器。请检查显卡驱动是否正常，或尝试在配置中切换图形后端。",
+  "c2me-opts-accel-wgpu.error.symbol_mismatch": "原生库版本不匹配，模组文件可能已损坏或混用。",
+  "c2me-opts-accel-wgpu.notify.init_failed_friendly": "GPU 初始化失败，已回退 CPU：%s",
+  "c2me-opts-accel-wgpu.config.backend.unavailable": "%s（当前平台不可用）"
 }

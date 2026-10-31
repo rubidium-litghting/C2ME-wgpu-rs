@@ -251,6 +251,17 @@ public class WgpuModMenuApi implements ModMenuApi {
                 names.add(e.label());
             }
             int cur = f.getInt(cfg);
+            if (!values.contains(cur)) {
+                // The configured value is valid for some platform but not for
+                // this one (DX12 on Linux, say). Showing "automatic" instead
+                // would silently disagree with the file and leave the player
+                // wondering why their choice did not stick. List it, marked,
+                // so the mismatch is visible.
+                values.add(cur);
+                names.add(Text.translatable(
+                        "c2me-opts-accel-wgpu.config.backend.unavailable",
+                        describeBackend(cur)).getString());
+            }
             int pos = values.indexOf(cur);
             return CyclingButtonWidget.<Integer>builder(
                             v -> Text.literal(names.get(Math.max(0, values.indexOf(v)))))
@@ -259,6 +270,21 @@ public class WgpuModMenuApi implements ModMenuApi {
                     .omitKeyText()
                     .build(x, y, w, ROW_H, Text.empty(),
                             (btn, v) -> setField(f, v));
+        }
+
+        /** Renders a {@code wgpu::Backends} bitmask using the same names the
+         *  config file comment uses. */
+        private static String describeBackend(int bits) {
+            int[][] table = {{2, 0}, {4, 1}, {8, 2}, {16, 3}};
+            String[] names = {"Vulkan", "Metal", "DX12", "GL"};
+            StringBuilder sb = new StringBuilder();
+            for (int[] row : table) {
+                if ((bits & row[0]) != 0) {
+                    if (sb.length() > 0) sb.append('+');
+                    sb.append(names[row[1]]);
+                }
+            }
+            return sb.length() == 0 ? "unknown" : sb.toString();
         }
 
         private Object getFieldQuietly(Field f) {

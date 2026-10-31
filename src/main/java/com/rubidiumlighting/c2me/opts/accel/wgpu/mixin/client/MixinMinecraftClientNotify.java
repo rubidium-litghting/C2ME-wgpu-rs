@@ -105,9 +105,16 @@ public class MixinMinecraftClientNotify {
                     .append(Text.translatable("c2me-opts-accel-wgpu.notify.ffm_disabled.hint").formatted(Formatting.GRAY));
             case NATIVE_UNAVAILABLE -> prefix()
                     .append(Text.translatable("c2me-opts-accel-wgpu.notify.native_unavailable").formatted(Formatting.YELLOW));
-            case INIT_FAILED -> prefix()
-                    .append(Text.translatable("c2me-opts-accel-wgpu.notify.init_failed",
+            case INIT_FAILED -> {
+                String errKey = ModuleEntryPoint.getErrorKey();
+                if (errKey != null) {
+                    yield prefix().append(Text.translatable("c2me-opts-accel-wgpu.notify.init_failed_friendly",
+                            Text.translatable(errKey)).formatted(Formatting.YELLOW));
+                } else {
+                    yield prefix().append(Text.translatable("c2me-opts-accel-wgpu.notify.init_failed",
                             String.valueOf(ModuleEntryPoint.getDetail())).formatted(Formatting.YELLOW));
+                }
+            }
             case OK -> prefix()
                     .append(Text.translatable("c2me-opts-accel-wgpu.notify.enabled",
                             com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuStatus.gpuName())

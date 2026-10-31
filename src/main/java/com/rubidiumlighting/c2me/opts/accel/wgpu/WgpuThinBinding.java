@@ -81,6 +81,9 @@ public class WgpuThinBinding {
      *  instead of blaming the GPU adapter. */
     private static String linkError = null;
 
+    /** The last error reported by create_instance, for user-facing notices. */
+    private static volatile String lastInstanceError = null;
+
     // Declared before the static initialiser: Java runs static field
     // initialisers in textual order, and the block below calls
     // invalidateListings(), which would otherwise NPE on a null field.
@@ -446,10 +449,13 @@ public class WgpuThinBinding {
                     errBuf,
                     errBuf.byteSize());
             if (r == 0) {
-                LOGGER.warn("[c2me-wgpu] Failed to create wgpu instance: {}", errBuf.getString(0));
+                String err = errBuf.getString(0);
+                lastInstanceError = err;
+                LOGGER.warn("[c2me-wgpu] Failed to create wgpu instance: {}", err);
                 return false;
             }
         }
+        lastInstanceError = null;
         available = true;
         instanceHandle = 1L;
         appliedCold = coldOf(cfg);
@@ -525,7 +531,7 @@ public class WgpuThinBinding {
                 WgpuFallbackNotice.report("rebuild-failed-" + reason,
                         "c2me-opts-accel-wgpu.notify.rebuild_failed",
                         describeBackend(requestedBackend),
-                        reason);
+                        ErrorTranslator.localize(reason));
                 return available;
             }
         }
@@ -595,6 +601,10 @@ public class WgpuThinBinding {
 
     public static boolean isAvailable() {
         return available;
+    }
+
+    public static String getLastInstanceError() {
+        return lastInstanceError;
     }
 
     /** @return the FFM linking failure detail, or {@code null} if linking was fine. */

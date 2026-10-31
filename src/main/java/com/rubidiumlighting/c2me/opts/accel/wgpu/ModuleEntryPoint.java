@@ -61,7 +61,8 @@ public class ModuleEntryPoint {
                     // driver issue and sends debugging in the wrong direction.
                     dt = "native library symbol mismatch (" + linkErr + ")";
                 } else {
-                    dt = "no suitable wgpu adapter (driver missing or unsupported GPU)";
+                    String instErr = WgpuThinBinding.getLastInstanceError();
+                    dt = (instErr != null) ? instErr : "no suitable wgpu adapter (driver missing or unsupported GPU)";
                 }
                 LOGGER.warn("[c2me-wgpu] {}, falling back to CPU", dt);
             } else {
@@ -124,5 +125,15 @@ public class ModuleEntryPoint {
 
     public static String getDetail() {
         return detail;
+    }
+
+    /**
+     * Returns a translation key for the failure detail, if it matches a known
+     * hardware/driver condition. Returns null if the error is unknown, in
+     * which case the caller should display the raw detail.
+     */
+    public static String getErrorKey() {
+        if (status != Status.INIT_FAILED) return null;
+        return ErrorTranslator.getErrorKey(detail);
     }
 }

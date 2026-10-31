@@ -181,13 +181,10 @@ public final class WgpuDimensionRegistry {
                 cfg.gpuIndex, cfg.backend, cfg.disablePipelineCache, cfg.mappedAtCreation);
         destroyAll();
         try {
-            boolean ok = WgpuThinBinding.rebuildFromConfig();
-            if (!ok) {
-                WgpuFallbackNotice.report("rebuild-failed",
-                        "c2me-opts-accel-wgpu.notify.init_failed",
-                        "config changed but GPU rebuild failed; see log");
-            }
-            return ok;
+            // On failure `rebuildFromConfig` has already queued a notice that
+            // names the requested backend and the translated reason, so no
+            // second (and less specific) message is emitted here.
+            return WgpuThinBinding.rebuildFromConfig();
         } catch (Throwable t) {
             LOGGER.warn("[c2me-wgpu] instance rebuild failed", t);
             return false;
