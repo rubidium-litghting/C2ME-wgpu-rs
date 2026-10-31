@@ -93,12 +93,30 @@ pub fn get_or_compile(
     device: &wgpu::Device,
     pipeline_layout: &wgpu::PipelineLayout,
 ) -> Result<wgpu::ComputePipeline> {
-    // §22 B-3: the bind-group layout gained binding 8/9 (aquifer). Any
-    // pipeline cached under the old layout is invalid, so perturb the key
-    // (and the on-disk cache path) with a layout version. Bump on any
-    // binding change.
-    const LAYOUT_VERSION: u32 = 28;
-    let fingerprint = fingerprint ^ LAYOUT_VERSION.wrapping_mul(0x9E37_79B9);
+    // The cache key must change whenever the generated shader or the bind
+    // group layout changes, or a stale compiled pipeline is handed out for a
+    // different shader/layout pair (DEVELOPMENT.md lesson #14).
+    //
+    // This used to be a hand-maintained `LAYOUT_VERSION` that had to be bumped
+    // on every codegen change. That failed in practice — it is easy to forget,
+    // and forgetting it is silent: the old pipeline is reused and the world
+    // quietly generates wrong terrain. Derive the key from the actual inputs:
+    //   * `shader_src` — the emitted WGSL. Covers every codegen change,
+    //     including binding declarations and the `WorldgenParams` struct.
+    //   * `bind_group.rs` — the static layout definitions. A layout-only edit
+    //     (e.g. adding a binding the shader does not reference) leaves the
+    //     WGSL unchanged, so it must be hashed separately.
+    //
+    // This runs on the slow path only (cache miss, once per world and pass),
+    // so hashing ~90 KB of WGSL is negligible next to a shader compile.
+    let src_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        shader_src.hash(&mut h);
+        include_str!("bind_group.rs").hash(&mut h);
+        h.finish() as u32
+    };
+    let fingerprint = fingerprint ^ src_hash;
     let key = (fingerprint, pass_id(pass));
     let entry_point = pass.entry_point();
 
@@ -328,5 +346,29 @@ mod tests {
         assert_eq!(pass_id(Pass::A), 1);
         assert_eq!(pass_id(Pass::B), 2);
         assert_eq!(pass_id(Pass::C), 3);
+    }
+
+    /// The cache key is derived from the shader source, not a hand-maintained
+    /// version constant. Changing the WGSL must change the key, or a stale
+    /// compiled pipeline gets reused for a different shader (lesson #14).
+    #[test]
+    fn cache_key_tracks_shader_source() {
+        use std::hash::{Hash, Hasher};
+        let derive = |src: &str| -> u32 {
+            let mut h = rustc_hash::FxHasher::default();
+            src.hash(&mut h);
+            include_str!("bind_group.rs").hash(&mut h);
+            h.finish() as u32
+        };
+        assert_ne!(
+            derive("fn main() {}"),
+            derive("fn main() { }"),
+            "a change in the emitted WGSL must change the cache key"
+        );
+        assert_eq!(
+            derive("fn main() {}"),
+            derive("fn main() {}"),
+            "hashing must be deterministic"
+        );
     }
 }
