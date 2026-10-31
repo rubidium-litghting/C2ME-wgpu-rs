@@ -826,7 +826,11 @@ fn block_out_executor_smoke() {
     let batch = Batch { positions: vec![(0, 0), (1, 0), (0, 1)], max_priority: Priority::Normal };
     let r = exec.request_chunks(world.clone(), batch).unwrap();
     println!("results={} block_data_len={}", r.results.len(), r.block_data.len());
+    let mut hist = std::collections::BTreeMap::<u32, usize>::new();
+    for &v in &r.block_data { *hist.entry(v).or_insert(0) += 1; }
+    println!("block state histogram: {:?}", hist);
     assert!(!r.block_data.is_empty(), "block output empty");
+
 }
 
 #[test]

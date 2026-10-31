@@ -18,10 +18,32 @@ pub fn split(node: &AstNode, inners: &mut Vec<AstNode>) -> AstNode {
     use AstNode::*;
     match node {
         // Leaf — nothing to split.
-        Constant(_) | ExternalInput { .. } | InputX | InputY | InputZ
+        Constant(_) | InputX | InputY | InputZ
         | SimplexNoise2D { .. } | SimplexNoise3D { .. } | InterpNoiseSampler { .. }
         | EndIslands { .. } | Beardifier { .. } | YClampedGradient { .. }
         | BiomeTree { .. } | NoiseSampler { .. } | InnerRef(_) => node.clone(),
+
+        // `ExternalInput` is a corner-grid quantity, not a per-block one.
+        //
+        // The Java side pre-evaluates every external subtree on the same
+        // `gx * gy * gz` lattice the interpolated noise uses
+        // (`WgpuBatchCoordinator.uploadExternalInputs`), and the WGSL reads
+        // those values back by cell index. Its semantics are therefore
+        // identical to an `InterpolatedNoiseSampler`: sample at the corners,
+        // then trilinearly interpolate.
+        //
+        // Leaving it in the outer tree broke that contract only on specific
+        // worlds: the outer tree is evaluated per block, and
+        // `external_inputs` is bound only in the corner shards. A tree with an
+        // external node in its outer half (observed with a Twilight Forest
+        // worldgen) made the BlockOut shader reference an undeclared
+        // `external_inputs`, fail validation, and leave the block buffer
+        // uninitialised.
+        ExternalInput { .. } => {
+            let idx = inners.len();
+            inners.push(node.clone());
+            InnerRef(idx)
+        }
 
         // The boundary: extract the whole subtree, replace with a ref.
         // Both `InterpolatedNoiseSampler` and `CacheInterpolated` are MC's
@@ -92,5 +114,87 @@ pub fn split(node: &AstNode, inners: &mut Vec<AstNode>) -> AstNode {
             density: Box::new(split(density, inners)),
             fluid_level: Box::new(split(fluid_level, inners)) },
         Root(chs) => Root(chs.iter().map(|c| split(c, inners)).collect()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::AstNode;
+
+    /// `ExternalInput` must be treated as a corner-grid boundary, like
+    /// `InterpolatedNoiseSampler`, not as a leaf.
+    ///
+    /// The Java side pre-evaluates external subtrees on the `gx * gy * gz`
+    /// lattice and the WGSL reads them back by cell index, so the values only
+    /// exist at corners. Leaving the node in the outer tree made the BlockOut
+    /// pass — which has no `external_inputs` binding — emit a read of it,
+    /// failing shader validation and leaving the block buffer uninitialised.
+    #[test]
+    fn external_input_is_extracted_as_a_boundary() {
+        let mut inners = Vec::new();
+        let node = AstNode::ExternalInput { index: 3 };
+
+        let outer = split(&node, &mut inners);
+
+        assert_eq!(inners.len(), 1, "the external subtree must be extracted");
+        assert_eq!(inners[0], node, "the extracted node must be the input itself");
+        assert_eq!(outer, AstNode::InnerRef(0), "the outer tree must see a ref");
+    }
+
+    /// The same node nested inside arithmetic must still be pulled out, and
+    /// the surrounding structure preserved.
+    #[test]
+    fn external_input_nested_in_arithmetic_is_extracted() {
+        let mut inners = Vec::new();
+        let ext = AstNode::ExternalInput { index: 0 };
+        let node = AstNode::Add(
+            Box::new(AstNode::Constant(1.0)),
+            Box::new(ext.clone()),
+        );
+
+        let outer = split(&node, &mut inners);
+
+        assert_eq!(inners.len(), 1);
+        assert_eq!(inners[0], ext);
+        assert_eq!(
+            outer,
+            AstNode::Add(
+                Box::new(AstNode::Constant(1.0)),
+                Box::new(AstNode::InnerRef(0)),
+            )
+        );
+    }
+
+    /// Guard against the regression this test was written for: a genuine leaf
+    /// must still be left in place, not extracted.
+    #[test]
+    fn plain_leaves_are_not_extracted() {
+        let mut inners = Vec::new();
+        let outer = split(&AstNode::InputX, &mut inners);
+        assert!(inners.is_empty(), "InputX is not a boundary");
+        assert_eq!(outer, AstNode::InputX);
+    }
+
+    /// Two external nodes must get distinct slots, in traversal order.
+    #[test]
+    fn multiple_external_inputs_get_distinct_indices() {
+        let mut inners = Vec::new();
+        let a = AstNode::ExternalInput { index: 0 };
+        let b = AstNode::ExternalInput { index: 1 };
+        let node = AstNode::Add(Box::new(a.clone()), Box::new(b.clone()));
+
+        let outer = split(&node, &mut inners);
+
+        assert_eq!(inners.len(), 2);
+        assert_eq!(inners[0], a);
+        assert_eq!(inners[1], b);
+        assert_eq!(
+            outer,
+            AstNode::Add(
+                Box::new(AstNode::InnerRef(0)),
+                Box::new(AstNode::InnerRef(1)),
+            )
+        );
     }
 }

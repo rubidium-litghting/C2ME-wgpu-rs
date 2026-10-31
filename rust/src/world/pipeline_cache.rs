@@ -97,7 +97,7 @@ pub fn get_or_compile(
     // pipeline cached under the old layout is invalid, so perturb the key
     // (and the on-disk cache path) with a layout version. Bump on any
     // binding change.
-    const LAYOUT_VERSION: u32 = 27;
+    const LAYOUT_VERSION: u32 = 28;
     let fingerprint = fingerprint ^ LAYOUT_VERSION.wrapping_mul(0x9E37_79B9);
     let key = (fingerprint, pass_id(pass));
     let entry_point = pass.entry_point();
@@ -116,12 +116,29 @@ pub fn get_or_compile(
     crate::wgpu_debug!("[compile] shader source: {} lines, {} bytes",
               shader_src.lines().count(), shader_src.len());
 
+    // Shader compilation failures are *validation* errors in wgpu: they do
+    // not come back as a Result, they go to the uncaptured-error handler and
+    // the call returns a module that is invalid. Without an error scope
+    // around it, a broken generated shader sails through this function, gets
+    // cached, gets submitted, and leaves the output buffers holding
+    // uninitialised GPU memory — which Java then reads as block states,
+    // producing an out-of-bounds palette index and a deadlocked chunk.
+    let shader_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(&format!("c2me_wgpu_shader_{fingerprint:08x}_p{}", pass_id(pass))),
         source: wgpu::ShaderSource::Wgsl(shader_src.into()),
     });
     crate::wgpu_debug!("[compile] create_shader_module done in {:?}",
               t_src0.elapsed());
+
+    // Fail before building a pipeline out of a module that does not compile.
+    // A broken module makes `create_compute_pipeline` fail too; bailing here
+    // avoids wasting that work on every subsequent chunk of this dimension.
+    if let Some(err) = pollster::block_on(shader_scope.pop()) {
+        return Err(anyhow::anyhow!(
+            "shader for pass {pass:?} failed validation: {err}"
+        ));
+    }
 
     // Build the compute pipeline. The `wgpu::PipelineCache` is optional:
     // some Vulkan drivers (Mali-G610) abort inside it, so
@@ -175,7 +192,6 @@ pub fn get_or_compile(
     crate::wgpu_debug!("[compile] create_compute_pipeline done in {:?}",
               t_pipe0.elapsed());
 
-    // 3. Insert. If another thread raced us, drop the loser.
     {
         let mut map = cache().lock().expect("pipeline cache mutex poisoned");
         if let Some(existing) = map.get(&key) {
