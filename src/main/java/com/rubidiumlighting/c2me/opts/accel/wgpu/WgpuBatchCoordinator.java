@@ -94,7 +94,20 @@ public final class WgpuBatchCoordinator {
         Job(int cx, int cz) { this.cx = cx; this.cz = cz; }
     }
 
-    private final BlockingQueue<Job> queue = new LinkedBlockingQueue<>();
+    /** Hard cap on queued requests. This queue used to be unbounded, which
+     *  turned into a leak on large pregeneration runs: C2ME submits chunks far
+     *  faster than the GPU can retire them (an End pregen of radius 11820 is
+     *  ~2.2M chunks), so hundreds of thousands of {@code Job} objects piled up,
+     *  memory climbed, GC pressure starved the completion thread, and the GPU
+     *  ended up idle waiting for work — throughput collapsed from ~500 CPS to
+     *  single digits.
+     *
+     *  A bounded queue applies backpressure to the submitting C2ME worker
+     *  thread instead, which is the correct place to stall: the GPU stays busy
+     *  and memory stays bounded. Sized well above MAX_BATCH so batches still
+     *  form instantly. */
+    private static final int QUEUE_CAPACITY = 4096;
+    private final BlockingQueue<Job> queue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
     private final long worldHandle;
     /** Kept so shutdown() can join them. Null in serial (non-pipeline) mode,
      *  where run() does the completion inline and no second thread exists. */
@@ -219,7 +232,24 @@ public final class WgpuBatchCoordinator {
      *  grow. This is the only request entry point. */
     public java.util.concurrent.CompletableFuture<GpuChunk> requestAsync(int cx, int cz) {
         Job job = new Job(cx, cz);
-        queue.add(job);
+        // Bounded queue: block the calling C2ME worker (never the main thread)
+        // until there is room, so the GPU is never starved by a huge backlog.
+        // Poll instead of put() so teardown can interrupt the wait: put() on a
+        // full queue is not wakeable by `running = false`.
+        while (running) {
+            try {
+                if (queue.offer(job, 50, TimeUnit.MILLISECONDS)) {
+                    return job.future;
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        // Shutting down (or interrupted): fail the request so C2ME regenerates
+        // this chunk on the CPU rather than waiting forever.
+        job.future.completeExceptionally(
+                new IllegalStateException("c2me-wgpu coordinator is shutting down"));
         return job.future;
     }
 
