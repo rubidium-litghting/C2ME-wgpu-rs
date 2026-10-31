@@ -1,7 +1,9 @@
 # C2ME WGPU 加速模块 — 开发文档
 
-> 最后更新：2026-10-24
-> 状态：**0.1.5 发布版**。完整实现 Pass E、GPU 矿脉、100% 对齐原版的 AquiferSampler 逻辑，并重构了 FFM 日志架构与底层防死锁机制。实机验证兼容 Epic Terrain 与 Tectonic。
+> 最后更新：2026-11-01
+> 状态：**0.1.5 已发布；0.1.6 待发布**。0.1.6 修掉了 modded 世界（暮色森林 / Tectonic）的
+> 死锁与全虚空问题，并把 shader/pipeline 编译失败从"静默死锁"改为"该维度回退 CPU + 玩家可读提示"。
+> 0.1.5 完整实现 Pass E、GPU 矿脉、100% 对齐原版的 AquiferSampler 逻辑，并重构了 FFM 日志架构与底层防死锁机制。实机验证兼容 Epic Terrain 与 Tectonic（Fabric 原生环境）。
 > 用户侧已落地：GPU 选择（能力优先，越界自动回退）、切存档热重载配置（冷/热两级，零锁）、
 > 聊天栏状态提示、由注解自动生成的 ModMenu 设置界面。
 > 移动端实测：Chunky A/B 测试在 Mali-G610 平板上，端到端总耗时从 3m12s 缩短至 2m19s（+61%）；纯地形生成实时吞吐从 23.52 CPS 提升至 30.65 CPS（+30.3%）。
@@ -186,7 +188,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
 
 
-### 待办与 0.1.5 规划（2026-10-18 更新）
+### 版本记录与 0.1.7+ 待办
 
 **0.1.4 已完全解决的历史遗留（存档记录）**
 - ✅ **§14 边界 bug**：通过 Pass E 架构（拆解 nonlinear outer 树与 InnerRef 角点）解决，Epic Terrain/Tectonic 地形完全正常。
@@ -194,7 +196,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 - ✅ **矿脉全 GPU 化**：完整的 RNG 与矿脉方块替换已实装，无需 CPU 回退。
 - ✅ **Shard B 瘦身**：高频内联公式函数化，从 3084 行降到 1771 行。
 
-**0.1.5 目标：代码整理与用户友好化（进入等 Issue 阶段）**
+**0.1.5 已完成（已发布）：代码整理与用户友好化**
 - [x] **代码清洁**：
   - 清理排查期间留下的历史冗余代码、无用 `#[allow(dead_code)]`。
   - 审查并移除重复的 `c2me_wgpu.log` 日志写入逻辑（如果有）。
@@ -260,10 +262,41 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   - 整理目前的 Debug 环境变量说明，把不再使用的变量（如 `MIN_STAGE`）彻底从文档中删除。
   - 补充了 FFM Upcall 日志回传机制与防死锁机制的说明。
 
-### 环境变量速查
+**0.1.6（未发布）：modded 世界正确性与错误可见性**
 
-本模组自己的开关已全部迁移到 `config/c2me-wgpu.json`（见 §12），不再读取任何
-`C2ME_*` 环境变量。仅剩 wgpu 库自身的标准变量：
+- ✅ **暮色森林死锁根因**：`ExternalInput` 是角点量，必须像
+  `InterpolatedNoiseSampler` 一样被 split 提取；`barrierNoise`（ch0）同样
+  要 split，否则 Tectonic 这类世界会因 BlockOut 引用未绑定的
+  `external_inputs` 而编译失败。
+- ✅ **shader / pipeline 校验失败不再静默**：两者都用 error scope 捕获，
+  失败即让该维度回退 CPU，而不是提交 invalid pipeline 导致死锁。
+- ✅ **错误可读化**：`failed validation` 翻译成玩家能懂的中文/英文说明。
+- ✅ **提示一致性**："GPU 加速已启用"改由真正初始化成功的维度上报，
+  不再与世界进入解耦地抢跑；通知带颜色（绿=正常，黄=降级）。
+- ✅ **external 节点上限 64**：超限直接回退 CPU，避免超出
+  `max_storage_buffer_binding_size` 并拖垮 CPU 采样。
+- ✅ **pipeline 缓存键改为哈希 WGSL 源码 + `bind_group.rs`**，废弃手写的
+  `LAYOUT_VERSION`（曾两次忘记 bump 且失败是静默的）。
+
+**0.1.7+ 待办**
+- [ ] **让 external payload 随批次携带**（而非走进程级 `world.external_data`）。
+  目前 `WgpuBatchCoordinator.pipeline = externalNodes.isEmpty()`：有 external
+  节点时强制串行提交。这不只是省内存，更是**防数据竞争**——`submit_async`
+  入队即返回，executor 稍后才在 prepare 阶段读全局数据，多批次在途时下一批
+  的 upload 会覆盖前一批尚未消费的内容。
+  代价：external 少的维度（如暮色森林，4 个节点）拿不到流水线化收益，
+  按 §23 的 A/B 大约是端到端 10%、CPU 占用 70%→50% 的损失。
+  修法是把 payload 从共享可变状态改成按批次传递（要动 FFI 签名与 Rust 侧
+  缓冲区分配），属于结构性改动。
+- [ ] 视距 / 种子对 CPS 的影响做正式 A/B（见教训 #40）。
+- [ ] 移动端兼容性：天玑 8100 一档的 Mali 驱动拒绝复杂 shader，目前靠
+  error scope 回退 CPU；考虑在超限前主动预估规模、直接提示。
+
+### wgpu 库自身的环境变量（仅排查用）
+
+**本模组的全部开关都在 `config/c2me-wgpu.json`，不读任何 `C2ME_*` 环境变量**
+（0.1.5 起已彻底迁移）。下面两个是 wgpu 库自己的标准变量，模组只是"顺带"受
+它们影响，正常游玩不需要设置：
 
 | 变量 | 值 | 效果 |
 |---|---|---|
