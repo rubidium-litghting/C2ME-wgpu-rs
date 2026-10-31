@@ -125,10 +125,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     渲染器（画面静止但操作有响应）。修法：设备创建时把 adapter 列表序列化
     存在 `WgpuInstance` 里，GUI 只读这份缓存，永不触发枚举。
 
-35. **Android 上 `/proc/meminfo` 对应用不可读**：`adb shell` 能读，但应用
-    进程内被 SELinux 挡住，`MemAvailable` 恒为 `?`。于是内存感知重建在
-    Android 上永远走"先删旧实例"的安全分支——方向正确，但失去了"内存充裕
-    时保留回退能力"的一半逻辑。桌面端能读到真实值，两个分支都验证过。
+
 
 
 ### 待办与 0.1.5 规划（2026-10-18 更新）

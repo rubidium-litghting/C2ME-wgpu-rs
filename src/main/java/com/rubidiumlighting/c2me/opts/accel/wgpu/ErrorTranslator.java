@@ -52,6 +52,13 @@ public final class ErrorTranslator {
         if (detail.contains("max_storage_buffer_binding_size")) {
             return "c2me-opts-accel-wgpu.error.gpu_too_weak";
         }
+        // Rust reports both shader-module and compute-pipeline validation
+        // failures as "… for pass X failed validation: <driver text>". They
+        // are the same class of problem for the player: this GPU/driver
+        // rejected the generated shader.
+        if (detail.contains("failed validation")) {
+            return "c2me-opts-accel-wgpu.error.shader_validation";
+        }
         if (detail.contains("panicked")) {
             return "c2me-opts-accel-wgpu.error.driver_panic";
         }

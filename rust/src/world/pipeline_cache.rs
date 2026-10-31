@@ -144,6 +144,20 @@ pub fn get_or_compile(
     // some Vulkan drivers (Mali-G610) abort inside it, so
     // `disable_pipeline_cache` in the config skips it entirely.
     let t_pipe0 = std::time::Instant::now();
+    // `create_compute_pipeline` reports failures the same way
+    // `create_shader_module` does: as a validation error, not as a Result.
+    // Without a scope around it, a pipeline that fails validation is handed
+    // back to the caller anyway, gets dispatched, and leaves the output
+    // buffers uninitialised — the same silent-corruption path the shader scope
+    // above closes for module creation. The usual trigger is corrupt or stale
+    // pipeline-cache data: `fallback: true` makes wgpu ignore bytes it cannot
+    // read, but the *driver* can still reject a pipeline built against a cache
+    // blob from a different driver/version.
+    let pipeline_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    // Deferred so the cache blob is only written when the pipeline was
+    // actually accepted; saving the output of a failed creation would persist
+    // the very data that broke it.
+    let mut pending_cache: Option<wgpu::PipelineCache> = None;
     let no_cache = crate::instance::WgpuInstance::instance()
         .map(|i| i.cold.disable_pipeline_cache)
         .unwrap_or(false);
@@ -180,14 +194,23 @@ pub fn get_or_compile(
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: Some(&pc),
         });
+        pending_cache = Some(pc);
+        p
+    };
 
+    if let Some(err) = pollster::block_on(pipeline_scope.pop()) {
+        return Err(anyhow::anyhow!(
+            "compute pipeline for pass {pass:?} failed validation: {err}"
+        ));
+    }
+
+    if let Some(pc) = pending_cache {
         if let Some(data) = pc.get_data() {
             if let Err(e) = save(fingerprint, &data) {
                 crate::wgpu_debug!("[cache] save failed: {e}");
             }
         }
-        p
-    };
+    }
 
     crate::wgpu_debug!("[compile] create_compute_pipeline done in {:?}",
               t_pipe0.elapsed());

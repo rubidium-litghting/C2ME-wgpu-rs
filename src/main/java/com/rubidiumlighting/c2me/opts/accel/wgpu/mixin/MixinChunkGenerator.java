@@ -27,6 +27,7 @@ package com.rubidiumlighting.c2me.opts.accel.wgpu.mixin;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.ChunkDumper;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.config.Config;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.DimState;
+import com.rubidiumlighting.c2me.opts.accel.wgpu.ErrorTranslator;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.ModuleEntryPoint;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.NoiseRouterBlobifier;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuBatchCoordinator;
@@ -746,8 +747,12 @@ public abstract class MixinChunkGenerator {
             String reason = (t.getMessage() != null)
                     ? t.getMessage()
                     : t.getClass().getSimpleName();
+            // Recognised low-level errors are replaced by a translated,
+            // player-readable explanation; unrecognised ones are passed
+            // through raw so no diagnostic detail is lost.
             WgpuFallbackNotice.report("dim-init",
-                    "c2me-opts-accel-wgpu.notify.dim_fallback", reason);
+                    "c2me-opts-accel-wgpu.notify.dim_fallback",
+                    ErrorTranslator.localize(reason));
             return null;
         }
     }
