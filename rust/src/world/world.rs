@@ -180,11 +180,23 @@ impl WorldContext {
         // §14 Pass E: pre-split finalDensity (ch11) into per-corner subtrees
         // (`inners`) and a per-block `outer` tree, so the GPU can evaluate
         // non-linear wrappers per block instead of per corner.
+        // Both trees that end up in the BlockOut shard must be split: the
+        // per-block `outer` tree (finalDensity) and the `barrier` tree
+        // (channel 0, barrierNoise). They share one `inners` vec so the
+        // indices stay consistent — every `InnerRef(i)` in either tree refers
+        // to the same inner shard slot.
+        //
+        // Splitting only finalDensity was a real bug: a modded worldgen
+        // (Tectonic) that puts an external node inside barrierNoise left it
+        // in the barrier tree, which is injected verbatim into BlockOut. That
+        // shard has no `external_inputs` binding, so the shader failed to
+        // compile with "no definition in scope for identifier:
+        // external_inputs" and the whole dimension fell back to the CPU.
         let (density_inners, density_outer, barrier_noise) = match &ast_root {
             crate::ast::AstNode::Root(channels) if channels.len() > 11 => {
                 let mut inners = Vec::new();
                 let outer = crate::ast::split::split(&channels[11], &mut inners);
-                let barrier = if !channels.is_empty() { Some(channels[0].clone()) } else { None };
+                let barrier = Some(crate::ast::split::split(&channels[0], &mut inners));
                 (inners, Some(outer), barrier)
             }
             _ => (Vec::new(), None, None),

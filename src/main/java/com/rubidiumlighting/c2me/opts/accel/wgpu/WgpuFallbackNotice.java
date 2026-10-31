@@ -47,16 +47,39 @@ public final class WgpuFallbackNotice {
      *  worker threads, and resolving a key depends on the client's current
      *  language, which is a client-thread concern. The mixin builds the
      *  {@code Text} when it drains the queue. */
-    public record Notice(String key, Object[] args) {}
+    public record Notice(String key, Object[] args, net.minecraft.util.Formatting format) {}
 
     private static final Queue<Notice> PENDING = new ConcurrentLinkedQueue<>();
     private static final Set<String> SEEN = ConcurrentHashMap.newKeySet();
 
-    /** Enqueue a notice once per distinct {@code dedupKey}. */
+    /** Enqueue a notice once per distinct {@code dedupKey}, in yellow. */
     public static void report(String dedupKey, String translationKey, Object... args) {
+        report(dedupKey, net.minecraft.util.Formatting.YELLOW, translationKey, args);
+    }
+
+    /** Enqueue a notice once per distinct {@code dedupKey}, in {@code format}.
+     *
+     *  <p>Colour carries meaning here: yellow means "degraded / fell back",
+     *  green means "working as intended". A success notice rendered in yellow
+     *  reads like a warning, so callers reporting success pass
+     *  {@link net.minecraft.util.Formatting#GREEN}. */
+    public static void report(String dedupKey, net.minecraft.util.Formatting format,
+                              String translationKey, Object... args) {
         if (SEEN.add(dedupKey)) {
-            PENDING.add(new Notice(translationKey, args));
+            PENDING.add(new Notice(translationKey, args, format));
         }
+    }
+
+    /**
+     * Forget a de-duplication key so its notice can be emitted again.
+     *
+     * <p>Needed for "GPU acceleration is active": that claim is only true for
+     * the dimension currently being generated, so it must be re-announced
+     * after a save switch rather than silently suppressed by the key left
+     * over from the previous world.
+     */
+    public static void clearDedup(String dedupKey) {
+        SEEN.remove(dedupKey);
     }
 
     /** Return the next pending notice, or {@code null} if none. */

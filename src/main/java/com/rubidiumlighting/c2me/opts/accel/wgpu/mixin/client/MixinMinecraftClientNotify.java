@@ -54,7 +54,7 @@ public class MixinMinecraftClientNotify {
         if (chat == null) return;
         WgpuFallbackNotice.Notice n;
         while ((n = WgpuFallbackNotice.poll()) != null) {
-            chat.addMessage(Text.translatable(n.key(), n.args()).formatted(Formatting.YELLOW));
+            chat.addMessage(Text.translatable(n.key(), n.args()).formatted(n.format()));
         }
 
         // Throughput stats. These are only produced when debug_verbose_logging
@@ -81,6 +81,9 @@ public class MixinMinecraftClientNotify {
         // the hot flags), so running it unconditionally is simpler and more
         // predictable than special-casing the first join.
         try {
+            // The "active" claim belongs to the dimension being generated,
+            // so it must be re-announced for a newly loaded world.
+            com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuFallbackNotice.clearDedup("dim-active");
             com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuDimensionRegistry.onSaveSwitch();
         } catch (Throwable t) {
             org.slf4j.LoggerFactory.getLogger("c2me-wgpu")
@@ -115,10 +118,13 @@ public class MixinMinecraftClientNotify {
                             String.valueOf(ModuleEntryPoint.getDetail())).formatted(Formatting.YELLOW));
                 }
             }
-            case OK -> prefix()
-                    .append(Text.translatable("c2me-opts-accel-wgpu.notify.enabled",
-                            com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuStatus.gpuName())
-                            .formatted(Formatting.GREEN));
+            // "GPU acceleration is active" is NOT announced here. It is
+            // reported by MixinChunkGenerator once a dimension actually
+            // initialises on the GPU, because instance-level status says
+            // nothing about whether the dimension being generated can use it.
+            // Announcing on join produced contradictory pairs like
+            // "this dimension fell back to CPU" + "GPU acceleration enabled".
+            case OK -> null;
             default -> null;
         };
         if (msg != null) chat.addMessage(msg);

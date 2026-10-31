@@ -138,6 +138,51 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     渲染器（画面静止但操作有响应）。修法：设备创建时把 adapter 列表序列化
     存在 `WgpuInstance` 里，GUI 只读这份缓存，永不触发枚举。
 
+35. **Android 上 `/proc/meminfo` 对应用不可读**：`adb shell` 能读，但应用
+    进程内被 SELinux 挡住，`MemAvailable` 恒为 `?`。于是内存感知重建在
+    Android 上永远走"先删旧实例"的安全分支——方向正确，但失去了"内存充裕
+    时保留回退能力"的一半逻辑。桌面端能读到真实值，两个分支都验证过。
+
+36. **wgpu 的编译/校验失败不走返回值，必须用 error scope 显式捕获**：
+    `create_shader_module` 和 `create_compute_pipeline` 遇到 validation error
+    都不返回 `Err`，只把错误丢给 `on_uncaptured_error` 打日志，然后照样把
+    一个无效对象交给调用方。后果是静默的：invalid pipeline 被提交，输出
+    buffer 保持未初始化显存，Java 读到负的 palette 索引 → AIOOBE →
+    CompletableFuture 永不完成 → 整个游戏死锁。正解是在调用前后夹
+    `device.push_error_scope(ErrorFilter::Validation)` + `pollster::block_on(scope.pop())`，
+    有错就提前 return Err；这个 Err 会一路传到维度初始化的 catch，让该维度
+    整体回退 CPU，而不是挂死。注意 pipeline cache 只有在 pipeline **确认被
+    接受**之后才能落盘，否则会把导致失败的数据持久化。
+
+37. **`ExternalInput` 是角点量，必须像 `InterpolatedNoiseSampler` 一样被 split 提取**：
+    Java 侧在 `gx*gy*gz` 角点网格上预先求值 external 子树，WGSL 按 cell 索引
+    读回，语义与插值噪声一致。若留在 outer（per-block）树里，BlockOut shard
+    会引用它没有绑定的 `external_inputs`，shader 校验失败——而这正是上一条
+    的静默路径。该 bug 只在含 modded 密度节点的世界（如暮色森林）暴露。
+    **注意 barrierNoise（ch0）也要走 split**：它同样被注入 BlockOut，漏掉它
+    会让 Tectonic 这类把 modded 节点塞进 barrier 的世界直接编译失败。
+
+38. **症状变了先看 `git status` / `git diff`，别只信交接文档**：本次排查中
+    "死锁"被修好后变成"不卡死但全虚空"，一度被误判为 Rust 侧 pipeline /
+    cache / external 索引问题，绕了很久。真因是同一工作区里混着一处
+    未提交的误删：`writeBlocksFromGpu` 的写方块三层循环体被清空，GPU 算出
+    的方块全被丢弃，chunk 保持全空气。教训：**改了 A 之后症状发生变化，
+    第一件事是核对工作区实际改动，而不是顺着文档假设往下推**。
+
+39. **Sinytra Connector 会让世界生成模组的节点类型识别失效**：在 NeoForge
+    + Connector 下，Fabric 的 Tectonic 会把大量原版节点包装成其内部的
+    `ConfigNoise` 类，导致 `NoiseRouterBlobifier` 的 `instanceof` 全部落空，
+    数百个节点被当作 external 外置到 CPU。这不仅让上传 buffer 超过 128 MB
+    的 `max_storage_buffer_binding_size` 限制，还会让 CPU 串行采样把 CPS
+    拖到个位数。已在维度初始化处加 64 个 external 节点的硬上限，超限直接
+    回退 CPU。这是 Connector 的兼容性限制（非原生环境），不做逆向适配。
+
+40. **CPS 随种子（地形复杂度）剧烈波动**：旧的 Chunky 端到端数据（18s vs
+    23s、CPS 188）只在特定种子下成立。不同种子的噪声 octave 数量、spline
+    分支命中率、aquifer 命中率差异巨大，GPU 工作量完全不同。跨版本/跨环境
+    对比必须用同一种子、同视距，否则结论不可靠。视距也是强变量，A/B 测试
+    要一起控制。
+
 
 
 

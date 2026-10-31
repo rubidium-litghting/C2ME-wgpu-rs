@@ -738,8 +738,34 @@ public abstract class MixinChunkGenerator {
                 LOGGER.info("[c2me-wgpu] {} external (CPU-evaluated) density subtree(s)",
                         extNodes.size());
             }
+            // Every external subtree is sampled on the CPU over a corner
+            // lattice, once per chunk per node, and the results are shipped to
+            // the GPU as one storage buffer. A modded worldgen can externalise
+            // hundreds of nodes (Tectonic: ~700 with ConfigNoise), which makes
+            // two things go wrong at once:
+            //   * the upload exceeds max_storage_buffer_binding_size, so the
+            //     bind group is rejected and every submit fails validation;
+            //   * the CPU sampling alone takes tens of seconds per batch, so
+            //     the GPU path is far slower than plain CPU generation.
+            // Refuse up front instead of generating at 2 chunks/s.
+            final int MAX_EXTERNAL_NODES = 64;
+            if (extNodes.size() > MAX_EXTERNAL_NODES) {
+                throw new IllegalStateException(
+                        "too many external density subtrees (" + extNodes.size()
+                                + " > " + MAX_EXTERNAL_NODES
+                                + ") for GPU acceleration");
+            }
             WgpuBatchCoordinator coord = new WgpuBatchCoordinator(world, extNodes,
                     gx, gy, gz, hc, vc, minY);
+            // Announce GPU acceleration here, not on world join: "the GPU is
+            // active" is only true for a dimension that actually initialised.
+            // Reporting it on join raced with the per-dimension fallback notice,
+            // so a failed dimension showed both "fell back to CPU" and
+            // "GPU acceleration enabled".
+            WgpuFallbackNotice.report("dim-active",
+                    net.minecraft.util.Formatting.GREEN,
+                    "c2me-opts-accel-wgpu.notify.enabled",
+                    com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuStatus.gpuName());
             return new DimState(seed, world, coord, gx, gy, gz, hc, vc, minY, height, router,
                     settings.defaultBlock());
         } catch (Throwable t) {
