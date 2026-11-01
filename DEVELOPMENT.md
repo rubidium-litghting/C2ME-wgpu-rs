@@ -391,6 +391,16 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   在桌面验证过，移动端未测。
 - [ ] external 节点数 65–200 的中间地带：当前阈值 64 是实测两端（4 正常 /
   732 回退）之间拍的，中间区间的行为未验证。
+- [ ] **Connector 下 shader 膨胀的来源未查清**。实测数据：
+  - Fabric 原生 Tectonic：shard B 3100 行，shard Inner 2996 行。
+  - NeoForge + Connector：shard B **22546 行**，shard Inner **22441 行**，各多出
+    约 1.94 万行。
+  按 `ast/split.rs` 的逻辑，一个 `ExternalInput` 只会被推成 `inners` 里的一个
+  叶子，在 Inner shard 里占**一行**写入。732 个 external 最多加 732 行，与实测
+  的 1.94 万行差了 26 倍。**因此膨胀与 external 节点本身无关**，怀疑是 Connector
+  环境下树遍历或去重（`CacheFlat` / CSE）失效，导致子树被重复内联展开。
+  查法：在两边分别 dump `inners` 列表与 `split` 后的 outer 树，逐项对比找出重复
+  出现的子树。这条不阻塞 0.1.6（64 上限已经兜住正确性），属于 0.1.7+ 的探索项。
 
 ### wgpu 库自身的环境变量（仅排查用）
 
