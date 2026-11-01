@@ -194,6 +194,11 @@ public final class WgpuBatchCoordinator {
      *  which must not count time a batch spent in a previous window. */
     private final AtomicLong statInflightNanos = new AtomicLong();
     private volatile long statsWindowStart = System.nanoTime();
+    /** Size in bytes of the last external payload uploaded to binding 6. This
+     *  is the only dynamically sized binding, and the one that grows with
+     *  external-node count, so it is the one worth watching against
+     *  max_storage_buffer_binding_size. Reported in the 2-second stats line. */
+    private volatile long lastExternalBytes;
 
     public WgpuBatchCoordinator(long worldHandle,
                                 List<DensityFunction> externalNodes,
@@ -367,6 +372,7 @@ public final class WgpuBatchCoordinator {
         }
         int cellsPerChunk = gx * gy * gz;
         float[] data = new float[batch.size() * numExt * cellsPerChunk];
+        lastExternalBytes = (long) data.length * 4L; // f32
         int idx = 0;
         for (Job job : batch) {
             int sx = job.cx * 16;
@@ -587,10 +593,15 @@ public final class WgpuBatchCoordinator {
         // completeLoop is draining, and the one submit() has handed to Rust but
         // not yet put() into the queue. Hence STAGING + 2, not + 1.
         final int maxInflight = STAGING + 2;
+        // Binding 6 is the only one that grows with external-node count. The
+        // rest (output/block/staging/input sets) are fixed at executor init and
+        // logged once there. Showing it here makes a creeping external payload
+        // visible before it hits max_storage_buffer_binding_size.
+        double extMiB = lastExternalBytes / (1024.0 * 1024.0);
         String line = String.format(
                 "CPS=%.1f  batches=%d  chunks=%d  batchMs=%.2f  chunkMs=%.2f  "
-                + "inflight=%.2f/%d  (window=%.2fs)",
-                cps, b, c, avgBatchMs, avgChunkMs, inflight, maxInflight, sec);
+                + "inflight=%.2f/%d  ext=%.2fMiB  (window=%.2fs)",
+                cps, b, c, avgBatchMs, avgChunkMs, inflight, maxInflight, extMiB, sec);
         LOGGER.info(line);
         // Mirror to the chat HUD when the client can show it; the queue keeps
         // only the newest line, so headless/paused sessions do not build up.

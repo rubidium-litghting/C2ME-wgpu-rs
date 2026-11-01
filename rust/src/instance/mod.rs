@@ -252,6 +252,16 @@ impl WgpuInstance {
 
         features::check_required(&adapter, cold.disable_pipeline_cache)?;
         let adapter_info = adapter.get_info();
+        {
+            let l = adapter.limits();
+            crate::debug_log_line(&format!(
+                "[c2me-wgpu-rs] adapter limits: max_storage_buffer_binding_size={} MiB, max_buffer_size={} MiB, max_compute_workgroups={}, max_storage_buffers_per_stage={}",
+                l.max_storage_buffer_binding_size / (1024 * 1024),
+                l.max_buffer_size / (1024 * 1024),
+                l.max_compute_workgroups_per_dimension,
+                l.max_storage_buffers_per_shader_stage,
+            ));
+        }
         let workarounds = Workarounds::detect(&adapter_info);
         if workarounds.any() {
             crate::wgpu_debug!("[c2me-wgpu-rs] enabled workarounds for {} ({}): {:?}", adapter_info.name, adapter_info.driver, workarounds);

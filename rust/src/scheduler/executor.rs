@@ -9,6 +9,7 @@
 //!   4. 支持 ExecutorThread 独占线程串行化 GPU 提交。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::thread::{self, JoinHandle};
 
@@ -263,6 +264,23 @@ impl SingleBatchExecutor {
         let pipeline_layout = bind_group::create_pipeline_layout(&device, &bind_group_layout)
             .map_err(|e| format!("pipeline layout: {e}"))?;
 
+        // Print the static footprint so field logs show whether a driver limit
+        // is being approached. `external` is allocated per-world, so it is not
+        // included here.
+        let mib = |b: usize| b / (1024 * 1024);
+        crate::debug_log_line(&format!(
+            "[c2me-wgpu-rs] executor buffers: output={} MiB, block={} MiB, staging={} MiB x{}, \
+             input_sets={} x (aquifer={} KiB, beard={} KiB), max_batch={}",
+            mib(max_buffer_size as usize),
+            mib(block_max as usize),
+            mib(staging_size as usize),
+            config.staging_capacity,
+            depth,
+            aq_stride * 16 * 2 / 1024,
+            beard_size as usize / 1024,
+            config.max_batch_size,
+        ));
+
         Ok(Self {
             device,
             queue,
@@ -401,6 +419,35 @@ impl SingleBatchExecutor {
             .staging
             .acquire_slot()
             .ok_or_else(|| "no staging slot available".to_string())?;
+
+        // Print the actual size of each binding once per process. The static
+        // executor footprint is logged at init, but `external` (binding 6) and
+        // the per-world perm/origin/simplex tables are only known here, and
+        // binding 6 is the one that can grow past a driver's
+        // max_storage_buffer_binding_size on modded worlds.
+        {
+            static BINDINGS_LOGGED: AtomicBool = AtomicBool::new(false);
+            if !BINDINGS_LOGGED.swap(true, Ordering::Relaxed) {
+                let kb = |b: u64| b as f64 / 1024.0;
+                let set = &self.pool.sets[buf_set];
+                crate::debug_log_line(&format!(
+                    "[c2me-wgpu-rs] bindings (sizes in KiB): \
+                     b0_params={:.1} b1_perm={:.1} b2_out={:.1} b3_origin={:.1} \
+                     b4_pos={:.1} b5_simplex={:.1} b6_external={:.1} b7_block={:.1} \
+                     b8_aquifer={:.1} b9_beard={:.1}",
+                    kb(set.params.size()),
+                    kb(perm_buf.size()),
+                    kb(self.output_buf.size()),
+                    kb(origin_buf.size()),
+                    kb(set.positions.size()),
+                    kb(simplex_buf.size()),
+                    kb(ext_buf.size()),
+                    kb(self.block_buf.size()),
+                    kb(set.aquifer.size()),
+                    kb(set.beard.size()),
+                ));
+            }
+        }
 
         // Create bind group
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
