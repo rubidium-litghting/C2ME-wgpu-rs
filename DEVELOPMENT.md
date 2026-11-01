@@ -215,6 +215,34 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
       但队列上限这类修复参数目前不打日志，导致无法从 `latest.log` 反推。重要修复
       应在初始化时打一行"bounded queue, capacity=N"。
 
+43. **能力门槛要贴着规范下限，别拍脑袋抬高**：`max_storage_buffer_binding_size`
+    曾硬编码要求 256 MiB。这个数字原本是为了容纳 Tectonic 在 Sinytra Connector
+    下暴露的 732 个 external 节点，但那个场景后来已被 64 节点上限整维度回退
+    CPU 兜住，256 MiB 的余量早已没有用途。代价是 Adreno 750（骁龙 8 Gen 3）
+    这类**正好只报 128 MiB**（WebGPU 规范默认下限）的现代移动 GPU 在启动时就被
+    拒绝，玩家只看到"显卡性能不足"，无从判断是门槛而非能力问题。
+    0.1.6 起降到 128 MiB。实测数据：桌面 RADV 报 2047 MiB，其中最大的两个
+    binding 是 `b2_out`≈113 MiB、`b7_block`=32 MiB，离 128 仍有距离；Fabric
+    原生 Tectonic 下 `b6_external`=0，binding 占用与原版几乎相同。
+    **定门槛的方法**：先算出实际最大 binding 需求（按 max_batch × 每 chunk
+    角点 × 4 字节），再取"不低于规范默认下限、不高于实际需求太多"的值；
+    抬高门槛只会无谓地排除硬件。
+
+44. **Connector 的兼容边界比预想的更硬**：曾尝试两种让 Tectonic 在
+    NeoForge+Connector 下命中 GPU 的路线，都失败：
+    - 在外部化之前主动调一次 `df.apply(no-op visitor)`，期望 mod 节点的
+      `mapAll` 把自己降级成原版节点（Tectonic 的 `ConfigNoise` 在
+      `smootherScaling=false` 时确实会这么做）。实测无效，`ConfigNoise` 原样
+      返回，仍 external 化，仍 732 个。
+    - 直接放进 Fabric 版 Tectonic + Fabric 版 Lithostitched 交给 Connector
+      桥接。结果 Connector 加载其 Mixin 时直接
+      `Failed to execute task .../BiomeMixin.class`，整个游戏崩溃。
+    对照实验还确认了一件事：**Connector 不会包装原版密度节点**——纯原版地形
+    在 NeoForge+Connector 下 `b6_external`=0、GPU 正常加速。所以问题只出在
+    mod 节点，而 Connector 无法完整桥接 Tectonic 这类深度侵入的 mod。
+    结论：维持 64 节点回退 CPU 的设计，不做逆向适配；这条已写进 README 的
+    "已知限制"。
+
 
 
 
