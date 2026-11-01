@@ -726,3 +726,21 @@ lost` 和 wgpu 内部断言失败——那两类表现为 panic，最终仍会�
 
 ---
 
+### §24 极限 A/B 测试：WGPU vs 官方 OpenCL (1.21.1 同台竞技)
+
+**测试环境**：1.21.1 Fabric，AMD Cezanne 核显 (`gfx90c`)，都开启 ScalableLux，Chunky r=500 (4225 区块)，进图预热 5 秒后启动。
+
+| 指标 | WGPU (Vulkan) | 官方 OpenCL |
+|---|---|---|
+| **总耗时** | **15 s** | **13 s** |
+| **Chunky 峰值 Rate** | 317.6 cps | 339.1 cps |
+| **模组内部 CPS 峰值** | 301.1 | 未打印 |
+| **环境配置成本** | 零 | 极高（需手动隔离 `rusticl` 防黑屏） |
+
+**核心结论**：
+1. **OpenCL 的 2 秒优势**：底层通过 C 语言原生指针直写共享内存，免去了 WGPU 跨越 FFM（Java ↔ Rust）边界和 ResultBlob 回读的通信税。
+2. **WGPU 的架构优势**：做到了真正的开箱即用。OpenCL 在 Arch Linux 上因 ROCm 7 与 Mesa 冲突，会直接把 GPU 干挂（TDR 重置），普通玩家难以自行解决。
+3. **光照优化的决定性作用**：此前未装 ScalableLux 时，原版单线程光照成为瓶颈，WGPU 的 CPS 中位被压在 206；装上后峰值直接飙到 301，说明 GPU 算力完全充足，只是被主线程卡住了下发。
+
+---
+
