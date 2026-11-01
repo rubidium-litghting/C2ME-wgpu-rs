@@ -402,6 +402,49 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   查法：在两边分别 dump `inners` 列表与 `split` 后的 outer 树，逐项对比找出重复
   出现的子树。这条不阻塞 0.1.6（64 上限已经兜住正确性），属于 0.1.7+ 的探索项。
 
+### 借鉴官方 OpenCL 模块的优化点（0.1.7+ 任务池）
+
+官方 CL 模块（见本地 `~/Documents/C2ME/C2ME-fabric/c2me-opts-accel-opencl`）
+在架构上比我们走得更远（4x4 空间批处理、全链路 GPU 化）。结合 ARR 协议与
+跨平台底线，提炼出以下可借鉴的方向，按**实施难度**排序：
+
+#### 🟢 低难度：内部微调（改动小，收益直接）
+- [ ] **调色板写入加速（Unsafe 写入）**
+  * 官方用 `c2me$setUnsafe` 绕过原版 `chunk.setBlockState()` 的锁和事件开销。
+  * 检查 WGPU 的 `writeBlocksFromGpu`，尝试利用 C2ME 自带的 AW 或扩展接口，
+    采用安全且高效的底层直写，减少 Java 侧写回区块的 CPU 开销。
+- [ ] **攒批空间排序（伪 4x4 聚类）**
+  * 官方强行在状态机层面对齐 4x4 区块。咱们绝对不能改 C2ME 状态机。
+  * 折中方案：在 `WgpuBatchCoordinator` 的 Java 队列中，对即将下发的 `Job`
+    按坐标做空间排序（或简单聚类），让一次 Batch 内的区块尽量挨在一起，
+    从而利用 GPU 的 L2 缓存局部性，减少显存随机读取开销。
+
+#### 🟡 中难度：逻辑重构（需要严格实机验证）
+- [ ] **显存池按“用途”分类隔离**
+  * 官方 `CLBufferCache` 严格按用途（如 Biome、BlockState 等）分桶，不混用。
+  * 咱们 Rust 侧的 `BufferPool` 目前按 `(usage, size)` 做 LRU。可以借鉴其
+    “严格分类”的思路，确保高频输入（external/aquifer）与输出（block_out）
+    绝不会因为尺寸碰巧一致而被错误复用，进一步杜绝数据串流 bug。
+- [ ] **表面高度估算预计算（Estimate Surface Height）**
+  * 官方在结构生成前，通过 GPU 顺手算一个粗略的地表高度缓存。
+  * 咱们目前切在 `populateNoise`。如果新增一个极低精度的 WGSL 轻量管线，
+    在结构生成阶段提前提供粗略高度，能避免主线程频繁唤醒 CPU 计算。
+
+#### 🔴 高难度：核心功能突破（长远目标）
+- [ ] **把生物群系（Biome）拉上 GPU**
+  * 官方端到端快 2 秒的关键，在于把 `populateBiomes` 和地形 `populateNoise`
+    打包成一条完整的流水线。
+  * 如果实施，需要 Java 侧拦截 Biome 计算，并将参数树传给 Rust，在 WGSL
+    中实现 Biome 多噪声计算，最后写回调色板。工作量极大。
+- [ ] **多 Kernel 流水线（暂缓/仅评估）**
+  * 官方用 Event 串联 5 个独立 Kernel。咱们目前是一个 Compute Pass 跑多个 Shard。
+  * **不建议盲目拆分**：Vulkan 的提交和同步开销可能吃掉拆分收益。除非实机
+    发现某个 Shard 明显拖后腿，否则维持现状。
+
+> **🚫 兼容性红线**：
+> - 绝不引入官方对 C2ME `ChunkSystem` 状态机的强依赖（咱们是伴生模块）。
+> - 绝不放弃 Rust + FFM + Vulkan 架构去碰 JNI / OpenCL。
+
 ### wgpu 库自身的环境变量（仅排查用）
 
 **本模组的全部开关都在 `config/c2me-wgpu.json`，不读任何 `C2ME_*` 环境变量**
