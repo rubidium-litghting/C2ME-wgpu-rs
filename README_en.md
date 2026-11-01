@@ -60,6 +60,9 @@ Java 25 or newer is required: the mod is compiled for Java 25 and talks to its R
 It works out of the box; the default config needs no changes. If a compatible GPU **and** C2ME's scheduling API are found, terrain generation is offloaded to the GPU automatically; otherwise the mod stays silent and plain C2ME generates terrain on the CPU exactly as before.
 To tune it, edit `config/c2me-wgpu.json` — see below.
 
+> 💡 **Performance tip: pair it with a lighting optimization mod**
+> During extreme fast travel (e.g., spectator mode) or large-scale chunk pregeneration, vanilla Minecraft's single-threaded lighting engine can easily become the new bottleneck. This causes main-thread stutters, making it seem like chunk generation can't keep up. We strongly recommend **ScalableLux** (or a similar lighting optimization mod) to fully unleash the GPU terrain generation throughput.
+
 ---
 
 ## Platform support
