@@ -33,7 +33,7 @@
   "c2me-opts-accel-wgpu.notify.rebuild_failed": "无法使用 %s 后端，已改为自动选择（%s）",
   "c2me-opts-accel-wgpu.notify.backend_restart": "图形后端的更改将在重启游戏后生效",
   "c2me-opts-accel-wgpu.error.pipeline_cache": "显卡驱动不支持管线缓存。请尝试在配置文件中开启 \"disable_pipeline_cache\": true。",
-  "c2me-opts-accel-wgpu.error.gpu_too_weak": "显卡性能不足（不支持 256MB 大缓冲区），已回退 CPU。",
+  "c2me-opts-accel-wgpu.error.gpu_too_weak": "显卡性能不足（不支持 128MB 大缓冲区），已回退 CPU。",
   "c2me-opts-accel-wgpu.error.shader_validation": "显卡驱动拒绝了为该地形生成的着色器，此维度已改用 CPU 生成。更新显卡驱动可能有所改善。",
   "c2me-opts-accel-wgpu.error.driver_panic": "显卡驱动在初始化时崩溃。请尝试在配置中切换图形后端。",
   "c2me-opts-accel-wgpu.error.no_adapter": "未找到可用的显卡适配器。请检查显卡驱动是否正常，或尝试在配置中切换图形后端。",

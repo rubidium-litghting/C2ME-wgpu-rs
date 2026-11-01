@@ -3,7 +3,7 @@
 //! Capability check — MUST PASS or we refuse to use the adapter.
 //!
 //! 4 mandatory checks:
-//!   1. max_storage_buffer_binding_size ≥ 256 MiB
+//!   1. max_storage_buffer_binding_size ≥ 128 MiB
 //!   2. max_compute_workgroups_per_dimension ≥ 65535
 //!   3. max_buffer_address_space_bits ≥ 31  (i.e. ≥ 2 GiB addressable)
 //!   4. Features::PIPELINE_CACHE is present
@@ -18,8 +18,13 @@ pub fn check_required(adapter: &wgpu::Adapter, disable_pipeline_cache: bool) -> 
     if adapter.limits().max_compute_workgroups_per_dimension < 65535 {
         return Err(anyhow::anyhow!("max_compute_workgroups_per_dimension < 65535"));
     }
-    if adapter.limits().max_storage_buffer_binding_size < 256 * 1024 * 1024 {
-        return Err(anyhow::anyhow!("max_storage_buffer_binding_size < 256 * 1024 * 1024"));
+    // 128 MiB is the WebGPU default minimum. We used to require 256 MiB to
+    // accommodate worlds with hundreds of external nodes (e.g. Tectonic under
+    // Sinytra Connector), but those are now capped at 64 per dimension, so
+    // 128 MiB is plenty. Lowering this lets modern mobile GPUs (e.g. Adreno 750,
+    // which reports exactly 128 MiB) use the GPU path instead of falling back.
+    if adapter.limits().max_storage_buffer_binding_size < 128 * 1024 * 1024 {
+        return Err(anyhow::anyhow!("max_storage_buffer_binding_size < 128 * 1024 * 1024"));
     }
     // PIPELINE_CACHE is only required when we actually use it. With
     // `disable_pipeline_cache` in the config we skip it, so adapters that lack the

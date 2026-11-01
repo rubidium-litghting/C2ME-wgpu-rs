@@ -33,7 +33,7 @@
   "c2me-opts-accel-wgpu.notify.rebuild_failed": "The %s backend is unavailable; falling back to automatic selection (%s)",
   "c2me-opts-accel-wgpu.notify.backend_restart": "The graphics backend change takes effect after restarting the game",
   "c2me-opts-accel-wgpu.error.pipeline_cache": "Your GPU driver does not support pipeline caching. Try setting \"disable_pipeline_cache\": true in the config.",
-  "c2me-opts-accel-wgpu.error.gpu_too_weak": "Your GPU is too weak (does not support 256MB storage buffers). Falling back to CPU.",
+  "c2me-opts-accel-wgpu.error.gpu_too_weak": "Your GPU is too weak (does not support 128MB storage buffers). Falling back to CPU.",
   "c2me-opts-accel-wgpu.error.shader_validation": "Your GPU driver rejected the generated shader for this terrain. This dimension uses CPU generation instead. Updating your graphics driver may help.",
   "c2me-opts-accel-wgpu.error.driver_panic": "The GPU driver crashed during initialization. Try switching the backend in the config.",
   "c2me-opts-accel-wgpu.error.no_adapter": "No usable GPU adapter found. Check your graphics driver, or try a different backend in the config.",
