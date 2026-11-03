@@ -409,10 +409,22 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 跨平台底线，提炼出以下可借鉴的方向，按**实施难度**排序：
 
 #### 🟢 低难度：内部微调（改动小，收益直接）
-- [ ] **调色板写入加速（Unsafe 写入）**
-  * 官方用 `c2me$setUnsafe` 绕过原版 `chunk.setBlockState()` 的锁和事件开销。
-  * 检查 WGPU 的 `writeBlocksFromGpu`，尝试利用 C2ME 自带的 AW 或扩展接口，
-    采用安全且高效的底层直写，减少 Java 侧写回区块的 CPU 开销。
+- ~~**调色板写入加速（Unsafe 写入）**~~ **(已证伪，勿重试)**
+  * 参考官方 `c2me$setUnsafe`，曾实现过一版：新增 `MixinPalettedContainer`
+    暴露 `c2me$setUnsafe`，`writeBlocksFromGpu` 改走底层 `PalettedContainer.set(index, value)`，
+    每 section 写完再调一次原版 `ChunkSection.calculateCounts()` 重建计数。
+  * **实测结果（Chunky r=500，同种子，预热 5s）**：基线 15 s / Rate 298.4，
+    改动后 16 s / Rate 299.3。Rate 差异 0.3% 属噪声，**没有收益**；CPS 峰值
+    (325 vs 283.7) 是 2 秒窗口的瞬时波动，不作判据。
+  * **根因**：`setBlockState` 的记账开销本来就不是瓶颈——实测 `writeback`
+    仅 1.4 ms/chunk，分摊到 9 个 worker 线程后墙钟影响可忽略。而新写法把
+    **空气方块也计入了成本**：原版 `setBlockState` 对 `v == 0` 的方块直接
+    `continue` 跳过、零记账；`calculateCounts()` 却要遍历该 section 全部
+    4096 格（其中 40–60% 是空气）重算三个 short 计数。省下的增量更新，
+    被"给空气补记账"吃掉，总记账量反而接近翻倍。
+  * **教训**：优化前先测量瓶颈在哪。`calculateCounts()` 是给"整体替换
+    section"场景设计的，不适合逐方块写入；官方 CL 能用是因为它的瓶颈在
+    GPU 往返与 4x4 批处理，写回不在关键路径上。
 - [ ] **攒批空间排序（伪 4x4 聚类）**
   * 官方强行在状态机层面对齐 4x4 区块。咱们绝对不能改 C2ME 状态机。
   * 折中方案：在 `WgpuBatchCoordinator` 的 Java 队列中，对即将下发的 `Job`
@@ -754,6 +766,13 @@ lost` 和 wgpu 内部断言失败——那两类表现为 panic，最终仍会�
 
 **教训**：`batchMs` 在两种模式下口径不同，不可直接对比——串行时它只计 map 段，
 流水线化后包含完整在途时间。只有端到端和 CPU 占用是可比的。
+
+**教训（写回路径）**：写回（`writeback`）实测仅约 1.4 ms/chunk，且由 9 个
+C2ME worker 线程并行承担，不是端到端瓶颈。曾尝试用底层调色板直写 +
+`calculateCounts()` 重建计数来加速它，实测零收益（Rate 298.4 → 299.3，属噪声），
+因为原版 `setBlockState` 对空气方块是零成本跳过，而 `calculateCounts()`
+要对整个 section 的 4096 格（含大量空气）重扫一遍。**优化非瓶颈路径不会
+有收益；判断瓶颈要看实测拆分，不要看"哪里代码看着低效"。**
 
 **瓶颈仍是 GPU**：`readback` 占每批 90%，是 compute + 拷贝的真实时间，批次再多
 也无法重叠。想再提 CPS 只能减少 GPU 工作量（降分辨率、减 shard），代价是地形质量
