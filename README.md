@@ -274,6 +274,15 @@ cd rust && cargo test --lib -- --ignored real_router_vs_vanilla
 
 ---
 
+## 致谢
+
+特别感谢 **C2ME 作者团队**（[ishland](https://github.com/ishland) 及所有贡献者）：
+
+- C2ME 本体提供的多线程区块生成和调度器（`SchedulingManager`），是本模组能够满载运行、将 GPU 算力发挥到极致的绝对基石。
+- 官方 C2ME OpenCL 加速模块（`c2me-opts-accel-opencl`）在架构设计、批处理策略和驱动兼容性处理上，为 `c2me-wgpu-rs` 的早期骨架搭建提供了极大的启发（详见 `DEVELOPMENT.md` 中的相关分析与借鉴）。
+
+---
+
 ## 许可证
 
 MIT — 参见 [LICENSE](LICENSE)。
