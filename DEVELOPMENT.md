@@ -431,11 +431,13 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     在结构生成阶段提前提供粗略高度，能避免主线程频繁唤醒 CPU 计算。
 
 #### 🔴 高难度：核心功能突破（长远目标）
-- [ ] **把生物群系（Biome）拉上 GPU**
-  * 官方端到端快 2 秒的关键，在于把 `populateBiomes` 和地形 `populateNoise`
-    打包成一条完整的流水线。
-  * 如果实施，需要 Java 侧拦截 Biome 计算，并将参数树传给 Rust，在 WGSL
-    中实现 Biome 多噪声计算，最后写回调色板。工作量极大。
+- ~~**把生物群系（Biome）拉上 GPU**~~ **(已证伪，切勿重试)**
+  * 官方端到端快 2 秒的关键之一是把 Biome 也纳入 GPU 流水线，但这依赖于官方
+    直接深度绑定了 C2ME 状态机。
+  * 本模组在 2026-10（§5.17）尝试过（代码保存在 `experiment/biome-gpu` 分支），
+    结论是**净负优化**：biome 在 NOISE 之前生成，GPU 每次的 14ms 往返延迟
+    直接卡在区块生成的关键路径上，不仅自己慢，还抢占地形的 GPU 队列。
+  * **结论**：vanilla 的 biome 采样纯 CPU 跑极快，不需要 GPU 加速。
 - [ ] **多 Kernel 流水线（暂缓/仅评估）**
   * 官方用 Event 串联 5 个独立 Kernel。咱们目前是一个 Compute Pass 跑多个 Shard。
   * **不建议盲目拆分**：Vulkan 的提交和同步开销可能吃掉拆分收益。除非实机

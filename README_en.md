@@ -272,7 +272,7 @@ Scope note: the review was done at the feature/architecture level, not as a char
 
 ## Acknowledgements
 
-We would like to express our sincere gratitude to the **C2ME author team** ([ishland](https://github.com/ishland) and all contributors):
+We would like to express our sincere gratitude to the **C2ME author team** ([RelativityMC](https://github.com/RelativityMC) and all contributors):
 
 - C2ME's multithreaded chunk generation and scheduler (`SchedulingManager`) are the absolute foundation that allows this mod to run saturated and maximize GPU compute.
 - The official C2ME OpenCL acceleration module (`c2me-opts-accel-opencl`) provided immense inspiration for building the early skeleton of `c2me-wgpu-rs`, particularly its architectural design, batching strategies, and driver compatibility workarounds (see the relevant analysis and borrowed ideas in `DEVELOPMENT.md`).
