@@ -60,7 +60,11 @@ public final class WgpuBatchCoordinator {
 
     /** Max chunks coalesced into one GPU dispatch. */
     private static final int MAX_BATCH = 64;
-    /** Max time (ms) to wait for more requests before flushing a short batch. */
+    /** Max time (ms) to wait for more requests before flushing a short batch.
+     *
+     *  Kept at 5ms: a 15ms experiment produced no larger batches (C2ME is the
+     *  bottleneck, not the gather window) and only added latency — the stable
+     *  Chunky rate dropped from ~298 to ~250 cps. See DEVELOPMENT.md. */
     private static final long MAX_WAIT_MS = 5L;
     /** Poll backoff. The first few polls are cheap (the batch may already be
      *  done), then the interval doubles up to POLL_MAX_NS. A 30ms batch needs
