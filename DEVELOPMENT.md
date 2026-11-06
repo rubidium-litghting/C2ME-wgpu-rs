@@ -448,10 +448,18 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   * 咱们 Rust 侧的 `BufferPool` 目前按 `(usage, size)` 做 LRU。可以借鉴其
     “严格分类”的思路，确保高频输入（external/aquifer）与输出（block_out）
     绝不会因为尺寸碰巧一致而被错误复用，进一步杜绝数据串流 bug。
-- [ ] **表面高度估算预计算（Estimate Surface Height）**
-  * 官方在结构生成前，通过 GPU 顺手算一个粗略的地表高度缓存。
-  * 咱们目前切在 `populateNoise`。如果新增一个极低精度的 WGSL 轻量管线，
-    在结构生成阶段提前提供粗略高度，能避免主线程频繁唤醒 CPU 计算。
+- ~~**表面高度估算预计算（Estimate Surface Height）**~~ **(不适用，已结案)**
+  * 官方在结构生成前通过 GPU 算一份粗略地表高度缓存，省掉结构选址时的反复
+    采样。查证后确认两点：
+    1. 它在官方实现里挂在 `ChunkGenerating.generateStructures`，属于 C2ME 的
+       状态机层——我们的兼容性红线，不能碰。
+    2. 我们的 §20 架构是 GPU 直接输出方块状态，与官方"GPU 只出密度、Java 做
+       后续"的流程不同，强行嫁接会破坏现有路径。
+  * 顺带查清了 `FindTopSurface`：它是 1.18 之前的旧节点，**1.21.1 的
+    NoiseRouter 里根本不存在**，Java 侧只定义 `TAG_FIND_TOP_SURF` 却从不写入，
+    真实 router 测试数据里也搜不到。它的 WGSL emitter 曾返回一个未定义的占位
+    字符串（会生成非法 shader），现已改为显式返回 `Err`，让该维度干净回退
+    CPU。反序列化路径保留，仅为了兼容旧 blob 与单元测试。
 
 #### 🔴 高难度：核心功能突破（长远目标）
 - ~~**把生物群系（Biome）拉上 GPU**~~ **(已证伪，切勿重试)**
