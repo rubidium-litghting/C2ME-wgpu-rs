@@ -43,6 +43,28 @@ impl ResultBlob {
     ///   0x08: offsets[16] (128B) — byte offset of each channel from payload start
     ///   0x88: payload — all f32 density data (MC-native stride)
     ///   end-4: CRC32 (4B) — over everything before this
+    /// Build a blob around an already-encoded payload, without re-serialising
+    /// or re-copying it beyond this single copy into the final buffer.
+    ///
+    /// `payload` is the MC-native f32 layout the Java side expects (the same
+    /// bytes `from_f32_data` would have written). This exists for the
+    /// production path: the staging buffer already holds exactly these bytes,
+    /// so decoding them into `Vec<f32>` per chunk and re-encoding was four
+    /// redundant copies of ~24 MiB per batch.
+    pub fn from_raw_payload(payload: &[u8], channel_offsets: [u64; 16], chunk_count: u16) -> Self {
+        let mut v = Vec::<u8>::with_capacity(136 + payload.len() + 4);
+        v.extend_from_slice(&MAGIC.to_le_bytes());
+        v.extend_from_slice(&VERSION.to_le_bytes());
+        v.extend_from_slice(&chunk_count.to_le_bytes());
+        for offset in &channel_offsets {
+            v.extend_from_slice(&offset.to_le_bytes());
+        }
+        v.extend_from_slice(payload);
+        let crc = crate::result::crc32::crc32(&v);
+        v.extend_from_slice(&crc.to_le_bytes());
+        Self { data: v }
+    }
+
     pub fn from_f32_data(f32_data: &[f32], channel_offsets: [u64; 16], chunk_count: u16) -> Self {
         let mut v = Vec::<u8>::new();
 

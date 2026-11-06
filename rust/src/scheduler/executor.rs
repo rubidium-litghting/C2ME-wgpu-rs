@@ -71,11 +71,26 @@ impl Default for ExecutorConfig {
 /// 一次已执行的批次，包含结果和元数据。
 pub struct ExecutedBatch {
     pub batch: Batch,
-    pub results: FxHashMap<i64, ResultBlob>,
     pub dispatch_time: Duration,
-    /// §20 per-block state bytes (chunk-major, u32 per block: 0=air 1=stone).
-    /// Empty unless the BlockOut shard is enabled.
+    /// Number of density channels actually read back (2 for the real router).
+    pub out_channels: usize,
+
+    // ── test path (`finish_batch` with raw = false) ──────────────────
+    /// Per-chunk decoded results, keyed by packed chunk position. Used by the
+    /// offline tests, which want one blob per chunk.
+    pub results: FxHashMap<i64, ResultBlob>,
+    /// §20 per-block state bytes (u32 per block, chunk-major).
     pub block_data: Vec<u32>,
+
+    // ── production path (`finish_batch` with raw = true) ─────────────
+    /// Density readback exactly as the GPU wrote it: chunk-major, channels
+    /// contiguous within each chunk, f32 little-endian. This is byte-identical
+    /// to the layout `ResultBlob::from_f32_data` expects, so the Java-facing
+    /// blob can be assembled from it without decoding and re-encoding.
+    pub raw_density: Vec<u8>,
+    /// Per-block state bytes, u32 LE per block, chunk-major. Same content as
+    /// `block_data` but already in the form the blob needs.
+    pub raw_block: Vec<u8>,
 }
 
 /// A submitted batch whose output is being mapped asynchronously.
@@ -306,7 +321,8 @@ impl SingleBatchExecutor {
     ) -> Result<Arc<ExecutedBatch>, String> {
         let prepared = self.prepare_batch(world, batch)?;
         self.wait_for_batch(&prepared);
-        self.finish_batch(prepared)
+        // Tests read the per-chunk map, so this path keeps the decoded form.
+        self.finish_batch(prepared, false)
     }
 
     /// Block until the batch's mapping completes. `try_finish_map` checks the
@@ -610,29 +626,55 @@ impl SingleBatchExecutor {
     }
     /// Read back a batch prepared by [`Self::prepare_batch`]. The caller must
     /// have driven its mapping to completion first.
-    fn finish_batch(&mut self, prepared: PreparedBatch) -> Result<Arc<ExecutedBatch>, String> {
+    /// Consume a completed batch.
+    ///
+    /// `raw = true` is the production path: the staging buffer already holds
+    /// exactly the bytes the Java-facing blob needs, so they are sliced out
+    /// once instead of being decoded into `Vec<f32>` per chunk, re-serialised
+    /// by the C callback, and decoded again. That round trip used to copy
+    /// ~24 MiB of block data and the full density readback four extra times
+    /// per batch.
+    ///
+    /// `raw = false` keeps the per-chunk `ResultBlob` map, which the offline
+    /// tests read directly.
+    fn finish_batch(&mut self, prepared: PreparedBatch, raw: bool)
+        -> Result<Arc<ExecutedBatch>, String> {
         let PreparedBatch {
             batch, buf_set, slot_handle, out_channels, density_bytes,
             block_bytes, has_block, prof, t0, t_submit, encode_ms, submit_ms,
         } = prepared;
         let readback_ms = t_submit.elapsed().as_secs_f64() * 1e3;
 
-        // Read results from staging buffer
         let t_decode0 = std::time::Instant::now();
-        let result_map = self.read_results(&batch, slot_handle, out_channels)?;
-        let decode_ms = t_decode0.elapsed().as_secs_f64() * 1e3;
+        let mut result_map = FxHashMap::default();
+        let mut raw_density: Vec<u8> = Vec::new();
+        let mut block_data: Vec<u32> = Vec::new();
+        let mut raw_block: Vec<u8> = Vec::new();
 
-        // §20: extract the per-block state bytes (chunk-major) for Java.
-        let block_data: Vec<u32> = if has_block {
-            match self.staging.get_data(slot_handle) {
-                Some(d) if d.len() >= density_bytes + block_bytes => d
-                    [density_bytes..density_bytes + block_bytes]
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                    .collect(),
-                _ => Vec::new(),
+        if raw {
+            // One copy out of the mapped staging buffer, then one more for the
+            // block half. Nothing is decoded.
+            if let Some(d) = self.staging.get_data(slot_handle) {
+                let den_end = density_bytes.min(d.len());
+                raw_density = d[..den_end].to_vec();
+                if has_block && d.len() >= density_bytes + block_bytes {
+                    raw_block = d[density_bytes..density_bytes + block_bytes].to_vec();
+                }
             }
-        } else { Vec::new() };
+        } else {
+            result_map = self.read_results(&batch, slot_handle, out_channels)?;
+            if has_block {
+                if let Some(d) = self.staging.get_data(slot_handle) {
+                    if d.len() >= density_bytes + block_bytes {
+                        block_data = d[density_bytes..density_bytes + block_bytes]
+                            .chunks_exact(4)
+                            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                            .collect();
+                    }
+                }
+            }
+        }
+        let decode_ms = t_decode0.elapsed().as_secs_f64() * 1e3;
 
         self.staging.consume(slot_handle);
         // The GPU work for this batch is complete (its output has been read
@@ -649,9 +691,12 @@ impl SingleBatchExecutor {
 
         Ok(Arc::new(ExecutedBatch {
             batch,
-            results: result_map,
             dispatch_time,
+            out_channels,
+            results: result_map,
             block_data,
+            raw_density,
+            raw_block,
         }))
     }
 
@@ -901,6 +946,9 @@ enum ExecutorMessage {
     SubmitBatch {
         world: Arc<WorldContext>,
         batch: Batch,
+        /// Return the readback as raw bytes (production) instead of a decoded
+        /// per-chunk blob map (offline tests).
+        raw: bool,
         /// Called once the batch finishes, on the executor thread. The caller
         /// supplies whatever it needs to publish the result (the C API uses
         /// this to fill its BatchRequest). Passing a callback instead of a
@@ -968,6 +1016,9 @@ impl ExecutorThread {
         self.sender.send(ExecutorMessage::SubmitBatch {
             world,
             batch,
+            // Synchronous callers are the offline tests, which read the
+            // per-chunk blob map — keep the decoded form for them.
+            raw: false,
             on_done: Box::new(move |r| {
                 let _ = reply_tx.send(r);
             }),
@@ -989,6 +1040,9 @@ impl ExecutorThread {
         self.sender.send(ExecutorMessage::SubmitBatch {
             world,
             batch,
+            // Production path: hand back the raw readback bytes, which the C
+            // callback turns into the Java blob without decoding per chunk.
+            raw: true,
             on_done: Box::new(on_done),
         }).map_err(|_| "executor channel closed".to_string())
     }
@@ -1028,7 +1082,7 @@ impl ExecutorThread {
         // here rather than inside PreparedBatch: finish_batch consumes the
         // batch, and the callback must survive that move to be invoked after.
         let mut in_flight: std::collections::VecDeque<
-            (PreparedBatch, Box<dyn FnOnce(Result<Arc<ExecutedBatch>, String>) + Send>)
+            (PreparedBatch, bool, Box<dyn FnOnce(Result<Arc<ExecutedBatch>, String>) + Send>)
         > = std::collections::VecDeque::new();
 
         loop {
@@ -1036,7 +1090,7 @@ impl ExecutorThread {
             //    accepting new work so the read-back gap stays short.
             loop {
                 let ready = match in_flight.front() {
-                    Some((front, _)) => executor
+                    Some((front, _, _)) => executor
                         .staging
                         .try_finish_map(front.slot_handle, &executor.device),
                     None => false,
@@ -1044,15 +1098,15 @@ impl ExecutorThread {
                 if !ready {
                     break;
                 }
-                let (prepared, on_done) = in_flight.pop_front().unwrap();
-                let result = executor.finish_batch(prepared);
+                let (prepared, raw, on_done) = in_flight.pop_front().unwrap();
+                let result = executor.finish_batch(prepared, raw);
                 on_done(result);
             }
 
             // 2. Accept one new batch. The timeout doubles as the mapping
             //    re-check interval, so a busy executor still polls often.
             match receiver.recv_timeout(Self::POLL_INTERVAL) {
-                Ok(ExecutorMessage::SubmitBatch { world, batch, on_done }) => {
+                Ok(ExecutorMessage::SubmitBatch { world, batch, raw, on_done }) => {
                     if in_flight.len() >= executor.config.pipeline_depth {
                         // The caller went past the agreed depth. Failing is
                         // safer than growing the pool on demand.
@@ -1060,7 +1114,7 @@ impl ExecutorThread {
                         continue;
                     }
                     match executor.prepare_batch(&world, &batch) {
-                        Ok(prepared) => in_flight.push_back((prepared, on_done)),
+                        Ok(prepared) => in_flight.push_back((prepared, raw, on_done)),
                         Err(e) => on_done(Err(e)),
                     }
                 }
@@ -1074,7 +1128,7 @@ impl ExecutorThread {
         }
 
         // Shutdown: drain in flight so no Rust-side request handle leaks.
-        while let Some((prepared, on_done)) = in_flight.pop_front() {
+        while let Some((prepared, raw, on_done)) = in_flight.pop_front() {
             let deadline = std::time::Instant::now() + Self::BATCH_TIMEOUT;
             while !executor
                 .staging
@@ -1088,7 +1142,7 @@ impl ExecutorThread {
                     timeout: Some(Self::POLL_INTERVAL),
                 });
             }
-            let result = executor.finish_batch(prepared);
+            let result = executor.finish_batch(prepared, raw);
             on_done(result);
         }
     }

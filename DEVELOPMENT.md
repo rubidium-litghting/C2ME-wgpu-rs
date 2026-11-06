@@ -897,9 +897,86 @@ Biome 也在 GPU 上 vs 仍在 CPU。要追平需要碰 C2ME 状态机（兼容�
 
 #### 25.6 剩余的理论空间
 
-- **decode 占 11%（1.6ms）**：可优化，但即便归零也只影响总耗时的个位数百分比。
+- ~~**decode 占 11%（1.6ms）**~~ **已在 §26 解决，降到 0.47ms**。
 - **poll 轮询下沉到 Rust**：减少每批的 FFM 调用次数，属于结构性改动，收益未知。
 - **真正的 4x4 批次选择**：需要改 C2ME 状态机，触碰兼容性红线，不做。
+
+---
+
+### §26 readback 路径去冗余拷贝（0.1.6 之后）
+
+#### 26.1 问题：同一份数据被拷了六遍
+
+`finish_batch` 到 Java 拿到的 blob 之间，密度数据和方块数据各自经历了一串
+完全冗余的转换：
+
+密度（每批 ~1 MiB）：
+```
+staging bytes
+  → Vec<f32>                      (read_results 解码)
+    → 每 chunk 一个 ResultBlob     (from_f32_data: 拷贝 + CRC32)
+      → decode_blob_f32s()         (把刚序列化的 blob 又解析回 Vec<f32>)
+        → all_f32s.extend          (拼接)
+          → from_f32_data          (再序列化 + 再算 CRC)
+```
+
+方块（每批 ~24 MiB）：
+```
+staging bytes
+  → Vec<u32>                      (逐 u32 转换)
+    → Vec<u8>                     (flat_map to_le_bytes)
+      → ResultBlob::from_bytes    (再拷一次)
+```
+
+关键在于：**staging 里躺着的字节，就是 Java 要的 payload 布局**
+（chunk-major、通道连续、f32 LE）。中间的编码-解码往返没有任何语义变化，
+纯粹是历史包袱——`ExecutedBatch.results` 的 per-chunk blob map 是旧架构
+（Java 逐 chunk 消费）的产物，现在 Java 只取一个聚合 blob。
+
+#### 26.2 改法
+
+- `ResultBlob::from_raw_payload(payload, offsets, chunk_count)`：直接用现成
+  字节拼 blob（头 + offsets + payload + CRC），不做类型转换。
+- `ExecutedBatch` 增加 `raw_density: Vec<u8>` / `raw_block: Vec<u8>`，
+  由 `finish_batch` 直接从 staging 切片得到。
+- `finish_batch(prepared, raw)` 按调用方分流：
+  - `raw = true`：生产路径（`submit_async` → C API 回调），返回原始字节。
+  - `raw = false`：`request_chunks` 同步路径，保留 per-chunk blob map，
+    供 89 个离线测试读取。
+- `SubmitBatch` 消息带上 `raw` 标志，随 `in_flight` 队列一起传递。
+- 删掉 `decode_blob_f32s`（不再需要）。
+
+**踩到的坑**：最初只给 `execute_batch`（测试用）传 `raw = false`，
+但测试实际走的是 `request_chunks`，它同样经过 `run_loop` 的生产分支，
+导致 10 个测试因 `results` 为空而失败。修正方式是把 `raw` 提升为
+`SubmitBatch` 消息的一部分，由两个入口各自声明——**这提醒了一件事：
+"synchronous" 和 "test-only" 不是同一回事，判断调用路径要看它最终走哪个循环。**
+
+#### 26.3 实测
+
+Chunky r=1000（16129 chunks），同种子、同预热：
+
+| 阶段 | §25（改前） | §26（改后） | 变化 |
+|---|---|---|---|
+| encode | 0.03 ms | 0.03 ms | — |
+| submit | 0.32 ms | 0.31 ms | — |
+| readback | 11–14 ms | 9.5–11.8 ms | -1~2 ms |
+| **decode** | **1.6 ms** | **0.45–0.50 ms** | **-72%** |
+| **total** | 14–17 ms | **10.6–13.0 ms** | **-23%** |
+
+端到端：总耗时 **1m04s → 1m02s**，CPS 峰值 325 → 342.6。
+
+**readback 也跟着降了**：executor 线程不再被 decode 占着，映射检查更及时。
+
+#### 26.4 对 §25 结论的影响
+
+§25 判定真正的瓶颈是 C2ME 提交速率（`inflight` 长期只有 0.9–1.1 / 4），
+这一点没变。但 **decode 从 1.6ms 降到 0.47ms 后，WGPU 的总耗时追平了
+官方 OpenCL（都是 1m02s）**——说明之前那 2 秒差距里，有一部分其实是
+我们自己制造的拷贝开销，而不是架构差距。
+
+**教训**：在断言"差距是架构性的"之前，先确认自己这边没有低级浪费。
+`total` 里的每一项都要问一句"这份数据真的需要换个形状吗"。
 
 ---
 

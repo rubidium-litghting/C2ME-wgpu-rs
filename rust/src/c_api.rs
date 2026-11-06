@@ -632,36 +632,32 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
             }
         };
 
-        // Merge all per-chunk results into one combined blob.
-        // Each per-chunk blob now carries only the 2 consumed channels
-        // (finalDensity, veinToggle) — see executor.rs OUT_CHANNELS.
-        const OUT_CHANNELS: u64 = 2;
-        let mut all_f32s: Vec<f32> = Vec::new();
+        // The executor hands back the density readback exactly as the GPU
+        // wrote it — chunk-major, channels contiguous per chunk, f32 LE —
+        // which is the payload layout ResultBlob expects. Assembling the blob
+        // from those bytes directly avoids decoding to Vec<f32> per chunk and
+        // re-serialising (four extra ~24 MiB copies per batch).
+        let out_channels = executed.out_channels.max(1);
+        let num_chunks = executed.batch.positions.len();
+        // Density bytes per chunk in the staging layout.
+        let density_per_chunk = if num_chunks > 0 {
+            executed.raw_density.len() / num_chunks
+        } else { 0 };
+        let cells_per_channel_bytes = if out_channels > 0 {
+            density_per_chunk / out_channels
+        } else { 0 };
+        let _ = cells_per_channel_units; // retained for the cells-per-chunk shape
+
         let mut combined_offsets = [0u64; 16];
-        for ch in 0..OUT_CHANNELS as usize {
-            combined_offsets[ch] = (ch as u64) * cells_per_channel_units * 4;
-        }
-        let mut chunk_idx = 0u16;
-
-        // Emit chunks in the SAME order as batch.positions (sorted, deduped).
-        // The previous FxHashMap iteration order was non-deterministic, so
-        // multi-chunk blobs could not be mapped back to chunk coords.
-        for &(cx, cz) in &executed.batch.positions {
-            let key = ((cx as i64) << 32) | (cz as i64 & 0xFFFFFFFF);
-            let blob = match executed.results.get(&key) {
-                Some(b) => b,
-                None => continue,
-            };
-            let chunk_f32s = decode_blob_f32s(blob);
-            if chunk_f32s.is_empty() { continue; }
-            all_f32s.extend_from_slice(&chunk_f32s);
-            chunk_idx += 1;
+        for ch in 0..out_channels {
+            combined_offsets[ch] = (ch * cells_per_channel_bytes) as u64;
         }
 
-        let result_blob = if all_f32s.is_empty() {
+        let result_blob = if executed.raw_density.is_empty() {
             ResultBlob::new_empty()
         } else {
-            ResultBlob::from_f32_data(&all_f32s, combined_offsets, chunk_idx)
+            ResultBlob::from_raw_payload(
+                &executed.raw_density, combined_offsets, num_chunks as u16)
         };
         match req_bg.result.lock() {
             Ok(mut slot) => *slot = Some(result_blob),
@@ -670,13 +666,10 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
                 return;
             }
         }
-        // §20 block-state bytes as a separate blob (raw u32, no CRC needed
-        // by Java's reader — reuse ResultBlob only as a byte container).
-        if !executed.block_data.is_empty() {
-            let bytes: Vec<u8> = executed.block_data.iter()
-                .flat_map(|v| v.to_le_bytes()).collect();
+        // §20 block-state bytes, already u32 LE and chunk-major.
+        if !executed.raw_block.is_empty() {
             match req_bg.block.lock() {
-                Ok(mut slot) => *slot = Some(ResultBlob::from_bytes(bytes)),
+                Ok(mut slot) => *slot = Some(ResultBlob::from_bytes(executed.raw_block.clone())),
                 Err(_) => {
                     req_bg.status.store(STATUS_ERROR, Ordering::Release);
                     return;
@@ -955,23 +948,6 @@ pub unsafe extern "C" fn c2me_wgpu_set_log_path(ptr: *const u8, len: usize) {
 // Internal helpers
 
 /// Extract f32 data from a ResultBlob (skip the header + offsets).
-fn decode_blob_f32s(blob: &ResultBlob) -> Vec<f32> {
-    let bytes = blob.as_bytes();
-    if bytes.len() < 136 { // 8 header + 128 offsets
-        return Vec::new();
-    }
-    let payload_start = 8 + 16 * 8; // after header + offsets
-    let payload_end = bytes.len().saturating_sub(4); // before CRC
-    if payload_start >= payload_end {
-        return Vec::new();
-    }
-    let payload = &bytes[payload_start..payload_end];
-    payload
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-        .collect()
-}
-
 /// A BatchRequest tracks one GPU batch. `status`/`result` are shared between
 /// the C caller and a background worker thread (which fills them), so they
 /// live behind an `Arc` and the result behind a `Mutex`. The request is
