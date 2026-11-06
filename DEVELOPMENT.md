@@ -469,13 +469,16 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   * 咱们 Rust 侧的 `BufferPool` 目前按 `(usage, size)` 做 LRU。可以借鉴其
     “严格分类”的思路，确保高频输入（external/aquifer）与输出（block_out）
     绝不会因为尺寸碰巧一致而被错误复用，进一步杜绝数据串流 bug。
-- ~~**表面高度估算预计算（Estimate Surface Height）**~~ **(不适用，已结案)**
+- [ ] **表面高度估算预计算（Estimate Surface Height）——前提已变，需重新评估**
   * 官方在结构生成前通过 GPU 算一份粗略地表高度缓存，省掉结构选址时的反复
-    采样。查证后确认两点：
-    1. 它在官方实现里挂在 `ChunkGenerating.generateStructures`，属于 C2ME 的
-       状态机层——我们的兼容性红线，不能碰。
-    2. 我们的 §20 架构是 GPU 直接输出方块状态，与官方"GPU 只出密度、Java 做
-       后续"的流程不同，强行嫁接会破坏现有路径。
+    采样。
+  * 原判定"不适用"基于两点，现都已不成立：
+    1. ~~它挂在 `ChunkGenerating.generateStructures`，属状态机层，是红线~~
+       → 状态机依赖已解除（见架构边界修订），挂点不再是障碍。
+    2. ~~与 §20 架构冲突，强行嫁接会破坏现有路径~~ → 这条仍然存在：我们是
+       GPU 直接出方块状态，官方是"GPU 出密度、Java 做后续"。合并的可行性
+       取决于新的 `NewChunkStatus` 实现能否同时承接表面高度估算，尚未验证。
+  * 结论：**从"不做"变为"待评估"**，但不是自动可行。
   * 顺带查清了 `FindTopSurface`：它是 1.18 之前的旧节点，**1.21.1 的
     NoiseRouter 里根本不存在**，Java 侧只定义 `TAG_FIND_TOP_SURF` 却从不写入，
     真实 router 测试数据里也搜不到。它的 WGSL emitter 曾返回一个未定义的占位
@@ -483,21 +486,60 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     CPU。反序列化路径保留，仅为了兼容旧 blob 与单元测试。
 
 #### 🔴 高难度：核心功能突破（长远目标）
-- ~~**把生物群系（Biome）拉上 GPU**~~ **(已证伪，切勿重试)**
-  * 官方端到端快 2 秒的关键之一是把 Biome 也纳入 GPU 流水线，但这依赖于官方
-    直接深度绑定了 C2ME 状态机。
-  * 本模组在 2026-10（§5.17）尝试过（代码保存在 `experiment/biome-gpu` 分支），
-    结论是**净负优化**：biome 在 NOISE 之前生成，GPU 每次的 14ms 往返延迟
-    直接卡在区块生成的关键路径上，不仅自己慢，还抢占地形的 GPU 队列。
-  * **结论**：vanilla 的 biome 采样纯 CPU 跑极快，不需要 GPU 加速。
+- [ ] **把生物群系（Biome）拉上 GPU——前提已变，需重新评估**
+  * 原结论（§5.17，2026-10，代码在 `experiment/biome-gpu` 分支）是**净负优化**：
+    biome 在 NOISE 之前，GPU 每次 14ms 的往返延迟直接卡在关键路径上，还抢占
+    地形队列。这个实测结论**对"独立 GPU 路径"依然成立**。
+  * 但当时的架构前提已经变了：
+    1. ~~biome 必须走独立的 GPU 请求~~ → 官方 CL 的做法是把 BIOME 和 NOISE
+       放进**同一个批次、同一次提交**，没有额外往返。这个模式我们现在才具备
+       实现条件（需要自定义 `NewChunkStatus`）。
+    2. ~~抢占地形队列~~ → 有界队列 + `pipeline_depth=3` 后，队列纪律比当时好，
+       但共享 executor 的争抢是否消失尚未验证。
+  * **补充实测**（2026-11）：跳过 `populateBiomes` 后跑 r=500，`inflight` 纹丝
+    不动（1.0–1.3/4），CPS 峰值仅 +4%。说明 biome 的计算量本身不是上游瓶颈，
+    **收益上限不高**。
+  * 结论：**从"证伪"改为"收益有限但机制可行"**。§5.17 失败的是实现方式，
+    不是这件事本身。若重做，必须走"合并进同一批次"，绝不能重走独立路径。
 - [ ] **多 Kernel 流水线（暂缓/仅评估）**
   * 官方用 Event 串联 5 个独立 Kernel。咱们目前是一个 Compute Pass 跑多个 Shard。
   * **不建议盲目拆分**：Vulkan 的提交和同步开销可能吃掉拆分收益。除非实机
     发现某个 Shard 明显拖后腿，否则维持现状。
 
-> **🚫 兼容性红线**：
-> - 绝不引入官方对 C2ME `ChunkSystem` 状态机的强依赖（咱们是伴生模块）。
-> - 绝不放弃 Rust + FFM + Vulkan 架构去碰 JNI / OpenCL。
+> **⚖️ 架构边界（2026-11 修订，原为"兼容性红线"）**
+>
+> **仍成立的：**
+> - **绝不放弃 Rust + FFM + Vulkan 架构去碰 JNI / OpenCL。** 这是跨平台
+>   （fp32、Mac、Android）的根基，没有任何理由动摇。
+>
+> **已解除的：原"绝不引入 C2ME ChunkSystem 状态机强依赖"。**
+>
+> 建立这条红线的理由曾是：我们是伴生模块，C2ME 内部 API 不稳定，绑死会让
+> 大版本更新直接崩溃。这个判断在当时是对的。
+>
+> 解除的三条依据（2026-11 查证）：
+> 1. **扩展点是官方提供的，不是 hack**。C2ME 在 `compat/internal_api` 包里
+>    暴露了 `NewStatusHook.beforeVanillaStatusRegister(ArrayList<NewChunkStatus>,
+>    ChunkStatus)`，官方 OpenCL 模块用的就是它。
+> 2. **三个版本结构一致**。查证 1.21.1（0.4.0-a.0.29）、1.21.11（0.4.0-a.0.28）、
+>    26.2（0.4.2-a.0.60）的 chunk-system jar：`NewStatusHook`、
+>    `compat/internal_api` 包、`VanillaWorldGenerationDelegate extends
+>    NewChunkStatus`、`upgradeToThis` 返回 RxJava `Completable` —— 全部一致。
+>    写一套集成代码可以跨版本复用，只需处理命名空间差异。
+> 3. **旧路径已经走不通了**。1.21.11 起 `populateNoise` 的返回值从
+>    `CompletableFuture<Chunk>` 变成同步 `Chunk`，且签名改为
+>    `(Blender, StructureAccessor, NoiseConfig, Chunk, int, int)`。C2ME 自己也
+>    改成了只 redirect 内部 executor（`MixinNoiseChunkGenerator` 仅有两个
+>    `redirect*Executor` 方法）。继续绑在 `populateNoise` 上等于放弃所有新版本。
+>
+> 解除的代价，必须写清楚：
+> - 依赖 `ChunkLoadingContext` / `ChunkState` / `NewChunkStatus` / `ItemHolder`
+>   / `KeyStatusPair` 等内部类；
+> - **C2ME 大版本更新时可能启动失败**（不是降级，是崩溃）；
+> - 必须锁定 C2ME 最低版本，并在 `fabric.mod.json` 里声明。
+>
+> 因此执行方式：**分支开发 + 强制最低 C2ME 版本 + 每版本实机验证**，
+> main 分支在验证通过前不变。
 
 ### wgpu 库自身的环境变量（仅排查用）
 
@@ -909,7 +951,9 @@ r=1000 时 Chunky 跑到外围区域，结构生成 / 生物群系 / 光照这�
 
 r=500 时差距只有 3.2%（15s vs 13s），拉到 r=1000 后稳态差距暴露为 ~8.5%。
 **这 8% 是架构性的**：JNI 原生指针 vs FFM、4x4 空间批处理 vs 散装批次、
-Biome 也在 GPU 上 vs 仍在 CPU。要追平需要碰 C2ME 状态机（兼容性红线）。
+Biome 也在 GPU 上 vs 仍在 CPU。要追平需要碰 C2ME 状态机——**当时**这条被划为
+兼容性红线，故判为不做。（2026-11 该红线已解除，见"架构边界"一节；本条
+结论从"不做"变为"有路径，未实施"。）
 
 #### 25.5 本轮证伪的优化尝试（全部记录，避免重试）
 
@@ -928,7 +972,9 @@ Biome 也在 GPU 上 vs 仍在 CPU。要追平需要碰 C2ME 状态机（兼容�
 
 - ~~**decode 占 11%（1.6ms）**~~ **已在 §26 解决，降到 0.47ms**。
 - **poll 轮询下沉到 Rust**：减少每批的 FFM 调用次数，属于结构性改动，收益未知。
-- **真正的 4x4 批次选择**：需要改 C2ME 状态机，触碰兼容性红线，不做。
+- **真正的 4x4 批次选择**：需要改 C2ME 状态机。**当时**因兼容性红线判为不做；
+  2026-11 红线解除后，这是"有明确收益、有可行路径"的首选方向（官方 CL 正是
+  靠它把批次做大、摊薄固定开销），但尚未实施。
 
 ---
 
