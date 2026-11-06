@@ -1,7 +1,7 @@
 # C2ME WGPU 加速模块 — 开发文档
 
-> 最后更新：2026-11-01
-> 状态：**0.1.5 已发布；0.1.6 待发布**。0.1.6 修掉了 modded 世界（暮色森林 / Tectonic）的
+> 最后更新：2026-11-07
+> 状态：**0.1.5、0.1.6 已发布**。0.1.6 修掉了 modded 世界（暮色森林 / Tectonic）的
 > 死锁与全虚空问题，并把 shader/pipeline 编译失败从"静默死锁"改为"该维度回退 CPU + 玩家可读提示"。
 > 0.1.5 完整实现 Pass E、GPU 矿脉、100% 对齐原版的 AquiferSampler 逻辑，并重构了 FFM 日志架构与底层防死锁机制。实机验证兼容 Epic Terrain 与 Tectonic（Fabric 原生环境）。
 > 用户侧已落地：GPU 选择（能力优先，越界自动回退）、切存档热重载配置（冷/热两级，零锁）、
@@ -337,7 +337,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   - 整理目前的 Debug 环境变量说明，把不再使用的变量（如 `MIN_STAGE`）彻底从文档中删除。
   - 补充了 FFM Upcall 日志回传机制与防死锁机制的说明。
 
-**0.1.6（未发布）：modded 世界正确性与错误可见性**
+**0.1.6（已发布）：modded 世界正确性与错误可见性**
 
 - ✅ **暮色森林死锁根因**：`ExternalInput` 是角点量，必须像
   `InterpolatedNoiseSampler` 一样被 split 提取；`barrierNoise`（ch0）同样
