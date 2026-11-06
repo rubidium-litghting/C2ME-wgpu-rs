@@ -244,15 +244,21 @@ fn interp_noise_sampler(
     // lower/upper use the RAW (un-divided) coords and a different
     // arg4/arg5 scaling than the interp stack (per MC bytecode).
     for (var i = 0; i < lc; i++) {
+        // MC computes these once per iteration and feeds both the lower and
+        // the upper sampler (InterpolatedNoiseSampler.sample, locals d32/d34/
+        // d36). Calling maintainPrecision inside each branch recomputed the
+        // identical values twice — 48 redundant div+floor+mul+sub sequences
+        // per sample.
+        let px = maintain_precision(d * r);
+        let py = maintain_precision(e * r);
+        let pz = maintain_precision(f * r);
+        let py_raw = e * r;
+        let smear = smear_y_raw * r;
         if (!noLower) {
-            lo += perlin_ysmear(lb + i * 256,
-                                maintain_precision(d * r), maintain_precision(e * r),
-                                maintain_precision(f * r), smear_y_raw * r, e * r) / r;
+            lo += perlin_ysmear(lb + i * 256, px, py, pz, smear, py_raw) / r;
         }
         if (!noUpper) {
-            up += perlin_ysmear(ub + i * 256,
-                                maintain_precision(d * r), maintain_precision(e * r),
-                                maintain_precision(f * r), smear_y_raw * r, e * r) / r;
+            up += perlin_ysmear(ub + i * 256, px, py, pz, smear, py_raw) / r;
         }
         r *= 0.5;
     }
