@@ -14,6 +14,10 @@
 > 池化输入 buffer + 多批次在途 18 s / CPU ~50%。CPS 中位持平（188），p90 238→254。
 > **结论：流水线化省的是 CPU 等待与端到端时间，不是稳定态 CPS**——GPU 执行（readback）仍是瓶颈。
 > 历史细节见文末「附录：开发历程」。
+>
+> **0.1.7-alpha.1（分支 `feature/chunk-status-integration`）**：C2ME
+> `NewStatusHook` / `NewChunkStatus` 接入阶段 1 已提交并通过实机验证（透明委托，
+> r=500 4225 chunks / 15 s，与基线持平）。见 §27。
 
 ---
 
@@ -41,6 +45,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 | **移动端端到端提速** | ✅ 3m12s→2m19s；CPS 23.52→30.65 (+30.3%) |
 | 史诗地形/构造地形兼容 | ✅ Epic Terrain, Tectonic |
 | WeirdScaledSampler | ✅ 完整实现 |
+| **C2ME `NewChunkStatus` 接入（阶段 1）** | ✅ 透明委托，见 §27 |
 
 ### 关键教训速查
 
@@ -259,6 +264,17 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     - **内部指标比端到端稳定得多**：`encode/submit/readback/decode` 这类
       毫秒级分阶段数据受种子影响远小于总耗时，可以作为跨实验基准；端到端
       耗时只能在同一批实验内部比。
+46. **用官方扩展点接入状态机，别改它的内部表**：`NewStatusHook` 是 C2ME 留给
+    外部模块的稳定入口（官方 OpenCL 同样用它）。注入点必须是
+    `beforeVanillaStatusRegister` 的 `HEAD`，在原版 delegate 注册前 `add`，
+    新状态才会拿到 `statuses.size()`，随后注册的原版 delegate 顺延一位，顺序
+    才是 `... BIOMES → 我们的状态 → vanilla NOISE`。放到 `RETURN` 就落在
+    NOISE 之后，依赖关系直接反了。
+47. **类初始化期间不能依赖"还没注册完"的静态表**：`NewChunkStatus.<clinit>` 里
+    调 hook 时，`VANILLA_WORLDGEN_PIPELINE[NOISE]` 仍是 null。任何在构造器里
+    解析该表的写法都会拿到 null（或触发二次初始化），必须**惰性解析 + 兜底**
+    （本次是 `volatile` 字段 + 首次调用 `fromVanillaStatus`）。同理，构造器里
+    不要打"已就绪"日志——真正可用是在第一次 `upgradeToThis`。
 
 
 
@@ -380,6 +396,21 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 > `QUEUE_CAPACITY = 4096`（见教训 #42）。4225 chunk 规模太小，无法暴露队列问题，
 > 含修复的真正压力验证是 NF-3。大规模 GPU vs CPU 对照（B-5，同 4225/400c 口径）
 > 尚未跑。
+
+**0.1.7（开发中，分支 `feature/chunk-status-integration`）：C2ME chunk-status 接入**
+
+- [x] **阶段 1：打通官方扩展点（透明委托）**。通过 `MixinNewStatusHook` 在 C2ME
+  注册原版 `NOISE` delegate 之前插入 `WgpuNoiseStatus`；该状态的
+  `upgradeToThis` / `getDependencies` 全部转发给 C2ME 的
+  `VanillaWorldGenerationDelegate`，GPU 仍走原有 `populateNoise` →
+  `WgpuBatchCoordinator`。详见 §27。
+- [x] `fabric.mod.json` 下限锁到 `"c2me": ">=0.4.0-alpha.0.29"`（`NewStatusHook`
+  可用的版本）。
+- [x] 构建期 C2ME/FlowSched stub + `compileOnly` RxJava 3.1.12，不打包、不链接 C2ME。
+- [ ] **阶段 2：状态直接持有并提交 GPU 批次**（取消对 vanilla delegate 的转发）。
+  需要自己准备 `Blender`、`StructureAccessor` 与 `ChunkNoiseSampler`，否则
+  aquifer/beard 会算错——这正是阶段 1 只做透明委托的原因。
+- [ ] **阶段 3：4x4 空间批处理**（官方 CL 的核心收益来源），依赖阶段 2。
 
 **0.1.7+ 待办**
 - [ ] **让 external payload 随批次携带**（而非走进程级 `world.external_data`）。
@@ -633,8 +664,16 @@ jar），Java 代码直接引用这些类。详见 §10。
 否则 Groovy 的 `GString` 会抛 `ClassCastException`。
 
 ### 2.3 C2ME 依赖方式
-- **编译期**：无。**运行时**：`fabric.mod.json` 声明 `"c2me": "*"` 硬依赖。
-  实测（§10）：无 C2ME 时桌面 CPS ~144→~13（批攒不满）。C2ME 是性能硬需求。
+- **编译期**：`src/stub` 提供 `NewChunkStatus` / `NewStatusHook` /
+  `SchedulingManager` 等接口签名（`compileOnly`），另加
+  `compileOnly io.reactivex.rxjava3:rxjava:3.1.12` 仅为类型检查；C2ME 与
+  RxJava 都不打包、不链接。
+- **运行时**：`fabric.mod.json` 声明 `"c2me": ">=0.4.0-alpha.0.29"` 硬依赖
+  （下限即 `NewStatusHook` 可用的版本）。实测（§10）：无 C2ME 时桌面
+  CPS ~144→~13（批攒不满）。C2ME 是性能硬需求。
+- **兼容性红线**：只用 C2ME 的公开扩展点（`NewStatusHook` /
+  `NewChunkStatus`），不 mixin 它的内部实现。升级 C2ME 后若签名变化，
+  编译期会直接失败，而不是运行期错地形。见 §27。
 
 ### 2.4 Access Widener（自写）
 `src/main/resources/c2me-opts-accel-wgpu.accesswidener`：只放宽真正访问的
@@ -695,6 +734,11 @@ MixinChunkGenerator.populateNoise：
 ## §10 与 C2ME 的关系（构建期 Stub + 运行时强依赖）
 
 - **构建期（Stub 依赖）**：为了不拉取整个 C2ME 源码，我们通过 `src/stub`（`compileOnly`）提供了 `SchedulingManager` 等类的接口签名。Java 代码中依然直接引用了这些类。
+- **扩展点（0.1.7-alpha.1 起）**：chunk status 走 C2ME 的
+  `com.ishland.c2me.rewrites.chunksystem.common.compat.internal_api.NewStatusHook`，
+  由 `MixinNewStatusHook` 注入；`NewChunkStatus` 与
+  `VanillaWorldGenerationDelegate` 同样只存在于 stub。**没有 mixin 任何 C2ME
+  内部实现类**，升级时只受公开接口签名影响。
 - **运行时强依赖**：实测无 C2ME 时桌面 CPS ~144→~13（缺多线程并行，批攒不满）。同时，异步写回架构强依赖 `SchedulingManager.positionedExecutor()` 来执行，若获取不到调度器，GPU 加速将直接回退纯 CPU 路径。
 - **自写 AW**：不再借 C2ME 的 access widener，避免其删条目导致 `IllegalAccessError`。
 
@@ -879,6 +923,9 @@ C2ME worker 线程并行承担，不是端到端瓶颈。曾尝试用底层调�
 - `rust/src/world/{aquifer,beard}.rs`：aquifer 表解析 + Beardifier 复现。
 - `rust/src/c_api.rs`：C API（含 `set_aquifer_table` / `set_beard_table`）。
 - `src/main/java/.../mixin/MixinChunkGenerator.java`：写回 + stage + dump。
+- `src/main/java/.../chunkstatus/WgpuNoiseStatus.java`：阶段 1 的透明委托状态。
+- `src/main/java/.../mixin/MixinNewStatusHook.java`：在 C2ME 注册原版 NOISE 前插入状态。
+- `src/stub/java/com/ishland/...`：C2ME / FlowSched 的编译期接口签名（不打包）。
 - `src/main/java/.../WgpuThinBinding.java`：FFM 绑定。
 
 ---
@@ -1065,4 +1112,76 @@ Chunky r=1000（16129 chunks），同种子、同预热：
 `total` 里的每一项都要问一句"这份数据真的需要换个形状吗"。
 
 ---
+
+### §27 C2ME `NewChunkStatus` 接入（0.1.7-alpha.1，阶段 1）
+
+#### 27.1 为什么要接
+
+0.1.6 之前，GPU 加速的入口是 `MixinChunkGenerator.populateNoise`：vanilla
+`NOISE` 状态跑到一半，我们拦下密度计算，再 `cir.setReturnValue`。这条路能跑，
+但天花板受 C2ME 状态机限制（§25：`inflight` 长期 0.9–1.1 / 4）。官方 OpenCL
+模块走得更远：它注册自己的 `NewChunkStatus`，直接持有批次、做 4x4 空间批处理。
+要拿到同样的收益，必须先证明我们能安全地进入这条状态机。
+
+#### 27.2 阶段 1 只做透明委托
+
+`WgpuNoiseStatus` 插在 `BIOMES` 与 `NOISE` 之间，但**不自己生成地形**：
+`upgradeToThis` / `getDependencies` 原样转发给 C2ME 的
+`VanillaWorldGenerationDelegate(NOISE)`。于是 GPU 路径保持
+`populateNoise` → `WgpuBatchCoordinator` 不变，这一轮只验证三件事：
+
+1. `NewStatusHook` 注入点确实在 vanilla NOISE 之前；
+2. 自定义 ordinal 与依赖声明能被调度器接受；
+3. 现有地形和性能没有被破坏。
+
+**为什么不直接提交**：vanilla 生成步骤手里有 `Blender`、`StructureAccessor`
+和已构建的 `ChunkNoiseSampler`，aquifer/beardifier staging 依赖它们。在状态里
+自建一套等于写第二份世界生成，错了很难归因。阶段 1 把"钩子错了"和"生成错了"
+分开，阶段 2 再接管数据。
+
+#### 27.3 实现要点
+
+- `MixinNewStatusHook` 注入 `beforeVanillaStatusRegister` 的 `HEAD`；
+  `vanillaStatus == ChunkStatus.NOISE` 时执行
+  `statuses.add(new WgpuNoiseStatus(statuses.size()))`。`remap = false`——
+  目标是 C2ME 的类，不是 Minecraft。
+- 顺序由插入时机决定：新状态拿 `statuses.size()`，随后注册的 vanilla
+  delegate 顺延一位，得到 `... BIOMES → WgpuNoiseStatus → vanilla NOISE ...`。
+- `vanillaNoise` **惰性解析**：hook 执行时 `NewChunkStatus.<clinit>` 还没跑完，
+  `VANILLA_WORLDGEN_PIPELINE[NOISE]` 是 null。字段声明为 `volatile`，首次
+  `upgradeToThis` / `getDependencies` 时用 `fromVanillaStatus(NOISE)` 取。
+- 兜底：若解析不到（理论上不可能），记录 warn 并返回
+  `Completable.complete()` / `EMPTY_DEPENDENCIES`，让调度器继续走真正的
+  vanilla delegate，而不是死锁。
+- `ANNOUNCED` 保证 "active" 日志只打一次，避免每个 chunk 刷屏。
+- 升级/降级钩子（`postUpgradeToThis` / `preDowngradeFromThis` /
+  `downgradeFromThis`）返回 `Completable.complete()`：本状态不持有资源。
+
+#### 27.4 实机验证（2026-11-07）
+
+环境：1.21.1 Fabric，RADV RENOIR，种子 `-836645977851536298`，Chunky r=500。
+（种子仅用于本次记录；跨实验比较仍按教训 #45 标注可比性。）
+
+| 检查项 | 结果 |
+|---|---|
+| hook 注册 | `[c2me-wgpu-status] active: ordinal=6`，全程仅 1 次 |
+| r=500 端到端 | 4225 chunks / **15 s**，与现有基线持平 |
+| CPS | 稳态 260–299，峰值 298.5 |
+| 崩溃 / 异常 | 无（仅 flite、离线认证等环境噪声） |
+| 地形 | 正常，无空洞 / 错位切面 |
+| 退出 | 全部维度保存成功 |
+
+**结论**：持平而非提升是预期结果——这一阶段 GPU 工作与 0.1.6 完全相同，
+只是多包了一层状态。它证明的是扩展点、顺序和依赖声明正确，不能证明性能。
+
+#### 27.5 下一阶段的前提
+
+阶段 2 要自己提交批次，必须先解决三件事：
+
+1. 在状态内拿到与 vanilla 等价的 `ChunkNoiseSampler`（或复刻其采样上下文）；
+2. `Blender` / `StructureAccessor` 的线程安全获取方式（C2ME worker 上并发）；
+3. 4x4 批次的坐标聚合与 `WgpuBatchCoordinator` 接口改造（目前按 chunk 请求）。
+
+在这些验证完成之前，不要删除 `MixinChunkGenerator` 的写回路径——它仍是唯一
+经过完整实机验证的正确路径。
 
