@@ -1,0 +1,59 @@
+/*
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2026 RubidiumLighting
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+package com.rubidiumlighting.c2me.opts.accel.wgpu.mixin;
+
+import com.ishland.c2me.rewrites.chunksystem.common.NewChunkStatus;
+import com.ishland.c2me.rewrites.chunksystem.common.compat.internal_api.NewStatusHook;
+import com.rubidiumlighting.c2me.opts.accel.wgpu.chunkstatus.WgpuNoiseStatus;
+import net.minecraft.world.chunk.ChunkStatus;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+import java.util.ArrayList;
+
+/**
+ * Inject {@link WgpuNoiseStatus} just before the vanilla {@code NOISE} delegate
+ * is registered by C2ME.
+ *
+ * <p>Mirrors the pattern used by C2ME's own OpenCL module. At the moment C2ME
+ * is about to append its {@code VanillaWorldGenerationDelegate} for
+ * {@code vanillaStatus}, {@code statuses} holds everything registered so far.
+ * Adding our status now gives it the ordinal {@code statuses.size()}, and the
+ * vanilla delegate that follows gets {@code statuses.size()+1}, so the
+ * resulting order is {@code ... BIOMES, WgpuNoiseStatus, vanilla NOISE, ...}.
+ */
+@Mixin(NewStatusHook.class)
+public abstract class MixinNewStatusHook {
+
+    @Inject(method = "beforeVanillaStatusRegister", at = @At("HEAD"), remap = false)
+    private static void c2me_wgpu$addWgpuNoiseStatus(
+            ArrayList<NewChunkStatus> statuses, ChunkStatus vanillaStatus, CallbackInfo ci) {
+        if (vanillaStatus == ChunkStatus.NOISE) {
+            statuses.add(new WgpuNoiseStatus(statuses.size()));
+        }
+    }
+}

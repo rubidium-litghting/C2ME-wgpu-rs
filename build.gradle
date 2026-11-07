@@ -38,6 +38,12 @@ tasks.withType(JavaCompile) {
 sourceSets {
     stub {
         java.srcDir 'src/stub/java'
+        // The stub classes import Minecraft and RxJava types (ChunkPos,
+        // ChunkStatus, Completable, ...), so they need the same classpath the
+        // main sources get. `main.compileClasspath` already contains both;
+        // adding the stub *output* is done separately (below) so there is no
+        // circular dependency between the two source sets.
+        compileClasspath += sourceSets.main.compileClasspath
     }
 }
 tasks.withType(AbstractArchiveTask) {
@@ -47,6 +53,12 @@ tasks.withType(AbstractArchiveTask) {
 
 // Stub classes must exist before the main sources that reference them compile.
 compileJava.dependsOn tasks.named('compileStubJava')
+// Add the stub output to the Java compile task classpath directly (not to the
+// `compileOnly` configuration) so the main set can reference the stub classes
+// without making the stub set depend on the main set (which would be circular).
+tasks.named('compileJava') {
+    classpath += sourceSets.stub.output
+}
 
 // ---------------------------------------------------------------------------
 // Fabric Loom + Minecraft deps (versions come from gradle.properties)
@@ -64,7 +76,12 @@ repositories {
 dependencies {
     // Type-checked against the stub signatures; the stub classes are not
     // shipped (compileOnly + separate source set). See the stub sourceSet.
-    compileOnly sourceSets.stub.output
+    // RxJava's Completable is the return type of the C2ME chunk-status
+    // interface methods we override. It is NOT shipped (compileOnly) and it
+    // does NOT drag in C2ME: it is a standard Maven Central artifact that
+    // Gradle resolves automatically. C2ME itself bundles the same version at
+    // runtime.
+    compileOnly 'io.reactivex.rxjava3:rxjava:3.1.12'
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
