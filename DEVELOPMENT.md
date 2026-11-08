@@ -21,11 +21,11 @@
 > **0.1.7-alpha.2**：阶段 2 的 `chunk_batch_size` 对齐批次（2×2 / 4×4 / 8×8）
 > 已实现并通过实机验证（同种子 r=500：2/4/8 分别 14 / 13 / 15 s，4×4 最优，
 > CPS 298；地形正常、无死锁）。默认值仍为 1，不改变已验证行为。见 §27.7。
-> **表面高度估算已评估：暂不实现**。一轮 r=500 约 4700 次 `getHeight`
-> （矿井 `spacing=1` 每区块 1 次），折合 1.4–3.8 s CPU 且大部分被 GPU 等待
-> 掩盖；先打点测量再谈实现。见 §28。
-> **0.1.7-alpha.3**：表面高度查询打点（`debug_height_probe`）已实装，用来给
-> §28 的结论补上真实数据。
+> **表面高度估算：已实测并结案（负结果）**。同种子 r=500 只有 696 次
+> `getHeight`、累计 1.58 s（≈12% 墙钟，约一半与在途 GPU 批次重叠），重复率
+> 6%；纯 CPU 缓存省不到 1%，GPU 预计算要多跑一遍噪声。见 §28。
+> **0.1.7-alpha.3**：表面高度查询打点（`debug_height_probe`，默认关闭）保留为
+> 诊断开关，可随时复测。
 
 ---
 
@@ -289,6 +289,15 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     上限是每轮 r=500 约 4700 次 `getHeight`、1.4–3.8 s CPU，而墙钟里能拿回
     来的只有压在关键路径上的那部分；同时"从现有 GPU 结果反推高度"被时序、
     beardifier、surface rules 三条独立否掉。**没有分母的优化讨论都是猜。**
+49. **"某结构会查高度"≠"它每次都查"：分支条件要从字节码确认**：§28 初稿按
+    "矿井 placement 是 `spacing=1`，每个区块都是候选"估出一轮 r=500 有
+    ≈4700 次 `getHeight`。实测只有 **696 次**——`MineshaftStructure` 的高度
+    查询在 `type == MESA` 分支里，普通矿井走
+    `StructurePiecesCollector.shiftInto(seaLevel, minY, rng, 10)`。凡是靠
+    "结构集合 × placement 概率"推出来的分母，都必须先打点再信。
+    反方向也有惊喜：实测单次 **2.2 ms** 是"1/6 区块"模型（≈0.6 ms）的 3–7 倍，
+    说明重建 `ChunkNoiseSampler` 的固定开销主导——这一点在写任何代码之前
+    都推不出来。
 
 
 
@@ -534,20 +543,15 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   * 咱们 Rust 侧的 `BufferPool` 目前按 `(usage, size)` 做 LRU。可以借鉴其
     “严格分类”的思路，确保高频输入（external/aquifer）与输出（block_out）
     绝不会因为尺寸碰巧一致而被错误复用，进一步杜绝数据串流 bug。
-- [ ] **表面高度估算预计算（Estimate Surface Height）——已评估，暂不实现（§28）**
-  * 官方在结构生成前通过 GPU 算一份地表高度缓存，省掉结构选址时的反复采样。
-  * 挂点不再是障碍（状态机依赖已解除），但**成本模型决定它现在不划算**：
-    主世界每区块固定 1 次高度查询（矿井 `spacing=1` 使每个区块都是候选，
-    且高度采样发生在生物群系过滤之前），一轮 r=500 约 4700 次
-    （≈ 1.1 次/区块），折合 1.4–3.8 s CPU ——而且大部分落在 worker 等 GPU
-    readback 的空档里，不是墙钟。
-  * "从现有 GPU 结果反推高度"被三条独立否掉：`NOISE` 晚于
-    `STRUCTURE_STARTS`（时序）、`Beardifier.INSTANCE` 与真实 beardifier 不同、
-    `WORLD_SURFACE_WG` 不含 surface rules（语义）。见 §28.3。
-  * **打点已实装（0.1.7-alpha.3，`debug_height_probe`）**，等一轮同种子 r=500
-    的数据：看 `total`（上限）、`gpuBusy`（与 GPU 重叠的比例）、`dup`
-    （记忆化空间）。累计 <3% 墙钟就结案；>5% 再考虑 CPU 记忆化，最后才是
-    GPU 区域预计算（且必须先设计结果重用，否则净负）。见 §28.5。
+- [x] **表面高度估算预计算（Estimate Surface Height）——已实测，结案（§28）**
+  * 实测（`debug_height_probe`，同种子 r=500）：**696 次调用 / 1.58 s**，
+    0.165 次/区块，单次 2.2 ms，重复率 6%，约一半与在途 GPU 批次重叠。
+  * 初稿的"矿井每区块 1 次 → 4700 次"是错的：`MineshaftStructure` 只在
+    `type == MESA` 分支查高度，普通矿井用 `shiftInto`。**教训 #49**。
+  * 结论：纯 CPU 记忆化省不到 1%；GPU 懒算被单列 readback 延迟吃掉；GPU 区域
+    预计算要多跑一遍噪声。**不做**，探针保留可随时复测。
+  * "从现有 GPU 结果反推高度"另有三条硬伤（时序 / beardifier / surface
+    rules），见 §28.3。
 
 #### 🔴 高难度：核心功能突破（长远目标）
 - [ ] **把生物群系（Biome）拉上 GPU——前提已变，需重新评估**
@@ -1324,10 +1328,10 @@ status = fromVanillaStatus(directDependencies.get(d))
 
 ### §28 表面高度估算（Estimate Surface Height）评估（2026-11-08）
 
-> 结论先行：**暂不实现**。上限约 1.4–3.8 s CPU/轮，且大部分落在 worker 等
-> GPU readback 的空档里；下限成本是新 shader 入口 + 区域预计算 + 精确性校验，
-> 而且**必须重用预计算结果**，否则等于多跑一遍噪声，净负。先按 §28.5 打点
-> 测量，再决定是否进入实现。
+> 结论先行：**已实测，结案（负结果）**。一轮 r=500 只有 696 次 `getHeight`、
+> 累计 1.58 s（≈12% 墙钟，且约一半与 GPU 在途重叠），重复率 6%；纯 CPU 缓存
+> 省不到 1%，GPU 预计算要多跑一遍噪声，都不划算。测量方法与数据见 §28.2 /
+> §28.5。
 
 #### 28.1 原版 `getHeight` 的成本模型
 
@@ -1351,40 +1355,57 @@ status = fromVanillaStatus(directDependencies.get(d))
   （一个 `iconst_1; isub`）。
 
 按 §25 的纯 CPU 端到端（r=500 / 4225 chunks / 27 s ≈ 6.4 ms per chunk）反推，
-密度部分约 3–4 ms/chunk，则一次 `getHeight` 粗估 **0.3–0.8 ms**（196/1225 的
-网格点，加最多 384 次逐格插值与含水层判定）。
+密度部分约 3–4 ms/chunk，则一次 `getHeight` 粗估 **0.3–0.8 ms**
+（196/1225 的网格点，加最多 384 次逐格插值与含水层判定）。
+**实测是 2.2 ms（§28.2），比这个模型高 3–7 倍**：每次调用重建
+`ChunkNoiseSampler` / 插值器的固定开销主导，网格点数量反而不是主要成本。
 
-#### 28.2 谁在调用，一轮要调多少次
+#### 28.2 谁在调用，以及实测结果（2026-11-08）
 
 | 调用点 | 每次调用数 | 备注 |
 |---|---|---|
 | `Structure.getCornerHeights`（`getAverageCornerHeights` / `getMinCornerHeight`） | 4 × `getHeightInGround` | 大多数结构选址的公共路径 |
-| `MineshaftStructure#getStructurePosition` | 1 × `getHeight` | **每个主世界区块都会走** |
 | `StructurePoolBasedGenerator` / `StructurePoolGenerator` | 2 × `getHeightOnGround` / 锚点 | 拼图结构（村庄、前哨站、试炼密室、远古城市…） |
+| `MineshaftStructure#getStructurePosition` | 1 × `getHeight`，**仅 MESA 分支** | 见下方勘误 |
 | `RuinedPortalStructure` | 依地形适应性分支 | 少数 |
 
-两条容易被忽略的放大因素：
+**勘误（本节初稿错了）**：初稿按"矿井 `spacing=1` → 每个区块 1 次"估出
+≈4700 次/轮。字节码显示 `MineshaftStructure` 只在 `type == MESA` 分支里调
+`getHeight`，普通矿井走 `StructurePiecesCollector.shiftInto(seaLevel, minY, rng, 10)`
+——恶地以外的矿井**一次都不查**。这个错误只有实测能纠正。
 
-1. **高度采样发生在生物群系过滤之前**。`Structure.getValidStructurePosition`
-   的字节码是 `getStructurePosition(ctx).filter(isBiomeValid)`；
-   `StructurePlacementCalculator#canGenerate` 也只查 placement、不查群系。
-   即生物群系不匹配的候选区块照样要付这 4 次采样。
-2. **矿井的 placement 是 `spacing=1 separation=0`**
-   （原版 `data/minecraft/worldgen/structure_set/mineshafts.json`），
-   **每个区块都是候选**。因此主世界每区块固定 1 次高度查询，占了总量的大头。
+另外两条仍然是事实，但不改变量级：
 
-按 1.21.1 原版 `structure_set` 数据估算一轮 r=500（4225 chunks）：
+1. 高度采样发生在生物群系过滤之前（`getStructurePosition(ctx).filter(isBiomeValid)`，
+   `canGenerate` 也只查 placement），生物群系不匹配的候选照样付采样钱。
+2. 主世界里真正在付钱的是稀疏集合（村庄 / 前哨站 / 试炼密室 / 远古城市 /
+   废弃传送门…），每个结构起始约 4 次角点。
 
-| 来源 | 次数/轮 |
-|---|---|
-| 矿井（1/区块） | ≈ 4225 |
-| 稀疏集合候选（合计约 0.015/区块 × 4 次） | ≈ 250 |
-| 拼图锚点追加 | ≈ 200–300 |
-| **合计** | **≈ 4700 ± 500（约 1.1 次/区块）** |
+**实测**（`debug_height_probe`，同种子 `-836645977851536298`，r=500 / 4225
+chunks，`chunk_batch_size=4`）：
 
-乘 0.3–0.8 ms → **1.4–3.8 s CPU**。这是**天花板，不是收益**：这些工作目前
-大多落在 worker 等 GPU readback 的空档里（§25、教训 #41），能从墙钟里拿回来
-的只有压在关键路径上的那部分。
+| 指标 | 实测 | 初稿估计 |
+|---|---|---|
+| 调用次数 | **696**（0.165 次/区块） | 4700（1.1 次/区块） |
+| 类型分布 | `WORLD_SURFACE_WG` 577 / `OCEAN_FLOOR_WG` 119 | — |
+| 平均单次耗时 | **2.2 ms**（max 46.75 ms，首次调用） | 0.3–0.8 ms |
+| 累计 | **1.58 s** | 1.4–3.8 s |
+| 去重后重复率 | **6%** | — |
+| 调用时 GPU 有批次在途 | **~50%** | — |
+
+两个数字值得单独记：
+
+- **单次 2.2 ms 是"1/6 个区块"模型的 3–7 倍**。196 个网格点本身只值 ~0.6 ms，
+  多出来的是每次调用重建 `ChunkNoiseSampler` + 插值器 + 遍历 density 树图的
+  固定开销——**固定成本主导，不是算术量主导**。这直接否掉了"按列懒算"的便宜
+  路径：要么整区域预计算，要么不查。
+- 调用量只有 0.165 次/区块。真正的成本来自每个结构起始的 4 次角点，矿井几乎
+  不出钱；这也意味着"每区块缓存 16×16 高度"能命中的调用本来就很少。
+
+（同轮 Chunky 总耗时 25 s、稳态 CPS 中位 118，明显差于上一轮同配置的 13 s /
+298。`c2me-wgpu.log` 里 readback 仍是每 chunk ~3 ms，差别在流水线爬升速度，
+属环境波动；高度查询的累计值与墙钟无关，但占比按 13 s 算才是保守口径，
+即 **1.58 s ≈ 12%**。）
 
 #### 28.3 为什么不能直接拿现有 GPU 结果反推
 
@@ -1443,7 +1464,17 @@ status = fromVanillaStatus(directDependencies.get(d))
 3. **只有 (1) 显示 >5% 且 (2) 收益不够时**，才做 §28.4 的 GPU 预计算，并且必须
    先设计结果重用。
 
-**当前决定**：停在 (1)。打点已实装，等一轮同种子 r=500 的数据再判断。
+**测量结果（2026-11-08，0.1.7-alpha.3）**：一轮 696 次 / **1.58 s**（按 13 s 口径
+约 12% 墙钟），重复率仅 6%，约一半调用与在途 GPU 批次重叠。据此：
+
+- 纯 CPU 记忆化最多省 `6% × 1.58 s ≈ 0.1 s`（<1%），不值得加缓存；
+- GPU 懒算不可行：列坐标在结构选址内部才确定，单列 dispatch 的 readback 延迟
+  （0.3–1 ms）与 2.2 ms 的 CPU 单次成本同量级，还要额外承担精确性风险；
+- GPU 区域预计算 = 每个区块多跑一遍噪声（+10–20 s），而上限只有 1.58 s，
+  回收不了成本。
+
+**结论：结案（负结果）**。`debug_height_probe` 保留为诊断开关（默认 `false`），
+以后视距 / 维度 / 结构集变化时可以一键复测，不需要再写代码。
 
 #### 28.6 `FindTopSurface` 的历史结论（保留）
 
