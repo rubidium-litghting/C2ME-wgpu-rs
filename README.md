@@ -132,6 +132,7 @@
   //   0: AMD Radeon Graphics (RADV RENOIR) [Vulkan]
   "gpu_index": -1,
   "disable_pipeline_cache": false,
+  "chunk_batch_size": 1,
   "debug_verbose_logging": false,
   "debug_stage_timing": false,
   "debug_height_probe": false,
@@ -153,6 +154,7 @@
 | `gpu_index` | `-1` | 用哪块 GPU 生成地形。`-1` = 自动（核显优先）。序号对应配置文件注释里列出的清单，也可以用 ModMenu 的设置界面选择。越界或该卡不满足要求时会自动回退到自动选择，并在日志里说明原因。 |
 | `backend` | `-1` | 图形后端。`-1` = 自动（Vulkan/DX12/Metal，不含 GL）。可选值与当前平台有关，配置文件里会有注释列出。桌面端切换后**退出存档再进入**即生效；Android 上切换需要**重启游戏**（见「已知限制」）。注意 wgpu 的 GL 后端不提供管线缓存功能，选 GL 时需要同时开启 `disable_pipeline_cache`。 |
 | `disable_pipeline_cache` | `false` | 绕过磁盘上的着色器管线缓存。仅在驱动于管线缓存处崩溃时才需要开启，代价是每次启动重新编译着色器。 |
+| `chunk_batch_size` | `1` | 对齐批次大小：`1` = 逐区块（默认，行为与旧版完全一致），`2` / `4` / `8` = 把 N×N 个区块收敛成一次调度，提高 GPU 批次聚合度。同种子 r=500 实测：逐区块 18 s、2×2 14 s、**4×4 13 s（最快）**、8×8 15 s（批太大，单批延迟吃掉收益）。**改动需要完全重启游戏**，退出存档再进入不会生效。 |
 | `mapped_at_creation` | `null` | 缓冲区的上传方式。`null` = 平台默认（桌面用映射路径，Android 用 write_buffer），`true` / `false` 强制指定。写缓冲区多一次拷贝但更保守，这也是 Android 默认走它的原因；映射路径在实测的 Mali-G610 上同样可用，两条路径都能工作。 |
 
 ### 调试（`debug_` 前缀）

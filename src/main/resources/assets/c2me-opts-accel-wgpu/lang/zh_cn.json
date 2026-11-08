@@ -40,5 +40,11 @@
   "c2me-opts-accel-wgpu.error.no_adapter": "未找到可用的显卡适配器。请检查显卡驱动是否正常，或尝试在配置中切换图形后端。",
   "c2me-opts-accel-wgpu.error.symbol_mismatch": "原生库版本不匹配，模组文件可能已损坏或混用。",
   "c2me-opts-accel-wgpu.notify.init_failed_friendly": "GPU 初始化失败，已回退 CPU：%s",
-  "c2me-opts-accel-wgpu.config.backend.unavailable": "%s（当前平台不可用）"
+  "c2me-opts-accel-wgpu.config.backend.unavailable": "%s（当前平台不可用）",
+  "c2me-opts-accel-wgpu.config.batch_size": "区块批次大小",
+  "c2me-opts-accel-wgpu.config.batch.1": "1（逐区块）",
+  "c2me-opts-accel-wgpu.config.batch.2": "2×2 区块",
+  "c2me-opts-accel-wgpu.config.batch.4": "4×4 区块（最快）",
+  "c2me-opts-accel-wgpu.config.batch.8": "8×8 区块",
+  "c2me-opts-accel-wgpu.config.batch_hint": "批次大小需完全重启游戏后生效"
 }

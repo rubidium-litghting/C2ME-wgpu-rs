@@ -78,9 +78,10 @@ public final class Config {
      *  previously verified behaviour; 2, 4 or 8 group the chunks of an
      *  aligned square so the scheduler advances the whole group together.
      *  Must be a power of two. Read once when the status is registered, so a
-     *  change takes effect on the next launch, not on a save switch. Not
-     *  annotated for the GUI: the screen has no integer widget yet. */
+     *  change takes effect on the next launch, not on a save switch. */
     @SerializedName("chunk_batch_size")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.batch_size",
+            kind = ConfigOption.Kind.BATCH_SIZE, order = 25)
     public int chunkBatchSize = 1;
 
     // ── debug ──────────────────────────────────────────────────────────

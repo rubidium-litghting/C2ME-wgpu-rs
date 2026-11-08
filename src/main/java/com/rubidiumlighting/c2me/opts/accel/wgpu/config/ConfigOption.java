@@ -66,6 +66,8 @@ public @interface ConfigOption {
         /** Free-form text, rendered as a text field. */
         STRING,
         /** Graphics backend, from the list of usable ones. */
-        BACKEND
+        BACKEND,
+        /** Chunk batch size: 1 (per-chunk) or an aligned N×N square. */
+        BATCH_SIZE
     }
 }

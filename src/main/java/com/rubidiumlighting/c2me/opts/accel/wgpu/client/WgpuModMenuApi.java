@@ -187,6 +187,7 @@ public class WgpuModMenuApi implements ModMenuApi {
                     }
                     case GPU_INDEX -> buildGpuWidget(f, ctrlX, y, ctrlW);
                     case BACKEND -> buildBackendWidget(f, ctrlX, y, ctrlW);
+                    case BATCH_SIZE -> buildBatchWidget(f, ctrlX, y, ctrlW);
                     case STRING -> new TextFieldWidget(this.textRenderer, ctrlX, y, ctrlW, ROW_H,
                             Text.empty()) {{
                         setMaxLength(512);
@@ -199,6 +200,26 @@ public class WgpuModMenuApi implements ModMenuApi {
                         .warn("[c2me-wgpu] cannot build widget for {}", f.getName(), e);
                 return null;
             }
+        }
+
+        /**
+         * Batch size picker: 1 (per-chunk, the default and only verified value)
+         * plus the aligned N×N squares. The labels carry the recommendation
+         * because the setting is invisible in play and depends on the
+         * workload — 4×4 measured fastest on this machine, 8×8 regressed.
+         */
+        private ClickableWidget buildBatchWidget(Field f, int x, int y, int w)
+                throws ReflectiveOperationException {
+            List<Integer> values = List.of(1, 2, 4, 8);
+            int cur = f.getInt(cfg);
+            int pos = values.indexOf(cur);
+            return CyclingButtonWidget.<Integer>builder(
+                            v -> Text.translatable("c2me-opts-accel-wgpu.config.batch." + v))
+                    .values(values)
+                    .initially(pos >= 0 ? cur : 1)
+                    .omitKeyText()
+                    .build(x, y, w, ROW_H, Text.empty(),
+                            (btn, v) -> setField(f, v));
         }
 
         private ClickableWidget buildGpuWidget(Field f, int x, int y, int w)
@@ -391,6 +412,9 @@ public class WgpuModMenuApi implements ModMenuApi {
             // device settings need the instance rebuilt, which happens when a
             // save is reloaded. Saying so here is cheaper than a bug report
             // asking why the GPU choice did nothing.
+            ctx.drawCenteredTextWithShadow(this.textRenderer,
+                    Text.translatable("c2me-opts-accel-wgpu.config.batch_hint"),
+                    this.width / 2, this.height - 56, 0x808080);
             ctx.drawCenteredTextWithShadow(this.textRenderer,
                     Text.translatable("c2me-opts-accel-wgpu.config.hint"),
                     this.width / 2, this.height - 44, 0x808080);

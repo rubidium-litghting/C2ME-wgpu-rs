@@ -40,5 +40,11 @@
   "c2me-opts-accel-wgpu.error.no_adapter": "No usable GPU adapter found. Check your graphics driver, or try a different backend in the config.",
   "c2me-opts-accel-wgpu.error.symbol_mismatch": "Native library version mismatch. The mod files may be corrupted or mixed.",
   "c2me-opts-accel-wgpu.notify.init_failed_friendly": "GPU initialization failed, falling back to CPU: %s",
-  "c2me-opts-accel-wgpu.config.backend.unavailable": "%s (unavailable on this platform)"
+  "c2me-opts-accel-wgpu.config.backend.unavailable": "%s (unavailable on this platform)",
+  "c2me-opts-accel-wgpu.config.batch_size": "Chunk batch size",
+  "c2me-opts-accel-wgpu.config.batch.1": "1 (per chunk)",
+  "c2me-opts-accel-wgpu.config.batch.2": "2×2 chunks",
+  "c2me-opts-accel-wgpu.config.batch.4": "4×4 chunks (fastest)",
+  "c2me-opts-accel-wgpu.config.batch.8": "8×8 chunks",
+  "c2me-opts-accel-wgpu.config.batch_hint": "Batch size takes effect after a full restart"
 }
