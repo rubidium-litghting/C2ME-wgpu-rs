@@ -27,7 +27,9 @@
 // Declares only the members this mod calls, so it does not pin a C2ME version.
 package com.ishland.c2me.rewrites.chunksystem.common;
 
+import com.ishland.flowsched.scheduler.ItemHolder;
 import com.ishland.flowsched.scheduler.ItemStatus;
+import com.ishland.flowsched.scheduler.KeyStatusPair;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.world.chunk.ChunkStatus;
 
@@ -48,6 +50,15 @@ public abstract class NewChunkStatus
     }
 
     public ChunkStatus getEffectiveVanillaStatus() {
+        throw new UnsupportedOperationException("stub");
+    }
+
+    /** Turn positions relative to {@code holder} into absolute chunk
+     *  positions. Implemented by the real class; declared here so our status
+     *  can reuse it instead of duplicating the conversion. */
+    protected static KeyStatusPair<ChunkPos, ChunkState, ChunkLoadingContext>[] relativeToAbsoluteDependencies(
+            ItemHolder<ChunkPos, ChunkState, ChunkLoadingContext, ?> holder,
+            KeyStatusPair<ChunkPos, ChunkState, ChunkLoadingContext>[] relative) {
         throw new UnsupportedOperationException("stub");
     }
 

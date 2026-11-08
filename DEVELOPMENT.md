@@ -17,7 +17,10 @@
 >
 > **0.1.7-alpha.1（分支 `feature/chunk-status-integration`）**：C2ME
 > `NewStatusHook` / `NewChunkStatus` 接入阶段 1 已提交并通过实机验证（透明委托，
-> r=500 4225 chunks / 15 s，与基线持平）。见 §27。
+> r=500 4225 chunks / 15 s，与基线持平）。
+> **0.1.7-alpha.2**：阶段 2 的 `chunk_batch_size` 对齐批次（2×2 / 4×4 / 8×8）
+> 已实现并通过实机验证（同种子 r=500：2/4/8 分别 14 / 13 / 15 s，4×4 最优，
+> CPS 298；地形正常、无死锁）。默认值仍为 1，不改变已验证行为。见 §27.7。
 
 ---
 
@@ -46,6 +49,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 | 史诗地形/构造地形兼容 | ✅ Epic Terrain, Tectonic |
 | WeirdScaledSampler | ✅ 完整实现 |
 | **C2ME `NewChunkStatus` 接入（阶段 1）** | ✅ 透明委托，见 §27 |
+| **对齐批次（阶段 2，`chunk_batch_size`）** | ✅ 2/4/8 实机验证通过；4×4 最优（13 s / CPS 298），默认仍为 1，见 §27.7 |
 
 ### 关键教训速查
 
@@ -312,9 +316,10 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
       能跑 shader 的才参与选择。越界或不达标都会打日志并回退到自动顺序，坏配置
       不会让整个会话掉到 CPU。
   - [x] **切换存档时热重载配置**：
-    - 配置分三类：A 类影响 instance（`gpu_index`、`backend`、
+    - 配置分四类：A 类影响 instance（`gpu_index`、`backend`、
       `disable_pipeline_cache`）、B 类影响 world 创建（`mapped_at_creation`）、
-      C 类只影响行为（`debug_*`）。
+      C 类只影响行为（`debug_*`）、D 类在 chunk-status 注册时读取一次
+      （`chunk_batch_size`，改动需重进游戏/重启，不能靠切存档热重载）。
     - 实现上没有引入任何锁：`debug` / `profile` 是两条 `AtomicBool`（热路径零开销）；
       A/B 两类在重建 instance 时作为 `ColdConfig` 一并替换，因此不存在"全局可变
       配置"这一概念。
@@ -407,10 +412,18 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 - [x] `fabric.mod.json` 下限锁到 `"c2me": ">=0.4.0-alpha.0.29"`（`NewStatusHook`
   可用的版本）。
 - [x] 构建期 C2ME/FlowSched stub + `compileOnly` RxJava 3.1.12，不打包、不链接 C2ME。
-- [ ] **阶段 2：状态直接持有并提交 GPU 批次**（取消对 vanilla delegate 的转发）。
-  需要自己准备 `Blender`、`StructureAccessor` 与 `ChunkNoiseSampler`，否则
-  aquifer/beard 会算错——这正是阶段 1 只做透明委托的原因。
-- [ ] **阶段 3：4x4 空间批处理**（官方 CL 的核心收益来源），依赖阶段 2。
+- [x] **阶段 2：对齐空间批次（`chunk_batch_size`）**。把 `N×N`（2/4/8）的
+  对齐方阵收敛成一个依赖单元：只有最小角（anchor）走 `upgradeToThis`，
+  其余成员依赖 anchor 的本状态；anchor 声明整组的原版 `NOISE` 依赖并集，
+  然后**仍通过 C2ME 的 `VanillaWorldGenerationDelegate`** 并行生成每个成员。
+  GPU 工作继续留在 `populateNoise` → `WgpuBatchCoordinator`，因此没有第二份
+  地形实现。默认 `1` 完全等价于阶段 1。设计见 §27.6。
+- [x] **阶段 2 实机验证**：`chunk_batch_size=2` → 4 → 8，同种子 r=500 对比
+  地形、CPS 与端到端。结果 14 / **13** / 15 s，4×4 最优（CPS 298）；无死锁、
+  无 member 漏生成、地形正常。详见 §27.7。默认值暂不提高，4 作为推荐手动值。
+- [ ] **阶段 3：批内真正共享采样上下文**（官方 CL 的剩余收益）。当前批次只
+  收敛调度依赖，每个成员仍各自构建 `ChunkNoiseSampler`；要进一步必须自己
+  持有 `Blender` / `StructureAccessor` / sampler，风险远高于阶段 2，暂不做。
 
 **0.1.7+ 待办**
 - [ ] **让 external payload 随批次携带**（而非走进程级 `world.external_data`）。
@@ -674,6 +687,12 @@ jar），Java 代码直接引用这些类。详见 §10。
 - **兼容性红线**：只用 C2ME 的公开扩展点（`NewStatusHook` /
   `NewChunkStatus`），不 mixin 它的内部实现。升级 C2ME 后若签名变化，
   编译期会直接失败，而不是运行期错地形。见 §27。
+- **许可证红线（2026-11 补充）**：本地的 `c2me-opts-accel-opencl` 模块是
+  `All-Rights-Reserved`（`LICENSE-ARR.txt`）。反编译只允许用来确认**行为事实**
+  （例如"官方确实通过 `NewStatusHook` 做批处理"）和公开 API 的存在/签名，
+  **不得复制代码、常量、命名、注释或类结构**。本项目的实现只从 MIT 的
+  C2ME 公开 API、原版 `ChunkGenerationSteps` 语义和本项目实机数据独立推导。
+  需要对照时，读 `C2ME-fabric` 仓库（MIT）而不是 CL 的字节码。
 
 ### 2.4 Access Widener（自写）
 `src/main/resources/c2me-opts-accel-wgpu.accesswidener`：只放宽真正访问的
@@ -1174,14 +1193,123 @@ Chunky r=1000（16129 chunks），同种子、同预热：
 **结论**：持平而非提升是预期结果——这一阶段 GPU 工作与 0.1.6 完全相同，
 只是多包了一层状态。它证明的是扩展点、顺序和依赖声明正确，不能证明性能。
 
-#### 27.5 下一阶段的前提
+#### 27.5 阶段 2 为什么没有接管生成
 
-阶段 2 要自己提交批次，必须先解决三件事：
+原计划在阶段 2 里自己构建 `ChunkNoiseSampler` / `Blender` / `StructureAccessor`，
+但那样等于写第二份世界生成器：aquifer、beardifier、写回半径都要逐项对齐，
+出错时很难区分是"调度错了"还是"采样错了"。因此阶段 2 改为**只收敛调度**：
 
-1. 在状态内拿到与 vanilla 等价的 `ChunkNoiseSampler`（或复刻其采样上下文）；
-2. `Blender` / `StructureAccessor` 的线程安全获取方式（C2ME worker 上并发）；
-3. 4x4 批次的坐标聚合与 `WgpuBatchCoordinator` 接口改造（目前按 chunk 请求）。
+- 生成仍然由 C2ME 的 `VanillaWorldGenerationDelegate` 完成；
+- GPU 仍然由 `populateNoise` → `WgpuBatchCoordinator` 服务；
+- 批次只改变"整组什么时候算就绪、由谁触发"。
 
-在这些验证完成之前，不要删除 `MixinChunkGenerator` 的写回路径——它仍是唯一
-经过完整实机验证的正确路径。
+这样任何批次逻辑的 bug 都只可能表现为**慢**或**回退到逐块生成**，而不是错地形。
+`MixinChunkGenerator` 的写回路径继续保留，不删除。
+
+#### 27.6 对齐批次设计（`chunk_batch_size`）
+
+配置字段 `chunk_batch_size`：`1`（默认，透明委托）/ `2` / `4` / `8`，必须是
+2 的幂；非法值在 `Config#clamp` 里回落为 1。状态注册时读取一次（每 JVM 一次），
+改动必须完全重启 Minecraft，只退出存档再进入无效。实机结果里 **4×4 最优**
+（§27.7），作为推荐的手动值；默认保持 1，保证未验证场景行为不变。
+
+**分组与对齐**。以 `mask = N-1` 判定最小角（anchor）：
+
+```
+isAnchor(x, z)  =  (x & mask) == 0 && (z & mask) == 0
+anchorOf(x, z)  =  (x & ~mask, z & ~mask)
+```
+
+一个组覆盖 `[anchor.x, anchor.x+N-1] × [anchor.z, anchor.z+N-1]`。负坐标按
+二进制补码同样成立（例如 `-1 & 3 = 3`，`-4 & 3 = 0`）。
+
+**anchor 的依赖并集**。原版 `NOISE` 生成步骤的 `directDependencies()` 是
+`[BIOMES(0..1), STRUCTURE_STARTS(2..8)]`（半径 8）。组的并集是每个成员各扩
+8 格后的方形并集，即相对 anchor 的 `[-8, N+7]²`，大小
+`(N+16)²-1`（N=2 → 323，N=4 → 399，N=8 → 575）。对偏移 `(x,z)`：
+
+```
+dx = max(0, -x, x-(N-1))
+dz = max(0, -z, z-(N-1))
+d  = max(dx, dz)          // 到组方阵的 Chebyshev 距离
+status = fromVanillaStatus(directDependencies.get(d))
+```
+
+`d=0..1` 得到 `BIOMES`，`d=2..8` 得到 `STRUCTURE_STARTS`，与单块完全一致
+（N=1 时逐项等于原版 `NOISE` 的依赖集）。
+
+**非 anchor**。`getDependencies` 只声明一条：`anchor @ 本状态`。它的
+`upgradeToThis` 直接 `Completable.complete()`，因为 anchor 完成时已经替整组
+写好了 `ChunkState`。
+
+**anchor 的升级**。按组遍历成员：
+
+1. 自己用当前 `ctx` 调 `vanilla.upgradeToThis(ctx, cancellable)`；
+2. 其余成员通过 `ctx.theChunkSystem().getHolder(pos)` 取 `ItemHolder`，
+   用 `new ChunkLoadingContext(memberHolder, ctx.tacs(), ctx.schedulingManager(),
+   ctx.theChunkSystem(), ctx.dependencies())` 构造成员上下文，再调同一个
+   vanilla delegate；
+3. 用 `Completable.merge` 同时订阅。原版 `NOISE` 的 `blockStateWriteRadius`
+   是 0，所以成员的锁集互不重叠，C2ME 调度器可以并行执行；GPU coordinator
+   因此能在同一个 5 ms 窗口里收到整组请求（N=8 正好等于 `MAX_BATCH=64`）。
+
+成员上下文里的 `dependencies()` 只是占位：已确认
+`VanillaWorldGenerationDelegate.upgradeToThis` 不读取该字段，区域与锁都由
+它自己按 `theChunkSystem` / `schedulingManager` 重建。
+
+**跳过与兜底**（这是正确性的关键）：
+
+- 任何成员只要 `ChunkState.reachedStatus() >= NOISE` 就跳过；
+- 取不到 holder / `ChunkState` 的成员跳过并 warn；
+- anchor 自己已经 `>= NOISE` 时整组直接完成；
+- 被跳过的成员**不会漏生成**：本状态之后紧跟的原版 `NOISE` delegate 会检查
+  自己的 `ChunkState`，未到的照常逐块生成。也就是说本状态是纯优化层，
+  原版 delegate 仍是最终保证。
+- 已经 `>= NOISE` 的 holder 返回 `EMPTY_DEPENDENCIES`，不再无谓等待 anchor。
+
+**版本敏感点**。本实现用的是 1.21.1 / C2ME `0.4.0-alpha.0.29` 的
+`ChunkLoadingContext.theChunkSystem()` + `ItemHolder.getUserData()` 语义。
+后来（26.2 线）的 C2ME 把 record 组件改成了 `chunks`，所以这段代码只承诺
+1.21.1；升级 C2ME 时必须在编译期重新核对 stub 签名。若运行期类形状不符，
+表现是 `NoSuchMethodError` 启动/生成失败（fail-fast），不会静默错地形。
+
+#### 27.7 阶段 2 实机验证结果（2026-11-08）
+
+测试条件：同一个世界、种子 `-836645977851536298`，每档都**删除并重建世界**
+（保证真正重新生成），Chunky r=500（4225 chunks）。四轮中心分别为
+`-6.5,-3.5` / `6.5,-1.5` / `-3.5,-7.5` / `1.5,-5.5`——最大相差 13 格
+（小于一个区块），按约定视为同一区域。
+
+| batch | 启动日志 | 总耗时 | 稳态 CPS 中位 | CPS 峰值 | 每批平均 chunk |
+|---|---|---|---|---|---|
+| 1 | `batch_size=1` | 18 s | 266 | 306 | ~4.1 |
+| 2 | `batch_size=2 (... 323 dependencies ...)` | 14 s | 247 | 309 | 7.8 |
+| **4** | `batch_size=4 (... 399 dependencies ...)` | **13 s** | **298** | 330 | 15.3 |
+| 8 | `batch_size=8 (... 575 dependencies ...)` | 15 s | 260 | 372 | 28.8 |
+
+- **地形**：四档均由用户目视确认正常（无空洞、断层、错位切面）。未做逐方块
+  dump 对比；批次逻辑只收敛调度，生成仍走原版 delegate，这是目视检查足够
+  的原因。
+- **稳定性**：四轮均无 `batch member ... has no holder/ChunkState` 警告、
+  无 `NoSuchMethodError` / `ClassCastException` / 调度器异常，区块持续完成，
+  三存档正常保存。仅有的 ERROR 是认证 / Realms / 旁白环境噪声。
+- **批次聚合确实生效**：`c2me-wgpu.log` 的每批平均 chunk 数随 N 单调上升
+  （4.1 → 7.8 → 15.3 → 28.8），说明 anchor 把整组一起交给了 GPU。
+- **4×4 最优**：13 s / CPS 298。8×8 反而回落到 15 s / CPS 260，虽然峰值最高
+  （372）：`c2me-wgpu.log` 显示 8×8 的单批耗时升到 58–93 ms（readback 占大头），
+  而每批只有 ~29 个 chunk，已经接近 `MAX_BATCH=64` 的收益上限，属于"批太大、
+  攒批等待和单批延迟吃掉收益"。
+- batch=1 的 18 s 明显高于历史 15 s，但历史数据是不同种子；本表四轮同种子，
+  组内可比（教训 #45）。因此结论只取组内相对值：**4 > 2 ≈ 8 > 1**。
+
+**结论**：`chunk_batch_size` 保留默认 `1`（不改变已验证行为），把 **4** 作为
+推荐的手动值写进 §27.6。是否把默认改成 4，需要先补一轮同区域、同机器负载的
+1 vs 4 重复实验，避免被单次会话波动误导。
+
+**操作注意**：`chunk_batch_size` 在 `NewChunkStatus.<clinit>` 时读取一次，
+每 JVM 只执行一次，所以改值必须**完全重启 Minecraft**，只退出存档再进入
+不会生效。该字段也不会自动写进旧配置文件（GSON 缺字段时用默认值），需手动
+添加；值非法时 `Config#clamp` 回落为 1。
+
+回退：把值改回 `1` 并重启即可，不需要换 jar。
 

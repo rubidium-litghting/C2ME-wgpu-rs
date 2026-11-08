@@ -73,6 +73,16 @@ public final class Config {
     @ConfigOption(label = "c2me-opts-accel-wgpu.config.pipeline_cache", order = 20)
     public boolean disablePipelineCache = false;
 
+    /** Chunks per side in one aligned NOISE batch (the C2ME chunk-status
+     *  integration). 1 = transparent per-chunk delegation, which keeps the
+     *  previously verified behaviour; 2, 4 or 8 group the chunks of an
+     *  aligned square so the scheduler advances the whole group together.
+     *  Must be a power of two. Read once when the status is registered, so a
+     *  change takes effect on the next launch, not on a save switch. Not
+     *  annotated for the GUI: the screen has no integer widget yet. */
+    @SerializedName("chunk_batch_size")
+    public int chunkBatchSize = 1;
+
     // ── debug ──────────────────────────────────────────────────────────
     // Everything below is for troubleshooting and normally stays off. They
     // all share the `debug_` prefix so a glance at the file shows which
@@ -235,6 +245,11 @@ public final class Config {
         }
         if (backend < -1) {
             backend = -1;
+            changed = true;
+        }
+        if (chunkBatchSize != 1 && chunkBatchSize != 2
+                && chunkBatchSize != 4 && chunkBatchSize != 8) {
+            chunkBatchSize = 1;
             changed = true;
         }
         return changed;

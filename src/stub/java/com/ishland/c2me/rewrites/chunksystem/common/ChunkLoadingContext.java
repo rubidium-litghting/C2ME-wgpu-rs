@@ -28,10 +28,22 @@ package com.ishland.c2me.rewrites.chunksystem.common;
 
 import com.ishland.c2me.base.common.scheduler.SchedulingManager;
 import com.ishland.flowsched.scheduler.ItemHolder;
+import com.ishland.flowsched.scheduler.KeyStatusPair;
 import net.minecraft.server.world.ServerChunkLoadingManager;
 import net.minecraft.util.math.ChunkPos;
 
 public final class ChunkLoadingContext {
+    /** Mirrors the record's canonical constructor so a batch anchor can build
+     *  a context for a member chunk. The descriptor is erased, so this links
+     *  to the real constructor at runtime. */
+    public ChunkLoadingContext(
+            ItemHolder<ChunkPos, ChunkState, ChunkLoadingContext, ?> holder,
+            ServerChunkLoadingManager tacs,
+            SchedulingManager schedulingManager,
+            TheChunkSystem theChunkSystem,
+            KeyStatusPair<ChunkPos, ChunkState, ChunkLoadingContext>[] dependencies) {
+        throw new UnsupportedOperationException("stub");
+    }
     public ItemHolder<ChunkPos, ChunkState, ChunkLoadingContext, ?> holder() {
         throw new UnsupportedOperationException("stub");
     }
@@ -39,6 +51,12 @@ public final class ChunkLoadingContext {
         throw new UnsupportedOperationException("stub");
     }
     public SchedulingManager schedulingManager() {
+        throw new UnsupportedOperationException("stub");
+    }
+    public TheChunkSystem theChunkSystem() {
+        throw new UnsupportedOperationException("stub");
+    }
+    public KeyStatusPair<ChunkPos, ChunkState, ChunkLoadingContext>[] dependencies() {
         throw new UnsupportedOperationException("stub");
     }
 }
