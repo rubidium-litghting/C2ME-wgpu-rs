@@ -1,6 +1,6 @@
 # C2ME WGPU 加速模块 — 开发文档
 
-> 最后更新：2026-11-07
+> 最后更新：2026-11-08
 > 状态：**0.1.5、0.1.6 已发布**。0.1.6 修掉了 modded 世界（暮色森林 / Tectonic）的
 > 死锁与全虚空问题，并把 shader/pipeline 编译失败从"静默死锁"改为"该维度回退 CPU + 玩家可读提示"。
 > 0.1.5 完整实现 Pass E、GPU 矿脉、100% 对齐原版的 AquiferSampler 逻辑，并重构了 FFM 日志架构与底层防死锁机制。实机验证兼容 Epic Terrain 与 Tectonic（Fabric 原生环境）。
@@ -21,6 +21,9 @@
 > **0.1.7-alpha.2**：阶段 2 的 `chunk_batch_size` 对齐批次（2×2 / 4×4 / 8×8）
 > 已实现并通过实机验证（同种子 r=500：2/4/8 分别 14 / 13 / 15 s，4×4 最优，
 > CPS 298；地形正常、无死锁）。默认值仍为 1，不改变已验证行为。见 §27.7。
+> **表面高度估算已评估：暂不实现**。一轮 r=500 约 4700 次 `getHeight`
+> （矿井 `spacing=1` 每区块 1 次），折合 1.4–3.8 s CPU 且大部分被 GPU 等待
+> 掩盖；先打点测量再谈实现。见 §28。
 
 ---
 
@@ -279,6 +282,11 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     解析该表的写法都会拿到 null（或触发二次初始化），必须**惰性解析 + 兜底**
     （本次是 `volatile` 字段 + 首次调用 `fromVanillaStatus`）。同理，构造器里
     不要打"已就绪"日志——真正可用是在第一次 `upgradeToThis`。
+48. **优化前先算天花板，别先写 shader**："表面高度估算"从"不做"改成"待评估"
+    之后，第一件该做的事是数调用点和调用量，不是动手实现。这一轮数出来的
+    上限是每轮 r=500 约 4700 次 `getHeight`、1.4–3.8 s CPU，而墙钟里能拿回
+    来的只有压在关键路径上的那部分；同时"从现有 GPU 结果反推高度"被时序、
+    beardifier、surface rules 三条独立否掉。**没有分母的优化讨论都是猜。**
 
 
 
@@ -524,21 +532,19 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   * 咱们 Rust 侧的 `BufferPool` 目前按 `(usage, size)` 做 LRU。可以借鉴其
     “严格分类”的思路，确保高频输入（external/aquifer）与输出（block_out）
     绝不会因为尺寸碰巧一致而被错误复用，进一步杜绝数据串流 bug。
-- [ ] **表面高度估算预计算（Estimate Surface Height）——前提已变，需重新评估**
-  * 官方在结构生成前通过 GPU 算一份粗略地表高度缓存，省掉结构选址时的反复
-    采样。
-  * 原判定"不适用"基于两点，现都已不成立：
-    1. ~~它挂在 `ChunkGenerating.generateStructures`，属状态机层，是红线~~
-       → 状态机依赖已解除（见架构边界修订），挂点不再是障碍。
-    2. ~~与 §20 架构冲突，强行嫁接会破坏现有路径~~ → 这条仍然存在：我们是
-       GPU 直接出方块状态，官方是"GPU 出密度、Java 做后续"。合并的可行性
-       取决于新的 `NewChunkStatus` 实现能否同时承接表面高度估算，尚未验证。
-  * 结论：**从"不做"变为"待评估"**，但不是自动可行。
-  * 顺带查清了 `FindTopSurface`：它是 1.18 之前的旧节点，**1.21.1 的
-    NoiseRouter 里根本不存在**，Java 侧只定义 `TAG_FIND_TOP_SURF` 却从不写入，
-    真实 router 测试数据里也搜不到。它的 WGSL emitter 曾返回一个未定义的占位
-    字符串（会生成非法 shader），现已改为显式返回 `Err`，让该维度干净回退
-    CPU。反序列化路径保留，仅为了兼容旧 blob 与单元测试。
+- [ ] **表面高度估算预计算（Estimate Surface Height）——已评估，暂不实现（§28）**
+  * 官方在结构生成前通过 GPU 算一份地表高度缓存，省掉结构选址时的反复采样。
+  * 挂点不再是障碍（状态机依赖已解除），但**成本模型决定它现在不划算**：
+    主世界每区块固定 1 次高度查询（矿井 `spacing=1` 使每个区块都是候选，
+    且高度采样发生在生物群系过滤之前），一轮 r=500 约 4700 次
+    （≈ 1.1 次/区块），折合 1.4–3.8 s CPU ——而且大部分落在 worker 等 GPU
+    readback 的空档里，不是墙钟。
+  * "从现有 GPU 结果反推高度"被三条独立否掉：`NOISE` 晚于
+    `STRUCTURE_STARTS`（时序）、`Beardifier.INSTANCE` 与真实 beardifier 不同、
+    `WORLD_SURFACE_WG` 不含 surface rules（语义）。见 §28.3。
+  * **下一步不是实现，而是打点测量**：调用次数 / 累计 nanos / 去重列数 /
+    线程分布（§28.5）。测出来 <3% 墙钟就结案；>5% 再考虑 CPU 记忆化，
+    最后才是 GPU 区域预计算（且必须先设计结果重用，否则净负）。
 
 #### 🔴 高难度：核心功能突破（长远目标）
 - [ ] **把生物群系（Biome）拉上 GPU——前提已变，需重新评估**
@@ -1312,4 +1318,123 @@ status = fromVanillaStatus(directDependencies.get(d))
 添加；值非法时 `Config#clamp` 回落为 1。
 
 回退：把值改回 `1` 并重启即可，不需要换 jar。
+
+### §28 表面高度估算（Estimate Surface Height）评估（2026-11-08）
+
+> 结论先行：**暂不实现**。上限约 1.4–3.8 s CPU/轮，且大部分落在 worker 等
+> GPU readback 的空档里；下限成本是新 shader 入口 + 区域预计算 + 精确性校验，
+> 而且**必须重用预计算结果**，否则等于多跑一遍噪声，净负。先按 §28.5 打点
+> 测量，再决定是否进入实现。
+
+#### 28.1 原版 `getHeight` 的成本模型
+
+依据 1.21.1 named jar 的 `NoiseChunkGenerator#sampleHeightmap` 字节码（行为
+事实，未参考任何非 MIT 实现）：
+
+- 每次调用新建一个 `ChunkNoiseSampler`，横向 cell 数固定为 **1**
+  （构造器第一个参数 `iconst_1`），垂直方向按 `GenerationShapeConfig` trim 后
+  的高度切 cell。主世界 384 高、cell 8 → 48 层 → 密度网格点
+  `2 × 49 × 2 = 196`；满区块是 `5 × 49 × 5 = 1225`。即**一次高度查询 ≈ 1/6
+  个区块的噪声求值**。
+- 传入的是 `Beardifier.INSTANCE`（空 beardifier）和
+  `Blender.getNoBlending()`：**高度与 blending 无关，也看不到已放置的结构**，
+  只由种子 + `NoiseConfig` 决定。这一点后面 §28.5 的缓存方案直接受益。
+- `AquiferSampler.FluidLevelSampler` 与区块生成共用同一个工厂，含水层参与
+  判定；但 **surface rules 不参与**（`buildSurface` 在更晚的状态）。
+- 求值方式是从世界顶部**逐格**向下 `sampleBlockState()`，命中谓词即
+  `stopInterpolation()` 返回；`WORLD_SURFACE_WG` 的谓词是
+  `Heightmap.NOT_AIR`——水、树叶、雪都算"非空气"。
+- `getHeightOnGround` / `getHeightInGround` 只是 `getHeight` 的 ±1 包装
+  （一个 `iconst_1; isub`）。
+
+按 §25 的纯 CPU 端到端（r=500 / 4225 chunks / 27 s ≈ 6.4 ms per chunk）反推，
+密度部分约 3–4 ms/chunk，则一次 `getHeight` 粗估 **0.3–0.8 ms**（196/1225 的
+网格点，加最多 384 次逐格插值与含水层判定）。
+
+#### 28.2 谁在调用，一轮要调多少次
+
+| 调用点 | 每次调用数 | 备注 |
+|---|---|---|
+| `Structure.getCornerHeights`（`getAverageCornerHeights` / `getMinCornerHeight`） | 4 × `getHeightInGround` | 大多数结构选址的公共路径 |
+| `MineshaftStructure#getStructurePosition` | 1 × `getHeight` | **每个主世界区块都会走** |
+| `StructurePoolBasedGenerator` / `StructurePoolGenerator` | 2 × `getHeightOnGround` / 锚点 | 拼图结构（村庄、前哨站、试炼密室、远古城市…） |
+| `RuinedPortalStructure` | 依地形适应性分支 | 少数 |
+
+两条容易被忽略的放大因素：
+
+1. **高度采样发生在生物群系过滤之前**。`Structure.getValidStructurePosition`
+   的字节码是 `getStructurePosition(ctx).filter(isBiomeValid)`；
+   `StructurePlacementCalculator#canGenerate` 也只查 placement、不查群系。
+   即生物群系不匹配的候选区块照样要付这 4 次采样。
+2. **矿井的 placement 是 `spacing=1 separation=0`**
+   （原版 `data/minecraft/worldgen/structure_set/mineshafts.json`），
+   **每个区块都是候选**。因此主世界每区块固定 1 次高度查询，占了总量的大头。
+
+按 1.21.1 原版 `structure_set` 数据估算一轮 r=500（4225 chunks）：
+
+| 来源 | 次数/轮 |
+|---|---|
+| 矿井（1/区块） | ≈ 4225 |
+| 稀疏集合候选（合计约 0.015/区块 × 4 次） | ≈ 250 |
+| 拼图锚点追加 | ≈ 200–300 |
+| **合计** | **≈ 4700 ± 500（约 1.1 次/区块）** |
+
+乘 0.3–0.8 ms → **1.4–3.8 s CPU**。这是**天花板，不是收益**：这些工作目前
+大多落在 worker 等 GPU readback 的空档里（§25、教训 #41），能从墙钟里拿回来
+的只有压在关键路径上的那部分。
+
+#### 28.3 为什么不能直接拿现有 GPU 结果反推
+
+三个独立原因，任何一个都足以否掉"扫一遍 block_out 取顶部"的方案：
+
+1. **时序**：`NOISE` 依赖半径 8 的 `STRUCTURE_STARTS`（§27.6 的依赖表）。
+   结构选址发生时，目标列的 `NOISE` 还没跑——而这正是我们要回答的问题。
+2. **Beardifier**：`sampleHeightmap` 用 `Beardifier.INSTANCE`（空），
+   `populateNoise` 用真实 `StructureAccessor` 的 beardifier。拿区块结果反推会
+   在结构附近产生 1–2 格偏差，直接影响结构 Y。
+3. **语义**：`WORLD_SURFACE_WG` 是"密度 + 含水层"后的最高非空气方块，不含
+   surface rules；只有能证明 block_out 与 vanilla `populateNoise` 逐块一致，
+   才谈得上等价推导（目前只有目视验证，见 §27.7）。
+
+所以"区块 NOISE 完成后缓存 16×16 高度"这条路命中率≈0：等缓存可用时，该区块
+的结构选址早已发生。
+
+#### 28.4 真要做的话，最小可行形状
+
+1. **GPU 新增高度入口**：输入列坐标数组，输出每列高度（4 B/列）。可复用现有
+   router 求值，但语义必须逐项对齐 `sampleHeightmap`：trim 后的 shape、
+   `Beardifier.INSTANCE`、同一 `FluidLevelSampler`、从顶向下取第一个非空气。
+2. **必须提前算**：在结构选址之前完成，只能按区域做（例如 anchor 组的 N×N
+   区块 + 一圈 margin），或按 `STRUCTURE_STARTS` 的波次推测性预取。
+3. **必须攒批**：单列一次 dispatch 的 readback 延迟（0.3–1 ms）会吃光收益，
+   需要复用 `WgpuBatchCoordinator` 的攒批机制。
+4. **必须留 CPU 兜底**：miss 直接走原版 `getHeight`，正确性由 fallback 保证。
+5. **必须重用**：预计算的列数据要能被随后同区块的 `NOISE` 复用，否则等于多跑
+   一遍噪声（整区域预计算 ≈ 一次完整 NOISE，量级 +10–20 s），净负。
+
+第 5 条是关键：**不重用结果的区域预计算，成本高于它省下的 CPU。**
+
+#### 28.5 建议的执行顺序
+
+1. **先测量，不写 shader**。在 `ChunkGenerator.getHeight` /
+   `getHeightOnGround` 上打点：调用次数、累计 nanos、去重列数、调用线程、
+   调用时该线程是否有在途 GPU 请求。同种子 r=500 跑一轮。
+   - 累计 < 3% 墙钟 → 直接结案，从待办里删掉。
+2. **若确实可观，先做便宜的 CPU 记忆化**：`(x, z, type) → height`，每维度一个
+   `Long2IntMap`（键为打包的 `x<<32|z` 加 type）。
+   - 精确性天然成立：§28.1 已确认高度与 blending 无关、只由种子决定，同种子下
+     永不失效。
+   - 命中率预计不高（结构角点基本不重合），但实现零风险，可作为第一刀。
+3. **只有 (1) 显示 >5% 且 (2) 收益不够时**，才做 §28.4 的 GPU 预计算，并且必须
+   先设计结果重用。
+
+**当前决定**：停在 (1) 之前，不实现；等有测量数据再回来。
+
+#### 28.6 `FindTopSurface` 的历史结论（保留）
+
+顺带查清了 `FindTopSurface`：它是 1.18 之前的旧节点，**1.21.1 的 NoiseRouter
+里根本不存在**，Java 侧只定义 `TAG_FIND_TOP_SURF` 却从不写入，真实 router
+测试数据里也搜不到。它的 WGSL emitter 曾返回一个未定义的占位字符串（会生成
+非法 shader），现已改为显式返回 `Err`，让该维度干净回退 CPU。反序列化路径
+保留，仅为了兼容旧 blob 与单元测试。
 
