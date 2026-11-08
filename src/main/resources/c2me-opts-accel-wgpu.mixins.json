@@ -6,6 +6,7 @@
   "mixins": [
     "MixinNewStatusHook",
     "MixinChunkGenerator",
+    "MixinNoiseChunkGeneratorHeight",
     "InterpolatedNoiseSamplerAccessor",
     "SimplexNoiseSamplerAccessor",
     "ChunkNoiseSamplerAccessor",

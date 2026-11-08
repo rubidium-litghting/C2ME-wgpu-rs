@@ -14,6 +14,7 @@
   "c2me-opts-accel-wgpu.config.mapped": "Mapped at creation",
   "c2me-opts-accel-wgpu.config.verbose": "Verbose logging",
   "c2me-opts-accel-wgpu.config.stage_timing": "Stage timing",
+  "c2me-opts-accel-wgpu.config.height_probe": "Height query probe",
   "c2me-opts-accel-wgpu.config.tristate.auto": "Automatic",
   "c2me-opts-accel-wgpu.config.tristate.on": "On",
   "c2me-opts-accel-wgpu.config.tristate.off": "Off",

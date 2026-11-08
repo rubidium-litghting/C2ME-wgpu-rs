@@ -38,6 +38,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -60,6 +61,17 @@ public final class WgpuBatchCoordinator {
 
     /** Max chunks coalesced into one GPU dispatch. */
     private static final int MAX_BATCH = 64;
+
+    /** Batches submitted to the GPU and not yet read back, summed over every
+     *  dimension. Only {@code HeightProbe} reads it: it is how the probe tells
+     *  whether a CPU-side height query ran while the GPU pipeline was busy.
+     *  Documentation: DEVELOPMENT.md §28.5. */
+    private static final AtomicInteger ACTIVE_REQUESTS = new AtomicInteger();
+
+    /** @see #ACTIVE_REQUESTS */
+    public static int activeRequests() {
+        return ACTIVE_REQUESTS.get();
+    }
     /** Max time (ms) to wait for more requests before flushing a short batch.
      *
      *  Kept at 5ms after bracketing the value from both sides: 15ms produced
@@ -418,6 +430,7 @@ public final class WgpuBatchCoordinator {
             failAll(batch, new RuntimeException("requestChunks returned 0"));
             return null;
         }
+        ACTIVE_REQUESTS.incrementAndGet();
         return new Inflight(batch, req, System.nanoTime());
     }
 
@@ -438,7 +451,13 @@ public final class WgpuBatchCoordinator {
             submitPermits.release();
             return;
         }
-        inflight.put(ib);
+        try {
+            inflight.put(ib);
+        } catch (InterruptedException ie) {
+            // The batch is dropped, so no completion will ever run for it.
+            ACTIVE_REQUESTS.decrementAndGet();
+            throw ie;
+        }
     }
 
     /** Serial mode (external inputs present): submit then wait inline. */
@@ -446,7 +465,7 @@ public final class WgpuBatchCoordinator {
         long t0 = System.nanoTime();
         Inflight ib = submitRequest(batch, positions);
         if (ib != null) {
-            complete(ib, t0);
+            completeTracked(ib, t0);
         }
     }
 
@@ -458,7 +477,7 @@ public final class WgpuBatchCoordinator {
             try {
                 Inflight ib = inflight.poll(50, TimeUnit.MILLISECONDS);
                 if (ib == null) continue;
-                complete(ib, ib.submitT0);
+                completeTracked(ib, ib.submitT0);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 return;
@@ -473,6 +492,17 @@ public final class WgpuBatchCoordinator {
                 // halt(1) is the only safe way to kill the process.
                 Runtime.getRuntime().halt(1); 
             }
+        }
+    }
+
+    /** {@link #complete} plus the probe bookkeeping for
+     *  {@link #ACTIVE_REQUESTS}. Every {@link Inflight} passes through here
+     *  exactly once, which is what keeps the counter honest. */
+    private void completeTracked(Inflight ib, long t0) {
+        try {
+            complete(ib, t0);
+        } finally {
+            ACTIVE_REQUESTS.decrementAndGet();
         }
     }
 

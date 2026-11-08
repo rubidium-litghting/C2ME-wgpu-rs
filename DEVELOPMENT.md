@@ -24,6 +24,8 @@
 > **表面高度估算已评估：暂不实现**。一轮 r=500 约 4700 次 `getHeight`
 > （矿井 `spacing=1` 每区块 1 次），折合 1.4–3.8 s CPU 且大部分被 GPU 等待
 > 掩盖；先打点测量再谈实现。见 §28。
+> **0.1.7-alpha.3**：表面高度查询打点（`debug_height_probe`）已实装，用来给
+> §28 的结论补上真实数据。
 
 ---
 
@@ -542,9 +544,10 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   * "从现有 GPU 结果反推高度"被三条独立否掉：`NOISE` 晚于
     `STRUCTURE_STARTS`（时序）、`Beardifier.INSTANCE` 与真实 beardifier 不同、
     `WORLD_SURFACE_WG` 不含 surface rules（语义）。见 §28.3。
-  * **下一步不是实现，而是打点测量**：调用次数 / 累计 nanos / 去重列数 /
-    线程分布（§28.5）。测出来 <3% 墙钟就结案；>5% 再考虑 CPU 记忆化，
-    最后才是 GPU 区域预计算（且必须先设计结果重用，否则净负）。
+  * **打点已实装（0.1.7-alpha.3，`debug_height_probe`）**，等一轮同种子 r=500
+    的数据：看 `total`（上限）、`gpuBusy`（与 GPU 重叠的比例）、`dup`
+    （记忆化空间）。累计 <3% 墙钟就结案；>5% 再考虑 CPU 记忆化，最后才是
+    GPU 区域预计算（且必须先设计结果重用，否则净负）。见 §28.5。
 
 #### 🔴 高难度：核心功能突破（长远目标）
 - [ ] **把生物群系（Biome）拉上 GPU——前提已变，需重新评估**
@@ -1416,10 +1419,22 @@ status = fromVanillaStatus(directDependencies.get(d))
 
 #### 28.5 建议的执行顺序
 
-1. **先测量，不写 shader**。在 `ChunkGenerator.getHeight` /
-   `getHeightOnGround` 上打点：调用次数、累计 nanos、去重列数、调用线程、
-   调用时该线程是否有在途 GPU 请求。同种子 r=500 跑一轮。
-   - 累计 < 3% 墙钟 → 直接结案，从待办里删掉。
+1. **先测量，不写 shader**。✅ 已实现（0.1.7-alpha.3）：
+   - 开关 `debug_height_probe`（默认 `false`；`HeightProbe` 类加载时读一次，
+     改值需重启游戏）。
+   - `MixinNoiseChunkGeneratorHeight` 在 `getHeight` 的 `HEAD` / `RETURN` 打点，
+     角点高度、矿井、拼图锚点三条路径最终都走 `getHeight`，因此都能覆盖。
+   - 统计：调用次数、累计/平均/最大 nanos、去重列数与重复率、按
+     `Heightmap.Type` 的分布、调用线程 Top-4，以及**调用时 GPU 是否仍有批次
+     在途**（`WgpuBatchCoordinator.activeRequests()`）。
+   - 每 256 次调用或 2 s 输出一行，logger 名 `c2me-wgpu-height`：
+     ```
+     [c2me-wgpu-height] calls=N (+窗口) unique=M dup=X% avg=..ms max=..ms
+                        total=..s gpuBusy=..% types=[WORLD_SURFACE_WG:..] threads=[..]
+     ```
+   - 判读：`total` 是**上限**；`gpuBusy` 高说明这些 CPU 时间本来就与 GPU
+     重叠，墙钟收益远小于 `total`；`dup` 决定纯 CPU 记忆化能省多少。
+   - 判据不变：累计 < 3% 墙钟 → 结案；>5% 才往下走。
 2. **若确实可观，先做便宜的 CPU 记忆化**：`(x, z, type) → height`，每维度一个
    `Long2IntMap`（键为打包的 `x<<32|z` 加 type）。
    - 精确性天然成立：§28.1 已确认高度与 blending 无关、只由种子决定，同种子下
@@ -1428,7 +1443,7 @@ status = fromVanillaStatus(directDependencies.get(d))
 3. **只有 (1) 显示 >5% 且 (2) 收益不够时**，才做 §28.4 的 GPU 预计算，并且必须
    先设计结果重用。
 
-**当前决定**：停在 (1) 之前，不实现；等有测量数据再回来。
+**当前决定**：停在 (1)。打点已实装，等一轮同种子 r=500 的数据再判断。
 
 #### 28.6 `FindTopSurface` 的历史结论（保留）
 

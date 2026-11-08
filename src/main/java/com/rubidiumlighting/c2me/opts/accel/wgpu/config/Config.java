@@ -100,6 +100,16 @@ public final class Config {
     @ConfigOption(label = "c2me-opts-accel-wgpu.config.stage_timing", order = 60)
     public boolean debugStageTiming = false;
 
+    /** Probe every {@code ChunkGenerator.getHeight} call: count, nanos,
+     *  unique columns, calling threads, and whether GPU work was in flight.
+     *  This is the measurement behind DEVELOPMENT.md §28.5 — it answers
+     *  "how much would a surface-height cache actually save" before anything
+     *  gets implemented. Read once when the mixin class loads, so changing it
+     *  needs a restart. */
+    @SerializedName("debug_height_probe")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.height_probe", order = 65)
+    public boolean debugHeightProbe = false;
+
     /** Override the buffer-upload path. null = platform default (mapped on
      *  desktop; write_buffer on Android, where some Mali drivers abort on the
      *  mapped path). This is a compatibility setting, not a diagnostic: it is
