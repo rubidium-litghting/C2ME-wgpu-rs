@@ -1,6 +1,6 @@
 # C2ME WGPU 加速模块 — 开发文档
 
-> 最后更新：2026-11-08
+> 最后更新：2026-11-10
 > 状态：**0.1.5、0.1.6 已发布**。0.1.6 修掉了 modded 世界（暮色森林 / Tectonic）的
 > 死锁与全虚空问题，并把 shader/pipeline 编译失败从"静默死锁"改为"该维度回退 CPU + 玩家可读提示"。
 > 0.1.5 完整实现 Pass E、GPU 矿脉、100% 对齐原版的 AquiferSampler 逻辑，并重构了 FFM 日志架构与底层防死锁机制。实机验证兼容 Epic Terrain 与 Tectonic（Fabric 原生环境）。
@@ -25,8 +25,12 @@
 > `getHeight`、累计 1.58 s（≈12% 墙钟，约一半与在途 GPU 批次重叠），重复率
 > 6%；纯 CPU 缓存省不到 1%，GPU 预计算要多跑一遍噪声。见 §28。
 > **0.1.7-alpha.3**：表面高度查询打点（`debug_height_probe`，默认关闭）保留为
-> 诊断开关，可随时复测；ModMenu 现在可以直接切换 `chunk_batch_size`
-> （1 / 2 / 4 / 8），不再需要手改 JSON。
+> 诊断开关，可随时复测。
+> **0.1.7-alpha.4**：ModMenu 直接提供 `chunk_batch_size` 循环控件
+> （1 / 2 / 4 / 8），不再需要手改 JSON；界面单独提示"需完全重启"。
+> **0.1.7-alpha.5**：C2ME 运行期形状检查 `C2meCompat` + `fabric.mod.json`
+> 上界 `<0.5.0`。C2ME 内部 API 变动时跳过对齐状态并保留 `populateNoise`
+> GPU 路径，而不是在生成中抛 `NoSuchMethodError`。见 §27.6。
 
 ---
 
@@ -299,6 +303,16 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     反方向也有惊喜：实测单次 **2.2 ms** 是"1/6 区块"模型（≈0.6 ms）的 3–7 倍，
     说明重建 `ChunkNoiseSampler` 的固定开销主导——这一点在写任何代码之前
     都推不出来。
+50. **兼容性要看"实际发布的 jar"，不要看分支名；能降级就别只靠版本号**：
+    §27.6 曾按分支名断言"26.2 把 `theChunkSystem` 改成了 `chunks`"，实际
+    `javap` 打开发布 jar 才发现 26.1/26.2/26.3 都还是 `theChunkSystem`，
+    改名发生在 1.21.11 线；1.21.1 的 `0.4.0-alpha.0.30` 也仍然兼容。
+    分支名、`gradle.properties` 里的 `mod_version`、甚至 GitHub release 列表
+    都可能与用户装的那个 jar 不一致（1.21.1 走的是 Modrinth devbuild 编号）。
+    **结论**：① 用 `javap` 核对实际 jar；② 版本号只做粗粒度闸门，真正的
+    形状匹配交给启动时反射检查，不匹配就跳过功能并保留降级路径；
+    ③ 反射检查代码若在 `Class.forName` 里加载会跑 `<clinit>` 的类，必须用
+    `initialize=false`——尤其是这段代码本身就跑在别人的 `<clinit>` 里。
 
 
 
@@ -429,8 +443,14 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   `upgradeToThis` / `getDependencies` 全部转发给 C2ME 的
   `VanillaWorldGenerationDelegate`，GPU 仍走原有 `populateNoise` →
   `WgpuBatchCoordinator`。详见 §27。
-- [x] `fabric.mod.json` 下限锁到 `"c2me": ">=0.4.0-alpha.0.29"`（`NewStatusHook`
-  可用的版本）。
+- [x] `fabric.mod.json` 锁到 `"c2me": ">=0.4.0-alpha.0.29 <0.5.0"`（下限是
+  `NewStatusHook` 可用的版本，上界防止跨到可能重写 API 的新线）。
+- [x] **C2ME 运行期形状检查**：`C2meCompat.verify()` 在注册 `WgpuNoiseStatus`
+  前反射核对 `ChunkLoadingContext` 五组件、规范构造器、`TheChunkSystem.getHolder`、
+  `ItemHolder`、`ChunkState.reachedStatus`、`NewChunkStatus` 的构造器与两个静态
+  方法。不符时打一条 ERROR 并跳过注册，旧的 `populateNoise` GPU 路径继续工作。
+  用 `Class.forName(name, false, ...)` 避免在 `NewChunkStatus.<clinit>` 里触发
+  其他静态初始化。见 §27.6。
 - [x] 构建期 C2ME/FlowSched stub + `compileOnly` RxJava 3.1.12，不打包、不链接 C2ME。
 - [x] **阶段 2：对齐空间批次（`chunk_batch_size`）**。把 `N×N`（2/4/8）的
   对齐方阵收敛成一个依赖单元：只有最小角（anchor）走 `upgradeToThis`，
@@ -609,6 +629,11 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 >
 > 因此执行方式：**分支开发 + 强制最低 C2ME 版本 + 每版本实机验证**，
 > main 分支在验证通过前不变。
+>
+> **2026-11 补充（0.1.7-alpha.5）**：新增运行期形状检查 `C2meCompat`
+> （不符则跳过注册、保留 `populateNoise` 路径），并把 `fabric.mod.json`
+> 依赖改为 `>=0.4.0-alpha.0.29 <0.5.0`。原先"大版本更新直接崩溃"降级为
+> "0.4.x 内部差异可降级，跨 0.5.0 由加载器提前拦截"。见 §27.6。
 
 ### wgpu 库自身的环境变量（仅排查用）
 
@@ -695,12 +720,17 @@ jar），Java 代码直接引用这些类。详见 §10。
   `SchedulingManager` 等接口签名（`compileOnly`），另加
   `compileOnly io.reactivex.rxjava3:rxjava:3.1.12` 仅为类型检查；C2ME 与
   RxJava 都不打包、不链接。
-- **运行时**：`fabric.mod.json` 声明 `"c2me": ">=0.4.0-alpha.0.29"` 硬依赖
-  （下限即 `NewStatusHook` 可用的版本）。实测（§10）：无 C2ME 时桌面
-  CPS ~144→~13（批攒不满）。C2ME 是性能硬需求。
+- **运行时**：`fabric.mod.json` 声明
+  `"c2me": ">=0.4.0-alpha.0.29 <0.5.0"` 硬依赖（下限即 `NewStatusHook`
+  可用的版本；上界防止跨到可能重写 API 的新线，见 §27.6）。实测（§10）：
+  无 C2ME 时桌面 CPS ~144→~13（批攒不满）。C2ME 是性能硬需求。
 - **兼容性红线**：只用 C2ME 的公开扩展点（`NewStatusHook` /
-  `NewChunkStatus`），不 mixin 它的内部实现。升级 C2ME 后若签名变化，
-  编译期会直接失败，而不是运行期错地形。见 §27。
+  `NewChunkStatus`），不 mixin 它的内部实现。**运行期**由
+  `C2meCompat.verify()` 在注册前核对 `ChunkLoadingContext` / FlowSched 的
+  字节码形状；不符时只打 ERROR 并跳过对齐状态，旧的 `populateNoise` GPU
+  路径继续可用（不再直接 `NoSuchMethodError`）。见 §27.6。
+  **编译期** stub 只保证源码能编过，不等于运行期一定匹配——这是原来
+  "编译期会直接失败"说法的修正。
 - **许可证红线（2026-11 补充）**：本地的 `c2me-opts-accel-opencl` 模块是
   `All-Rights-Reserved`（`LICENSE-ARR.txt`）。反编译只允许用来确认**行为事实**
   （例如"官方确实通过 `NewStatusHook` 做批处理"）和公开 API 的存在/签名，
@@ -1283,11 +1313,50 @@ status = fromVanillaStatus(directDependencies.get(d))
   原版 delegate 仍是最终保证。
 - 已经 `>= NOISE` 的 holder 返回 `EMPTY_DEPENDENCIES`，不再无谓等待 anchor。
 
-**版本敏感点**。本实现用的是 1.21.1 / C2ME `0.4.0-alpha.0.29` 的
-`ChunkLoadingContext.theChunkSystem()` + `ItemHolder.getUserData()` 语义。
-后来（26.2 线）的 C2ME 把 record 组件改成了 `chunks`，所以这段代码只承诺
-1.21.1；升级 C2ME 时必须在编译期重新核对 stub 签名。若运行期类形状不符，
-表现是 `NoSuchMethodError` 启动/生成失败（fail-fast），不会静默错地形。
+**版本敏感点**。本实现绑定的是 C2ME 1.21.1 补丁线
+`ChunkLoadingContext.holder()/tacs()/schedulingManager()/theChunkSystem()/dependencies()`
+五组件 record + FlowSched `ItemHolder.getItem()/getKey()` 的字节码形状。
+
+查证记录（2026-11，全部以**实际发布的 jar** 为准，不看分支名）：
+
+| C2ME 构建 | `ChunkLoadingContext` 第 4 组件 | 结论 |
+|---|---|---|
+| 1.21.1 `0.4.0-alpha.0.29`（实机基线） | `TheChunkSystem theChunkSystem` | 可用 |
+| 1.21.1 `0.4.0-alpha.0.30`（当前最新） | `TheChunkSystem theChunkSystem` | 形状兼容（`javap` + 离线检查；未实机） |
+| `dev/1.21.11` 线 | `BoundedRegionArray<AbstractChunkHolder> chunks` | 不可用 |
+
+即：**改名发生在 1.21.11 线，不在 26.2 线**。之前"26.2 把组件改成 `chunks`"
+的说法是误读分支名；26.1/26.2/26.3 的 `dev/*` 头仍叫 `theChunkSystem`。1.21.1
+补丁线到 `0.4.0-alpha.0.30` 为止都没有改，但它是**滚动 devbuild**，下一个小
+版本随时可能跟进改名。
+
+因此加了两层保护：
+
+1. **运行期形状检查**（`C2meCompat.verify()`，注册前调用）。用
+   `Class.forName(name, false, ...)`（**不初始化**，因为这段代码正跑在
+   `NewChunkStatus.<clinit>` 里）反射核对上面五个组件名/类型、规范构造器、
+   `TheChunkSystem.getHolder(Object)`、`ItemHolder.getItem()/getKey()`、
+   `ChunkState.reachedStatus()`、`NewChunkStatus(int, ChunkStatus)`、
+   `relativeToAbsoluteDependencies`、`fromVanillaStatus`。任何一项不符：
+   `[c2me-wgpu-status]` 打一条 ERROR，**不注册** `WgpuNoiseStatus`，
+   `populateNoise` 的旧 GPU 路径继续工作——降级，不是崩溃。
+2. **`fabric.mod.json` 上界** `>=0.4.0-alpha.0.29 <0.5.0`。上界故意放松到
+   0.5.0：`0.4.0-alpha.0.N` 是滚动构建号，卡死具体 N 会让每个 C2ME devbuild
+   都要跟一个本模组发版；具体形状差异交给第 1 层处理。0.5.0 视为可能重写
+   API 契约的新线，先由加载器给出清晰的不兼容提示（也覆盖"`NewStatusHook`
+   本身被移除、mixin 无法应用"这种运行期检查来不及处理的情况）。
+   放宽步骤：`javap` 核对新 jar 的 `C2meCompat` 所列签名 → 实机跑一轮
+   r=500 → 改 `fabric.mod.json` 并更新本表。
+
+**离线验证**（2026-11-10，不启动 Minecraft）：用真实的 1.21.1 中间名 MC jar +
+C2ME `0.4.0-alpha.0.29` / `0.4.0-alpha.0.30` 的嵌套 jar 运行
+`C2meCompat.mismatch()`，两者都返回 `null`；再用一个合成 record（第 4 组件改名
+`chunks`）遮挡 `ChunkLoadingContext`，返回
+`ChunkLoadingContext component 3 is 'chunks', expected 'theChunkSystem'`。
+这一步同时确认了 `Class.forName(..., false, ...)` 的必要性：用会触发初始化的
+`Class.forName(name)` 版本在同一环境直接抛 `ExceptionInInitializerError`，
+因为 `ItemHolder` / `TheChunkSystem` 的 `<clinit>` 不是为在
+`NewChunkStatus.<clinit>` 内部被调用而设计的。
 
 #### 27.7 阶段 2 实机验证结果（2026-11-08）
 

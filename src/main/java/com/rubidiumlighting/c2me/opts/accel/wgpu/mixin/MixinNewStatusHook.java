@@ -26,6 +26,7 @@ package com.rubidiumlighting.c2me.opts.accel.wgpu.mixin;
 
 import com.ishland.c2me.rewrites.chunksystem.common.NewChunkStatus;
 import com.ishland.c2me.rewrites.chunksystem.common.compat.internal_api.NewStatusHook;
+import com.rubidiumlighting.c2me.opts.accel.wgpu.chunkstatus.C2meCompat;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.chunkstatus.WgpuNoiseStatus;
 import net.minecraft.world.chunk.ChunkStatus;
 import org.spongepowered.asm.mixin.Mixin;
@@ -45,6 +46,11 @@ import java.util.ArrayList;
  * Adding our status now gives it the ordinal {@code statuses.size()}, and the
  * vanilla delegate that follows gets {@code statuses.size()+1}, so the
  * resulting order is {@code ... BIOMES, WgpuNoiseStatus, vanilla NOISE, ...}.
+ *
+ * <p>{@link C2meCompat} gates the registration: when a newer C2ME has changed
+ * the shape of {@code ChunkLoadingContext} or the FlowSched classes, the
+ * status is skipped and the pre-0.1.7 {@code populateNoise} GPU path keeps
+ * working instead of failing with {@code NoSuchMethodError} mid-generation.
  */
 @Mixin(NewStatusHook.class)
 public abstract class MixinNewStatusHook {
@@ -52,7 +58,7 @@ public abstract class MixinNewStatusHook {
     @Inject(method = "beforeVanillaStatusRegister", at = @At("HEAD"), remap = false)
     private static void c2me_wgpu$addWgpuNoiseStatus(
             ArrayList<NewChunkStatus> statuses, ChunkStatus vanillaStatus, CallbackInfo ci) {
-        if (vanillaStatus == ChunkStatus.NOISE) {
+        if (vanillaStatus == ChunkStatus.NOISE && C2meCompat.verify()) {
             statuses.add(new WgpuNoiseStatus(statuses.size()));
         }
     }
