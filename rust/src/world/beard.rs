@@ -1,4 +1,4 @@
-//! §23: StructureWeightSampler ("Beardifier") reproduction.
+//! §8.4: StructureWeightSampler ("Beardifier") reproduction.
 //! Static 24^3 weight table + per-chunk pieces/junctions. Per-block, applied
 //! to the density before aquifer classification so structures sit on terrain.
 

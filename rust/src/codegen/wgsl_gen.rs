@@ -45,12 +45,12 @@ pub enum Pass {
     B,
     /// Shard C — channels `[12, N)` (vein x3). Entry point `main_pass_c`.
     C,
-    /// §20 block-output shard: reads the finalDensity corner channel from
+    /// §3.5 block-output shard: reads the finalDensity corner channel from
     /// `out_buf`, trilinearly interpolates per BLOCK, and writes one block
     /// state byte per block to `block_buf` (binding 7). Entry point
     /// `main_block`. Dispatched after the corner shards.
     BlockOut,
-    /// §14 Pass E: inner shard that computes all `InnerRef` corners.
+    /// Pass E (§15.2.2): inner shard that computes all `InnerRef` corners.
     Inner,
 }
 
@@ -108,10 +108,10 @@ pub fn plan_shards(channel_count: usize) -> Vec<Shard> {
     if channel_count > VT {
         out.push(Shard { pass: Pass::C, start: VT, end: VT_END.min(channel_count) });
     }
-    // §20 block-output shard: not bound to any channel (start==end); it reads
+    // §3.5 block-output shard: not bound to any channel (start==end); it reads
     // ch11 corners from out_buf and writes block-state bytes. Gated.
     // BlockOut is the only GPU write-back path (the CPU density path was
-    // removed as a measured net loss, §20), so it is unconditional.
+    // removed as a measured net loss, §8.2), so it is unconditional.
     out.push(Shard { pass: Pass::Inner, start: 0, end: 0 });
     out.push(Shard { pass: Pass::BlockOut, start: 0, end: 0 });
     out
@@ -513,10 +513,10 @@ pub fn emit_shader_for_shard(
         // inject the AST evaluation right after the block's world coordinates.
         //
         // `str::replace` is silent when the needle is absent, which would
-        // ship a shader that ignores the AST (DEVELOPMENT.md §22). Assert the
+        // ship a shader that ignores the AST (DEVELOPMENT.md §3.5). Assert the
         // anchor exists, and assert the substitution actually happened.
         const BLOCK_OUT_INJECT_ANCHOR: &str =
-            "  // \u{a7}23: add the Beardifier contribution (per block, before the d>0 test).\n  var dd = d;";
+            "  // \u{a7}8.4: add the Beardifier contribution (per block, before the d>0 test).\n  var dd = d;";
         assert!(
             BLOCK_OUT_ENTRY.contains(BLOCK_OUT_INJECT_ANCHOR),
             "block_out.wgsl lost the AST-injection anchor; update \
@@ -524,7 +524,7 @@ pub fn emit_shader_for_shard(
         );
         let entry = BLOCK_OUT_ENTRY.replace(
             BLOCK_OUT_INJECT_ANCHOR,
-            &format!("{}\n  // \u{a7}23: add the Beardifier contribution.\n  var dd = d_final;", injected)
+            &format!("{}\n  // \u{a7}8.4: add the Beardifier contribution.\n  var dd = d_final;", injected)
         );
         debug_assert!(entry.contains("var dd = d_final;"), "AST injection did not take effect");
         out.push_str(&entry);
@@ -598,7 +598,7 @@ pub fn emit_shader(root: &AstNode) -> Result<String> {
 /// Keeps the same bind group layout and entry signature; body just writes a
 /// deterministic value into `out_buf`. If a device compiles+runs this but
 /// aborts on the full shader, the problem is shader size, not wgpu integration.
-/// §20 block-output entry point. Reads the finalDensity (ch11) corner values
+/// §3.5 block-output entry point. Reads the finalDensity (ch11) corner values
 /// that the corner shards already wrote into `out_buf`, trilinearly
 /// interpolates one value per BLOCK, and writes a block-state byte:
 ///   0 = air (d <= 0), 1 = stone (d > 0).
@@ -629,7 +629,7 @@ struct WorldgenParams {
 @group(0) @binding(6) var<storage, read>        external_inputs: array<f32>;
 "#;
 
-/// Bindings for the standalone BlockOut shard (§22). Deliberately separate
+/// Bindings for the standalone BlockOut shard (§3.5). Deliberately separate
 /// from `BINDINGS_HEADER`: this shard uses only params/out_buf/positions/
 /// block_buf/aq_p/aq_s (6 storage buffers), so it gets its own bind group
 /// layout that stays under `max_storage_buffers_per_shader_stage` (8).

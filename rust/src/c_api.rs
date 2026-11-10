@@ -604,7 +604,7 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
     // 3. Dispatch on a BACKGROUND thread; return a STATUS_PENDING handle
     //    immediately so the coordinator can pipeline (submit the next batch
     //    without waiting for this one). The worker fills result/status; Java
-    //    polls STATUS, then take_result_blob. See DEVELOPMENT §18.6.
+    //    polls STATUS, then take_result_blob. See DEVELOPMENT §3.5.
     let req = Arc::new(BatchRequest {
         status: AtomicI32::new(STATUS_PENDING),
         result: Mutex::new(None),
@@ -666,7 +666,7 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
                 return;
             }
         }
-        // §20 block-state bytes, already u32 LE and chunk-major.
+        // §3.5 block-state bytes, already u32 LE and chunk-major.
         if !executed.raw_block.is_empty() {
             match req_bg.block.lock() {
                 Ok(mut slot) => *slot = Some(ResultBlob::from_bytes(executed.raw_block.clone())),
@@ -755,7 +755,7 @@ pub unsafe extern "C" fn c2me_wgpu_take_result_blob(
 }
 
 // ---------------------------------------------------------------------------
-// ⑤b Consume the §20 per-block state blob (u32 per block). Same lifetime
+// ⑤b Consume the §3.5 per-block state blob (u32 per block). Same lifetime
 //     rules as take_result_blob.
 /// # Safety
 /// `request_h` must be a live handle from [`c2me_wgpu_request_chunks`],
@@ -955,7 +955,7 @@ pub unsafe extern "C" fn c2me_wgpu_set_log_path(ptr: *const u8, len: usize) {
 pub(crate) struct BatchRequest {
     pub status: AtomicI32,
     pub result: Mutex<Option<ResultBlob>>,
-    /// §20 per-block state bytes (u32 per block, chunk-major). Empty unless
+    /// §3.5 per-block state bytes (u32 per block, chunk-major). Empty unless
     /// the BlockOut shard is enabled. Separate from `result` so the density
     /// blob layout is untouched.
     pub block: Mutex<Option<ResultBlob>>,

@@ -94,7 +94,7 @@ public final class C2meCompat {
                         + "the aligned NOISE status is disabled and world generation "
                         + "continues on the regular populateNoise GPU path. "
                         + "Reason: {}. Update c2me-opts-accel-wgpu after checking "
-                        + "the API shape (see DEVELOPMENT.md §27.6).", mismatch);
+                        + "the API shape (see DEVELOPMENT.md §13.6).", mismatch);
             }
         }
         return compatible;

@@ -41,7 +41,7 @@ public interface ChunkNoiseSamplerAccessor {
     ChunkNoiseSampler.BlockStateSampler getBlockStateSampler();
 
     /** Per-column surface-height cache (keyed by packed (x,z)), filled lazily
-     *  by estimateSurfaceHeight. Used only by the aquifer reference dump (§20). */
+     *  by estimateSurfaceHeight. Used only by the aquifer reference dump (§8.4). */
     @Accessor("surfaceHeightEstimateCache")
     it.unimi.dsi.fastutil.longs.Long2IntMap getSurfaceHeightEstimateCache();
 }

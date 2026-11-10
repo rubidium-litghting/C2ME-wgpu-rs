@@ -68,9 +68,9 @@ public final class ChunkDumper {
     public static final boolean DUMP_BLOCKS = Config.get().debugDumpBlocks;
     /** Dump the per-cell aquifer table for the target chunk(s). */
     public static final boolean DUMP_AQUIFER = Config.get().debugDumpAquifer;
-    /** §23: dump Beardifier pieces/junctions + per-block beard reference. */
+    /** §8.4: dump Beardifier pieces/junctions + per-block beard reference. */
     public static final boolean DUMP_BEARD = Config.get().debugDumpBeard;
-    /** §23: dump only the FIRST structure-bearing chunk encountered. */
+    /** §8.4: dump only the FIRST structure-bearing chunk encountered. */
     private static final java.util.concurrent.atomic.AtomicBoolean BEARD_DUMPED =
             new java.util.concurrent.atomic.AtomicBoolean(false);
     /** One-shot guard for the per-chunk corner reference dump. */
@@ -157,7 +157,7 @@ public final class ChunkDumper {
             LOGGER.warn("[c2me-wgpu] block dump failed", t);
         }
     }
-    /** §23: dump the Beardifier's per-chunk pieces/junctions and per-block
+    /** §8.4: dump the Beardifier's per-chunk pieces/junctions and per-block
      *  beard values, for offline validation of the Rust/WGSL reproduction. */
     public static void dumpBeard(Chunk chunk,
             net.minecraft.world.gen.StructureWeightSampler sw) {
@@ -236,14 +236,14 @@ public final class ChunkDumper {
             sb.append("AQ ").append(startX).append(' ').append(startY).append(' ')
               .append(startZ).append(' ').append(sizeX).append(' ').append(sizeZ)
               .append('\n');
-            // §22: dump the aquifer RNG seed (seedLo/seedHi) so the Rust/WGSL
+            // §8.4: dump the aquifer RNG seed (seedLo/seedHi) so the Rust/WGSL
             // generator can reproduce blockPositions[] from scratch.
             {
                 var dbg = new StringBuilder();
                 a.getRandomDeriver().addDebugInfo(dbg);
                 sb.append("SEED ").append(dbg).append('\n');
             }
-            // §22: 预热所有 cell 的 waterLevels 表。MC 惰性填充（apply 访问到
+            // §8.4: 预热所有 cell 的 waterLevels 表。MC 惰性填充（apply 访问到
             // 才填），GPU 需要完整表。用 seedLo/seedHi 算每 cell 的
             // blockPosition，再调 getWaterLevel 触发 getFluidLevel。
             {
@@ -264,7 +264,7 @@ public final class ChunkDumper {
                     a.invokeGetWaterLevel(pos);
                 }
             }
-            // §22 Step B: serialize the compact per-chunk aquifer table.
+            // §8.4 Step B: serialize the compact per-chunk aquifer table.
             // Layout: magic(4) n(4) seedLo(8) seedHi(8) then n * (lvl_y i32 +
             // state u32). blockPositions[] is NOT included — Rust recomputes
             // it from the seed (verified bit-exact in aquifer_positions.rs).
@@ -314,7 +314,7 @@ public final class ChunkDumper {
             java.nio.file.Files.writeString(java.nio.file.Path.of(path), sb.toString());
             LOGGER.info("[c2me-wgpu] dumped aquifer table ({} cells) to {}", wl.length, path);
 
-            // §20: dump, per cell, the 5 noise inputs at the exact points
+            // §8.4: dump, per cell, the 5 noise inputs at the exact points
             // getFluidLevel samples + the expected output. Rust/WGSL then only
             // needs to reproduce the control flow (no noise).
             var flooded = unwrapRouter(router.fluidLevelFloodednessNoise());
@@ -454,7 +454,7 @@ public final class ChunkDumper {
             String rp = dumpDir() + "/ref_chunk_" + cx + "_" + cz + ".txt";
             java.nio.file.Files.writeString(java.nio.file.Path.of(rp), sb.toString());
             LOGGER.info("[c2me-wgpu] dumped per-chunk ref (decompiled tree) to {}", rp);
-            // §14 diag: also dump the COMPILED tree's depth, to compare against decompiled.
+            // §15.2.2 diag: also dump the COMPILED tree's depth, to compare against decompiled.
             try {
                 NoiseRouter comp = noiseConfig.getNoiseRouter();
                 StringBuilder cb = new StringBuilder();
@@ -473,7 +473,7 @@ public final class ChunkDumper {
                 java.nio.file.Files.writeString(java.nio.file.Path.of(dumpDir() + "/ref_chunk_"+cx+"_"+cz+"_compiled.txt"), cb.toString());
                 LOGGER.info("[c2me-wgpu] dumped COMPILED-tree depth ref to {}/ref_chunk_{}_{}_compiled.txt", dumpDir(), cx, cz);
             } catch (Throwable t2) { LOGGER.warn("[c2me-wgpu] compiled ref dump failed", t2); }
-            // §14 diag: dump every Spline's locations/derivatives from MC's
+            // §15.2.2 diag: dump every Spline's locations/derivatives from MC's
             // decompiled depth tree, to diff against our Rust deserialization.
             try {
                 final java.util.List<String> sp = new java.util.ArrayList<>();
@@ -499,7 +499,7 @@ public final class ChunkDumper {
                         String.join("\n", sp));
                 LOGGER.info("[c2me-wgpu] dumped {} MC splines to {}/mc_depth_splines.txt", sp.size(), dumpDir());
             } catch (Throwable t3) { LOGGER.warn("[c2me-wgpu] MC spline dump failed", t3); }
-            // §14 diag: value trace of every depth node at the failing point.
+            // §15.2.2 diag: value trace of every depth node at the failing point.
             try {
                 StringBuilder tb = new StringBuilder();
                 var pos = new net.minecraft.world.gen.densityfunction.DensityFunction.UnblendedNoisePos(
@@ -637,7 +637,7 @@ public final class ChunkDumper {
               .append(chunk.getPos().z).append('\n');
             sb.append("DIMS ").append(gx).append(" ").append(gy).append(" ").append(gz).append("\n");
             sb.append("CELL_W ").append(cellW).append("\nMIN_Y ").append(minY).append("\n");
-            NoiseRouter CR = router;  // §5.8: must match the blob's tree (decompiled), not the compiled router
+            NoiseRouter CR = router;  // §15.1 (milestone 2e): must match the blob's tree (decompiled), not the compiled router
             java.util.LinkedHashMap<String, net.minecraft.world.gen.densityfunction.DensityFunction> chans =
                     new java.util.LinkedHashMap<>();
             chans.put("barrierNoise", CR.barrierNoise());

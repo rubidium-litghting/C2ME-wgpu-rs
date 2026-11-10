@@ -30,7 +30,7 @@ import org.spongepowered.asm.mixin.gen.Accessor;
 
 /**
  * Accessors for {@link AquiferSampler.Impl}'s private per-cell caches, used
- * only by the aquifer reference dump (DEVELOPMENT §20). {@code waterLevels}
+ * only by the aquifer reference dump (DEVELOPMENT §8.4). {@code waterLevels}
  * is the per-cell FluidLevel table; {@code blockPositions} packs each cell's
  * random sample point. startX/Y/Z + sizeX/Z define the cell grid.
  */

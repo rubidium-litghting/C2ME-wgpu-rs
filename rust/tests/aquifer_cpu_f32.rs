@@ -1,4 +1,4 @@
-//! §20 Step B 预研：CPU-f32 复现 MC `AquiferSampler.Impl.apply` 的**控制流**。
+//! §8.4 Step B 预研：CPU-f32 复现 MC `AquiferSampler.Impl.apply` 的**控制流**。
 //! 读 /tmp/aquifer_noise_*.txt（per-cell 表：blockPositions + 最终 waterLevel）
 //! 与 /tmp/aq_blocks_*.txt（per-block 参考：x y z d state）。
 //! 只复现 12-cell 扫描 + 查表 + 分类；barrier 噪声（calculateDensity）先跳过。

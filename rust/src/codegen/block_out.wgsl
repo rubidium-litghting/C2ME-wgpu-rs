@@ -1,4 +1,4 @@
-// §23 Beardifier. Layout of beard_pj (per chunk, fixed stride 16 u32):
+// §8.4 Beardifier. Layout of beard_pj (per chunk, fixed stride 16 u32):
 //   [0] piece_count, [1] junction_count,
 //   [2..2+7*pc] pieces (7 i32: minX,minY,minZ,maxX,maxY,maxZ,adapt,delta),
 //   junctions follow (3 i32 each).
@@ -96,7 +96,7 @@ fn calc_density(
     return 2.0 * (r + q);
 }
 
-// ── Ore veins (§24) ─────────────────────────────────────────────────
+// ── Ore veins (§3.5) ─────────────────────────────────────────────────
 // Mirrors net.minecraft.world.gen.OreVeinSampler. Runs on blocks the aquifer
 // already classified as solid (density > 0), optionally replacing them with a
 // vein ore / raw-ore / stone variant.
@@ -202,14 +202,14 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
   let per_chunk: u32 = u32(16 * height_i * 16);
   let bidx: u32 = u32(chunk_index) * per_chunk + u32(cx_i32 + bz * 16 + cy_i32 * 256);
 
-  // §22 aquifer (12-cell scan + FluidLevel). Global block coords:
+  // §8.4 aquifer (12-cell scan + FluidLevel). Global block coords:
   let chunk_cx = positions[chunk_index * 2];
   let chunk_cz = positions[chunk_index * 2 + 1];
   let wx: i32 = chunk_cx * 16 + cx_i32;
   let wz: i32 = chunk_cz * 16 + bz;
   let wy: i32 = i32(params.min_y_f) + cy_i32;
 
-  // §23: add the Beardifier contribution (per block, before the d>0 test).
+  // §8.4: add the Beardifier contribution (per block, before the d>0 test).
   var dd = d;
   {
     let bbase = u32(chunk_index) * BEARD_STRIDE;
@@ -217,7 +217,7 @@ fn main_block(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (bcount > 0u) { dd = dd + beard_sample(bbase, wx, wy, wz); }
   }
 
-  // §22: per-dimension aquifer mode from params._pad[1..5].
+  // §8.4: per-dimension aquifer mode from params._pad[1..5].
   let has_aq = params._pad[1];
   if (has_aq == 0u) {
     // No aquifers (Nether/End): sea-level semantics, no 12-cell scan.

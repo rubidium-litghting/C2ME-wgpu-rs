@@ -14,24 +14,24 @@
 >
 > **0.1.7（分支 `feature/chunk-status-integration`）**
 > - `alpha.1`：`NewStatusHook` / `NewChunkStatus` 阶段 1 透明委托，r=500 与基线
->   持平（§27）。
+>   持平（§13）。
 > - `alpha.2`：`chunk_batch_size` 对齐批次（2×2 / 4×4 / 8×8）已实现并实机验证
 >   （同种子 r=500：14 / 13 / 15 s，4×4 最优、CPS 298，地形正常、无死锁）；
->   默认仍为 1，不改变已验证行为（§27.7）。
+>   默认仍为 1，不改变已验证行为（§13.7）。
 > - `alpha.3`：表面高度查询打点 `debug_height_probe`（默认关闭）。表面高度估算
 >   据此结案（负结果）：同种子 r=500 仅 696 次 `getHeight`、累计 1.58 s
 >   （≈12% 墙钟，约一半与在途 GPU 批次重叠），重复率 6%；纯 CPU 缓存省不到 1%，
->   GPU 预计算要多跑一遍噪声（§28）。探针保留，可随时复测。
+>   GPU 预计算要多跑一遍噪声（§14）。探针保留，可随时复测。
 > - `alpha.4`：ModMenu 直接提供 `chunk_batch_size` 循环控件（1 / 2 / 4 / 8），
 >   不再需要手改 JSON；界面单独提示"需完全重启"。
 > - `alpha.5`：C2ME 运行期形状检查 `C2meCompat` + `fabric.mod.json` 上界
 >   `<0.5.0`。C2ME 内部 API 变动时跳过对齐状态并保留 `populateNoise` GPU 路径，
->   而不是在生成中抛 `NoSuchMethodError`（§27.6）。
+>   而不是在生成中抛 `NoSuchMethodError`（§13.6）。
 >
-> **实测基线**（细节见 §23 / §24 / §25 / §27.7；跨组数据不可直接比较，见教训 #45）
+> **实测基线**（细节见 §9 / §10 / §11 / §13.7；跨组数据不可直接比较，见教训 #45）
 > - 桌面端端到端反超纯 CPU（Chunky r=500，RADV RENOIR）：**18 s vs 23 s**
->   （0.1.5 流水线化后；同规模后续记录为 **15 s**，§24）。0.1.7 `4×4` 对齐批次
->   进一步到 **13 s**（§27.7，另一组种子）。GPU 直接输出 per-block 方块状态，
+>   （0.1.5 流水线化后；同规模后续记录为 **15 s**，§10）。0.1.7 `4×4` 对齐批次
+>   进一步到 **13 s**（§13.7，另一组种子）。GPU 直接输出 per-block 方块状态，
 >   CPU 只写 palette。
 > - 移动端（Mali-G610 平板）：3m12s → 2m19s（+61%）；纯地形 23.52 → 30.65 CPS（+30.3%）。
 > - 服务端 headless（r=500，无渲染干扰）：纯 CPU 27 s（121.1 cps）vs GPU 21 s
@@ -42,7 +42,7 @@
 >   **结论：流水线化省的是 CPU 等待与端到端时间，不是稳定态 CPS**——GPU 执行
 >   （readback）仍是当时的瓶颈。
 >
-> 历史细节见「§5 附录：开发历程」。
+> 历史细节见「§15 附录：开发历程」。
 
 ---
 
@@ -66,12 +66,12 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 | **aquifer 全 GPU（水/岩浆/石分类）** | ✅ 100%（完整 barrier 与 calculateDensity） |
 | **Beardifier（结构地基）GPU** | ✅ bit-exact |
 | 矿脉 | ✅ 全 GPU（RNG 与方块替换） |
-| **端到端反超纯 CPU** | ✅ 18 s vs 23 s (RADV RENOIR，见 §23) |
+| **端到端反超纯 CPU** | ✅ 18 s vs 23 s (RADV RENOIR，见 §9) |
 | **移动端端到端提速** | ✅ 3m12s→2m19s；CPS 23.52→30.65 (+30.3%) |
 | 史诗地形/构造地形兼容 | ✅ Epic Terrain, Tectonic |
 | WeirdScaledSampler | ✅ 完整实现 |
-| **C2ME `NewChunkStatus` 接入（阶段 1）** | ✅ 透明委托，见 §27 |
-| **对齐批次（阶段 2，`chunk_batch_size`）** | ✅ 2/4/8 实机验证通过；4×4 最优（13 s / CPS 298），默认仍为 1；ModMenu 可切换，见 §27.7 |
+| **C2ME `NewChunkStatus` 接入（阶段 1）** | ✅ 透明委托，见 §13 |
+| **对齐批次（阶段 2，`chunk_batch_size`）** | ✅ 2/4/8 实机验证通过；4×4 最优（13 s / CPS 298），默认仍为 1；ModMenu 可切换，见 §13.7 |
 
 ### 关键教训速查
 
@@ -109,7 +109,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 18. **诊断代码放对位置**：别放在会被短路的分支后（否则是死代码）。
 
 **方法论（最重要）**
-19. **端到端指标才是判据**：Chunky 总时间，不看内部 batch 吞吐（§19 教训）。
+19. **端到端指标才是判据**：Chunky 总时间，不看内部 batch 吞吐（§8.1 教训）。
     **"测试全绿" ≠ "实机可用"**：单元/离线测试只覆盖它断言的那条链路。本次
     "全虚空"事故中 89 个 Rust 测试 + `real_router_vs_vanilla` 全部通过，但游戏
     里一个方块都没有——因为没有任何测试覆盖"GPU 算完 → Java 写回 chunk"这一
@@ -306,7 +306,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     上限是每轮 r=500 约 4700 次 `getHeight`、1.4–3.8 s CPU，而墙钟里能拿回
     来的只有压在关键路径上的那部分；同时"从现有 GPU 结果反推高度"被时序、
     beardifier、surface rules 三条独立否掉。**没有分母的优化讨论都是猜。**
-49. **"某结构会查高度"≠"它每次都查"：分支条件要从字节码确认**：§28 初稿按
+49. **"某结构会查高度"≠"它每次都查"：分支条件要从字节码确认**：§14.2 初稿按
     "矿井 placement 是 `spacing=1`，每个区块都是候选"估出一轮 r=500 有
     ≈4700 次 `getHeight`。实测只有 **696 次**——`MineshaftStructure` 的高度
     查询在 `type == MESA` 分支里，普通矿井走
@@ -316,7 +316,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     说明重建 `ChunkNoiseSampler` 的固定开销主导——这一点在写任何代码之前
     都推不出来。
 50. **兼容性要看"实际发布的 jar"，不要看分支名；能降级就别只靠版本号**：
-    §27.6 曾按分支名断言"26.2 把 `theChunkSystem` 改成了 `chunks`"，实际
+    §13.6 曾按分支名断言"26.2 把 `theChunkSystem` 改成了 `chunks`"，实际
     `javap` 打开发布 jar 才发现 26.1/26.2/26.3 都还是 `theChunkSystem`，
     改名发生在 1.21.11 线；1.21.1 的 `0.4.0-alpha.0.30` 也仍然兼容。
     分支名、`gradle.properties` 里的 `mod_version`、甚至 GitHub release 列表
@@ -347,7 +347,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 ### 版本记录与 0.1.7+ 待办
 
 **0.1.4 已完全解决的历史遗留（存档记录）**
-- ✅ **§14 边界 bug**：通过 Pass E 架构（拆解 nonlinear outer 树与 InnerRef 角点）解决，Epic Terrain/Tectonic 地形完全正常。
+- ✅ **interpolated 边界 bug**（§15.2.2）：通过 Pass E 架构（拆解 nonlinear outer 树与 InnerRef 角点）解决，Epic Terrain/Tectonic 地形完全正常。
 - ✅ **Barrier 噪声与含水层对齐**：完整移植原版 `calculateDensity`（含高度过滤和全局流体判定），彻底告别全水浮岛。
 - ✅ **矿脉全 GPU 化**：完整的 RNG 与矿脉方块替换已实装，无需 CPU 回退。
 - ✅ **Shard B 瘦身**：高频内联公式函数化，从 3084 行降到 1771 行。
@@ -469,7 +469,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   注册原版 `NOISE` delegate 之前插入 `WgpuNoiseStatus`；该状态的
   `upgradeToThis` / `getDependencies` 全部转发给 C2ME 的
   `VanillaWorldGenerationDelegate`，GPU 仍走原有 `populateNoise` →
-  `WgpuBatchCoordinator`。详见 §27。
+  `WgpuBatchCoordinator`。详见 §13。
 - [x] `fabric.mod.json` 锁到 `"c2me": ">=0.4.0-alpha.0.29 <0.5.0"`（下限是
   `NewStatusHook` 可用的版本，上界防止跨到可能重写 API 的新线）。
 - [x] **C2ME 运行期形状检查**：`C2meCompat.verify()` 在注册 `WgpuNoiseStatus`
@@ -477,17 +477,17 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   `ItemHolder`、`ChunkState.reachedStatus`、`NewChunkStatus` 的构造器与两个静态
   方法。不符时打一条 ERROR 并跳过注册，旧的 `populateNoise` GPU 路径继续工作。
   用 `Class.forName(name, false, ...)` 避免在 `NewChunkStatus.<clinit>` 里触发
-  其他静态初始化。见 §27.6。
+  其他静态初始化。见 §13.6。
 - [x] 构建期 C2ME/FlowSched stub + `compileOnly` RxJava 3.1.12，不打包、不链接 C2ME。
 - [x] **阶段 2：对齐空间批次（`chunk_batch_size`）**。把 `N×N`（2/4/8）的
   对齐方阵收敛成一个依赖单元：只有最小角（anchor）走 `upgradeToThis`，
   其余成员依赖 anchor 的本状态；anchor 声明整组的原版 `NOISE` 依赖并集，
   然后**仍通过 C2ME 的 `VanillaWorldGenerationDelegate`** 并行生成每个成员。
   GPU 工作继续留在 `populateNoise` → `WgpuBatchCoordinator`，因此没有第二份
-  地形实现。默认 `1` 完全等价于阶段 1。设计见 §27.6。
+  地形实现。默认 `1` 完全等价于阶段 1。设计见 §13.6。
 - [x] **阶段 2 实机验证**：`chunk_batch_size=2` → 4 → 8，同种子 r=500 对比
   地形、CPS 与端到端。结果 14 / **13** / 15 s，4×4 最优（CPS 298）；无死锁、
-  无 member 漏生成、地形正常。详见 §27.7。默认值暂不提高，4 作为推荐手动值。
+  无 member 漏生成、地形正常。详见 §13.7。默认值暂不提高，4 作为推荐手动值。
 - [ ] **阶段 3：批内真正共享采样上下文**（官方 CL 的剩余收益）。当前批次只
   收敛调度依赖，每个成员仍各自构建 `ChunkNoiseSampler`；要进一步必须自己
   持有 `Blender` / `StructureAccessor` / sampler，风险远高于阶段 2，暂不做。
@@ -499,8 +499,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   入队即返回，executor 稍后才在 prepare 阶段读全局数据，多批次在途时下一批
   的 upload 会覆盖前一批尚未消费的内容。
   代价：external 少的维度（如暮色森林，4 个节点）拿不到流水线化收益，
-  按 §23 的 A/B 大约是端到端 10%、CPU 占用 70%→50% 的损失。
-  **（注：10% / 70%→50% 为 §23 的 0.1.5 数据；0.1.6 引入有界队列后
+  按 §9 的 A/B 大约是端到端 10%、CPU 占用 70%→50% 的损失。
+  **（注：10% / 70%→50% 为 §9 的 0.1.5 数据；0.1.6 引入有界队列后
   未复测，实施前需重新 A/B。）**
   修法是把 payload 从共享可变状态改成按批次传递（要动 FFI 签名与 Rust 侧
   缓冲区分配），属于结构性改动。
@@ -577,7 +577,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     *选择*（攒满一个对齐区域才发），那是中高难度的事。
   * 注：代码里现有的 `batch.sort()` 保留（Rust 侧要求位置有序），但不是优化点。
   * 真正的 4×4 批次已由 0.1.7 的 `chunk_batch_size` 实现（改的是批次*选择*，
-    见 §27.6），本条仅记录当年"只排序"的无效思路。
+    见 §13.6），本条仅记录当年"只排序"的无效思路。
 - ~~**调大 `MAX_WAIT_MS` 让批次攒大**~~ **(已证伪)**
   * 观察到平均批次只有 ~4.5 chunk（655/144），怀疑是 5ms 聚集窗口太短，
     固定开销（encode/submit/poll/readback/FFM）被摊在太少 chunk 上。
@@ -593,7 +593,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   * 咱们 Rust 侧的 `BufferPool` 目前按 `(usage, size)` 做 LRU。可以借鉴其
     “严格分类”的思路，确保高频输入（external/aquifer）与输出（block_out）
     绝不会因为尺寸碰巧一致而被错误复用，进一步杜绝数据串流 bug。
-- [x] **表面高度估算预计算（Estimate Surface Height）——已实测，结案（§28）**
+- [x] **表面高度估算预计算（Estimate Surface Height）——已实测，结案（§14）**
   * 实测（`debug_height_probe`，同种子 r=500）：**696 次调用 / 1.58 s**，
     0.165 次/区块，单次 2.2 ms，重复率 6%，约一半与在途 GPU 批次重叠。
   * 初稿的"矿井每区块 1 次 → 4700 次"是错的：`MineshaftStructure` 只在
@@ -601,11 +601,11 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   * 结论：纯 CPU 记忆化省不到 1%；GPU 懒算被单列 readback 延迟吃掉；GPU 区域
     预计算要多跑一遍噪声。**不做**，探针保留可随时复测。
   * "从现有 GPU 结果反推高度"另有三条硬伤（时序 / beardifier / surface
-    rules），见 §28.3。
+    rules），见 §14.3。
 
 #### 🔴 高难度：核心功能突破（长远目标）
 - [ ] **把生物群系（Biome）拉上 GPU——前提已变，需重新评估**
-  * 原结论（§5.17，2026-10，代码在 `experiment/biome-gpu` 分支）是**净负优化**：
+  * 原结论（§15.1 的 2n，2026-10，代码在 `experiment/biome-gpu` 分支）是**净负优化**：
     biome 在 NOISE 之前，GPU 每次 14ms 的往返延迟直接卡在关键路径上，还抢占
     地形队列。这个实测结论**对"独立 GPU 路径"依然成立**。
   * 但当时的架构前提已经变了：
@@ -617,7 +617,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   * **补充实测**（2026-11）：跳过 `populateBiomes` 后跑 r=500，`inflight` 纹丝
     不动（1.0–1.3/4），CPS 峰值仅 +4%。说明 biome 的计算量本身不是上游瓶颈，
     **收益上限不高**。
-  * 结论：**从"证伪"改为"收益有限但机制可行"**。§5.17 失败的是实现方式，
+  * 结论：**从"证伪"改为"收益有限但机制可行"**。§15.1 的 2n 失败的是实现方式，
     不是这件事本身。若重做，必须走"合并进同一批次"，绝不能重走独立路径。
 - [ ] **多 Kernel 流水线（暂缓/仅评估）**
   * 官方用 Event 串联 5 个独立 Kernel。咱们目前是一个 Compute Pass 跑多个 Shard。
@@ -662,7 +662,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 > **2026-11 补充（0.1.7-alpha.5）**：新增运行期形状检查 `C2meCompat`
 > （不符则跳过注册、保留 `populateNoise` 路径），并把 `fabric.mod.json`
 > 依赖改为 `>=0.4.0-alpha.0.29 <0.5.0`。原先"大版本更新直接崩溃"降级为
-> "0.4.x 内部差异可降级，跨 0.5.0 由加载器提前拦截"。见 §27.6。
+> "0.4.x 内部差异可降级，跨 0.5.0 由加载器提前拦截"。见 §13.6。
 
 ### wgpu 库自身的环境变量（仅排查用）
 
@@ -701,13 +701,13 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
 ## §2 工程结构
 
-> **2026-10：C2ME 依赖关系**（§10）。构建期通过 Stub 提供接口签名，运行期强依赖调度器
+> **2026-10：C2ME 依赖关系**（§5）。构建期通过 Stub 提供接口签名，运行期强依赖调度器
 > （提供 GPU 批处理赖以吞吐的多线程并行度）。
 
 ### 2.1 构建
 曾用 Gradle `includeBuild` 引入 C2ME 复合构建，**现已移除**。改为在 `src/stub`
 提供 `SchedulingManager` / `IVanillaChunkManager` 的接口签名（`compileOnly`，不打进
-jar），Java 代码直接引用这些类。详见 §10。
+jar），Java 代码直接引用这些类。详见 §5。
 
 ### 2.2 版本对齐
 
@@ -751,13 +751,13 @@ jar），Java 代码直接引用这些类。详见 §10。
   RxJava 都不打包、不链接。
 - **运行时**：`fabric.mod.json` 声明
   `"c2me": ">=0.4.0-alpha.0.29 <0.5.0"` 硬依赖（下限即 `NewStatusHook`
-  可用的版本；上界防止跨到可能重写 API 的新线，见 §27.6）。实测（§10）：
+  可用的版本；上界防止跨到可能重写 API 的新线，见 §13.6）。实测（§5）：
   无 C2ME 时桌面 CPS ~144→~13（批攒不满）。C2ME 是性能硬需求。
 - **兼容性红线**：只用 C2ME 的公开扩展点（`NewStatusHook` /
   `NewChunkStatus`），不 mixin 它的内部实现。**运行期**由
   `C2meCompat.verify()` 在注册前核对 `ChunkLoadingContext` / FlowSched 的
   字节码形状；不符时只打 ERROR 并跳过对齐状态，旧的 `populateNoise` GPU
-  路径继续可用（不再直接 `NoSuchMethodError`）。见 §27.6。
+  路径继续可用（不再直接 `NoSuchMethodError`）。见 §13.6。
   **编译期** stub 只保证源码能编过，不等于运行期一定匹配——这是原来
   "编译期会直接失败"说法的修正。
 - **许可证红线（2026-11 补充）**：本地的 `c2me-opts-accel-opencl` 模块是
@@ -784,7 +784,7 @@ Loom 不重映射字符串常量，运行期类名是 intermediary（`class_6916
 下行（Java → Rust）是固定参数的 C 函数，外加 `c2me_wgpu_set_aquifer_table` /
 `c2me_wgpu_set_beard_table` / `c2me_wgpu_set_external_inputs` 推入的整表数据；
 上行（GPU → Java）只有一个聚合 blob，布局见 §3.4。旧的 per-chunk `ResultBlob`
-map 已不在生产路径上（§26）。
+map 已不在生产路径上（§12）。
 
 ### 3.3 置换表资源
 MC 构造完 Perlin 后丢 seed，只剩 `perm[256]+origin`，必须传表本身。
@@ -812,12 +812,16 @@ MixinChunkGenerator.populateNoise：
 3. GPU 直接输出 per-block 状态字节（0=air/1=stone/2=water/3=lava），Java 只把字节写进 chunk section 的 palette（含 heightmap 更新）
 4. cir.setReturnValue(completedFuture(chunk)) 取消原版生成
 5. **这是唯一的 GPU 写回路径**：旧的"GPU 只算角点密度、MC 在 CPU 上做三线性插值 +
-   aquifer + 矿脉"路径已按 §20 的测量结论删除（CPU 写回把 CPS 钉在 ~150，移动端 ~6）。
+   aquifer + 矿脉"路径已按 §8.2 的测量结论删除（CPU 写回把 CPS 钉在 ~150，移动端 ~6）。
    三个相关开关（`C2ME_WGPU_BLOCK_OUT/AQUIFER/BEARD`）也随之取消——它们已是正确性的
    必要条件，关掉只会产生错地形。
 6. 矿脉（`OreVeinSampler`，连片大矿脉）已在 GPU 上实现：`block_out.wgsl` 里的
    `vein_state()` 复刻了 MC 的采样器，RNG 种子由 `c2me_wgpu_set_ore_seed` 传入。
    普通矿石（煤/铁/金等）仍由 biome feature 阶段放置，不经过这条路径。
+7. **异步调度**（0.1.5 起）：`populateNoise` 提交 GPU 请求后先返回 pending
+   future，C2ME worker 不阻塞；GPU 完成后由
+   `SchedulingManager.positionedExecutor(pos)` 把写回任务投回同一个 worker 池，
+   future 完成时才释放位置锁。历史设计记录见 §15.6 迁移表的 18.6b 行。
 
 ---
 
@@ -827,7 +831,7 @@ MixinChunkGenerator.populateNoise：
 
 ---
 
-## §10 与 C2ME 的关系（构建期 Stub + 运行时强依赖）
+## §5 与 C2ME 的关系（构建期 Stub + 运行时强依赖）
 
 - **构建期（Stub 依赖）**：为了不拉取整个 C2ME 源码，我们通过 `src/stub`（`compileOnly`）提供了 `SchedulingManager` 等类的接口签名。Java 代码中依然直接引用了这些类。
 - **扩展点（0.1.7-alpha.1 起）**：chunk status 走 C2ME 的
@@ -838,13 +842,17 @@ MixinChunkGenerator.populateNoise：
 - **运行时强依赖**：实测无 C2ME 时桌面 CPS ~144→~13（缺多线程并行，批攒不满）。同时，异步写回架构强依赖 `SchedulingManager.positionedExecutor()` 来执行，若获取不到调度器，GPU 加速将直接回退纯 CPU 路径。
 - **自写 AW**：不再借 C2ME 的 access widener，避免其删条目导致 `IllegalAccessError`。
 
-## §11 混合执行（任意 modded 密度函数兜底）
+---
+
+## §6 混合执行（任意 modded 密度函数兜底）
 
 Rust 不认识的密度节点（地形 mod）在 CPU 按同一角点网格求值，作为 "external input"
 喂给 GPU（binding 6）。其余树仍走 GPU，**modded worldgen 保持工作**，只有不支持的子树付 CPU 成本。
 实机验证：Tectonic、Epic Terrain 正常。
 
-## §12 诊断基础设施
+---
+
+## §7 诊断基础设施
 
 - Rust 日志写 `<gameDir>/logs/c2me-wgpu.log`（Java 启动时传路径）。
 
@@ -855,115 +863,36 @@ Rust 不认识的密度节点（地形 mod）在 CPU 按同一角点网格求值
   readback/decode）与 CPU 侧 `[writeback-timing]`。两组要一起读才有意义。
 - `debug_height_probe`：`getHeight` 调用点打点（次数/耗时/重复率/GPU 是否在途），
   输出到 `c2me-wgpu-height`。默认关闭，`HeightProbe` 类加载时读一次，改值需重启。
-  用途与判读见 §28.5。
+  用途与判读见 §14.5。
 - `debug_dump_*`：离线参考 dump（密度/方块/blob/beard/aquifer 表）。
 
-## §5 附录：开发历程
+---
 
-> 以下为各里程碑历史，压缩自旧版文档，保留关键决策与教训。
+## §8 核心结论（0.1.5 基线）
 
-### §5.x 里程碑索引（细节见 git history）
+> 这四条是 0.1.5 架构定型的依据；后续实测见 §9–§14。
 
-- **§5.1 2a**：首个可跑管线。地形出现。修复：magic 字节序、instanceof、`dx_max` 重定义。
-- **§5.5 2b**：emitter memoization，WGSL 13 万行 → 5954 行；节点数值验证 ~1e-7。
-- **§5.6 2c**：批处理 + 网格对齐 MC 角点（4→8），方块匹配 94.68%→96.18%。
-- **§5.7 2d**：正确性验证框架；网格 Y cell 修正；EndIslands（simplex）1.19e-7；多维度守卫；磁盘 PipelineCache。教训：RAW_ROUTER 不可靠，要用 compiled router。
-- **§5.8 2e**：ch10/ch11 残差根因 = blob 数据源 + octave 顺序。教训：CPU 解释器一致 ≠ 对 vanilla 正确。
-- **§5.9 2f**：多维度 WorldContext；三个正确性 bug（octave 顺序 / simplex origin / EndIslands 环条件反转）。
-- **§5.10 2g**：NaN 语义兜底（远坐标）；测试判据改进。教训：平台未定义行为要显式兜底。
-- **§5.11 2h**：矿脉路线 3（GPU 角点粗筛 + MC 精算）。教训：CPU per-block 复用 MC 采样器 = 灾难。
-- **§5.12 2i**：前端通知 + 初始化失败安全回退。教训：`<clinit>` 抛异常 = 类永久损坏。
-- **§5.13 2j**：Android aarch64 交叉编译（cargo-ndk）。
-- **§5.14 2k**：内存泄漏修复（result blob 每 chunk 泄漏 + executor 每 batch 重建 buffer）。
-- **§5.15 2l**：Mali-G610 shader 规模崩溃 → 按通道拆 A/B/C 三片。教训：编译成本超线性，安全区 ~2100 行。
-- **§5.16 2m**：只算/只回读被消费通道（shader 6223→2740 行，回读 -87.5%）。教训：先数消费者。
-- **§5.17 2n**：群系气候 GPU 加速（design 2）。
-- **§5.18–§5.21**：异步调度 A/B、写回天花板实测、最小闭环。核心结论见 §19–§22。
-- **§22 2o**：aquifer + Beardifier 全 GPU，端到端反超纯 CPU。见下节。
+### 8.1 端到端 A/B：异步调度裁定
 
-### §13–§18 已证伪的实验（存档）
+桌面异步调度曾净负（30 vs 纯 CPU 23s），根因是 GPU 往返固定延迟落在关键路径。
+**教训：端到端指标才是判据。**
 
-- §13 手机"高 U 低显"负优化（旧架构 CPU 写回下成立，§20 后架构改变）。
-- §14 interpolated 边界 bug（已通过 Pass E 架构修复）。
-- §15 JFR 热点：写回瓶颈在 CPU 逐方块（aquifer/heightmap/vein）。
-- §16 GC 对负优化贡献：实测排除。
-- §17 aquifer 逐帧归因：~65% 写回，一半控制流一半噪声。
-- §18 各种"取巧"思路：heightmap 一次性、aquifer 部分 GPU 化等，多数证伪。
-  **结论：够长的杠杆是"整体写回 GPU 化"（§20–§22 已实现）。**
+### 8.2 写回天花板实测
 
-### 日志架构与防死锁机制（0.1.5 新增）
+MIN_STAGE（跳全部写回）11s ≪ 纯 CPU 23s，证明**净负全部来自 CPU 写回留在关键
+路径**，GPU 密度管线本身很快。
 
-- **FFM Upcall 日志回传**：Rust 侧不再直接向 `STDERR` 打印调试信息。所有的 `wgpu_debug!` 调用会通过 Panama FFM 的回调函数（`upcallStub`）直接传给 Java 端的 SLF4J `LOGGER`，完美合并进 `latest.log`，且格式统一。
-- **黑匣子防崩溃日志**：Rust 侧独立保留了对 `c2me-wgpu.log` 的写入。每次写入后执行 `f.flush()`，并在 `setup_panic_hook` 中执行 `f.sync_all()`，确保即便发生 `SIGABRT`（如 `panic=abort` 或 Android 驱动崩溃），底层原因依然能落盘。
-- **强制退出防死锁**：`pollStatus` 超时（原生 worker 无响应）时，主线程会永久卡在 C2ME 的 Future 上。此时 `WgpuBatchCoordinator` 调用 `LogManager.shutdown()` 刷出 Java 日志，然后 `Runtime.getRuntime().halt(1)` 强杀进程。批次级失败不走这条路径，见下节。
-- **原生库解压策略**：默认将 `.so`/`.dll` 解压到 `<gameDir>/c2me-wgpu-natives/`，避开系统临时目录可能存在的 `noexec` 权限限制。若游戏目录不可写或 `dlopen` 失败，自动清理并回退到系统临时目录（`/tmp`）。同时，解压后自动追加可执行权限，确保 Android 等严格沙箱能正常加载。
-- **FFI 边界护甲**：`c2me_wgpu_create_instance` 使用 `extern "C-unwind"`，并用 `std::panic::catch_unwind` 包裹。若 wgpu 底层在初始化时 panic（典型场景：强制指定 `WGPU_BACKEND=gl` 但 EGL 返回 `BadAccess`），可以安全地捕获并回退到 CPU。
-- **⚠️ 跨平台崩溃行为差异（重要）**：
-  - **桌面端**（Windows/Linux/macOS）：Rust 默认 `panic=unwind`，`catch_unwind` 能有效捕获 wgpu 的 panic，游戏**静默回退到 CPU**，不会闪退。
-  - **Android 端**：交叉编译默认 `panic=abort`，`catch_unwind` 失效。wgpu 的 panic 会触发 `SIGABRT`，**JVM 会被瞬间强杀**，游戏直接闪退。此时唯一可依赖的是提前注册的 `setup_panic_hook`，它会在 `abort` 前执行 `sync_all()`，把 panic 堆栈强行写入黑匣子 `c2me-wgpu.log`。
-  - **结论**：Android 用户如果设置了不兼容的 `WGPU_BACKEND` 环境变量（如 `gl`），游戏会闪退，但不会丢失崩溃原因。桌面端用户可以放心随意切换后端。
+### 8.3 最小闭环：BlockOut shard
 
-### 运行期错误处理的分层设计
+BlockOut shard 首次跑通（GPU 输出 per-block 状态字节），16s。
 
-失败按"能否确定状态"分三层处理，不是一刀切：
+### 8.4 aquifer + Beardifier 全 GPU
 
-- **初始化失败 → 回退 CPU**。`c2me_wgpu_create_instance` 是 `extern "C-unwind"` 且被
-  `catch_unwind` 包裹，adapter 选择、feature 检查、shader 编译失败都能捕获，Java 侧
-  得到 `STATUS_INIT_FAILED`，`ModuleEntryPoint` 记录原因并让该维度走 vanilla/C2ME
-  CPU 生成。此时还没分配任何 GPU 资源，回退是干净的。
-
-- **批次失败 → 该维度降级 CPU**。`execute_batch` 返回 `Err`（executor 获取失败、锁
-  中毒、单次提交出错）时 `status = STATUS_ERROR`。这是可恢复条件：`complete()` 取走
-  handle、标记 `gpuFailed`、把失败批次的 future 全部异常完成。
-
-  但仅仅完成异常 future 是不够的——C2ME 会释放位置锁（`ScheduledTask` 的
-  `whenComplete` 对异常完成同样执行），然后**放弃这个 chunk**，它永远停在
-  "upgrade to noise" 状态，依赖它的东西全部等死。所以失败回调必须自己把 chunk
-  用 vanilla 重新生成：置 `FAILED_DIMS`，再调一次 `populateNoise`，重入时
-  `acquireDimState` 看到标记直接返回、不 cancel，vanilla 正常生成。
-
-  `FAILED_DIMS` 的检查必须在 `acquireDimState` **最开头**、缓存查找之前。放在之后
-  是初版的 bug：失败回调重入时先拿到缓存里的死 `DimState`，继续往已死的 coordinator
-  提交，实测刷了 16 万行错误且地形完全不生成。
-
-  清理有意不做。`shutdown()` 会 join 批处理线程，而失败回调跑在完成线程上——在那里
-  调 `shutdown()` 两者互等。失败维度的 GPU 资源留到下次切存档时释放，代价是
-  有界的（一个维度的 buffer），优于挂起。
-
-- **超时 / 未知状态 → halt**。`pollStatus` 超过 30 秒仍 PENDING，或返回既非 DONE 也
-  非 ERROR 的状态，说明原生 worker 已经不响应了。此时 Java 侧无从判断 device 是否
-  还能用，`LogManager.shutdown()` 刷盘后 `Runtime.getRuntime().halt(1)`。
-
-**为什么超时不能降级？** 降级需要能保证"这个 chunk 会被重新生成"。但超时意味着 Rust
-侧的 `BatchRequest` 可能永远不完成，Java 侧持有的 handle 无法释放，对应的 chunk 永远
-等不到结果。这与批次失败不同——批次失败至少 Rust 侧返回了确定的状态。
-
-**`on_uncaptured_error` 覆盖到哪一层？** wgpu 的 validation error 和 OOM 被它拦截，
-只记日志不 panic，`execute_batch` 会返回 `Err` 走降级路径。它**覆盖不到** `device
-lost` 和 wgpu 内部断言失败——那两类表现为 panic，最终仍会走到 halt。
-
-**已知未覆盖**：如果 `execute_batch` 内部 panic（而非返回 Err），`status` 停在
-`STATUS_PENDING`（panic 发生在 `store` 之前），Java 侧只能等 30 秒超时后 halt。
-要覆盖这条需要在 `submit_async` 的回调外再包一层 `catch_unwind`，并引入
-`STATUS_PANICKED`。`setup_panic_hook` 已经把堆栈 `sync_all()` 写进
-`c2me-wgpu.log`，所以即使走到 halt，崩溃原因也不会丢。
-
-### §19–§22 核心结论（近期）
-
-**§19 端到端 A/B（异步调度裁定）**：桌面异步调度曾净负（30 vs 纯 CPU 23s），
-根因是 GPU 往返固定延迟落在关键路径。**教训：端到端指标才是判据。**
-
-**§20 写回天花板实测**：MIN_STAGE（跳全部写回）11s ≪ 纯 CPU 23s，证明
-**净负全部来自 CPU 写回留在关键路径**，GPU 密度管线本身很快。
-
-**§21 最小闭环**：BlockOut shard 首次跑通（GPU 输出 per-block 状态字节），16s。
-
-**§22 aquifer + Beardifier 全 GPU（当前）**：
 - aquifer：Java warmup 惰性表（315 cell ~0ms）+ compact 序列化（2544B）→
   Rust 现算 blockPositions（种子来自表头）→ GPU 12-cell 扫描 + 分类。99.97%。
 - beard：静态 24³ 权重表（每 world 一次）+ per-chunk pieces（固定 stride）。
   bit-exact。**必须 f32**（WGSL 无 f64）。
-- **端到端反超纯 CPU，功能完整，地形正确**（当前基准见 §23：18 s vs 23 s）。
+- **端到端反超纯 CPU，功能完整，地形正确**（当前基准见 §9：18 s vs 23 s）。
 - 遗留 0.03% = 过渡带 `calculateDensity`（barrier 噪声）分支未实现。
 - 验证链全离线：CPU-f32 / blockPositions / WGSL / e2e / beard，5 个测试。
 - shard B 瘦身（2026-10-17）：`spline_seg` + `octave_stack` 两个 WGSL helper 替换
@@ -972,9 +901,11 @@ lost` 和 wgpu 内部断言失败——那两类表现为 panic，最终仍会�
   → depth 偏差 ~0.08 → 海底 y≈43–55 误判 stone（chunk 50,50 diff 8.88%）。改
   `spline.rs`/`world.rs` 两处 n==1 分支 + bump `LAYOUT_VERSION` 4→5。验证：逐通道
   bad=0/1225、逐格 diff 归零（回退复现 +0.08~0.098）、GPU rms 2.5e-5/5.7e-5、84 测试
-  全过、实机 Tectonic 与 Epic 滴水石锥均消失；怪坑（§14 非线性外层）仍独立存在。
+  全过、实机 Tectonic 与 Epic 滴水石锥均消失；怪坑（§15.2.2 非线性外层）仍独立存在。
 
-### §23 执行器流水线化（0.1.5）
+---
+
+## §9 执行器流水线化（0.1.5）
 
 **问题**：`run_loop` 是 `prepare → submit → poll(Wait) → 读回 → 下一批`。GPU 算的
 时候 CPU 在干等，且 `poll(Wait)` 直接挂起线程。
@@ -1015,22 +946,9 @@ C2ME worker 线程并行承担，不是端到端瓶颈。曾尝试用底层调�
 也无法重叠。想再提 CPS 只能减少 GPU 工作量（降分辨率、减 shard），代价是地形质量
 与移动端兼容性。
 
-### 关键文件
-
-- `rust/src/codegen/wgsl_gen.rs`：WGSL 生成 + shard 规划 + BlockOut/beard/aquifer WGSL。
-- `rust/src/scheduler/executor.rs`：batch 执行、bind group、buffer 管理。
-- `rust/src/world/world.rs`：WorldContext、pipeline 编译、测试。
-- `rust/src/world/{aquifer,beard}.rs`：aquifer 表解析 + Beardifier 复现。
-- `rust/src/c_api.rs`：C API（含 `set_aquifer_table` / `set_beard_table`）。
-- `src/main/java/.../mixin/MixinChunkGenerator.java`：写回 + stage + dump。
-- `src/main/java/.../chunkstatus/WgpuNoiseStatus.java`：阶段 1 的透明委托状态。
-- `src/main/java/.../mixin/MixinNewStatusHook.java`：在 C2ME 注册原版 NOISE 前插入状态。
-- `src/stub/java/com/ishland/...`：C2ME / FlowSched 的编译期接口签名（不打包）。
-- `src/main/java/.../WgpuThinBinding.java`：FFM 绑定。
-
 ---
 
-### §24 极限 A/B 测试：WGPU vs 官方 OpenCL (1.21.1 同台竞技)
+## §10 极限 A/B 测试：WGPU vs 官方 OpenCL (1.21.1 同台竞技)
 
 **测试环境**：1.21.1 Fabric，AMD Cezanne 核显 (`gfx90c`)，都开启 ScalableLux，Chunky r=500 (4225 区块)，进图预热 5 秒后启动。
 
@@ -1047,17 +965,17 @@ C2ME worker 线程并行承担，不是端到端瓶颈。曾尝试用底层调�
 3. **光照优化的决定性作用**：此前未装 ScalableLux 时，原版单线程光照成为瓶颈，WGPU 的 CPS 中位被压在 206；装上后峰值直接飙到 301，说明 GPU 算力完全充足，只是被主线程卡住了下发。
 
 > **后续修正（2026-11）**：结论 1 里的"2 秒通信税"有一部分其实是我们自己的
-> decode 冗余拷贝，§26 去掉后同规模差距收窄；r=1000 的最新复测见 §25.7。本表
+> decode 冗余拷贝，§12 去掉后同规模差距收窄；r=1000 的最新复测见 §11.7。本表
 > 保留为 0.1.5 时点的记录，不与后续数据混用。
 
 ---
 
-### §25 性能天花板定位：r=1000 大规模实验（0.1.6 之后）
+## §11 性能天花板定位：r=1000 大规模实验（0.1.6 之后）
 
 为区分"代码效率问题"与"硬件瓶颈"，把规模从 r=500 拉到 **r=1000（16129 chunks）**，
 稀释冷启动与 Chunky 收尾 I/O 的占比，并开启 `debug_stage_timing`。
 
-#### 25.1 分阶段计时：CPU 侧已无空间
+### 11.1 分阶段计时：CPU 侧已无空间
 
 稳态（每 64 批一行）的分段耗时：
 
@@ -1073,7 +991,7 @@ C2ME worker 线程并行承担，不是端到端瓶颈。曾尝试用底层调�
 **已到极限**，Rust/FFM 架构本身没有问题。`readback` 是 GPU 真实计算 + 显存回读
 时间，属于硬件天花板。
 
-#### 25.2 关键异常：GPU 一直没吃饱
+### 11.2 关键异常：GPU 一直没吃饱
 
 - 平均批次只有 **3~10 个 chunk**（上限 `MAX_BATCH = 64`）
 - `inflight` 只有 **0.9~1.7 / 4**，流水线远未打满
@@ -1084,7 +1002,7 @@ r=1000 时 Chunky 跑到外围区域，结构生成 / 生物群系 / 光照这�
 阶段变重，就喂不满 GPU。日志里 A 组的 CPS 从 305 掉到 212 再爬回 268，正是
 这个上游波动的映射。
 
-#### 25.3 窗口参数已从两端夹死
+### 11.3 窗口参数已从两端夹死
 
 `MAX_WAIT_MS`（攒批等待窗口）做了三档实测，r=1000、同种子、预热 5s：
 
@@ -1101,7 +1019,7 @@ r=1000 时 Chunky 跑到外围区域，结构生成 / 生物群系 / 光照这�
 
 **结论：调窗口参数只是在"首块延迟"与"批次摊销"之间来回移动，动不了天花板。**
 
-#### 25.4 与官方 OpenCL 的同规模对比（r=1000）
+### 11.4 与官方 OpenCL 的同规模对比（r=1000）
 
 | 指标 | WGPU | OpenCL | 差异 |
 |---|---|---|---|
@@ -1116,12 +1034,12 @@ r=500 时是 **15 s vs 13 s**（约 13%）；r=1000 时总耗时差距缩到 3.2
 **这 8% 是架构性的**：JNI 原生指针 vs FFM、4x4 空间批处理 vs 散装批次、
 Biome 也在 GPU 上 vs 仍在 CPU。要追平需要碰 C2ME 状态机——**当时**这条被划为
 兼容性红线，故判为不做。（2026-11 该红线已解除并已落地：4x4 对齐批次由
-0.1.7-alpha.2 的 `chunk_batch_size` 实现，见 §27.6 / §27.7；Biome 仍未上 GPU。）
+0.1.7-alpha.2 的 `chunk_batch_size` 实现，见 §13.6 / §13.7；Biome 仍未上 GPU。）
 
-> 本表与 §25.7 处于不同电源状态（`low-power` vs `performance`）、不同构建，
+> 本表与 §11.7 处于不同电源状态（`low-power` vs `performance`）、不同构建，
 > 绝对耗时不可互比，只作历史对照。
 
-#### 25.5 本轮证伪的优化尝试（全部记录，避免重试）
+### 11.5 本轮证伪的优化尝试（全部记录，避免重试）
 
 | 尝试 | 结果 |
 |---|---|
@@ -1134,19 +1052,19 @@ Biome 也在 GPU 上 vs 仍在 CPU。要追平需要碰 C2ME 状态机——**�
 这个假设，但分阶段数据证明真正的瓶颈是 **C2ME 的提交速率**，不在我们这一侧。
 判断依据必须是实测拆分（`encode/submit/readback/decode`），不是"代码看着低效"。
 
-#### 25.6 剩余的理论空间
+### 11.6 剩余的理论空间
 
-- ~~**decode 占 11%（1.6ms）**~~ **已在 §26 解决，降到 0.47ms**。
+- ~~**decode 占 11%（1.6ms）**~~ **已在 §12 解决，降到 0.47ms**。
 - **poll 轮询下沉到 Rust**：减少每批的 FFM 调用次数，属于结构性改动，收益未知。
 - **真正的 4x4 批次选择**：需要改 C2ME 状态机。**当时**因兼容性红线判为不做；
-  2026-11 红线解除后已实现为 0.1.7 的 `chunk_batch_size` 对齐批次（§27.6），
-  r=500 同种子下 `4×4` 为 13 s / CPS 298（§27.7）。剩余空间在"批内共享采样
+  2026-11 红线解除后已实现为 0.1.7 的 `chunk_batch_size` 对齐批次（§13.6），
+  r=500 同种子下 `4×4` 为 13 s / CPS 298（§13.7）。剩余空间在"批内共享采样
   上下文"（阶段 3，未做）。
 
-#### 25.7 2026-11-10 复测（0.1.7-alpha.5，performance profile）
+### 11.7 2026-11-10 复测（0.1.7-alpha.5，performance profile）
 
 机器重启后 `platform_profile` 从 `low-power` 变为 `performance`，绝对耗时与
-§25.4 不可直接比较；这一轮只换加速器 jar（A = 官方 OpenCL 0.4.0-alpha.0.29，
+§11.4 不可直接比较；这一轮只换加速器 jar（A = 官方 OpenCL 0.4.0-alpha.0.29，
 B = 本模组 0.1.7-alpha.5），同实例、同种子 `-836645977851536298`、同中心与
 r=1000，每次全新世界 + 完整重启，A/B 交错并冷却 60 s。GPU 占用取自
 `/sys/class/drm/card1/device/gpu_busy_percent`（含渲染线程）。
@@ -1182,9 +1100,9 @@ r=1000，每次全新世界 + 完整重启，A/B 交错并冷却 60 s。GPU 占�
 
 ---
 
-### §26 readback 路径去冗余拷贝（0.1.6 之后）
+## §12 readback 路径去冗余拷贝（0.1.6 之后）
 
-#### 26.1 问题：同一份数据被拷了六遍
+### 12.1 问题：同一份数据被拷了六遍
 
 `finish_batch` 到 Java 拿到的 blob 之间，密度数据和方块数据各自经历了一串
 完全冗余的转换：
@@ -1212,7 +1130,7 @@ staging bytes
 纯粹是历史包袱——`ExecutedBatch.results` 的 per-chunk blob map 是旧架构
 （Java 逐 chunk 消费）的产物，现在 Java 只取一个聚合 blob。
 
-#### 26.2 改法
+### 12.2 改法
 
 - `ResultBlob::from_raw_payload(payload, offsets, chunk_count)`：直接用现成
   字节拼 blob（头 + offsets + payload + CRC），不做类型转换。
@@ -1231,11 +1149,11 @@ staging bytes
 `SubmitBatch` 消息的一部分，由两个入口各自声明——**这提醒了一件事：
 "synchronous" 和 "test-only" 不是同一回事，判断调用路径要看它最终走哪个循环。**
 
-#### 26.3 实测
+### 12.3 实测
 
 Chunky r=1000（16129 chunks），同种子、同预热：
 
-| 阶段 | §25（改前） | §26（改后） | 变化 |
+| 阶段 | §11（改前） | §12（改后） | 变化 |
 |---|---|---|---|
 | encode | 0.03 ms | 0.03 ms | — |
 | submit | 0.32 ms | 0.31 ms | — |
@@ -1247,9 +1165,9 @@ Chunky r=1000（16129 chunks），同种子、同预热：
 
 **readback 也跟着降了**：executor 线程不再被 decode 占着，映射检查更及时。
 
-#### 26.4 对 §25 结论的影响
+### 12.4 对 §11 结论的影响
 
-§25 判定真正的瓶颈是 C2ME 提交速率（`inflight` 长期只有 0.9–1.1 / 4），
+§11 判定真正的瓶颈是 C2ME 提交速率（`inflight` 长期只有 0.9–1.1 / 4），
 这一点没变。但 **decode 从 1.6ms 降到 0.47ms 后，WGPU 的总耗时追平了
 官方 OpenCL（都是 1m02s）**——说明之前那 2 秒差距里，有一部分其实是
 我们自己制造的拷贝开销，而不是架构差距。
@@ -1259,17 +1177,17 @@ Chunky r=1000（16129 chunks），同种子、同预热：
 
 ---
 
-### §27 C2ME `NewChunkStatus` 接入（0.1.7-alpha.1，阶段 1）
+## §13 C2ME `NewChunkStatus` 接入（0.1.7-alpha.1，阶段 1）
 
-#### 27.1 为什么要接
+### 13.1 为什么要接
 
 0.1.6 之前，GPU 加速的入口是 `MixinChunkGenerator.populateNoise`：vanilla
 `NOISE` 状态跑到一半，我们拦下密度计算，再 `cir.setReturnValue`。这条路能跑，
-但天花板受 C2ME 状态机限制（§25：`inflight` 长期 0.9–1.1 / 4）。官方 OpenCL
+但天花板受 C2ME 状态机限制（§11：`inflight` 长期 0.9–1.1 / 4）。官方 OpenCL
 模块走得更远：它注册自己的 `NewChunkStatus`，直接持有批次、做 4x4 空间批处理。
 要拿到同样的收益，必须先证明我们能安全地进入这条状态机。
 
-#### 27.2 阶段 1 只做透明委托
+### 13.2 阶段 1 只做透明委托
 
 `WgpuNoiseStatus` 插在 `BIOMES` 与 `NOISE` 之间，但**不自己生成地形**：
 `upgradeToThis` / `getDependencies` 原样转发给 C2ME 的
@@ -1285,7 +1203,7 @@ Chunky r=1000（16129 chunks），同种子、同预热：
 自建一套等于写第二份世界生成，错了很难归因。阶段 1 把"钩子错了"和"生成错了"
 分开，阶段 2 再接管数据。
 
-#### 27.3 实现要点
+### 13.3 实现要点
 
 - `MixinNewStatusHook` 注入 `beforeVanillaStatusRegister` 的 `HEAD`；
   `vanillaStatus == ChunkStatus.NOISE` 时执行
@@ -1303,7 +1221,7 @@ Chunky r=1000（16129 chunks），同种子、同预热：
 - 升级/降级钩子（`postUpgradeToThis` / `preDowngradeFromThis` /
   `downgradeFromThis`）返回 `Completable.complete()`：本状态不持有资源。
 
-#### 27.4 实机验证（2026-11-07）
+### 13.4 实机验证（2026-11-07）
 
 环境：1.21.1 Fabric，RADV RENOIR，种子 `-836645977851536298`，Chunky r=500。
 （种子仅用于本次记录；跨实验比较仍按教训 #45 标注可比性。）
@@ -1320,7 +1238,7 @@ Chunky r=1000（16129 chunks），同种子、同预热：
 **结论**：持平而非提升是预期结果——这一阶段 GPU 工作与 0.1.6 完全相同，
 只是多包了一层状态。它证明的是扩展点、顺序和依赖声明正确，不能证明性能。
 
-#### 27.5 阶段 2 为什么没有接管生成
+### 13.5 阶段 2 为什么没有接管生成
 
 原计划在阶段 2 里自己构建 `ChunkNoiseSampler` / `Blender` / `StructureAccessor`，
 但那样等于写第二份世界生成器：aquifer、beardifier、写回半径都要逐项对齐，
@@ -1333,12 +1251,12 @@ Chunky r=1000（16129 chunks），同种子、同预热：
 这样任何批次逻辑的 bug 都只可能表现为**慢**或**回退到逐块生成**，而不是错地形。
 `MixinChunkGenerator` 的写回路径继续保留，不删除。
 
-#### 27.6 对齐批次设计（`chunk_batch_size`）
+### 13.6 对齐批次设计（`chunk_batch_size`）
 
 配置字段 `chunk_batch_size`：`1`（默认，透明委托）/ `2` / `4` / `8`，必须是
 2 的幂；非法值在 `Config#clamp` 里回落为 1。状态注册时读取一次（每 JVM 一次），
 改动必须完全重启 Minecraft，只退出存档再进入无效。实机结果里 **4×4 最优**
-（§27.7），作为推荐值；默认保持 1，保证未验证场景行为不变。ModMenu 设置界面
+（§13.7），作为推荐值；默认保持 1，保证未验证场景行为不变。ModMenu 设置界面
 提供 `1 / 2 / 4 / 8` 的循环控件（0.1.7-alpha.4 起），不再需要手改 JSON；界面
 底部单独提示"需完全重启"。
 
@@ -1441,7 +1359,7 @@ C2ME `0.4.0-alpha.0.29` / `0.4.0-alpha.0.30` 的嵌套 jar 运行
 因为 `ItemHolder` / `TheChunkSystem` 的 `<clinit>` 不是为在
 `NewChunkStatus.<clinit>` 内部被调用而设计的。
 
-#### 27.7 阶段 2 实机验证结果（2026-11-08）
+### 13.7 阶段 2 实机验证结果（2026-11-08）
 
 测试条件：同一个世界、种子 `-836645977851536298`，每档都**删除并重建世界**
 （保证真正重新生成），Chunky r=500（4225 chunks）。四轮中心分别为
@@ -1471,8 +1389,8 @@ C2ME `0.4.0-alpha.0.29` / `0.4.0-alpha.0.30` 的嵌套 jar 运行
   组内可比（教训 #45）。因此结论只取组内相对值：**4 > 2 ≈ 8 > 1**。
 
 **结论**：`chunk_batch_size` 保留默认 `1`（不改变已验证行为），把 **4** 作为
-推荐的手动值写进 §27.6。0.1.7-alpha.4 起不再讨论"改默认值"：默认保持 1 以保证
-未验证场景行为不变，把切换权交给 ModMenu 的循环控件（§27.6）。
+推荐的手动值写进 §13.6。0.1.7-alpha.4 起不再讨论"改默认值"：默认保持 1 以保证
+未验证场景行为不变，把切换权交给 ModMenu 的循环控件（§13.6）。
 
 **操作注意**：`chunk_batch_size` 在 `NewChunkStatus.<clinit>` 时读取一次，
 每 JVM 只执行一次，所以改值必须**完全重启 Minecraft**，只退出存档再进入
@@ -1481,14 +1399,16 @@ C2ME `0.4.0-alpha.0.29` / `0.4.0-alpha.0.30` 的嵌套 jar 运行
 
 回退：把值改回 `1` 并重启即可，不需要换 jar。
 
-### §28 表面高度估算（Estimate Surface Height）评估（2026-11-08）
+---
+
+## §14 表面高度估算（Estimate Surface Height）评估（2026-11-08）
 
 > 结论先行：**已实测，结案（负结果）**。一轮 r=500 只有 696 次 `getHeight`、
 > 累计 1.58 s（≈12% 墙钟，且约一半与 GPU 在途重叠），重复率 6%；纯 CPU 缓存
-> 省不到 1%，GPU 预计算要多跑一遍噪声，都不划算。测量方法与数据见 §28.2 /
-> §28.5。
+> 省不到 1%，GPU 预计算要多跑一遍噪声，都不划算。测量方法与数据见 §14.2 /
+> §14.5。
 
-#### 28.1 原版 `getHeight` 的成本模型
+### 14.1 原版 `getHeight` 的成本模型
 
 依据 1.21.1 named jar 的 `NoiseChunkGenerator#sampleHeightmap` 字节码（行为
 事实，未参考任何非 MIT 实现）：
@@ -1500,7 +1420,7 @@ C2ME `0.4.0-alpha.0.29` / `0.4.0-alpha.0.30` 的嵌套 jar 运行
   个区块的噪声求值**。
 - 传入的是 `Beardifier.INSTANCE`（空 beardifier）和
   `Blender.getNoBlending()`：**高度与 blending 无关，也看不到已放置的结构**，
-  只由种子 + `NoiseConfig` 决定。这一点后面 §28.5 的缓存方案直接受益。
+  只由种子 + `NoiseConfig` 决定。这一点后面 §14.5 的缓存方案直接受益。
 - `AquiferSampler.FluidLevelSampler` 与区块生成共用同一个工厂，含水层参与
   判定；但 **surface rules 不参与**（`buildSurface` 在更晚的状态）。
 - 求值方式是从世界顶部**逐格**向下 `sampleBlockState()`，命中谓词即
@@ -1509,13 +1429,13 @@ C2ME `0.4.0-alpha.0.29` / `0.4.0-alpha.0.30` 的嵌套 jar 运行
 - `getHeightOnGround` / `getHeightInGround` 只是 `getHeight` 的 ±1 包装
   （一个 `iconst_1; isub`）。
 
-按 §25 的纯 CPU 端到端（r=500 / 4225 chunks / 27 s ≈ 6.4 ms per chunk）反推，
+按 §11 的纯 CPU 端到端（r=500 / 4225 chunks / 27 s ≈ 6.4 ms per chunk）反推，
 密度部分约 3–4 ms/chunk，则一次 `getHeight` 粗估 **0.3–0.8 ms**
 （196/1225 的网格点，加最多 384 次逐格插值与含水层判定）。
-**实测是 2.2 ms（§28.2），比这个模型高 3–7 倍**：每次调用重建
+**实测是 2.2 ms（§14.2），比这个模型高 3–7 倍**：每次调用重建
 `ChunkNoiseSampler` / 插值器的固定开销主导，网格点数量反而不是主要成本。
 
-#### 28.2 谁在调用，以及实测结果（2026-11-08）
+### 14.2 谁在调用，以及实测结果（2026-11-08）
 
 | 调用点 | 每次调用数 | 备注 |
 |---|---|---|
@@ -1563,23 +1483,23 @@ chunks，`chunk_batch_size=4`）：
 属环境波动，不是探针开销（探针每轮总计 <2 ms）。高度查询的累计值与墙钟无关，
 但占比按 13 s 算才是保守口径，即 **1.58 s ≈ 12%**；按 17 s 算是 9%。）
 
-#### 28.3 为什么不能直接拿现有 GPU 结果反推
+### 14.3 为什么不能直接拿现有 GPU 结果反推
 
 三个独立原因，任何一个都足以否掉"扫一遍 block_out 取顶部"的方案：
 
-1. **时序**：`NOISE` 依赖半径 8 的 `STRUCTURE_STARTS`（§27.6 的依赖表）。
+1. **时序**：`NOISE` 依赖半径 8 的 `STRUCTURE_STARTS`（§13.6 的依赖表）。
    结构选址发生时，目标列的 `NOISE` 还没跑——而这正是我们要回答的问题。
 2. **Beardifier**：`sampleHeightmap` 用 `Beardifier.INSTANCE`（空），
    `populateNoise` 用真实 `StructureAccessor` 的 beardifier。拿区块结果反推会
    在结构附近产生 1–2 格偏差，直接影响结构 Y。
 3. **语义**：`WORLD_SURFACE_WG` 是"密度 + 含水层"后的最高非空气方块，不含
    surface rules；只有能证明 block_out 与 vanilla `populateNoise` 逐块一致，
-   才谈得上等价推导（目前只有目视验证，见 §27.7）。
+   才谈得上等价推导（目前只有目视验证，见 §13.7）。
 
 所以"区块 NOISE 完成后缓存 16×16 高度"这条路命中率≈0：等缓存可用时，该区块
 的结构选址早已发生。
 
-#### 28.4 真要做的话，最小可行形状
+### 14.4 真要做的话，最小可行形状
 
 1. **GPU 新增高度入口**：输入列坐标数组，输出每列高度（4 B/列）。可复用现有
    router 求值，但语义必须逐项对齐 `sampleHeightmap`：trim 后的 shape、
@@ -1594,7 +1514,7 @@ chunks，`chunk_batch_size=4`）：
 
 第 5 条是关键：**不重用结果的区域预计算，成本高于它省下的 CPU。**
 
-#### 28.5 建议的执行顺序
+### 14.5 建议的执行顺序
 
 1. **先测量，不写 shader**。✅ 已实现（0.1.7-alpha.3）：
    - 开关 `debug_height_probe`（默认 `false`；`HeightProbe` 类加载时读一次，
@@ -1614,10 +1534,10 @@ chunks，`chunk_batch_size=4`）：
    - 判据不变：累计 < 3% 墙钟 → 结案；>5% 才往下走。
 2. **若确实可观，先做便宜的 CPU 记忆化**：`(x, z, type) → height`，每维度一个
    `Long2IntMap`（键为打包的 `x<<32|z` 加 type）。
-   - 精确性天然成立：§28.1 已确认高度与 blending 无关、只由种子决定，同种子下
+   - 精确性天然成立：§14.1 已确认高度与 blending 无关、只由种子决定，同种子下
      永不失效。
    - 命中率预计不高（结构角点基本不重合），但实现零风险，可作为第一刀。
-3. **只有 (1) 显示 >5% 且 (2) 收益不够时**，才做 §28.4 的 GPU 预计算，并且必须
+3. **只有 (1) 显示 >5% 且 (2) 收益不够时**，才做 §14.4 的 GPU 预计算，并且必须
    先设计结果重用。
 
 **测量结果（2026-11-08，0.1.7-alpha.3）**：一轮 696 次 / **1.58 s**（按 13 s 口径
@@ -1632,7 +1552,7 @@ chunks，`chunk_batch_size=4`）：
 **结论：结案（负结果）**。`debug_height_probe` 保留为诊断开关（默认 `false`），
 以后视距 / 维度 / 结构集变化时可以一键复测，不需要再写代码。
 
-#### 28.6 `FindTopSurface` 的历史结论（保留）
+### 14.6 `FindTopSurface` 的历史结论（保留）
 
 顺带查清了 `FindTopSurface`：它是 1.18 之前的旧节点，**1.21.1 的 NoiseRouter
 里根本不存在**，Java 侧只定义 `TAG_FIND_TOP_SURF` 却从不写入，真实 router
@@ -1640,3 +1560,156 @@ chunks，`chunk_batch_size=4`）：
 非法 shader），现已改为显式返回 `Err`，让该维度干净回退 CPU。反序列化路径
 保留，仅为了兼容旧 blob 与单元测试。
 
+---
+
+## §15 附录：开发历程
+
+> 以下为各里程碑历史，压缩自旧版文档，保留关键决策与教训。
+
+### 15.1 里程碑索引（细节见 git history）
+
+- **2a**：首个可跑管线。地形出现。修复：magic 字节序、instanceof、`dx_max` 重定义。
+- **2b**：emitter memoization，WGSL 13 万行 → 5954 行；节点数值验证 ~1e-7。
+- **2c**：批处理 + 网格对齐 MC 角点（4→8），方块匹配 94.68%→96.18%。
+- **2d**：正确性验证框架；网格 Y cell 修正；EndIslands（simplex）1.19e-7；多维度守卫；磁盘 PipelineCache。教训：RAW_ROUTER 不可靠，要用 compiled router。
+- **2e**：ch10/ch11 残差根因 = blob 数据源 + octave 顺序。教训：CPU 解释器一致 ≠ 对 vanilla 正确。
+- **2f**：多维度 WorldContext；三个正确性 bug（octave 顺序 / simplex origin / EndIslands 环条件反转）。
+- **2g**：NaN 语义兜底（远坐标）；测试判据改进。教训：平台未定义行为要显式兜底。
+- **2h**：矿脉路线 3（GPU 角点粗筛 + MC 精算）。教训：CPU per-block 复用 MC 采样器 = 灾难。
+- **2i**：前端通知 + 初始化失败安全回退。教训：`<clinit>` 抛异常 = 类永久损坏。
+- **2j**：Android aarch64 交叉编译（cargo-ndk）。
+- **2k**：内存泄漏修复（result blob 每 chunk 泄漏 + executor 每 batch 重建 buffer）。
+- **2l**：Mali-G610 shader 规模崩溃 → 按通道拆 A/B/C 三片。教训：编译成本超线性，安全区 ~2100 行。
+- **2m**：只算/只回读被消费通道（shader 6223→2740 行，回读 -87.5%）。教训：先数消费者。
+- **2n**：群系气候 GPU 加速（design 2）。
+- **异步调度 / 写回 / 最小闭环**：异步调度 A/B、写回天花板实测、最小闭环。核心结论见 §8.1–§8.3。
+- **2o**：aquifer + Beardifier 全 GPU，端到端反超纯 CPU。见 §8.4。
+
+### 15.2 已证伪的实验（存档）
+
+#### 15.2.1 手机"高 U 低显"负优化
+
+旧架构 CPU 写回下成立；§8.2 的测量之后架构改变。
+
+#### 15.2.2 interpolated 边界 bug
+
+已通过 Pass E 架构修复（见 §8.4）。
+
+#### 15.2.3 JFR 热点：写回瓶颈在 CPU 逐方块
+
+瓶颈在 aquifer / heightmap / vein。
+
+#### 15.2.4 GC 对负优化贡献
+
+实测排除。
+
+#### 15.2.5 aquifer 逐帧归因
+
+~65% 写回，一半控制流一半噪声。
+
+#### 15.2.6 各种"取巧"思路
+
+heightmap 一次性、aquifer 部分 GPU 化等，多数证伪。
+
+**结论：够长的杠杆是"整体写回 GPU 化"（§8.2–§8.4 已实现）。**
+
+### 15.3 日志架构与防死锁机制（0.1.5 新增）
+
+- **FFM Upcall 日志回传**：Rust 侧不再直接向 `STDERR` 打印调试信息。所有的 `wgpu_debug!` 调用会通过 Panama FFM 的回调函数（`upcallStub`）直接传给 Java 端的 SLF4J `LOGGER`，完美合并进 `latest.log`，且格式统一。
+- **黑匣子防崩溃日志**：Rust 侧独立保留了对 `c2me-wgpu.log` 的写入。每次写入后执行 `f.flush()`，并在 `setup_panic_hook` 中执行 `f.sync_all()`，确保即便发生 `SIGABRT`（如 `panic=abort` 或 Android 驱动崩溃），底层原因依然能落盘。
+- **强制退出防死锁**：`pollStatus` 超时（原生 worker 无响应）时，主线程会永久卡在 C2ME 的 Future 上。此时 `WgpuBatchCoordinator` 调用 `LogManager.shutdown()` 刷出 Java 日志，然后 `Runtime.getRuntime().halt(1)` 强杀进程。批次级失败不走这条路径，见下节。
+- **原生库解压策略**：默认将 `.so`/`.dll` 解压到 `<gameDir>/c2me-wgpu-natives/`，避开系统临时目录可能存在的 `noexec` 权限限制。若游戏目录不可写或 `dlopen` 失败，自动清理并回退到系统临时目录（`/tmp`）。同时，解压后自动追加可执行权限，确保 Android 等严格沙箱能正常加载。
+- **FFI 边界护甲**：`c2me_wgpu_create_instance` 使用 `extern "C-unwind"`，并用 `std::panic::catch_unwind` 包裹。若 wgpu 底层在初始化时 panic（典型场景：强制指定 `WGPU_BACKEND=gl` 但 EGL 返回 `BadAccess`），可以安全地捕获并回退到 CPU。
+- **⚠️ 跨平台崩溃行为差异（重要）**：
+  - **桌面端**（Windows/Linux/macOS）：Rust 默认 `panic=unwind`，`catch_unwind` 能有效捕获 wgpu 的 panic，游戏**静默回退到 CPU**，不会闪退。
+  - **Android 端**：交叉编译默认 `panic=abort`，`catch_unwind` 失效。wgpu 的 panic 会触发 `SIGABRT`，**JVM 会被瞬间强杀**，游戏直接闪退。此时唯一可依赖的是提前注册的 `setup_panic_hook`，它会在 `abort` 前执行 `sync_all()`，把 panic 堆栈强行写入黑匣子 `c2me-wgpu.log`。
+  - **结论**：Android 用户如果设置了不兼容的 `WGPU_BACKEND` 环境变量（如 `gl`），游戏会闪退，但不会丢失崩溃原因。桌面端用户可以放心随意切换后端。
+
+### 15.4 运行期错误处理的分层设计
+
+失败按"能否确定状态"分三层处理，不是一刀切：
+
+- **初始化失败 → 回退 CPU**。`c2me_wgpu_create_instance` 是 `extern "C-unwind"` 且被
+  `catch_unwind` 包裹，adapter 选择、feature 检查、shader 编译失败都能捕获，Java 侧
+  得到 `STATUS_INIT_FAILED`，`ModuleEntryPoint` 记录原因并让该维度走 vanilla/C2ME
+  CPU 生成。此时还没分配任何 GPU 资源，回退是干净的。
+
+- **批次失败 → 该维度降级 CPU**。`execute_batch` 返回 `Err`（executor 获取失败、锁
+  中毒、单次提交出错）时 `status = STATUS_ERROR`。这是可恢复条件：`complete()` 取走
+  handle、标记 `gpuFailed`、把失败批次的 future 全部异常完成。
+
+  但仅仅完成异常 future 是不够的——C2ME 会释放位置锁（`ScheduledTask` 的
+  `whenComplete` 对异常完成同样执行），然后**放弃这个 chunk**，它永远停在
+  "upgrade to noise" 状态，依赖它的东西全部等死。所以失败回调必须自己把 chunk
+  用 vanilla 重新生成：置 `FAILED_DIMS`，再调一次 `populateNoise`，重入时
+  `acquireDimState` 看到标记直接返回、不 cancel，vanilla 正常生成。
+
+  `FAILED_DIMS` 的检查必须在 `acquireDimState` **最开头**、缓存查找之前。放在之后
+  是初版的 bug：失败回调重入时先拿到缓存里的死 `DimState`，继续往已死的 coordinator
+  提交，实测刷了 16 万行错误且地形完全不生成。
+
+  清理有意不做。`shutdown()` 会 join 批处理线程，而失败回调跑在完成线程上——在那里
+  调 `shutdown()` 两者互等。失败维度的 GPU 资源留到下次切存档时释放，代价是
+  有界的（一个维度的 buffer），优于挂起。
+
+- **超时 / 未知状态 → halt**。`pollStatus` 超过 30 秒仍 PENDING，或返回既非 DONE 也
+  非 ERROR 的状态，说明原生 worker 已经不响应了。此时 Java 侧无从判断 device 是否
+  还能用，`LogManager.shutdown()` 刷盘后 `Runtime.getRuntime().halt(1)`。
+
+**为什么超时不能降级？** 降级需要能保证"这个 chunk 会被重新生成"。但超时意味着 Rust
+侧的 `BatchRequest` 可能永远不完成，Java 侧持有的 handle 无法释放，对应的 chunk 永远
+等不到结果。这与批次失败不同——批次失败至少 Rust 侧返回了确定的状态。
+
+**`on_uncaptured_error` 覆盖到哪一层？** wgpu 的 validation error 和 OOM 被它拦截，
+只记日志不 panic，`execute_batch` 会返回 `Err` 走降级路径。它**覆盖不到** `device
+lost` 和 wgpu 内部断言失败——那两类表现为 panic，最终仍会走到 halt。
+
+**已知未覆盖**：如果 `execute_batch` 内部 panic（而非返回 Err），`status` 停在
+`STATUS_PENDING`（panic 发生在 `store` 之前），Java 侧只能等 30 秒超时后 halt。
+要覆盖这条需要在 `submit_async` 的回调外再包一层 `catch_unwind`，并引入
+`STATUS_PANICKED`。`setup_panic_hook` 已经把堆栈 `sync_all()` 写进
+`c2me-wgpu.log`，所以即使走到 halt，崩溃原因也不会丢。
+
+### 15.5 关键文件
+
+- `rust/src/codegen/wgsl_gen.rs`：WGSL 生成 + shard 规划 + BlockOut/beard/aquifer WGSL。
+- `rust/src/scheduler/executor.rs`：batch 执行、bind group、buffer 管理。
+- `rust/src/world/world.rs`：WorldContext、pipeline 编译、测试。
+- `rust/src/world/{aquifer,beard}.rs`：aquifer 表解析 + Beardifier 复现。
+- `rust/src/c_api.rs`：C API（含 `set_aquifer_table` / `set_beard_table`）。
+- `src/main/java/.../mixin/MixinChunkGenerator.java`：写回 + stage + dump。
+- `src/main/java/.../chunkstatus/WgpuNoiseStatus.java`：阶段 1 的透明委托状态。
+- `src/main/java/.../mixin/MixinNewStatusHook.java`：在 C2ME 注册原版 NOISE 前插入状态。
+- `src/stub/java/com/ishland/...`：C2ME / FlowSched 的编译期接口签名（不打包）。
+- `src/main/java/.../WgpuThinBinding.java`：FFM 绑定。
+
+### 15.6 章节编号迁移表
+
+2026-11 把原先"追加式"的 §5 附录拆开、按顺序重编。历史重写中删掉的编号
+（如 §10.2、§18.6b）也一并列出，方便旧报告与提交记录对照。
+
+| 旧编号 | 新编号 | 说明 |
+|---|---|---|
+| §0–§4 | §0–§4 | 未变 |
+| §10 | §5 | 与 C2ME 的关系（构建期 Stub + 运行时强依赖） |
+| §11 | §6 | 混合执行（modded 密度函数兜底） |
+| §12 | §7 | 诊断基础设施 |
+| §19 | §8.1 | 端到端 A/B：异步调度裁定 |
+| §20 | §8.2 | 写回天花板实测 |
+| §21 | §8.3 | 最小闭环：BlockOut shard |
+| §22 | §8.4 | aquifer + Beardifier 全 GPU |
+| §23 | §9 | 执行器流水线化 |
+| §24 | §10 | 极限 A/B：WGPU vs 官方 OpenCL |
+| §25 / §25.x | §11 / §11.x | r=1000 性能天花板 |
+| §26 / §26.x | §12 / §12.x | readback 去冗余拷贝 |
+| §27 / §27.x | §13 / §13.x | C2ME `NewChunkStatus` 接入 |
+| §28 / §28.x | §14 / §14.x | 表面高度估算 |
+| §5 附录 | §15 | 开发历程 |
+| §5.x（里程碑） | §15.1 的 2a–2o | 例：§5.17 → §15.1 的 2n |
+| §5.18–§5.21 | §8.1–§8.3 | 异步 / 写回 / 最小闭环 |
+| §13–§18 | §15.2.1–§15.2.6 | 已证伪实验（存档） |
+| §10.2 | §5 | 运行时依赖 C2ME 的实测（原节已删） |
+| §18.6 / §18.6b | §3.5 | 异步调度设计（原节已删，见 §3.5 第 7 条） |
+
+> 代码注释里的旧编号已按同一张表改写。注意代码旧注释里的 §23 长期指
+> Beardifier（而不是文档旧的 §23 流水线），现在统一落到 §8.4。

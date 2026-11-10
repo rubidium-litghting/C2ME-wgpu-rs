@@ -1,4 +1,4 @@
-//! §22 Step B 端到端：读序列化的 aquifer 表（seed + per-cell lvl_y/state），
+//! §8.4 Step B 端到端：读序列化的 aquifer 表（seed + per-cell lvl_y/state），
 //! Rust 现算 blockPositions，复现 per-block 方块状态。对照 /tmp/aq_blocks_0_0.txt。
 //! 这验证"Java 只传 compact 表 + Rust 现算"的最终架构。
 

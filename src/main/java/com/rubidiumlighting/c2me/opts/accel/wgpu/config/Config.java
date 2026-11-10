@@ -103,7 +103,7 @@ public final class Config {
 
     /** Probe every {@code ChunkGenerator.getHeight} call: count, nanos,
      *  unique columns, calling threads, and whether GPU work was in flight.
-     *  This is the measurement behind DEVELOPMENT.md §28.5 — it answers
+     *  This is the measurement behind DEVELOPMENT.md §14.5 — it answers
      *  "how much would a surface-height cache actually save" before anything
      *  gets implemented. Read once when the mixin class loads, so changing it
      *  needs a restart. */

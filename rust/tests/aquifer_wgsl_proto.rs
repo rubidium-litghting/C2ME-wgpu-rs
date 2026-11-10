@@ -1,4 +1,4 @@
-//! §22 Step B 原型：aquifer 12-cell 扫描的 WGSL 实现（跳过 barrier 分支）。
+//! §8.4 Step B 原型：aquifer 12-cell 扫描的 WGSL 实现（跳过 barrier 分支）。
 //! 表从 /tmp/aquifer_0_0.txt 读，per-block 密度+参考从 /tmp/aq_blocks_0_0.txt。
 //! 目标：验证控制流在 GPU 上可行，复现 CPU-f32 的 99.95%。
 

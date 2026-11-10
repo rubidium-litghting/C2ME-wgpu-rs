@@ -146,7 +146,7 @@ pub fn emit_node(node: &AstNode, ctx: &mut GenCtx) -> Result<String> {
             emit_noise_sampler(ctx, first, second.as_ref(), *amplitude, *xz_scale, *y_scale)
         }
         AstNode::InnerRef(i) => {
-            // §14 Pass E: evaluate the per-block outer tree. `InnerRef(i)` means
+            // Pass E (§15.2.2): evaluate the per-block outer tree. `InnerRef(i)` means
             // "read the trilinear corner value stored in channel 16+i".
             let var = ctx.fresh_var("inner");
             ctx.emit(format!(

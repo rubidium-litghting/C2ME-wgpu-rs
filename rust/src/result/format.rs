@@ -94,7 +94,7 @@ impl ResultBlob {
     /// buffer to the caller, which MUST reclaim it via `free_raw_parts`
     /// (exposed to Java as `c2me_wgpu_free_result_blob`) or it leaks.
     /// Wrap raw bytes as a blob (same 8-byte header layout, magic/version).
-    /// Used for the §20 per-block state blob, which Java reads as raw u32s.
+    /// Used for the §3.5 per-block state blob, which Java reads as raw u32s.
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
         let mut v = Vec::<u8>::with_capacity(8 + bytes.len());
         v.extend_from_slice(&MAGIC.to_le_bytes());

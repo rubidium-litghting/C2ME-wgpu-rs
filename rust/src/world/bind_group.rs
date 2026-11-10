@@ -112,7 +112,7 @@ pub fn create_layout(device: &wgpu::Device) -> Result<wgpu::BindGroupLayout> {
                 },
                 count: None,
             },
-            // binding 7: block-state output (u32 per block), §20 block-output shard
+            // binding 7: block-state output (u32 per block), §3.5 block-output shard
             wgpu::BindGroupLayoutEntry {
                 binding: 7,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -128,7 +128,7 @@ pub fn create_layout(device: &wgpu::Device) -> Result<wgpu::BindGroupLayout> {
     Ok(layout)
 }
 
-/// Bind group layout for the standalone BlockOut shard (§22). Only the six
+/// Bind group layout for the standalone BlockOut shard (§3.5). Only the six
 /// buffers that shard actually reads/writes: params(0), out_buf(2),
 /// positions(4), block_buf(7), aq_p(8), aq_s(9). Keeping it separate from
 /// the density layout keeps each group under `max_storage_buffers_per_shader_stage`.
@@ -184,7 +184,7 @@ pub fn create_block_out_layout(device: &wgpu::Device) -> Result<wgpu::BindGroupL
                     has_dynamic_offset: false, min_binding_size: None },
                 count: None,
             },
-            // binding 10: static 24^3 Beardifier weight table (f32), §23.
+            // binding 10: static 24^3 Beardifier weight table (f32), §8.4.
             wgpu::BindGroupLayoutEntry {
                 binding: 10,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -193,7 +193,7 @@ pub fn create_block_out_layout(device: &wgpu::Device) -> Result<wgpu::BindGroupL
                     has_dynamic_offset: false, min_binding_size: None },
                 count: None,
             },
-            // binding 11: per-chunk Beardifier pieces/junctions (u32), §23.
+            // binding 11: per-chunk Beardifier pieces/junctions (u32), §8.4.
             wgpu::BindGroupLayoutEntry {
                 binding: 11,
                 visibility: wgpu::ShaderStages::COMPUTE,

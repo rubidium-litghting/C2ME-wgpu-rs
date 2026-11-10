@@ -1,4 +1,4 @@
-//! §22 Step B: per-chunk aquifer table — parse Java's compact layout and
+//! §8.4 Step B: per-chunk aquifer table — parse Java's compact layout and
 //! regenerate blockPositions[] from the dumped RNG seed. Verified bit-exact
 //! in `tests/aquifer_positions.rs` (315/315).
 

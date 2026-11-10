@@ -1,4 +1,4 @@
-//! §22: 用 dump 的 aquifer 种子 (seedLo/seedHi) 复现 blockPositions[]。
+//! §8.4: 用 dump 的 aquifer 种子 (seedLo/seedHi) 复现 blockPositions[]。
 //! 对照 /tmp/aquifer_0_0.txt 里每 cell 的 (bx,by,bz)。
 //! 逻辑：cell(x,y,z) -> hash3 -> split(hash^seedLo, seedHi) ->
 //!       nextInt(10/9/10) -> (x*16+dx, y*12+dy, z*16+dz)。

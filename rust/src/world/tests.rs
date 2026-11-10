@@ -105,7 +105,7 @@ fn integration_full_nodes_pipeline() {
     assert!(wgsl.contains("out_buf"));
     println!("✅ 集成测试通过：反序列化、优化、WGSL生成成功！");
 }
-/// §20 aquifer ground-work: verify a PURE u32-pair implementation of
+/// §8.4 aquifer ground-work: verify a PURE u32-pair implementation of
 /// MC's Xoroshiro128++ + MathHelper.hashCode + split + nextInt(bound),
 /// against values dumped from MC's own classes (Ref.java, seed 12345/
 /// 67890). Every op here is u32-expressible, so WGSL can reproduce it
@@ -210,7 +210,7 @@ fn xoro_u32pair_matches_mc_reference() {
     }
 }
 
-/// §20: same u32-pair Xoroshiro/hash3/split/nextInt, but in WGSL on the
+/// §8.4: same u32-pair Xoroshiro/hash3/split/nextInt, but in WGSL on the
 /// GPU, computing the aquifer cell positions. Must match the same MC
 /// reference values as the Rust test.
 #[test]
@@ -407,7 +407,7 @@ out[i*3u+2u] = x_next_int(&rr, 10);
     println!("WGSL xoro: all 15 cell values match MC reference");
 }
 
-/// §20 minimal-loop step 1: a per-BLOCK grid (16 x 16 x 384 = 98304
+/// §8.3 minimal-loop step 1: a per-BLOCK grid (16 x 16 x 384 = 98304
 /// invocations per chunk) writing one block-state byte each, read back
 /// intact. Validates the "GPU outputs block states" data path that the
 /// corner-density path never exercised (corner grid is only 1225).
@@ -505,7 +505,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     println!("per-block path: all {n} block outputs round-trip OK");
 }
 
-/// §20 minimal-loop step 2: WGSL per-block trilinear interpolation from
+/// §8.3 minimal-loop step 2: WGSL per-block trilinear interpolation from
 /// the corner cell grid, matching the Java write-back exactly. Synthetic
 /// cell values; CPU reference mirrors MixinChunkGenerator's loop.
 #[test]
@@ -658,7 +658,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     assert_eq!(bad, 0, "{bad} mismatches, max diff {maxd:e}");
 }
 
-/// §20 Step A: with REAL dumped corner densities for chunk (0,0), the WGSL
+/// §8.2 Step A: with REAL dumped corner densities for chunk (0,0), the WGSL
 /// per-block pipeline must reproduce (a) the trilinear density and (b) the
 /// trivial d>0 -> stone / else air state byte, matching the Java write-back
 /// dump (/tmp/aq_blocks_0_0.txt). Validates the "GPU outputs block states"
@@ -800,7 +800,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     assert_eq!(bad, 0, "{bad}/{n} blocks exceed 1e-4");
 }
 
-/// §20 block-output smoke: run the real executor (which now dispatches
+/// §8.3 block-output smoke: run the real executor (which now dispatches
 /// the BlockOut shard + copies block_buf) on the real router blob. Run
 /// Used to reproduce the in-game native
 /// abort offline where Rust panics/signals are visible.

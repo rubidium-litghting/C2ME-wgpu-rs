@@ -122,7 +122,7 @@ public abstract class MixinChunkGenerator {
             if (ChunkDumper.DUMP_AQUIFER) {
                 LOGGER.info("[c2me-wgpu] stageAquiferForGpu called for chunk: {}, DUMP_CHUNK: {},{}", chunk.getPos(), ChunkDumper.DUMP_CHUNK[0], ChunkDumper.DUMP_CHUNK[1]);
             }
-            // §22 diagnostic: dump this chunk's aquifer table if requested.
+            // §8.4 diagnostic: dump this chunk's aquifer table if requested.
             if (ChunkDumper.DUMP_AQUIFER
                     && chunk.getPos().x >= ChunkDumper.DUMP_CHUNK[0] && chunk.getPos().x <= ChunkDumper.DUMP_CHUNK[2]
                     && chunk.getPos().z >= ChunkDumper.DUMP_CHUNK[1] && chunk.getPos().z <= ChunkDumper.DUMP_CHUNK[3]) {
@@ -167,7 +167,7 @@ public abstract class MixinChunkGenerator {
             // pure overhead, so it is gone. `extractOreVeinSampler` is kept for
             // the upcoming GPU vein work.
 
-            // ── async scheduling path (§18.6b) ───────────────────
+            // ── async scheduling path (§3.5) ───────────────────
             // If enabled and we can reach C2ME's SchedulingManager, submit the
             // GPU request WITHOUT blocking, and run the write-back on C2ME's
             // worker pool (positionedExecutor — same pool, no new thread).
@@ -228,7 +228,7 @@ public abstract class MixinChunkGenerator {
                             }
                             // Enqueue write-back onto C2ME's worker pool. The
                             // chunk's position lock is held by C2ME's
-                            // ScheduledTask until `result` completes (§18.6b).
+                            // ScheduledTask until `result` completes (§3.5).
                             sched.positionedExecutor(pos).execute(() -> {
                                 final boolean prof = Config.get().debugStageTiming;
                                 final long tWrite = prof ? System.nanoTime() : 0L;
@@ -255,7 +255,7 @@ public abstract class MixinChunkGenerator {
             // ── no async scheduling available ────────────────────
             // Async scheduling is the ONLY GPU path. If C2ME's scheduler
             // cannot be reached (or is disabled), do NOT fall back to a
-            // synchronous GPU request: §10.2 measured plain C2ME on the CPU
+            // synchronous GPU request: §5 measured plain C2ME on the CPU
             // (desktop ~144 CPS) faster than our synchronous GPU path
             // (~80-110 CPS). Returning without cancelling lets vanilla/C2ME
             // CPU generation run.
@@ -436,7 +436,7 @@ public abstract class MixinChunkGenerator {
      * STONE / AIR. Cell grid = (16/cellW) × (height/cellH) × (16/cellW)
      * = 4 × 96 × 4 = 1536 cells; each cell covers cellW×cellH×cellW blocks.
      */
-    /** §20: write a chunk from GPU block-state bytes (u32/block: 0=air,
+    /** §3.5: write a chunk from GPU block-state bytes (u32/block: 0=air,
      *  1=stone). Chunk-major layout: [chunk][y][z][x] with x fastest,
      *  then z, then y (matches BLOCK_OUT_ENTRY). */
     private static void writeBlocksFromGpu(Chunk chunk, java.lang.foreign.MemorySegment blockSeg,
@@ -495,12 +495,12 @@ public abstract class MixinChunkGenerator {
                                  Heightmap.Type.WORLD_SURFACE_WG));
     }
 
-    /** §20: the ONLY GPU write-back path. The GPU emits one block-state
+    /** §3.5: the ONLY GPU write-back path. The GPU emits one block-state
      *  byte (0=air,1=stone,2=water,3=lava) per block; this copies them into
      *  the chunk palette and keeps the two WG heightmaps in sync.
      *
      *  The former "GPU density only, MC trilinear + aquifer + vein on the
-     *  CPU" path was removed: §20 measured it as a net loss (CPU write-back
+     *  CPU" path was removed: §8.2 measured it as a net loss (CPU write-back
      *  pinned CPS at ~150 on desktop, ~6 on mobile). Ore veins are not yet
      *  emitted by the GPU — see the GPU-vein TODO.
      *
@@ -545,18 +545,18 @@ public abstract class MixinChunkGenerator {
         writeBlocksFromGpu(chunk, blockSeg, batchIndex, ds);
     }
 
-    /** §20 reference: dump the aquifer per-cell table so the GPU reimplementation
+    /** §8.4 reference: dump the aquifer per-cell table so the GPU reimplementation
      *  of getWaterLevel can be checked against vanilla. Format:
      *    AQ startX startY startZ sizeX sizeZ
      *    CELL index blockX blockY blockZ y state
      *  blockPositions is a packed long = BlockPos.asLong(blockX,blockY,blockZ). */
     /**
-     * §22 Step B: warm up the aquifer's lazy waterLevels table, then serialize
+     * §8.4 Step B: warm up the aquifer's lazy waterLevels table, then serialize
      * the compact table (seed + per-cell lvl_y/state) and stage it to Rust.
      * blockPositions are recomputed on the Rust side from the seed.
      */
     /**
-     * §23: pack the Beardifier's pieces/junctions (u32 LE) and stage to Rust.
+     * §8.4: pack the Beardifier's pieces/junctions (u32 LE) and stage to Rust.
      * Layout: [0]=piece_count, [1]=junction_count, then per piece 8 i32
      * (minX,minY,minZ,maxX,maxY,maxZ,adaptation,groundLevelDelta), then per
      * junction 3 i32. Adaptation codes match beard.rs / WGSL.
@@ -698,7 +698,7 @@ public abstract class MixinChunkGenerator {
                 return null;
             }
             LOGGER.info("[c2me-wgpu] Rust WorldContext created, handle={}", world);
-            // §22: per-dimension aquifer mode. Nether/End have no aquifers;
+            // §8.4: per-dimension aquifer mode. Nether/End have no aquifers;
             // their default fluid is lava (Nether) / none (End), sea level 32/0.
             {
                 int dfl = 0;

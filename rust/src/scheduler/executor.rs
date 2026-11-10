@@ -30,7 +30,7 @@ use crate::world::bind_group;
 /// ch11) and veinToggle (global ch12) are consumed (see
 /// `wgsl_gen::plan_shards`); the shader still writes a 16-channel out_buf,
 /// we just copy these two out, shrinking the readback 8x.
-/// Maximum number of `InnerRef` subtrees (from §14 Pass E split).
+/// Maximum number of `InnerRef` subtrees (from the Pass E split, §15.2.2).
 /// Total channels = 16 (original) + this.
 pub const MAX_INNER_COUNT: usize = 128;
 
@@ -79,7 +79,7 @@ pub struct ExecutedBatch {
     /// Per-chunk decoded results, keyed by packed chunk position. Used by the
     /// offline tests, which want one blob per chunk.
     pub results: FxHashMap<i64, ResultBlob>,
-    /// §20 per-block state bytes (u32 per block, chunk-major).
+    /// §3.5 per-block state bytes (u32 per block, chunk-major).
     pub block_data: Vec<u32>,
 
     // ── production path (`finish_batch` with raw = true) ─────────────
@@ -162,13 +162,13 @@ pub struct SingleBatchExecutor {
     /// OOM'd. Sizes are fixed by max_batch_size, so one set suffices.
     pool: BufferPool,
     output_buf: wgpu::Buffer,
-    /// §20 block-state output (binding 7): u32 per block, for the BlockOut
+    /// §3.5 block-state output (binding 7): u32 per block, for the BlockOut
     /// shard. Sized for the max batch; the block count per chunk is
     /// 16 * height * 16 (up to 16*512*16 = 131072).
     block_buf: wgpu::Buffer,
     #[allow(dead_code)]
     bind_group_layout: wgpu::BindGroupLayout,
-    /// §22: separate layout for the BlockOut shard (6 storage buffers).
+    /// §3.5: separate layout for the BlockOut shard (6 storage buffers).
     block_out_bg_layout: wgpu::BindGroupLayout,
     #[allow(dead_code)]
     pipeline_layout: wgpu::PipelineLayout,
@@ -187,7 +187,7 @@ impl SingleBatchExecutor {
         // this bound must be >= any shape we might see. 5×129×5 covers
         // height up to 512 with cell_height down to 4.
         const MAX_CELLS_PER_CHUNK: usize = 5 * 129 * 5;
-        // §14 Pass E: the outer tree needs per-block evaluation, which reads
+        // Pass E (§15.2.2): the outer tree needs per-block evaluation, which reads
         // all the split `inners` from extra channels. Reserve up to 128 inner
         // channels (144 total). Memory cost per chunk is ~700 KB, so a batch of
         // 100 chunks is ~70 MB — fine for desktop and modern mobile.
@@ -199,7 +199,7 @@ impl SingleBatchExecutor {
         // `total_bytes` is actually mapped/copied per batch, so the 8x
         // readback saving is unaffected by this slack.
         let max_buffer_size = out_bytes_per_chunk * config.max_batch_size.max(1);
-        // §20: block-state output (u32/block), 16*512*16 blocks/chunk max.
+        // §3.5: block-state output (u32/block), 16*512*16 blocks/chunk max.
         const MAX_BLOCKS_PER_CHUNK: usize = 16 * 512 * 16;
         let block_max = MAX_BLOCKS_PER_CHUNK * config.max_batch_size.max(1) * 4;
         // Staging holds density readback + block bytes.
@@ -223,11 +223,11 @@ impl SingleBatchExecutor {
             mapped_at_creation: false,
         });
 
-        // §22 B-2: aquifer cell tables. Max cells/chunk ≈ 3*131*3 = 1179 for
+        // §8.4 B-2: aquifer cell tables. Max cells/chunk ≈ 3*131*3 = 1179 for
         // height=512, cell_height=4; round to 1200. vec4<i32>/cell + u32/cell.
         const MAX_AQ_CELLS: usize = 1200;
         let aq_stride = MAX_AQ_CELLS * config.max_batch_size.max(1);
-        // §23: 24^3 weight table (13824 u32) followed by 4096-u32/chunk pj.
+        // §8.4: 24^3 weight table (13824 u32) followed by 4096-u32/chunk pj.
         const BEARD_W_LEN: usize = 24 * 24 * 24;
         let beard_size = ((BEARD_W_LEN + 4096 * config.max_batch_size.max(1)) * 4) as u64;
 
@@ -381,7 +381,7 @@ impl SingleBatchExecutor {
         let out_channels = readback.len().max(1);
         // Bytes copied into staging: only the read-back channels.
         let density_bytes = (num_chunks as usize) * out_channels * cells_per_chunk * 4;
-        // §20 BlockOut shard present? (reads ch11 corners, writes block bytes)
+        // §3.5 BlockOut shard present? (reads ch11 corners, writes block bytes)
         let has_block = world.shards().iter()
             .any(|sh| sh.pass == crate::codegen::wgsl_gen::Pass::BlockOut);
         let blocks_per_chunk = 16usize * (shape_height(world) as usize) * 16;
@@ -505,7 +505,7 @@ impl SingleBatchExecutor {
             ],
         });
 
-        // §22: BlockOut shard gets its own bind group (6 buffers).
+        // §3.5: BlockOut shard gets its own bind group (6 buffers).
         let block_out_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("c2me_wgpu_block_out_bg"),
             layout: &self.block_out_bg_layout,
@@ -547,7 +547,7 @@ impl SingleBatchExecutor {
             let wg_z = (ccz * num_chunks + 3) / 4;
 
             // One dispatch per shard. Corner shards use the corner grid; the
-            // §20 BlockOut shard uses a per-BLOCK grid (16 x height x 16 per
+            // §3.5 BlockOut shard uses a per-BLOCK grid (16 x height x 16 per
             // chunk). Both write disjoint buffers, so order is irrelevant.
             let shards = world.shards();
             let height = shape.height.max(1) as u32;
@@ -593,7 +593,7 @@ impl SingleBatchExecutor {
             }
         }
 
-        // §20: copy the per-block state bytes into staging after the density.
+        // §3.5: copy the per-block state bytes into staging after the density.
         if has_block {
             encoder.copy_buffer_to_buffer(
                 &self.block_buf, 0, &staging_buf, density_bytes as u64, block_bytes as u64);
@@ -727,7 +727,7 @@ impl SingleBatchExecutor {
             _pad: [0; 12],
         };
         params._pad[0] = world.external_count() as u32;
-        // §22: per-dimension aquifer mode in _pad[1..5].
+        // §8.4: per-dimension aquifer mode in _pad[1..5].
         {
             let am = world.aquifer_mode();
             params._pad[1] = if am.has_aquifers { 1 } else { 0 };

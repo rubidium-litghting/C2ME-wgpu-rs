@@ -65,7 +65,7 @@ public final class WgpuBatchCoordinator {
     /** Batches submitted to the GPU and not yet read back, summed over every
      *  dimension. Only {@code HeightProbe} reads it: it is how the probe tells
      *  whether a CPU-side height query ran while the GPU pipeline was busy.
-     *  Documentation: DEVELOPMENT.md §28.5. */
+     *  Documentation: DEVELOPMENT.md §14.5. */
     private static final AtomicInteger ACTIVE_REQUESTS = new AtomicInteger();
 
     /** @see #ACTIVE_REQUESTS */
@@ -79,7 +79,7 @@ public final class WgpuBatchCoordinator {
      *  limit) and only added latency; 1ms did keep the pipeline fuller
      *  (inflight 1.3→1.7, peak CPS 325→347) but shrank batches from 5.0 to
      *  3.4 chunks, so the per-batch overhead ate the gain — total time was a
-     *  wash (1m04 → 1m05). 5ms is the sweet spot. See DEVELOPMENT.md §25. */
+     *  wash (1m04 → 1m05). 5ms is the sweet spot. See DEVELOPMENT.md §11. */
     private static final long MAX_WAIT_MS = 5L;
     /** Poll backoff. The first few polls are cheap (the batch may already be
      *  done), then the interval doubles up to POLL_MAX_NS. A 30ms batch needs
@@ -95,7 +95,7 @@ public final class WgpuBatchCoordinator {
     public static final class GpuChunk {
         public final MemorySegment seg;
         public final int batchIndex;
-        /** §20 per-block state bytes (u32/block, chunk-major) for the whole
+        /** §3.5 per-block state bytes (u32/block, chunk-major) for the whole
          *  batch. BlockOut is the only write-back path, so this is non-null
          *  whenever the request succeeded; the caller slices its chunk via
          *  batchIndex. */
@@ -251,7 +251,7 @@ public final class WgpuBatchCoordinator {
     }
 
     /** Submit one chunk and return a future completed when its result is
-     *  ready. Does NOT block the caller — the C2ME-scheduling path (§18.6b)
+     *  ready. Does NOT block the caller — the C2ME-scheduling path (§3.5)
      *  uses this so the worker is freed to submit more chunks and batches can
      *  grow. This is the only request entry point. */
     public java.util.concurrent.CompletableFuture<GpuChunk> requestAsync(int cx, int cz) {
@@ -549,7 +549,7 @@ public final class WgpuBatchCoordinator {
             return;
         }
 
-        // §20: take the BLOCK blob FIRST — it borrows the handle, and
+        // §3.5: take the BLOCK blob FIRST — it borrows the handle, and
         // takeResultBlob below frees it. (Reversed order = use-after-free.)
         MemorySegment blockSeg = null;
         try {

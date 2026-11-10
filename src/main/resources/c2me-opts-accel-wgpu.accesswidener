@@ -44,10 +44,10 @@ accessible field net/minecraft/util/math/noise/SimplexNoiseSampler GRADIENTS [[I
 accessible field net/minecraft/world/gen/chunk/AquiferSampler$FluidLevel y I
 accessible field net/minecraft/world/gen/chunk/AquiferSampler$FluidLevel state Lnet/minecraft/block/BlockState;
 
-# §18.6b: reach StructureAccessor.world -> ServerWorld -> chunkLoadingManager
+# §3.5: reach StructureAccessor.world -> ServerWorld -> chunkLoadingManager
 # -> IVanillaChunkManager.c2me$getSchedulingManager().
 accessible field net/minecraft/world/gen/StructureAccessor world Lnet/minecraft/world/WorldAccess;
 
-# §23: Beardifier piece/junction iterators, read for the offline beard dump.
+# §8.4: Beardifier piece/junction iterators, read for the offline beard dump.
 accessible field net/minecraft/world/gen/StructureWeightSampler pieceIterator Lit/unimi/dsi/fastutil/objects/ObjectListIterator;
 accessible field net/minecraft/world/gen/StructureWeightSampler junctionIterator Lit/unimi/dsi/fastutil/objects/ObjectListIterator;

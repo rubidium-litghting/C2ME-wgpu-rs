@@ -24,7 +24,7 @@ pub struct WorldContext {
     /// Parsed shape config (min_y / height / cell_*).
     pub(crate) shape: ShapeConfig,
     /// Biome tail from end of blob (currently `AstNode::BiomeTree { _placeholder }`
-    /// with no further payload decoded). See plan.txt §4.4 for future protocol.
+    /// with no further payload decoded). See §3.4 for the protocol.
     #[allow(dead_code)]
     pub(crate) biome_source: AstNode,
     /// 32-bit fingerprint = hash(ast). Used for pipeline_cache lookups.
@@ -55,7 +55,7 @@ pub struct WorldContext {
     pub(crate) perm_buffer: Option<wgpu::Buffer>,
     /// SimplexNoiseSampler tables for EndIslands (binding 5).
     pub(crate) simplex_buffer: Option<wgpu::Buffer>,
-    /// §23: static 24^3 Beardifier weight table (binding 10), uploaded once.
+    /// §8.4: static 24^3 Beardifier weight table (binding 10), uploaded once.
     pub(crate) beard_weight_buffer: Option<wgpu::Buffer>,
     /// GPU-side per-entry origin buffer (binding 3), f32 x3 per entry.
     pub(crate) origin_buffer: Option<wgpu::Buffer>,
@@ -64,17 +64,17 @@ pub struct WorldContext {
     /// CPU-computed values for those subtrees, laid out
     /// [chunk][ext][cell]. Uploaded to binding 6 before each dispatch.
     pub(crate) external_data: std::sync::Mutex<Vec<f32>>,
-    /// §22 Step B: per-chunk aquifer tables, keyed by (cx, cz). Each value is
+    /// §8.4 Step B: per-chunk aquifer tables, keyed by (cx, cz). Each value is
     /// the compact Java-serialized table (magic + n + seedLo/Hi + per-cell
     /// lvl_y/state). Set via `c2me_wgpu_set_aquifer_table` before a request.
     pub(crate) aquifer_tables: std::sync::Mutex<std::collections::HashMap<(i32, i32), Vec<u8>>>,
-    /// §23: per-chunk Beardifier pieces/junctions, same stage pattern as
+    /// §8.4: per-chunk Beardifier pieces/junctions, same stage pattern as
     /// aquifer. Empty for structure-free chunks (beard contributes 0).
     pub(crate) beard_tables: std::sync::Mutex<std::collections::HashMap<(i32, i32), Vec<u8>>>,
-    /// §22 fix: per-dimension aquifer mode. Dimensions without aquifers
+    /// §8.4 fix: per-dimension aquifer mode. Dimensions without aquifers
     /// (Nether/End) skip the 12-cell scan and use sea-level semantics.
     pub(crate) aquifer_mode: std::sync::Mutex<AquiferMode>,
-    /// §14: finalDensity (ch11) split into interpolated boundaries (`inners`)
+    /// §15.2.2: finalDensity (ch11) split into interpolated boundaries (`inners`)
     /// and the remaining per-block tree (`outer`). Empty when no split was
     /// needed (vanilla terrain has no non-linear wrapper outside an interp).
     pub(crate) density_inners: Vec<crate::ast::AstNode>,
@@ -177,7 +177,7 @@ impl WorldContext {
         // 2. Run 4-pass optimization pipeline (constant_fold → normalize → cse → dce)
         let ast_root = opto::run_pipeline(ast_root)?;
 
-        // §14 Pass E: pre-split finalDensity (ch11) into per-corner subtrees
+        // Pass E (§15.2.2): pre-split finalDensity (ch11) into per-corner subtrees
         // (`inners`) and a per-block `outer` tree, so the GPU can evaluate
         // non-linear wrappers per block instead of per corner.
         // Both trees that end up in the BlockOut shard must be split: the
@@ -207,7 +207,7 @@ impl WorldContext {
 
         // 4. Emit one WGSL module per channel shard and smoke-test via naga.
         //    Sharding keeps every module under the Mali-G610 driver's safe
-        //    compile budget (DEVELOPMENT.md §5.15.5).
+        //    compile budget (DEVELOPMENT.md §15.1, milestone 2l).
         let channel_count = match &ast_root {
             AstNode::Root(chs) => chs.len(),
             _ => 0,
@@ -294,7 +294,7 @@ impl WorldContext {
         let bg_layout = bind_group::create_layout(device)?;
         crate::wgpu_debug!("[compile] bind group layout ok, creating pipeline layout...");
         let pipeline_layout = bind_group::create_pipeline_layout(device, &bg_layout)?;
-        // §22: BlockOut uses its own (smaller) layout — 6 storage buffers,
+        // §3.5: BlockOut uses its own (smaller) layout — 6 storage buffers,
         // under the 8-per-stage limit.
         let bo_bg_layout = bind_group::create_block_out_layout(device)?;
         let bo_pipeline_layout = bind_group::create_pipeline_layout(device, &bo_bg_layout)?;
@@ -382,7 +382,7 @@ impl WorldContext {
             self.simplex_buffer = Some(sb);
         }
 
-        // §23: Beardifier static weight table (binding 10), once per world.
+        // §8.4: Beardifier static weight table (binding 10), once per world.
         if self.beard_weight_buffer.is_none() {
             let table = crate::world::beard::build_weight_table();
             let bb = create_init_buffer(
@@ -405,7 +405,7 @@ impl WorldContext {
     }
 
     /// Borrow the channel shards (parallel to `pipelines()`), so callers can
-    /// tell a corner shard from the §20 BlockOut shard (different dispatch).
+    /// tell a corner shard from the §3.5 BlockOut shard (different dispatch).
     pub fn shards(&self) -> &[wgsl_gen::Shard] {
         &self.shards
     }
@@ -475,7 +475,7 @@ impl WorldContext {
     }
 
     /// Borrow the simplex table buffer (binding 5), if uploaded.
-    /// §22: set the per-dimension aquifer mode (called after world_new).
+    /// §8.4: set the per-dimension aquifer mode (called after world_new).
     pub fn set_aquifer_mode(&self, mode: AquiferMode) {
         if let Ok(mut m) = self.aquifer_mode.lock() { *m = mode; }
     }

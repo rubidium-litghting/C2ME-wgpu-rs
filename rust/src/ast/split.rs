@@ -1,4 +1,4 @@
-//! §14 fix: split `finalDensity` into its interpolated-boundary subtrees
+//! Pass E (§15.2.2): split `finalDensity` into its interpolated-boundary subtrees
 //! (computed at cell corners) and the outer tree (evaluated per block).
 //!
 //! MC semantics: `outer(trilinear(inner))`, not `trilinear(outer(inner))`.

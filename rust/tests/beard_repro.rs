@@ -1,4 +1,4 @@
-//! §23: reproduce the Beardifier's per-block `sample` from dumped pieces.
+//! §8.4: reproduce the Beardifier's per-block `sample` from dumped pieces.
 //! Reads /tmp/beard_X_Z.txt (PIECE/JUNC/BLOCK sections) and compares the
 //! Rust `beard::sample` against MC's per-block reference.
 

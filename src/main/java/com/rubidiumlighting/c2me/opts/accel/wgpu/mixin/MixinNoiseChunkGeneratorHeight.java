@@ -38,7 +38,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
  * Times every vanilla height query. See {@link HeightProbe} and
- * DEVELOPMENT.md §28.5.
+ * DEVELOPMENT.md §14.5.
  *
  * <p>Targets {@code NoiseChunkGenerator} rather than the concrete
  * {@code getHeightOnGround}/{@code getHeightInGround} wrappers: callers reach

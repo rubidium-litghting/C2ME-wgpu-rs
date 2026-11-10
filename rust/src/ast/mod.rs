@@ -241,7 +241,7 @@ pub enum AstNode {
     Cache2D(Box<AstNode>),
     CacheInterpolated(Box<AstNode>),
 
-    /// §14 fix: placeholder for the i-th extracted interpolated-boundary
+    /// Pass E (§15.2.2): placeholder for the i-th extracted interpolated-boundary
     /// subtree of finalDensity. The corner pass computes the 8 extracted
     /// subtrees into out_buf slots 1..=8; the BlockOut pass trilinearly
     /// interpolates them to block resolution and substitutes the result

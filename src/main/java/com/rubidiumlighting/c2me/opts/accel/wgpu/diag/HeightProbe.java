@@ -46,7 +46,7 @@ import java.util.concurrent.atomic.LongAdder;
  * how much of it runs while the GPU pipeline is busy.
  *
  * <p>This exists to answer one question before any surface-height
- * optimisation is written (DEVELOPMENT.md §28.5): how much wall-clock time
+ * optimisation is written (DEVELOPMENT.md §14.5): how much wall-clock time
  * could a cached heightmap actually save? The cost model says a single
  * {@code getHeight} is roughly 1/6 of a chunk's noise work, and that the
  * overworld pays one call per chunk because mineshafts use

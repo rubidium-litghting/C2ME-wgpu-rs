@@ -674,10 +674,10 @@ public class WgpuThinBinding {
      * @param data   flat [chunk][ext][cell] f32 values
      */
     /**
-     * §22 Step B: stage a per-chunk aquifer table for the next request.
+     * §8.4 Step B: stage a per-chunk aquifer table for the next request.
      * `table` is the compact Java-serialized layout (magic + n + seed + cells).
      */
-    /** §22: set per-dimension aquifer mode (hasAquifers/seaLevel/fluid/lavaY). */
+    /** §8.4: set per-dimension aquifer mode (hasAquifers/seaLevel/fluid/lavaY). */
     public static void setAquiferMode(long worldH, boolean hasAquifers,
                                       int seaLevel, int defaultFluid, int lavaLevel) {
         try {
@@ -701,7 +701,7 @@ public class WgpuThinBinding {
         }
     }
 
-    /** §23: stage a per-chunk Beardifier table (packed u32 LE). */
+    /** §8.4: stage a per-chunk Beardifier table (packed u32 LE). */
     public static void setBeardTable(long worldH, int cx, int cz, byte[] table) {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment seg = arena.allocateFrom(ValueLayout.JAVA_BYTE, table);
@@ -787,7 +787,7 @@ public class WgpuThinBinding {
      * Use .asByteBuffer() then .asFloatBuffer() to read density channels.
      */
     /**
-     * §20: take the per-block state blob (raw u32 per block, chunk-major).
+     * §3.5: take the per-block state blob (raw u32 per block, chunk-major).
      * Same lifetime/copy semantics as {@link #takeResultBlob}.
      */
     public static MemorySegment takeBlockBlob(long requestH) {
