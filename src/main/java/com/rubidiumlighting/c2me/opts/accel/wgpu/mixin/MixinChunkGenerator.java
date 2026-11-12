@@ -735,24 +735,24 @@ public abstract class MixinChunkGenerator {
             java.util.List<net.minecraft.world.gen.densityfunction.DensityFunction> extNodes =
                     new java.util.ArrayList<>(NoiseRouterBlobifier.EXTERNAL_NODES);
             if (!extNodes.isEmpty()) {
-                LOGGER.info("[c2me-wgpu] {} external (CPU-evaluated) density subtree(s)",
-                        extNodes.size());
+                // References vs distinct instances: the tree is a DAG and the
+                // serializer inlines it, so the same node is written many
+                // times. Only distinct instances cost a slot (see
+                // NoiseRouterBlobifier.EXTERNAL_INDEX).
+                LOGGER.info("[c2me-wgpu] {} external (CPU-evaluated) density subtree(s)"
+                                + " from {} reference(s)",
+                        extNodes.size(), NoiseRouterBlobifier.EXTERNAL_REFS);
             }
             // Every external subtree is sampled on the CPU over a corner
             // lattice, once per chunk per node, and the results are shipped to
-            // the GPU as one storage buffer. A modded worldgen can externalise
-            // hundreds of nodes (Tectonic: ~700 with ConfigNoise), which makes
-            // two things go wrong at once:
-            //   * the upload exceeds max_storage_buffer_binding_size, so the
-            //     bind group is rejected and every submit fails validation;
-            //   * the CPU sampling alone takes tens of seconds per batch, so
-            //     the GPU path is far slower than plain CPU generation.
+            // the GPU as one storage buffer. Both cost and memory scale with
+            // the number of *distinct* nodes, so the cap below counts slots.
             // Refuse up front instead of generating at 2 chunks/s.
             final int MAX_EXTERNAL_NODES = 64;
             if (extNodes.size() > MAX_EXTERNAL_NODES) {
                 throw new IllegalStateException(
                         "too many external density subtrees (" + extNodes.size()
-                                + " > " + MAX_EXTERNAL_NODES
+                                + " distinct > " + MAX_EXTERNAL_NODES
                                 + ") for GPU acceleration");
             }
             WgpuBatchCoordinator coord = new WgpuBatchCoordinator(world, extNodes,

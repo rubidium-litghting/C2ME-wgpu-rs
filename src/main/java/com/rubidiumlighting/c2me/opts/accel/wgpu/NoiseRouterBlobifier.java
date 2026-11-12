@@ -88,6 +88,24 @@ public class NoiseRouterBlobifier {
      *  to the GPU as external inputs (binding 6). Cleared per blobify(). */
     public static final java.util.List<DensityFunction> EXTERNAL_NODES =
             new java.util.ArrayList<>();
+    /** Identity index backing {@link #EXTERNAL_NODES}.
+     *
+     *  <p>The density tree is a DAG: the same subtree instance is reachable
+     *  from many places (shared registry entries, inlined parents), and the
+     *  serializer walks it without memoization. Emitting one slot per
+     *  *occurrence* therefore counts references, not distinct work. Tectonic
+     *  3.0.28 defines 7 `tectonic:config_noise` nodes but they are referenced
+     *  732 times, which used to trip the 64-node cap and drop the whole
+     *  dimension to the CPU.
+     *
+     *  <p>Sharing a slot is exact, not an approximation: `sample(pos)` is pure,
+     *  so two occurrences of the same instance at the same corner lattice
+     *  produce identical values. Cleared per blobify(). */
+    private static final java.util.IdentityHashMap<DensityFunction, Integer> EXTERNAL_INDEX =
+            new java.util.IdentityHashMap<>();
+    /** Occurrences seen, including ones folded into an existing slot by
+     *  {@link #EXTERNAL_INDEX}; cleared per blobify(). */
+    public static int EXTERNAL_REFS = 0;
 
     // ── Tags ────────────────────────────────────────────────────────
     private static final byte TAG_CONSTANT = 0x01;
@@ -137,6 +155,8 @@ public class NoiseRouterBlobifier {
         SEEN_INS.clear();
         SIMPLEX_SAMPLERS.clear();
         EXTERNAL_NODES.clear();
+        EXTERNAL_INDEX.clear();
+        EXTERNAL_REFS = 0;
         // ── HEADER (10B) ─────────────────────────────────────────
         buf.put((byte) 0x4D);
         buf.put((byte) 0x43);
@@ -471,8 +491,17 @@ public class NoiseRouterBlobifier {
         if (UNSUPPORTED_SEEN.putIfAbsent(cls, Boolean.TRUE) == null) {
             LOGGER.warn("[c2me-wgpu] UNSUPPORTED NODE (externalized to CPU): " + cls);
         }
-        int extIndex = EXTERNAL_NODES.size();
-        EXTERNAL_NODES.add(df);
+        EXTERNAL_REFS++;
+        Integer shared = EXTERNAL_INDEX.get(df);
+        int extIndex;
+        if (shared != null) {
+            // Same instance reached again through another path of the DAG.
+            extIndex = shared;
+        } else {
+            extIndex = EXTERNAL_NODES.size();
+            EXTERNAL_INDEX.put(df, extIndex);
+            EXTERNAL_NODES.add(df);
+        }
         buf.put(TAG_EXTERNAL_INPUT);
         buf.putInt(extIndex);
     }
