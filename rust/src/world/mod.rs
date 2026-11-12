@@ -8,5 +8,6 @@ pub mod bind_group;
 pub mod constants;
 pub mod aquifer;
 pub mod beard;
+pub mod progress;
 
 pub use world::WorldContext;

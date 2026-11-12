@@ -1,7 +1,7 @@
 # C2ME WGPU 加速模块 — 开发文档
 
-> 最后更新：2026-11-10
-> 状态：**0.1.5、0.1.6 已发布；0.1.7 开发中（最新 `0.1.7-alpha.5`，未发布）**。
+> 最后更新：2026-11-12
+> 状态：**0.1.5、0.1.6 已发布；0.1.7 开发中（最新 `0.1.7-alpha.6`，未发布）**。
 >
 > **已发布**
 > - **0.1.6**：修掉 modded 世界（暮色森林 / Tectonic）的死锁与全虚空问题，并把
@@ -27,6 +27,10 @@
 > - `alpha.5`：C2ME 运行期形状检查 `C2meCompat` + `fabric.mod.json` 上界
 >   `<0.5.0`。C2ME 内部 API 变动时跳过对齐状态并保留 `populateNoise` GPU 路径，
 >   而不是在生成中抛 `NoSuchMethodError`（§13.6）。
+> - `alpha.6`：shader 编译进度覆盖层。首次进入维度时在屏幕顶部显示
+>   `正在编译 GPU 着色器… n/N（秒）` 与进度条，画在 `GameRenderer.render` 的
+>   TAIL（世界 + HUD + 当前 Screen 之上），因此加载地形界面也看得到。数据走
+>   Rust 侧拉取式快照，见教训 #52。
 >
 > **实测基线**（细节见 §9 / §10 / §11 / §13.7；跨组数据不可直接比较，见教训 #45）
 > - 桌面端端到端反超纯 CPU（Chunky r=500，RADV RENOIR）：**18 s vs 23 s**
@@ -352,6 +356,19 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     - **跑得快也要对**：污染批次看起来只是"慢一点"，没有任何崩溃或报错，靠
       端到端数字根本发现不了。
 
+52. **覆盖层要画在 `GameRenderer.render` 的 TAIL，不是 HUD 或聊天栏**：shader
+    编译发生在首次进入维度的 C2ME worker 上，而那正是
+    `DownloadingTerrainScreen` 占满画面的时候。`InGameHud` 的聊天栏、HUD 回调
+    和 `Screen` 自己画的内容都在这一层**下面**，所以"编译进度"用聊天提示或
+    普通 HUD 回调根本看不见。`GameRenderer.render` 已经把世界、HUD 和当前
+    `Screen` 全部画完，TAIL 注入正好在 framebuffer blit 之前；新建一个临时
+    `DrawContext` → 画 → `draw()`，和原版输出 profiler 饼图的位置、做法完全
+    相同，不需要碰渲染管线状态。
+    数据通道用**拉取式快照**而不是新造一条 upcall：Rust 侧只需一个互斥量
+    （`world::progress`）存 `active/done/total`，渲染线程每帧做一次 downcall；
+    暂停或最小化时自然零成本，也不会从 worker 线程碰 Java 对象。编译失败时
+    靠 RAII guard 在 `?` 提前返回时清标志，否则进度条会永远停在屏幕上。
+
 ### 版本记录与 0.1.7+ 待办
 
 **0.1.4 已完全解决的历史遗留（存档记录）**
@@ -496,6 +513,12 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 - [x] **阶段 2 实机验证**：`chunk_batch_size=2` → 4 → 8，同种子 r=500 对比
   地形、CPS 与端到端。结果 14 / **13** / 15 s，4×4 最优（CPS 298）；无死锁、
   无 member 漏生成、地形正常。详见 §13.7。默认值暂不提高，4 作为推荐手动值。
+- [x] **shader 编译进度覆盖层**。首次进入维度要编译 shard，桌面端几百毫秒到
+  几秒、移动端更久；期间画面卡住却毫无反馈。现在在屏幕顶部画进度条与
+  `n/N`、已用秒数，位置在 `GameRenderer.render` 的 TAIL，覆盖世界、HUD 和
+  `DownloadingTerrainScreen`。进度由 Rust `world::progress` 的拉取式快照提供
+  （`c2me_wgpu_compile_progress`），编译失败时 RAII guard 会清掉标志，不会留下
+  卡住的进度条。见教训 #52。
 - [ ] **阶段 3：批内真正共享采样上下文**（官方 CL 的剩余收益）。当前批次只
   收敛调度依赖，每个成员仍各自构建 `ChunkNoiseSampler`；要进一步必须自己
   持有 `Blender` / `StructureAccessor` / sampler，风险远高于阶段 2，暂不做。
@@ -512,20 +535,6 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   未复测，实施前需重新 A/B。）**
   修法是把 payload 从共享可变状态改成按批次传递（要动 FFI 签名与 Rust 侧
   缓冲区分配），属于结构性改动。
-- [ ] **shader 编译时给玩家可见的进度提示**（参照官方 C2ME OpenCL 模块）。
-  首次进入某个维度要编译 4 个 shard：桌面端几百毫秒到几秒、移动端更久，期间
-  画面卡住却毫无反馈，玩家容易误以为卡死。
-  思路：
-    * 进度来源：`compile_pipeline` 逐 shard 编译时，通过已有的 FFM upcall
-      日志通道回传「哪个 shard、第几个、共几个」。
-    * 界面选择取决于时机：
-      - **还在加载界面上**（`DownloadingTerrainScreen` 阶段）→ 在屏幕上画
-        进度条 + 文字，形如官方模块的
-        「Compiling <通道名> for <存档名> on <设备名> (n/N)」。
-      - **已经进入世界才开始编译**（例如切换维度、或新维度首次生成）→
-        画面已经可见，不适合再盖全屏 UI，改为在**聊天栏**提示编译进度。
-    * 编译发生在 C2ME worker 线程，UI 更新必须投递回渲染线程。
-  需要新增的状态：当前是否有编译在进行、当前 shard 序号/总数，供客户端查询。
 
 ### 待测与验证计划（不属于版本功能）
 

@@ -75,6 +75,13 @@ public class WgpuThinBinding {
     private static MethodHandle MH_set_log_path;
     private static MethodHandle MH_setup_panic_hook;
     private static MethodHandle MH_set_log_callback;
+    /**
+     * Optional: reports shader-compile progress to the overlay. Resolved
+     * separately from the main link, so a native library from before this
+     * feature (e.g. a stale dev build) degrades to "no overlay" instead of
+     * disabling GPU acceleration entirely.
+     */
+    private static MethodHandle MH_compile_progress;
 
     /** Non-null when the FFM downcall linking failed (e.g. a symbol is
      *  missing from the native library). Lets callers report the real cause
@@ -368,6 +375,14 @@ public class WgpuThinBinding {
                             ValueLayout.JAVA_LONG        // len: usize
                     )
             );
+            try {
+                MH_compile_progress = NativeLoader.linker.downcallHandle(
+                        NativeLoader.lookup.find("c2me_wgpu_compile_progress").orElseThrow(),
+                        FunctionDescriptor.of(ValueLayout.JAVA_LONG)
+                );
+            } catch (Throwable t) {
+                MH_compile_progress = null;
+            }
         } catch (Throwable t) {
             System.err.println("[c2me-wgpu] FFM link failed: " + t);
             linkError = String.valueOf(t);
@@ -601,6 +616,23 @@ public class WgpuThinBinding {
 
     public static boolean isAvailable() {
         return available;
+    }
+
+    /**
+     * Packed shader-compile progress: {@code active << 32 | done << 16 | total}.
+     *
+     * <p>Returns {@code -1} when the native library predates the symbol or the
+     * call fails, which the overlay treats as "nothing compiling". Never
+     * throws: this is polled from the render thread every frame.
+     */
+    public static long compileProgress() {
+        MethodHandle mh = MH_compile_progress;
+        if (mh == null) return -1L;
+        try {
+            return (long) mh.invokeExact();
+        } catch (Throwable t) {
+            return -1L;
+        }
     }
 
     public static String getLastInstanceError() {

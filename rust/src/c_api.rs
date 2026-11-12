@@ -524,6 +524,23 @@ pub unsafe extern "C" fn c2me_wgpu_world_new(
     handle
 }
 
+/// Report shader-compile progress to the client overlay.
+///
+/// Packed as `active << 32 | done << 16 | total`, where `active` is 0 or 1,
+/// and `done`/`total` are the shard counters. Pull-based (see
+/// `world::progress`): the render thread calls this once per frame while it
+/// cares, and the worker thread only ever writes the snapshot.
+///
+/// Safe to call on any thread, including before any compile has started;
+/// then `active == 0`.
+#[unsafe(no_mangle)]
+pub extern "C" fn c2me_wgpu_compile_progress() -> i64 {
+    let (active, done, total) = crate::world::progress::snapshot();
+    ((active as i64) << 32)
+        | (((done & 0xFFFF) as i64) << 16)
+        | ((total & 0xFFFF) as i64)
+}
+
 // ---------------------------------------------------------------------------
 // ③ Submit a batch of chunk (cx, cz) positions for GPU computation.
 ///

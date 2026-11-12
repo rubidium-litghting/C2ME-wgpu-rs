@@ -15,7 +15,8 @@
     "XoroshiroSplitterAccessor"
   ],
   "client": [
-    "client.MixinMinecraftClientNotify"
+    "client.MixinMinecraftClientNotify",
+    "client.MixinGameRendererOverlay"
   ],
   "server": [],
   "injectors": {

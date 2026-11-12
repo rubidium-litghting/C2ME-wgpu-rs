@@ -83,7 +83,7 @@ On Android, custom JVMs do **not** support `-XX:+UseZGC`, and the mod will not s
 
 1. **Serialisation** — vanilla's `NoiseRouter` (the density-function tree that drives terrain) is serialised on the Java side into a compact binary blob.
 2. **Hand-off** — that blob is passed to a Rust `cdylib` over the Panama FFM API. The calls follow a down-call C function + polling model; the only up-call forwards Rust logs to Java's SLF4J.
-3. **Compilation** — Rust deserialises the tree, runs optimisation passes, and generates WGSL compute shaders, which are then compiled into GPU pipelines (and cached on disk).
+3. **Compilation** — Rust deserialises the tree, runs optimisation passes, and generates WGSL compute shaders, which are then compiled into GPU pipelines (and cached on disk). When a dimension needs compiling for the first time, a progress bar with elapsed time appears at the top of the screen — above the loading screen, so the client never looks frozen.
 4. **Dispatch** — one GPU dispatch computes the density field for a whole batch of chunks. To handle non-linear density functions from mods correctly (e.g. `squeeze`), the final density tree is split (the "Pass E" architecture): interpolated subtrees are evaluated on the corner grid, while the non-linear outer layers are applied per block during final classification.
 5. **Block states** — the GPU classifies each block itself (air / stone / water / lava), applying the aquifer, the beardifier (structure base) and the **ore-vein sampler** (with a native GPU Xoroshiro RNG) on the GPU. Java only writes the resulting per-block state bytes into the chunk palette.
 

@@ -290,6 +290,10 @@ impl WorldContext {
             .unwrap_or(!cfg!(target_os = "android"));
         crate::wgpu_debug!("[compile] compile_pipeline start");
 
+        // Report progress to the client overlay. The guard clears the flag on
+        // every exit path, including `?` from a rejected shader.
+        let mut progress = crate::world::progress::CompileProgress::start(self.shards.len());
+
         crate::wgpu_debug!("[compile] creating bind group layout...");
         let bg_layout = bind_group::create_layout(device)?;
         crate::wgpu_debug!("[compile] bind group layout ok, creating pipeline layout...");
@@ -320,6 +324,7 @@ impl WorldContext {
                 layout,
             )?;
             pipelines.push(pipeline);
+            progress.step();
         }
         crate::wgpu_debug!("[compile] {} pipeline(s) compiled ok", pipelines.len());
         self.pipelines = pipelines;

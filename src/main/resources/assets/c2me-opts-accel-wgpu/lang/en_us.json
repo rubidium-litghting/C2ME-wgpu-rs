@@ -7,6 +7,7 @@
   "c2me-opts-accel-wgpu.notify.gc_hint.hint": "\n  Suggested JVM argument: -XX:+UseZGC",
   "c2me-opts-accel-wgpu.notify.dim_fallback": "This dimension fell back to CPU: the GPU cannot handle this terrain (%s)",
   "c2me-opts-accel-wgpu.notify.enabled": "GPU acceleration active on: %s",
+  "c2me-opts-accel-wgpu.overlay.compiling": "Compiling GPU shaders… %s/%s (%s s)",
   "c2me-opts-accel-wgpu.config.title": "C2ME-wgpu-rs settings",
   "c2me-opts-accel-wgpu.config.gpu": "GPU",
   "c2me-opts-accel-wgpu.config.gpu.auto": "Automatic (integrated first)",
