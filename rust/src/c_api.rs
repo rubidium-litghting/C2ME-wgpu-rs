@@ -58,26 +58,58 @@ fn get_pending_queue() -> &'static Mutex<PendingQueue> {
 static EXECUTOR: parking_lot::RwLock<Option<Arc<ExecutorThread>>> =
     parking_lot::RwLock::new(None);
 
-fn get_or_create_executor() -> Result<Arc<ExecutorThread>, String> {
+/// (Re)create the GPU executor when the caller's dimension needs more buffer
+/// than the current one was sized for.
+///
+/// The executor is device-global, but its persistent buffers depend on the
+/// shape: the output/staging size scales with cells per chunk, and the
+/// BlockOut buffer with world height. Never growing them was a real bug: an
+/// 832-block Tectonic overworld needs 212 992 blocks/chunk, so a 43-chunk batch
+/// tried to copy 36.6 MB out of a 32 MiB buffer, wgpu discarded the whole
+/// command buffer, and the terrain came out as floating slabs and clipped
+/// walls. Growing on demand also keeps the vanilla footprint smaller than the
+/// old "assume 512 blocks everywhere" allocation.
+///
+/// Growth only: a batch needing fewer cells keeps using the existing executor.
+/// A rebuild shuts the old worker down, which first finishes its queued and
+/// in-flight batches, so no request is dropped; it happens once per shape
+/// change, not per batch.
+fn get_or_create_executor(
+    cells_per_chunk: usize,
+    blocks_per_chunk: usize,
+) -> Result<Arc<ExecutorThread>, String> {
     if let Some(e) = EXECUTOR.read().as_ref() {
-        return Ok(Arc::clone(e));
+        if e.fits(cells_per_chunk, blocks_per_chunk) {
+            return Ok(Arc::clone(e));
+        }
     }
 
     let instance = WgpuInstance::instance().map_err(|e| format!("WgpuInstance not initialised: {e}"))?;
     let device = Arc::new(instance.device.clone());
     let queue = Arc::new(instance.queue.clone());
-    let config = ExecutorConfig::default();
+    let config = ExecutorConfig {
+        cells_per_chunk: cells_per_chunk.max(1),
+        blocks_per_chunk: blocks_per_chunk.max(1),
+        ..ExecutorConfig::default()
+    };
 
+    let mut guard = EXECUTOR.write();
+    if let Some(existing) = guard.as_ref() {
+        if existing.fits(cells_per_chunk, blocks_per_chunk) {
+            return Ok(Arc::clone(existing));
+        }
+    }
     let executor = Arc::new(
         ExecutorThread::spawn(device, queue, config)
             .map_err(|e| format!("executor spawn failed: {e}"))?,
     );
+    let replaced = guard.replace(Arc::clone(&executor));
+    drop(guard);
 
-    let mut guard = EXECUTOR.write();
-    if let Some(existing) = guard.as_ref() {
-        return Ok(Arc::clone(existing));
+    if let Some(old) = replaced {
+        // Drains queued/in-flight batches, then releases the old buffers.
+        old.shutdown();
     }
-    *guard = Some(Arc::clone(&executor));
     Ok(executor)
 }
 
@@ -677,8 +709,11 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
     });
     // Shape-dependent per-chunk cell count, computed before the move.
     let cells_per_channel_units: u64 = world_arc.cells_per_chunk() as u64;
+    let cells_per_chunk = world_arc.cells_per_chunk();
+    // BlockOut writes one u32 per block, `16 * height * 16` per chunk.
+    let blocks_per_chunk = 16usize * world_arc.shape().height.max(1) as usize * 16;
 
-    let executor = match get_or_create_executor() {
+    let executor = match get_or_create_executor(cells_per_chunk, blocks_per_chunk) {
         Ok(e) => e,
         Err(_e) => {
             req.status.store(STATUS_ERROR, Ordering::Release);

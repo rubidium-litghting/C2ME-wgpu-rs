@@ -222,6 +222,7 @@ impl StagingChain {
     }
 
     pub fn capacity(&self) -> usize { self.slots.len() }
+    pub fn slot_size(&self) -> usize { self.slots.first().map_or(0, |s| s.buffer.size() as usize) }
     pub fn inflight_count(&self) -> usize { self.inflight_count }
     pub fn ready_count(&self) -> usize { self.ready_count }
     pub fn free_count(&self) -> usize {

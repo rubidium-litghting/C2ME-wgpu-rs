@@ -1,7 +1,7 @@
 # C2ME WGPU 加速模块 — 开发文档
 
 > 最后更新：2026-11-12
-> 状态：**0.1.5、0.1.6 已发布；0.1.7 开发中（最新 `0.1.7-alpha.8`，未发布）**。
+> 状态：**0.1.5、0.1.6 已发布；0.1.7 开发中（最新 `0.1.7-alpha.9`，未发布）**。
 >
 > **已发布**
 > - **0.1.6**：修掉 modded 世界（暮色森林 / Tectonic）的死锁与全虚空问题，并把
@@ -47,6 +47,13 @@
 >   现在按实例共享槽位（`sample` 纯函数，同一实例同一角点值必然相同），
 >   日志同时打「槽位数 + 引用数」。能否让 Tectonic 真正走 GPU 待实机确认
 >   （教训 #55）。
+> - `alpha.9`：executor 缓冲按**实际维度形状**分配（`cells_per_chunk` /
+>   `blocks_per_chunk`），形状变大时重建 executor；无法容纳的批次**直接报错**
+>   而不是提交。修掉 Tectonic（832 高）地形错乱：BlockOut 的 block buffer 原先
+>   按「高度 ≤512」写死，43 chunk 的批次要拷 36.6 MB 出 32 MiB 的 buffer，
+>   wgpu 校验失败后**整条 command buffer 被丢弃**，回读到的就是脏数据——
+>   表现为悬空板块、被切断的悬崖（教训 #56）。顺带把原版形状（高度 384）的缓冲
+>   占用降下来：block buffer 32 MiB→25 MB，每份 staging ≈145→≈115 MB。
 >
 > **实测基线**（细节见 §9 / §10 / §11 / §13.7；跨组数据不可直接比较，见教训 #45）
 > - 桌面端端到端反超纯 CPU（Chunky r=500，RADV RENOIR）：**18 s vs 23 s**
@@ -277,9 +284,12 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     CPU 兜住，256 MiB 的余量早已没有用途。代价是 Adreno 750（骁龙 8 Gen 3）
     这类**正好只报 128 MiB**（WebGPU 规范默认下限）的现代移动 GPU 在启动时就被
     拒绝，玩家只看到"显卡性能不足"，无从判断是门槛而非能力问题。
-    0.1.6 起降到 128 MiB。实测数据：桌面 RADV 报 2047 MiB，其中最大的两个
-    binding 是 `b2_out`≈113 MiB、`b7_block`=32 MiB，离 128 仍有距离；Fabric
-    原生 Tectonic 下 `b6_external`=0，binding 占用与原版几乎相同。
+    0.1.6 起降到 128 MiB。实测数据：桌面 RADV 报 2047 MiB，原版形状下最大的两个
+    binding 是 `b2_out`≈85 MiB、`b7_block`≈25 MB（alpha.9 起按形状分配，见
+    教训 #56），离 128 仍有距离。**余量最紧的是 Tectonic 这类高维度**：
+    832 高、cell_height=4 时 `b2_out`≈92 MiB、`b7_block`≈52 MiB，仍低于
+    128 MiB 门槛，但继续加高（或 max_batch 变大）就会顶到门槛。Fabric 原生
+    Tectonic 下 `b6_external` 只有几百 KiB，不再是占用大户。
     **定门槛的方法**：先算出实际最大 binding 需求（按 max_batch × 每 chunk
     角点 × 4 字节），再取"不低于规范默认下限、不高于实际需求太多"的值；
     抬高门槛只会无谓地排除硬件。
@@ -442,6 +452,34 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     日志里两者都打（`N subtree(s) from M reference(s)`），否则下一次还会误判。
     顺带修正了 64 节点上限的语义：它约束的是槽位（buffer 大小与 CPU 采样量），
     不是引用次数。
+
+56. **持久缓冲的大小必须由"当前维度的形状"算出来，不能写死上界；而 wgpu 的
+    校验错误会丢掉整条 command buffer，表现为静默的地形垃圾：Tectonic 进
+    世界后地形是悬空板块、被切断的悬崖，日志里没有一条 ERROR 参与世界生成，
+    只有两行 `[wgpu-error] Validation Error`：
+    `Copy at offset 0 for 36634624 bytes would end up overrunning the bounds of
+    the Source buffer of size 33554432`。42 chunk × `16*832*16` 方块 × 4 B =
+    36.6 MB，而 `block_buf` 是按旧常量 `16*512*16`（高度 ≤512）分配的 32 MiB。
+    **根因不是"算错了"，而是缓冲大小与形状解耦**：`cells_per_chunk` 早就是
+    按维度算的，`blocks_per_chunk` 却留了个"足够大"的魔数；任何高度 >512 的
+    数据包都会越界。
+    两个规矩：
+    - **凡是随维度/数据包变化的缓冲，尺寸都从 `world.shape()` 推**，并在
+      真正提交前做一次显式的 `need <= have` 校验；容纳不下就返回错误让该批次
+      回退，不要提交。
+    - **别把 wgpu 的校验错误当成"会被上层看到"的失败**。`Copy` 越界时 wgpu
+      拒绝的是**整条** `CommandEncoder`，队列里后续的 dispatch 也一起没了，
+      但 `queue.submit` 的返回值并不携带这个失败；CPU 侧照常按 staging 的
+      大小去 map，读到的就是上一批的残留或零——于是"GPU 算完了、结果是错的"。
+      上游兜底越完善（这里是有循环体被清空的那类 bug 的天然温床），越要保证
+      `ErrorFilter::Validation` 的作用域覆盖到提交点，并把回读长度与期望值对账。
+    修法：`ExecutorConfig { cells_per_chunk, blocks_per_chunk }` 由
+    `get_or_create_executor` 从实际形状传入，executor 只在**变大**时重建
+    （旧 worker `shutdown()` 会先排空队列，不丢批次）；`prepare_batch` 再校验
+    一次。附带收益：原版形状不再按 512 高分配，`block_buf` 从 32 MiB 降到
+    25 MB，每份 staging 从约 145 MB 降到约 115 MB（3 份 + 输入集）。
+    新测试 `oversized_shape_is_rejected_not_silently_corrupted` 固定这个契约：
+    形状超出时必须 `Err("does not fit the executor buffers")`，而不是提交。
 
 ### 版本记录与 0.1.7+ 待办
 

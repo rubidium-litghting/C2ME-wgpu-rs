@@ -1474,6 +1474,53 @@ fn external_payload_travels_with_batch() {
     }
 }
 
+/// A world whose grid exceeds the executor's allocation must be rejected with
+/// an error, not submitted.
+///
+/// wgpu validates the copy bounds and discards the entire command buffer, so
+/// an over-large batch used to come back as stale/zero block data — floating
+/// slabs and clipped walls instead of an error (Tectonic's 832-block
+/// overworld). The executor is rebuilt by `get_or_create_executor` when a
+/// world needs more room, so this path only fires if that sizing ever drifts
+/// again; failing loudly keeps the corruption from reaching worldgen.
+#[test]
+fn oversized_shape_is_rejected_not_silently_corrupted() {
+    use crate::instance::WgpuInstance;
+    use crate::scheduler::batcher::{Batch, Priority};
+    use crate::scheduler::executor::{ExecutorConfig, ExecutorThread};
+    use crate::world::WorldContext;
+    use std::sync::Arc;
+
+    let mut ctx = WorldContext::new(&external_only_blob()).unwrap();
+    let instance = WgpuInstance::instance().unwrap();
+    ctx.compile_pipeline(&instance.device).unwrap();
+    let executor = ExecutorThread::spawn(
+        Arc::new(instance.device.clone()),
+        Arc::new(instance.queue.clone()),
+        ExecutorConfig {
+            // Deliberately too small for the 384-block, 5x97x5 world.
+            cells_per_chunk: 16,
+            blocks_per_chunk: 16,
+            ..ExecutorConfig::default()
+        },
+    )
+    .unwrap();
+
+    let batch = Batch {
+        positions: vec![(0, 0)],
+        max_priority: Priority::Normal,
+        ..Batch::default()
+    };
+    let err = match executor.request_chunks(Arc::new(ctx), batch) {
+        Ok(_) => panic!("an oversized world must not be dispatched"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("does not fit the executor buffers"),
+        "unexpected error: {err}"
+    );
+}
+
 #[test]
 fn numerical_validation_offset_isolation() {
     use crate::world::constants::permutation_table_for_seed;

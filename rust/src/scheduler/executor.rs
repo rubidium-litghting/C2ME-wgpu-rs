@@ -53,6 +53,18 @@ pub struct ExecutorConfig {
     /// set costs a few MB (params/positions/aquifer/beard/external), not the
     /// hundreds the output buffers would.
     pub pipeline_depth: usize,
+    /// Corner-grid cells per chunk of the shape these buffers are sized for.
+    ///
+    /// The persistent output/staging buffers are allocated once, and their
+    /// size is `channels × max_batch_size × cells_per_chunk`. A world with a
+    /// taller or denser grid needs a rebuilt executor; see
+    /// `c_api::get_or_create_executor`. (Hard-coding an upper bound here was
+    /// wrong: Tectonic's 832-block overworld needs 2625 cells and 212 992
+    /// blocks per chunk, which no vanilla-derived constant covers.)
+    pub cells_per_chunk: usize,
+    /// Blocks per chunk (`16 * height * 16`) for the BlockOut buffer (binding
+    /// 7, u32 per block). Same rebuild-on-growth rule as `cells_per_chunk`.
+    pub blocks_per_chunk: usize,
 }
 
 impl Default for ExecutorConfig {
@@ -64,6 +76,11 @@ impl Default for ExecutorConfig {
             // Same as the staging depth: the pool must be able to serve every
             // batch the staging chain can hold.
             pipeline_depth: 3,
+            // Vanilla-ish upper bound. Production callers override these from
+            // the actual shape; the defaults exist for unit tests and for the
+            // offline blobs, which use a 384-block, cell_height=4 grid.
+            cells_per_chunk: 5 * 129 * 5,
+            blocks_per_chunk: 16 * 512 * 16,
         }
     }
 }
@@ -182,26 +199,26 @@ impl SingleBatchExecutor {
         queue: Arc<wgpu::Queue>,
         config: ExecutorConfig,
     ) -> Result<Self, String> {
-        // Size persistent buffers for the worst realistic shape. The real
-        // per-chunk size is derived per-batch from world.cells_per_chunk();
-        // this bound must be >= any shape we might see. 5×129×5 covers
-        // height up to 512 with cell_height down to 4.
-        const MAX_CELLS_PER_CHUNK: usize = 5 * 129 * 5;
+        // Size persistent buffers for the shape this config was built for.
+        // `cells_per_chunk` comes from the world's own grid (cell width and
+        // height), so a modded dimension cannot fall outside the allocation;
+        // a world that needs more rebuilds the executor instead.
+        let max_cells_per_chunk = config.cells_per_chunk.max(1);
         // Pass E (§15.2.2): the outer tree needs per-block evaluation, which reads
         // all the split `inners` from extra channels. Reserve up to 128 inner
         // channels (144 total). Memory cost per chunk is ~700 KB, so a batch of
         // 100 chunks is ~70 MB — fine for desktop and modern mobile.
         let total_channels = 16 + MAX_INNER_COUNT;
-        let out_bytes_per_chunk: usize = total_channels * MAX_CELLS_PER_CHUNK * 4;
+        let out_bytes_per_chunk: usize = total_channels * max_cells_per_chunk * 4;
         // staging receives only the read-back channels, but the executor is
         // shared across worlds (real router = 2 channels, Single-mode test
         // blobs = up to N), so reserve the full 16-channel width. Only
         // `total_bytes` is actually mapped/copied per batch, so the 8x
         // readback saving is unaffected by this slack.
         let max_buffer_size = out_bytes_per_chunk * config.max_batch_size.max(1);
-        // §3.5: block-state output (u32/block), 16*512*16 blocks/chunk max.
-        const MAX_BLOCKS_PER_CHUNK: usize = 16 * 512 * 16;
-        let block_max = MAX_BLOCKS_PER_CHUNK * config.max_batch_size.max(1) * 4;
+        // §3.5: block-state output (u32/block), `16 * height * 16` per chunk.
+        let max_blocks_per_chunk = config.blocks_per_chunk.max(1);
+        let block_max = max_blocks_per_chunk * config.max_batch_size.max(1) * 4;
         // Staging holds density readback + block bytes.
         let staging_size = max_buffer_size + block_max;
         let staging = StagingChain::new(&device, config.staging_capacity, staging_size);
@@ -281,11 +298,13 @@ impl SingleBatchExecutor {
 
         // Print the static footprint so field logs show whether a driver limit
         // is being approached. `external` is allocated per-world, so it is not
-        // included here.
+        // included here. The shape is logged too: buffers are rebuilt when a
+        // world needs more, so this line must say what it was sized for.
         let mib = |b: usize| b / (1024 * 1024);
         crate::debug_log_line(&format!(
             "[c2me-wgpu-rs] executor buffers: output={} MiB, block={} MiB, staging={} MiB x{}, \
-             input_sets={} x (aquifer={} KiB, beard={} KiB), max_batch={}",
+             input_sets={} x (aquifer={} KiB, beard={} KiB), max_batch={}, \
+             sized_for={} cells/chunk / {} blocks/chunk",
             mib(max_buffer_size as usize),
             mib(block_max as usize),
             mib(staging_size as usize),
@@ -294,6 +313,8 @@ impl SingleBatchExecutor {
             aq_stride * 16 * 2 / 1024,
             beard_size as usize / 1024,
             config.max_batch_size,
+            max_cells_per_chunk,
+            max_blocks_per_chunk,
         ));
 
         Ok(Self {
@@ -389,6 +410,25 @@ impl SingleBatchExecutor {
             (num_chunks as usize) * blocks_per_chunk * 4
         } else { 0 };
         let total_bytes = density_bytes + block_bytes;
+
+        // The buffers were sized from this dimension's grid when the executor
+        // was built (see `get_or_create_executor`). If a batch ever needs
+        // more, fail it here instead of emitting a copy that overruns its
+        // source: wgpu then discards the whole command buffer, so the batch
+        // silently yields garbage block data (observed as floating/clipped
+        // terrain with 832-block Tectonic worlds).
+        if cells_per_chunk > self.config.cells_per_chunk
+            || blocks_per_chunk > self.config.blocks_per_chunk
+            || total_bytes > self.staging.slot_size()
+        {
+            return Err(format!(
+                "batch does not fit the executor buffers: need {} cells/chunk and {} blocks/chunk \
+                 (density {} B + block {} B), executor sized for {} cells/chunk and {} blocks/chunk \
+                 ({} B staging)",
+                cells_per_chunk, blocks_per_chunk, density_bytes, block_bytes,
+                self.config.cells_per_chunk, self.config.blocks_per_chunk,
+                self.staging.slot_size()));
+        }
 
         let shape = world.shape();
 
@@ -953,6 +993,10 @@ pub struct ExecutorThread {
     /// would be unavailable exactly when it is needed most.
     handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     sender: channel::Sender<ExecutorMessage>,
+    /// Shape the persistent buffers were allocated for. A world that needs
+    /// more must rebuild the executor; see `c_api::get_or_create_executor`.
+    cells_per_chunk: usize,
+    blocks_per_chunk: usize,
 }
 
 enum ExecutorMessage {
@@ -980,6 +1024,8 @@ impl ExecutorThread {
         config: ExecutorConfig,
     ) -> Result<Self, String> {
         let (sender, receiver) = channel::bounded(4);
+        let (cells_per_chunk, blocks_per_chunk) =
+            (config.cells_per_chunk.max(1), config.blocks_per_chunk.max(1));
 
         // Startup handshake: the worker owns buffer allocation, which can fail
         // (OOM, unsupported limit). Without this, spawn() would return Ok while
@@ -1007,7 +1053,12 @@ impl ExecutorThread {
             .map_err(|e| format!("failed to spawn executor thread: {e}"))?;
 
         match init_rx.recv() {
-            Ok(Ok(())) => Ok(Self { handle: std::sync::Mutex::new(Some(handle)), sender }),
+            Ok(Ok(())) => Ok(Self {
+                handle: std::sync::Mutex::new(Some(handle)),
+                sender,
+                cells_per_chunk,
+                blocks_per_chunk,
+            }),
             Ok(Err(e)) => {
                 let _ = handle.join();
                 Err(format!("executor init failed: {e}"))
@@ -1017,6 +1068,12 @@ impl ExecutorThread {
                 Err("executor thread died during init".to_string())
             }
         }
+    }
+
+    /// True when the persistent buffers cover a grid of this shape, so a batch
+    /// from that world can be prepared without reallocating.
+    pub fn fits(&self, cells_per_chunk: usize, blocks_per_chunk: usize) -> bool {
+        cells_per_chunk <= self.cells_per_chunk && blocks_per_chunk <= self.blocks_per_chunk
     }
 
     /// Submit a batch synchronously (blocking) and return the result.
