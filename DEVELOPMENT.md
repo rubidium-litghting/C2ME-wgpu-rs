@@ -30,7 +30,9 @@
 > - `alpha.6`：shader 编译进度覆盖层。首次进入维度时在屏幕顶部显示
 >   `正在编译 GPU 着色器… n/N（秒）` 与进度条，注入在 `GameRenderer.render`
 >   唯一那处 `DrawContext.draw()` 之前（世界 + HUD + 当前 Screen 之上），因此
->   加载地形界面也看得到。数据走 Rust 侧拉取式快照，见教训 #52。
+>   加载地形界面也看得到。数据走 Rust 侧拉取式快照，见教训 #52。**已实机验证**
+>   （清空 `~/.cache/c2me/wgpu_pipelines` 后冷编译，覆盖层在加载地形界面上可见、
+>   逐 shard 前进、结束即消失）。
 >
 > **实测基线**（细节见 §9 / §10 / §11 / §13.7；跨组数据不可直接比较，见教训 #45）
 > - 桌面端端到端反超纯 CPU（Chunky r=500，RADV RENOIR）：**18 s vs 23 s**
@@ -380,6 +382,17 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     暂停或最小化时自然零成本，也不会从 worker 线程碰 Java 对象。编译失败时
     靠 RAII guard 在 `?` 提前返回时清标志，否则进度条会永远停在屏幕上。
 
+53. **"地形变了"先确认是不是同一个世界**：A/B 或回归测试里，一次"地形怎么变了"
+    的警报最后是空响——两轮测试各自**新建了一个世界**（日志里
+    `Deleting level Chunky WGPU`、`Deleting level Chunky`），新世界就是新随机
+    种子，地形本来就该不同。判定方法很简单：看 `logs/latest.log` 里的
+    `[c2me-wgpu] first chunk [x z]`，如果两轮的出生区块坐标不同，种子几乎必然
+    不同，这时任何地形差异都不能算到代码头上；再核对 `[c2me-wgpu] shape:` 是否
+    一致，一致说明维度/噪声设置没变，只是种子变了。
+    规矩：**地形正确性只在固定种子、或复用同一份存档上比较**；纯粹测耗时/耗时
+    回归才可以随便新建世界。同理，临时插桩（例如 sleep）只会改时间线，不会改
+    生成结果——先排除"世界/种子/维度"三个变量，再怀疑代码。
+
 ### 版本记录与 0.1.7+ 待办
 
 **0.1.4 已完全解决的历史遗留（存档记录）**
@@ -530,6 +543,9 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   之前，覆盖世界、HUD 和 `DownloadingTerrainScreen`。进度由 Rust
   `world::progress` 的拉取式快照提供（`c2me_wgpu_compile_progress`），编译
   失败时 RAII guard 会清掉标志，不会留下卡住的进度条。见教训 #52。
+  实机验证方式：清空磁盘管线缓存（`rm -rf ~/.cache/c2me/wgpu_pipelines`）后
+  进新维度，覆盖层持续 1–3 s；日志里 `compile overlay shown` / `hidden`
+  成对出现。**热缓存下只有约 50 ms，看不见是正常的**，不要据此判断功能失效。
 - [ ] **阶段 3：批内真正共享采样上下文**（官方 CL 的剩余收益）。当前批次只
   收敛调度依赖，每个成员仍各自构建 `ChunkNoiseSampler`；要进一步必须自己
   持有 `Blender` / `StructureAccessor` / sampler，风险远高于阶段 2，暂不做。
