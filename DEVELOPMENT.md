@@ -1,7 +1,7 @@
 # C2ME WGPU 加速模块 — 开发文档
 
 > 最后更新：2026-11-12
-> 状态：**0.1.5、0.1.6 已发布；0.1.7 开发中（最新 `0.1.7-alpha.9`，未发布）**。
+> 状态：**0.1.5、0.1.6 已发布；0.1.7 代码完成、版本号已提升为 `0.1.7`，待最后一轮实机验证后打 tag 发布**。
 >
 > **已发布**
 > - **0.1.6**：修掉 modded 世界（暮色森林 / Tectonic）的死锁与全虚空问题，并把
@@ -12,7 +12,7 @@
 >   切存档热重载配置（冷/热两级，零锁）、聊天栏状态提示、由注解自动生成的
 >   ModMenu 设置界面。
 >
-> **0.1.7（分支 `feature/chunk-status-integration`）**
+> **0.1.7**
 > - `alpha.1`：`NewStatusHook` / `NewChunkStatus` 阶段 1 透明委托，r=500 与基线
 >   持平（§13）。
 > - `alpha.2`：`chunk_batch_size` 对齐批次（2×2 / 4×4 / 8×8）已实现并实机验证
@@ -57,6 +57,9 @@
 >   遗留：批次上限（64）与 external 节点上限（64）仍是代码里的魔数，没有按
 >   设备实际限额反推，见下方 0.1.7+ 待办（同一形状下 cell 高=4 时 `b2_out`
 >   会超 128 MiB）。
+>
+> 0.1.7 的全部改动都已合入 `main`；`feature/chunk-status-integration` 只是历史
+> 分支（比 `main` 落后 18 个提交、无独有提交），发版从 `main` 打 tag 即可。
 >
 > **实测基线**（细节见 §9 / §10 / §11 / §13.7；跨组数据不可直接比较，见教训 #45）
 > - 桌面端端到端反超纯 CPU（Chunky r=500，RADV RENOIR）：**18 s vs 23 s**
@@ -603,7 +606,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 > 含修复的真正压力验证是 NF-3。大规模 GPU vs CPU 对照（B-5，同 4225/400c 口径）
 > 尚未跑。
 
-**0.1.7（开发中，分支 `feature/chunk-status-integration`）：C2ME chunk-status 接入**
+**0.1.7：C2ME chunk-status 接入**（原 `feature/chunk-status-integration` 分支已
+全部合入 `main`，发版以 `main` 为准）
 
 - [x] **阶段 1：打通官方扩展点（透明委托）**。通过 `MixinNewStatusHook` 在 C2ME
   注册原版 `NOISE` delegate 之前插入 `WgpuNoiseStatus`；该状态的
