@@ -1,7 +1,7 @@
 # C2ME WGPU 加速模块 — 开发文档
 
 > 最后更新：2026-11-12
-> 状态：**0.1.5、0.1.6 已发布；0.1.7 代码完成、版本号已提升为 `0.1.7`，待最后一轮实机验证后打 tag 发布**。
+> 状态：**0.1.5、0.1.6 已发布；0.1.7 已通过 Fabric 与 NeoForge（+Connector，含 Tectonic）实机验证，版本号已提升为 `0.1.7`，待打 tag 发布**。
 >
 > **已发布**
 > - **0.1.6**：修掉 modded 世界（暮色森林 / Tectonic）的死锁与全虚空问题，并把
@@ -45,8 +45,10 @@
 >   `tectonic:config_noise`，却被引用 732 次，于是撞上 64 节点上限、
 >   整维度回退 CPU（`too many external density subtrees (732 > 64)`）。
 >   现在按实例共享槽位（`sample` 纯函数，同一实例同一角点值必然相同），
->   日志同时打「槽位数 + 引用数」。能否让 Tectonic 真正走 GPU 待实机确认
->   （教训 #55）。
+>   日志同时打「槽位数 + 引用数」。**已实机确认**：Fabric 与 NeoForge +
+>   Connector 下都是 2 槽位 / 732 引用，832 高维度正常跑 GPU、地形正确
+>   （2026-11-13）。README/教训 #39/#44 里"Connector 下 Tectonic 必回退 CPU"
+>   的旧结论随之作废（教训 #57）。
 > - `alpha.9`：executor 缓冲按**实际维度形状**分配（`cells_per_chunk` /
 >   `blocks_per_chunk`），形状变大时重建 executor；无法容纳的批次**直接报错**
 >   而不是提交。修掉 Tectonic（832 高）地形错乱：BlockOut 的 block buffer 原先
@@ -244,7 +246,14 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     数百个节点被当作 external 外置到 CPU。这不仅让上传 buffer 超过 128 MB
     的 `max_storage_buffer_binding_size` 限制，还会让 CPU 串行采样把 CPS
     拖到个位数。已在维度初始化处加 64 个 external 节点的硬上限，超限直接
-    回退 CPU。这是 Connector 的兼容性限制（非原生环境），不做逆向适配。
+    回退 CPU。
+    **2026-11-13 更正**：当时"Connector 下 Tectonic 一定回退 CPU"的结论是错的，
+    错在把**引用数**当成了节点数（教训 #55）。alpha.8 按实例去重后，**NeoForge
+    版 Tectonic 3.0.28 在 Connector 下只有 2 个槽位 / 732 次引用**，832 高的
+    维度正常跑 GPU：`sized_for=2625 cells/chunk / 212992 blocks/chunk`，shader
+    与 Fabric 原生**逐字节相同**（3069 / 2967 行），地形正常。Connector 仍不是
+    官方支持环境，
+    但"外部化数量"不再是它的障碍——真正的障碍只有 64 槽位上限本身。
 
 40. **CPS 对种子和视距敏感，但幅度依规模而定**：旧的 Chunky 端到端数据（18s vs
     23s、CPS 188）只在特定种子下成立，不同种子的噪声 octave 数量、spline
@@ -286,8 +295,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
 43. **能力门槛要贴着规范下限，别拍脑袋抬高**：`max_storage_buffer_binding_size`
     曾硬编码要求 256 MiB。这个数字原本是为了容纳 Tectonic 在 Sinytra Connector
-    下暴露的 732 个 external 节点，但那个场景后来已被 64 节点上限整维度回退
-    CPU 兜住，256 MiB 的余量早已没有用途。代价是 Adreno 750（骁龙 8 Gen 3）
+    下暴露的 732 个 external 节点，但那 732 其实是**引用数**：按实例去重后只有
+    2 个槽位（alpha.8，教训 #55/#57），256 MiB 的余量从一开始就没有用途。代价是 Adreno 750（骁龙 8 Gen 3）
     这类**正好只报 128 MiB**（WebGPU 规范默认下限）的现代移动 GPU 在启动时就被
     拒绝，玩家只看到"显卡性能不足"，无从判断是门槛而非能力问题。
     0.1.6 起降到 128 MiB。实测数据：桌面 RADV 报 2047 MiB，原版形状下最大的两个
@@ -310,10 +319,12 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
       桥接。结果 Connector 加载其 Mixin 时直接
       `Failed to execute task .../BiomeMixin.class`，整个游戏崩溃。
     对照实验还确认了一件事：**Connector 不会包装原版密度节点**——纯原版地形
-    在 NeoForge+Connector 下 `b6_external`=0、GPU 正常加速。所以问题只出在
-    mod 节点，而 Connector 无法完整桥接 Tectonic 这类深度侵入的 mod。
-    结论：维持 64 节点回退 CPU 的设计，不做逆向适配；这条已写进 README 的
-    "已知限制"。
+    在 NeoForge+Connector 下 `b6_external`=0、GPU 正常加速。
+    **2026-11-13 更正**：这两条路线确实不通，但"Connector 无法完整桥接 Tectonic"
+    的结论下早了。改放 **NeoForge 版** Tectonic（ModLauncher 原生加载，不经过
+    Connector 的桥接）后一切正常：2 个槽位、832 高、GPU 加速、地形正确。所以
+    结论应改为"用对平台构建件即可，不需要逆向适配"；同时 64 节点上限带来的
+    CPU 回退在去重后也不再触发（见教训 #39 的更正）。
 
 45. **测试数据必须带种子和可比性声明**：教训 #40 指出 CPS 对种子敏感，但
     这条纪律经常被自己违反。本轮就出过一次：两次 r=500 测试分别测得 20 s 和
@@ -446,14 +457,15 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     里报 `732 external density subtree(s)`，而它整个 jar 只定义了
     **7 个** `tectonic:config_noise`。原因是密度树是 DAG（注册表里的同一实例
     被许多父节点共享），而序列化器为了简单**不做 memo、逐路径内联**，于是
-    "遇到几次未支持节点"= "写几个槽位"，把 7 个实例数成了 732 个引用，
+    "遇到几次未支持节点"= "写几个槽位"，把 2 个实际进入该维度路由的实例数成了
+    732 个引用（整个 jar 定义 7 个 `config_noise`，其余不参与本维度），
     直接撞上 64 节点上限，整个维度回退 CPU——看起来像"mod 又没被支持"，
     实际是记账方式错了。
     改法：`IdentityHashMap<DensityFunction,Integer>` 按实例共享槽位。共享是
     **精确**的，不是近似：外置子树只通过 `sample(pos)` 参与计算，纯函数在同一
     角点必然给同一个值；引用它的位置拿到的是同一个 `ExternalInput(index)`。
     代价只有一点：CPU 每个批次仍要把每个**实例**在每 chunk 的角点上采一遍
-    （7 × 5×105×5 × 4 chunk ≈ 7 万次采样），与 732 实例的 770 万次差两个数量级。
+    （2 × 5×105×5 × 4 chunk ≈ 2 万次采样），与 732 槽位的 770 万次差两个数量级。
     规矩：**遇到"数量爆炸"先分清引用数 / 去重后的实例数 / 真正的工作量**；
     日志里两者都打（`N subtree(s) from M reference(s)`），否则下一次还会误判。
     顺带修正了 64 节点上限的语义：它约束的是槽位（buffer 大小与 CPU 采样量），
@@ -486,6 +498,24 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     25 MB，每份 staging 从约 145 MB 降到约 115 MB（3 份 + 输入集）。
     新测试 `oversized_shape_is_rejected_not_silently_corrupted` 固定这个契约：
     形状超出时必须 `Err("does not fit the executor buffers")`，而不是提交。
+
+57. **把限制归因于"外部兼容性"之前，先排除自己代码里的计量缺陷**：0.1.6 的
+    README 和文档都写着"Tectonic 在 NeoForge+Connector 下会因节点过多回退
+    CPU，这是 Connector 的兼容性限制"，NF-1 那行实测记录也是"回退 CPU（732
+    external）"。这个结论活了好几个版本，直到 alpha.8 把 external 槽位按实例
+    去重、由 732 降到 2，NeoForge + Connector + Tectonic 才被实测证明能正常
+    跑 GPU（832 高、shader 3069 行、地形正确，2026-11-13）。
+    当时的观察没错（mod 节点确实被当作 external），错的是**归因**：真正撞墙的
+    是我们自己"一个引用一个槽位"的记账方式，不是 Connector 的桥接能力。
+    这类误判代价很高——它会让一条本可修好的路径被写进 README 当成永久限制，
+    并且挡住后续排查（大家都以为"官方不支持，不用查了"）。
+    规矩：
+    - **写"某某组合/某某平台不支持"之前，先问三件事**：限制是谁报的（我们的
+      阈值还是对方的拒绝）、阈值是怎么算的、换个记账口径还成立吗？
+    - 这类结论要带**版本号 + 实测数值**（本条就是 `0.1.6 / 732 slots`），
+      这样后续修复才能被识别为"推翻了旧结论"，而不是"又出 bug 了"。
+    - 结论被推翻时，把**更正**写回原处（教训 #39/#44、NF-1 表、README），
+      而不是只在新版本里加一句——否则读旧章节的人仍会得到错误结论。
 
 ### 版本记录与 0.1.7+ 待办
 
@@ -599,7 +629,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 | A-1/A-2 | Fabric | Tectonic | 4225 | 26–33 s | — | — | ❌ |
 | NF-2 | NeoForge | 原版（末地） | 63001 | 1m49s | 516–695 | 0 | ❌ |
 | NF-3 | NeoForge | 原版（末地） | 160801 | 4m31s | **599.8**（p90 649.9） | **0** | ✅ |
-| NF-1 | NeoForge | Tectonic+Connector | — | 回退 CPU（732 external） | — | — | — |
+| NF-1 | NeoForge | Tectonic+Connector | — | alpha.8 前回退 CPU（732 external）；alpha.8 后 **GPU 正常**（2 槽位 / 732 引用） | — | — | — |
 
 > 注：A-5 的 jar 构建于 02:38、源码改于 02:37、提交于 02:53，字节码已确认含
 > `QUEUE_CAPACITY = 4096`（见教训 #42）。4225 chunk 规模太小，无法暴露队列问题，
@@ -698,16 +728,15 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   实测样本：需要构造 65–200 个**不同实例**的世界来验证上限与性能。上限本身
   应当由设备限额与每节点每 chunk 的角点字节数算出，而不是固定 64（见 0.1.7+
   待办 ·「能力上限从设备实际限额反推」）。
-- [ ] **Connector 下 shader 膨胀的来源未查清**。实测数据：
-  - Fabric 原生 Tectonic：shard B 3100 行，shard Inner 2996 行。
-  - NeoForge + Connector：shard B **22546 行**，shard Inner **22441 行**，各多出
-    约 1.94 万行。
-  按 `ast/split.rs` 的逻辑，一个 `ExternalInput` 只会被推成 `inners` 里的一个
-  叶子，在 Inner shard 里占**一行**写入。732 个 external 最多加 732 行，与实测
-  的 1.94 万行差了 26 倍。**因此膨胀与 external 节点本身无关**，怀疑是 Connector
-  环境下树遍历或去重（`CacheFlat` / CSE）失效，导致子树被重复内联展开。
-  查法：在两边分别 dump `inners` 列表与 `split` 后的 outer 树，逐项对比找出重复
-  出现的子树。0.1.6 已由 64 上限兜住正确性，本条属于 0.1.7+ 的探索项。
+- [x] ~~**Connector 下 shader 膨胀的来源未查清**~~ **已结案（2026-11-13）**：
+  膨胀就是 732 个 external 槽位造成的。同一台机器、同一 Tectonic 3.0.28、
+  同一 832 高维度，去重到 2 个槽位后 shader 与 Fabric 原生**逐字节相同**
+  （shard B 3069 行、Inner 2967 行、字节数也一致），而旧版 Connector 下是
+  22546 / 22441 行。
+  当时按"一个 `ExternalInput` 只占一行"推算出 732 行、与实际 1.94 万行差 26 倍，
+  于是错误地排除了 external 这个原因；实测每个槽位在 inner shard 里带的是一整段
+  取值表达式（≈26 行/槽），732 × 26 ≈ 1.9 万行，吻合。
+  **教训**：估算"某类节点只占 O(1) 行"之前，先量一行到底有多长。
 
 ### 借鉴官方 OpenCL 模块的优化点（0.1.7+ 任务池）
 
