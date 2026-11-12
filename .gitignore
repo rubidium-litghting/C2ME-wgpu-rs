@@ -39,6 +39,11 @@ hs_err_pid*
 # temporary files which can be created if a process still has a handle open of a deleted file
 .fuse_hidden*
 
+# OnlyOffice / LibreOffice lock files (".~lock.<name>#"). These were once
+# committed by accident and sat in the tree unnoticed because git ignored the
+# dirty state; ignoring them keeps an open editor from looking like a change.
+.~lock.*#
+
 # KDE directory preferences
 .directory
 
