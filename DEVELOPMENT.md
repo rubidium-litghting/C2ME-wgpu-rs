@@ -54,6 +54,9 @@
 >   wgpu 校验失败后**整条 command buffer 被丢弃**，回读到的就是脏数据——
 >   表现为悬空板块、被切断的悬崖（教训 #56）。顺带把原版形状（高度 384）的缓冲
 >   占用降下来：block buffer 32 MiB→25 MB，每份 staging ≈145→≈115 MB。
+>   遗留：批次上限（64）与 external 节点上限（64）仍是代码里的魔数，没有按
+>   设备实际限额反推，见下方 0.1.7+ 待办（同一形状下 cell 高=4 时 `b2_out`
+>   会超 128 MiB）。
 >
 > **实测基线**（细节见 §9 / §10 / §11 / §13.7；跨组数据不可直接比较，见教训 #45）
 > - 桌面端端到端反超纯 CPU（Chunky r=500，RADV RENOIR）：**18 s vs 23 s**
@@ -651,6 +654,35 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   mismatch），随版本号一起升级。
   **收益未复测**：0.1.5 的 A/B 是端到端 10%、CPU 70%→50%；0.1.6 引入有界队列
   后未重跑，external 维度的真实收益仍待实机 A/B。
+- [ ] **能力上限从设备实际限额反推，别写死在代码里**（alpha.9 遗留的口子）。
+  alpha.9 让缓冲尺寸跟着形状走，等于把"能用/不能用"变成形状的函数，但代码里
+  仍有一批魔数在替设备做决定：
+  - `ExecutorConfig.max_batch_size = 64`（Rust/Java 两侧各一份 `MAX_BATCH`）；
+  - `MAX_EXTERNAL_NODES = 64`（`MixinChunkGenerator`）；
+  - `features.rs` 的 128 MiB 门槛；
+  - 两处尚未校验的硬限额：`max_storage_buffer_binding_size` 与
+    `max_buffer_size`。
+  **现状数据**（64 chunk 批次，`Limits::default()`）：原版 384 高 →
+  `b2_out` 85.3 MiB / block 24 MiB / staging 109 MiB；Tectonic 832 高、cell 4×8 →
+  92.3 / 52.0 / 144.3 MiB，对应限额 128 / 128 / 256 MiB，都还在里面。
+  但**同一高度若 cell 高是 4**，`b2_out` 就要 192 MiB，直接越过 128 MiB ——
+  Tectonic 只是恰好用 4×8 躲过去。越过之后的失败方式正是 alpha.9 修掉的那类：
+  wgpu 校验失败、整条 command buffer 被丢弃、回读脏数据。
+  **改法**：`batch_limit = min(hard_cap, binding_limit / 每 chunk 绑定字节,
+  buffer_limit / 每 chunk 总字节)`，按形状和设备限额算；Java 通过一个只读
+  FFM 查询拿到这个上限再攒批（否则 `prepare_batch` 的"容纳不下"会让 Java
+  一批一批地失败）。external 的 64 同理，应由每个节点每 chunk 的角点字节数算出。
+  **关键前提**：必须用 **device** 的限额，不是 adapter 的。设备是用
+  `required_limits = wgpu::Limits::default()` 创建的，adapter 报 2047 MiB 也
+  不起作用，真正的 ceiling 就是 WebGPU 默认的 128/256 MiB。
+  **关于"临时建 instance 查真实限额"的想法**：方向对，但要注意活动设备的约束——
+  Android 上已经有了一个 device 时再建临时 device，会冻住渲染器（`instance/mod.rs`
+  里 adapter 列表就是为此改成初始化时构建一次、GUI 不再自行枚举）。所以：
+  - 有活动设备时，直接读它的 `device.limits()` / `get_info()`，不新建；
+  - 只有在"还没有设备"的阶段（启动能力检查、GUI 选卡）才适合临时实例；
+  - 现在启动日志已打出 adapter limits，缺的只是一个 Java 能读到 **device**
+    limits 的查询口。
+  关联：待测与验证计划第 2 项（65–200 个 external 实例的中间地带）。
 
 ### 待测与验证计划（不属于版本功能）
 
@@ -659,7 +691,9 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 - [ ] external 节点数 65–200 的中间地带：阈值 64 原本是拿"4 正常 / 732 回退"
   两端之间拍的，但 732 其实是**引用数**，按实例去重后 Tectonic 只有 7 个
   （alpha.8，教训 #55；能否真跑 GPU 待实机确认）。去重后这个区间还没有任何
-  实测样本：需要构造 65–200 个**不同实例**的世界来验证上限与性能。
+  实测样本：需要构造 65–200 个**不同实例**的世界来验证上限与性能。上限本身
+  应当由设备限额与每节点每 chunk 的角点字节数算出，而不是固定 64（见 0.1.7+
+  待办 ·「能力上限从设备实际限额反推」）。
 - [ ] **Connector 下 shader 膨胀的来源未查清**。实测数据：
   - Fabric 原生 Tectonic：shard B 3100 行，shard Inner 2996 行。
   - NeoForge + Connector：shard B **22546 行**，shard Inner **22441 行**，各多出
