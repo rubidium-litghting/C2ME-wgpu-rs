@@ -28,9 +28,9 @@
 >   `<0.5.0`。C2ME 内部 API 变动时跳过对齐状态并保留 `populateNoise` GPU 路径，
 >   而不是在生成中抛 `NoSuchMethodError`（§13.6）。
 > - `alpha.6`：shader 编译进度覆盖层。首次进入维度时在屏幕顶部显示
->   `正在编译 GPU 着色器… n/N（秒）` 与进度条，画在 `GameRenderer.render` 的
->   TAIL（世界 + HUD + 当前 Screen 之上），因此加载地形界面也看得到。数据走
->   Rust 侧拉取式快照，见教训 #52。
+>   `正在编译 GPU 着色器… n/N（秒）` 与进度条，注入在 `GameRenderer.render`
+>   唯一那处 `DrawContext.draw()` 之前（世界 + HUD + 当前 Screen 之上），因此
+>   加载地形界面也看得到。数据走 Rust 侧拉取式快照，见教训 #52。
 >
 > **实测基线**（细节见 §9 / §10 / §11 / §13.7；跨组数据不可直接比较，见教训 #45）
 > - 桌面端端到端反超纯 CPU（Chunky r=500，RADV RENOIR）：**18 s vs 23 s**
@@ -356,14 +356,25 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     - **跑得快也要对**：污染批次看起来只是"慢一点"，没有任何崩溃或报错，靠
       端到端数字根本发现不了。
 
-52. **覆盖层要画在 `GameRenderer.render` 的 TAIL，不是 HUD 或聊天栏**：shader
-    编译发生在首次进入维度的 C2ME worker 上，而那正是
-    `DownloadingTerrainScreen` 占满画面的时候。`InGameHud` 的聊天栏、HUD 回调
-    和 `Screen` 自己画的内容都在这一层**下面**，所以"编译进度"用聊天提示或
+52. **覆盖层要画在 `GameRenderer.render` 里 `DrawContext.draw()` 之前，不是 TAIL、
+    更不是 HUD 或聊天栏**：shader 编译发生在首次进入维度的 C2ME worker 上，而那
+    正是 `DownloadingTerrainScreen` 占满画面的时候。`InGameHud` 的聊天栏、HUD
+    回调和 `Screen` 自己画的内容都在这一层**下面**，所以"编译进度"用聊天提示或
     普通 HUD 回调根本看不见。`GameRenderer.render` 已经把世界、HUD 和当前
-    `Screen` 全部画完，TAIL 注入正好在 framebuffer blit 之前；新建一个临时
-    `DrawContext` → 画 → `draw()`，和原版输出 profiler 饼图的位置、做法完全
-    相同，不需要碰渲染管线状态。
+    `Screen` 全部画完，注入到它唯一那处 `DrawContext.draw()` 调用之前即可。
+    但**不能注入 TAIL**：原版这个方法结尾是
+    ```
+    ctx.draw();                        // 974
+    modelViewStack.popMatrix();        // 977
+    RenderSystem.applyModelViewMatrix();// 983
+    return;                            // 986 ← TAIL 在这里
+    ```
+    GUI 的 2D 矩阵（`translate(0,0,-11000)`）在 TAIL 之前已经被弹出，而
+    `setOrtho(0,w,h,0,1000,21000)` 的投影还挂着：z=0 的四边形落到近裁剪面
+    背面，被**静默裁掉**——不报错、不崩溃、日志干净，看起来就像"覆盖层没触发"。
+    注入到 `draw()` 之前，矩阵还活着，而且我们自己排进共享 immediate 缓冲区的
+    顶点会被原版紧接着的那次 `draw()` 一起刷掉。教训：判断"我画的东西在哪一
+    层"时，要读目标方法的**结尾字节码**，别按方法名想当然。
     数据通道用**拉取式快照**而不是新造一条 upcall：Rust 侧只需一个互斥量
     （`world::progress`）存 `active/done/total`，渲染线程每帧做一次 downcall；
     暂停或最小化时自然零成本，也不会从 worker 线程碰 Java 对象。编译失败时
@@ -515,10 +526,10 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   无 member 漏生成、地形正常。详见 §13.7。默认值暂不提高，4 作为推荐手动值。
 - [x] **shader 编译进度覆盖层**。首次进入维度要编译 shard，桌面端几百毫秒到
   几秒、移动端更久；期间画面卡住却毫无反馈。现在在屏幕顶部画进度条与
-  `n/N`、已用秒数，位置在 `GameRenderer.render` 的 TAIL，覆盖世界、HUD 和
-  `DownloadingTerrainScreen`。进度由 Rust `world::progress` 的拉取式快照提供
-  （`c2me_wgpu_compile_progress`），编译失败时 RAII guard 会清掉标志，不会留下
-  卡住的进度条。见教训 #52。
+  `n/N`、已用秒数，注入在 `GameRenderer.render` 唯一那处 `DrawContext.draw()`
+  之前，覆盖世界、HUD 和 `DownloadingTerrainScreen`。进度由 Rust
+  `world::progress` 的拉取式快照提供（`c2me_wgpu_compile_progress`），编译
+  失败时 RAII guard 会清掉标志，不会留下卡住的进度条。见教训 #52。
 - [ ] **阶段 3：批内真正共享采样上下文**（官方 CL 的剩余收益）。当前批次只
   收敛调度依赖，每个成员仍各自构建 `ChunkNoiseSampler`；要进一步必须自己
   持有 `Blender` / `StructureAccessor` / sampler，风险远高于阶段 2，暂不做。

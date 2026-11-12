@@ -37,17 +37,27 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 /**
  * Draws the shader-compile overlay above everything else in the frame.
  *
- * <p>{@code GameRenderer.render} is the last thing the client renders before
- * the framebuffer is blitted to the window, and it already includes the HUD
- * and the current {@code Screen}. Injecting at TAIL therefore puts the
- * panel above the terrain-download screen as well as above the chat HUD —
- * which is the case that matters, because the first compile happens while
- * that screen is up.
+ * <p>{@code GameRenderer.render} already contains the world, the HUD and the
+ * current {@code Screen}, so drawing at the end of it puts the panel above
+ * the terrain-download screen — which is the case that matters, because the
+ * first compile happens while that screen is up.
+ *
+ * <p><b>Not TAIL.</b> The method ends with
+ * {@code DrawContext.draw(); modelViewStack.popMatrix(); applyModelViewMatrix();}
+ * — i.e. by the time TAIL runs, the GUI matrix (the {@code translate(0,0,
+ * -11000)} vanilla pushes for 2D drawing) has already been popped while the
+ * orthographic projection with near=1000 is still bound. Quads at {@code z=0}
+ * then sit behind the near plane and are clipped: the overlay draws nothing
+ * and raises no error. Injecting on the single {@code DrawContext.draw()}
+ * call keeps the GUI matrix live, and vanilla's own {@code draw()} flushes
+ * the vertices we queued into the shared immediate buffer.
  */
 @Mixin(GameRenderer.class)
 public abstract class MixinGameRendererOverlay {
 
-    @Inject(method = "render", at = @At("TAIL"))
+    @Inject(method = "render",
+            at = @At(value = "INVOKE",
+                     target = "Lnet/minecraft/client/gui/DrawContext;draw()V"))
     private void c2me$drawCompileOverlay(RenderTickCounter tickCounter, boolean tick,
                                         CallbackInfo ci) {
         MinecraftClient mc = MinecraftClient.getInstance();

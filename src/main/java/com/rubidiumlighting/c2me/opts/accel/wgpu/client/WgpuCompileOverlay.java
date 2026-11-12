@@ -62,6 +62,13 @@ public final class WgpuCompileOverlay {
     /** Set once if the overlay ever throws, so a broken frame cannot repeat. */
     private static boolean broken;
 
+    private static final org.slf4j.Logger LOGGER =
+            org.slf4j.LoggerFactory.getLogger("c2me-wgpu");
+
+    /** One-shot guards so a normal load adds at most a couple of log lines. */
+    private static boolean warnedNoSymbol;
+    private static boolean warnedShown;
+
     /**
      * Poll the native snapshot and report whether this frame should draw.
      *
@@ -72,12 +79,22 @@ public final class WgpuCompileOverlay {
         if (broken) return false;
         long packed = WgpuThinBinding.compileProgress();
         if (packed < 0) {
+            // Native library predates the symbol: the overlay is simply absent.
+            if (!warnedNoSymbol) {
+                warnedNoSymbol = true;
+                LOGGER.info("[c2me-wgpu] compile overlay unavailable: "
+                        + "the native library exposes no compile-progress symbol");
+            }
             active = false;
             return false;
         }
         boolean nowActive = ((packed >>> 32) & 1L) != 0;
         if (!nowActive) {
-            active = false;
+            if (active) {
+                active = false;
+                LOGGER.info("[c2me-wgpu] compile overlay hidden after {} shard(s)",
+                        done);
+            }
             return false;
         }
         if (!active) {
@@ -87,6 +104,10 @@ public final class WgpuCompileOverlay {
         }
         done = (int) ((packed >>> 16) & 0xFFFFL);
         total = (int) (packed & 0xFFFFL);
+        if (!warnedShown) {
+            warnedShown = true;
+            LOGGER.info("[c2me-wgpu] compile overlay shown ({} shard(s))", total);
+        }
         return true;
     }
 
