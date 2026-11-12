@@ -397,7 +397,8 @@ impl SingleBatchExecutor {
         // (external inputs / aquifer / beard), then write params ONCE.
         let mut params = Self::build_params(world, batch, num_chunks, shape);
         let ext_buf = Self::ensure_external_buffer(
-            &self.device, &self.queue, &mut self.pool.sets[buf_set], world);
+            &self.device, &self.queue, &mut self.pool.sets[buf_set],
+            batch.externals.as_ref());
         if let Some(aq_n) = Self::upload_aquifer_tables(
             &self.queue, &mut self.pool.sets[buf_set], world, batch, shape) {
             // aq_s half-offset: only the first `aq_n` vec4 entries were
@@ -726,7 +727,10 @@ impl SingleBatchExecutor {
             batch_count_z: 1,
             _pad: [0; 12],
         };
-        params._pad[0] = world.external_count() as u32;
+        // CPU-evaluated external slots per chunk, carried by the batch itself.
+        // (Was a process-global on WorldContext, which is why external worlds
+        // had to run serially; see `ExternalInputs`.)
+        params._pad[0] = batch.externals.as_ref().map_or(0, |e| e.per_chunk);
         // §8.4: per-dimension aquifer mode in _pad[1..5].
         {
             let am = world.aquifer_mode();
@@ -749,8 +753,13 @@ impl SingleBatchExecutor {
         params
     }
 
-    /// Return the external-inputs buffer (binding 6), (re)creating it in the
-    /// set if the current CPU-side payload needs more room.
+    /// Return the external-inputs buffer (binding 6) for this batch,
+    /// (re)creating it in the set if the payload needs more room.
+    ///
+    /// The payload comes from the batch, not from the world: each batch owns
+    /// its values, so a queued batch can be prepared after a newer one has
+    /// already staged its own. Recreate only grows the buffer; a smaller
+    /// batch writes a prefix and the shader never indexes past it.
     ///
     /// Takes the buffer set rather than `&mut self` so the caller can hold the
     /// set borrow while writing other buffers.
@@ -758,12 +767,16 @@ impl SingleBatchExecutor {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         set: &mut InputBufferSet,
-        world: &WorldContext,
+        externals: Option<&crate::scheduler::ExternalInputs>,
     ) -> wgpu::Buffer {
-        let ext_count = world.external_count();
-        let ext_data = world.external_data();
-        let ext_bytes = (ext_data.len() * 4).max(4);
-        if ext_count > 0 {
+        let (per_chunk, data) = match externals {
+            Some(e) if e.per_chunk > 0 && !e.data.is_empty() => {
+                (e.per_chunk, e.data.as_slice())
+            }
+            _ => (0, &[][..]),
+        };
+        let ext_bytes = (data.len() * 4).max(4);
+        if per_chunk > 0 {
             let need_recreate = match &set.external {
                 Some(b) => b.size() < ext_bytes as u64 || b.size() < 4,
                 None => true,
@@ -777,7 +790,7 @@ impl SingleBatchExecutor {
                 }));
             }
             let buf = set.external.as_ref().unwrap();
-            queue.write_buffer(buf, 0, bytemuck::cast_slice(&ext_data));
+            queue.write_buffer(buf, 0, bytemuck::cast_slice(data));
             buf.clone()
         } else {
             // No external inputs: bind a dedicated 4-byte dummy so binding 6
@@ -1211,6 +1224,7 @@ mod tests {
         let batch = Batch {
             positions: vec![(3, 3), (0, 0), (1, 0)],
             max_priority: Priority::Normal,
+            ..Batch::default()
         };
         assert_eq!(batch.positions.len(), 3);
     }

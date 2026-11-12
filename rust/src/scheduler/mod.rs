@@ -7,5 +7,5 @@ pub mod batcher;
 pub mod priority;
 pub mod executor;
 
-pub use batcher::{Batch, ChunkPos, PendingQueue, Priority};
+pub use batcher::{Batch, ChunkPos, ExternalInputs, PendingQueue, Priority};
 pub use executor::{ExecutedBatch, ExecutorThread};

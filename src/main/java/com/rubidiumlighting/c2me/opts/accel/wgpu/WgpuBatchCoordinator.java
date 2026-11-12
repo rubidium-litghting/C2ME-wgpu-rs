@@ -128,8 +128,7 @@ public final class WgpuBatchCoordinator {
     private static final int QUEUE_CAPACITY = 4096;
     private final BlockingQueue<Job> queue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
     private final long worldHandle;
-    /** Kept so shutdown() can join them. Null in serial (non-pipeline) mode,
-     *  where run() does the completion inline and no second thread exists. */
+    /** Kept so shutdown() can join them. */
     private final Thread batchThread;
     private final Thread completeThread;
     private volatile boolean running = true;
@@ -175,10 +174,9 @@ public final class WgpuBatchCoordinator {
      */
     private final java.util.concurrent.Semaphore submitPermits =
             new java.util.concurrent.Semaphore(STAGING);
-    /** Pipelining is safe only when there are no CPU-evaluated external
-     *  inputs, because those share one Rust buffer (binding 6) that a later
-     *  batch would overwrite. With externals we fall back to serial. */
-    private final boolean pipeline;
+    // Pipelining is unconditional: the external-input payload (binding 6) is
+    // carried by each batch, so a later batch can no longer overwrite data a
+    // queued one still needs. See computeExternalInputs().
 
     private static final class Inflight {
         final List<Job> batch;
@@ -227,27 +225,17 @@ public final class WgpuBatchCoordinator {
         this.gx = gx; this.gy = gy; this.gz = gz;
         this.cellW = cellW; this.cellH = cellH;
         this.minY = minY;
-        // External inputs force serial submission. This is a correctness
-        // requirement, not just a memory one: the payload travels through the
-        // process-global `world.external_data`, and `submit_async` returns as
-        // soon as the batch is queued — the executor reads that global later,
-        // during prepare. With several batches in flight the next batch's
-        // upload would overwrite the data a queued batch has not consumed yet.
-        // Serial mode blocks until each batch completes, so the global can only
-        // be rewritten after its contents are safely on the GPU.
-        // Fixing this properly means carrying the payload per batch instead of
-        // through shared mutable state; until then, keep modded worlds serial.
-        this.pipeline = externalNodes.isEmpty();
+        // External payloads used to force serial submission because they went
+        // through a process-global `world.external_data` that `submit_async`
+        // only reads later, during prepare. They now travel inside the request
+        // (`WgpuThinBinding.requestChunks`) and are owned by that batch, so the
+        // pipeline is always safe to use.
         this.batchThread = new Thread(this::run, "c2me-wgpu-batch");
         this.batchThread.setDaemon(true);
         this.batchThread.start();
-        if (pipeline) {
-            this.completeThread = new Thread(this::completeLoop, "c2me-wgpu-complete");
-            this.completeThread.setDaemon(true);
-            this.completeThread.start();
-        } else {
-            this.completeThread = null;
-        }
+        this.completeThread = new Thread(this::completeLoop, "c2me-wgpu-complete");
+        this.completeThread.setDaemon(true);
+        this.completeThread.start();
     }
 
     /** Submit one chunk and return a future completed when its result is
@@ -364,11 +352,7 @@ public final class WgpuBatchCoordinator {
                     positions[i * 2 + 1] = job.cz;
                 }
 
-                if (pipeline) {
-                    submit(batch, positions);          // enqueue to inflight
-                } else {
-                    submitAndComplete(batch, positions); // serial (external inputs)
-                }
+                submit(batch, positions);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 return;
@@ -382,12 +366,18 @@ public final class WgpuBatchCoordinator {
     }
 
     /** Evaluate every external subtree at each chunk's corner grid, in the
-     *  exact [chunk][ext][cell] order the WGSL external_inputs[] index uses. */
-    private void uploadExternalInputs(List<Job> batch) {
+     *  exact [chunk][ext][cell] order the WGSL external_inputs[] index uses.
+     *
+     *  <p>Returns {@code null} when the dimension has no CPU-evaluated
+     *  subtrees (binding 6 is never read). The values are passed straight to
+     *  {@link WgpuThinBinding#requestChunks} and copied into the Rust batch, so
+     *  they stay valid for as long as that batch is queued — no shared state
+     *  is involved, which is what lets several batches be in flight. */
+    private float[] computeExternalInputs(List<Job> batch) {
         int numExt = externalNodes.size();
         if (numExt == 0) {
-            // No external subtrees: binding 6 is never read, skip the FFM call.
-            return;
+            // No external subtrees: binding 6 is never read, skip the work.
+            return null;
         }
         int cellsPerChunk = gx * gy * gz;
         float[] data = new float[batch.size() * numExt * cellsPerChunk];
@@ -411,17 +401,18 @@ public final class WgpuBatchCoordinator {
                 }
             }
         }
-        WgpuThinBinding.setExternalInputs(worldHandle, numExt, data);
+        return data;
     }
 
-    /** Upload externals (no-op when none) and submit the batch to Rust.
+    /** Evaluate externals and submit the batch to Rust.
      *  Returns the in-flight record, or null if the request could not be
      *  issued — in that case the batch's futures have already been failed. */
     private Inflight submitRequest(List<Job> batch, int[] positions) {
-        uploadExternalInputs(batch);
+        float[] externals = computeExternalInputs(batch);
         long req;
         try {
-            req = WgpuThinBinding.requestChunks(worldHandle, positions);
+            req = WgpuThinBinding.requestChunks(
+                    worldHandle, positions, externalNodes.size(), externals);
         } catch (Throwable t) {
             failAll(batch, t);
             return null;
@@ -457,15 +448,6 @@ public final class WgpuBatchCoordinator {
             // The batch is dropped, so no completion will ever run for it.
             ACTIVE_REQUESTS.decrementAndGet();
             throw ie;
-        }
-    }
-
-    /** Serial mode (external inputs present): submit then wait inline. */
-    private void submitAndComplete(List<Job> batch, int[] positions) {
-        long t0 = System.nanoTime();
-        Inflight ib = submitRequest(batch, positions);
-        if (ib != null) {
-            completeTracked(ib, t0);
         }
     }
 

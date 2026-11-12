@@ -1,7 +1,7 @@
 # C2ME WGPU 加速模块 — 开发文档
 
 > 最后更新：2026-11-12
-> 状态：**0.1.5、0.1.6 已发布；0.1.7 开发中（最新 `0.1.7-alpha.6`，未发布）**。
+> 状态：**0.1.5、0.1.6 已发布；0.1.7 开发中（最新 `0.1.7-alpha.7`，未发布）**。
 >
 > **已发布**
 > - **0.1.6**：修掉 modded 世界（暮色森林 / Tectonic）的死锁与全虚空问题，并把
@@ -33,6 +33,13 @@
 >   加载地形界面也看得到。数据走 Rust 侧拉取式快照，见教训 #52。**已实机验证**
 >   （清空 `~/.cache/c2me/wgpu_pipelines` 后冷编译，覆盖层在加载地形界面上可见、
 >   逐 shard 前进、结束即消失）。
+> - `alpha.7`：external payload 改为**随批次携带**。`c2me_wgpu_request_chunks`
+>   新增 `(external_count, external_ptr, external_len)`，Rust 把它拷进
+>   `Batch.externals`，executor 只读这一份；进程级的 `world.external_data` /
+>   `c2me_wgpu_set_external_inputs` 已删除。因此有 CPU 外置节点的维度
+>   （暮色森林等）也能走流水线，`WgpuBatchCoordinator` 的串行分支整段移除。
+>   payload 长度与 positions 不匹配时直接报错，而不是静默错位地形（教训 #54）。
+>   Rust 侧 e2e 测试 `external_payload_travels_with_batch` 覆盖。
 >
 > **实测基线**（细节见 §9 / §10 / §11 / §13.7；跨组数据不可直接比较，见教训 #45）
 > - 桌面端端到端反超纯 CPU（Chunky r=500，RADV RENOIR）：**18 s vs 23 s**
@@ -393,6 +400,25 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     回归才可以随便新建世界。同理，临时插桩（例如 sleep）只会改时间线，不会改
     生成结果——先排除"世界/种子/维度"三个变量，再怀疑代码。
 
+54. **跨线程/跨阶段的数据必须由消费它的那次请求拥有，别放在进程级全局状态里**：
+    external payload（绑定 6）原本挂在 `WorldContext` 上，靠
+    `c2me_wgpu_set_external_inputs` 在每次 `request_chunks` 前覆盖一次。串行
+    执行时这没问题；一旦允许流水线（`submit_async` 入队即返回、executor 稍后
+    才在 prepare 阶段读它），"入队顺序"和"消费顺序"就解耦了，第二批的 upload
+    会覆盖第一批还没消费的数据——地形错位且不报错。这也是当时有 external 节点
+    就强制串行的原因。
+    判据很简单：**"写入者"和"读取者"不在同一个调用栈、且生命周期需要跨过返回
+    点，就不能共享可变全局**。改法是把 payload 作为参数随请求拷进 `Batch`，
+    让它的生命周期与那次 GPU 提交绑定；副作用是 FFI 签名变化（旧 native 链接
+    失败，属可接受的预发布不兼容），好处是串行分支和随之而来的"外部维度没有
+    流水线收益"的例外一并消失。新增测试
+    `external_payload_travels_with_batch` 用两个不同 payload 的批次断言回读值
+    逐 cell 一致。
+    另外：payload 长度必须与最终批次的 chunk 数严格校验（`chunks × slots ×
+    cells`）。`flush()` 会排序去重，若调用方按自己的列表构造 payload 而队列里
+    恰好还有别人的 chunk，长度对不上就是静默错位——宁可报错回退，也不要生成
+    一张"看起来正常但错了一层"的地形。
+
 ### 版本记录与 0.1.7+ 待办
 
 **0.1.4 已完全解决的历史遗留（存档记录）**
@@ -551,17 +577,18 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   持有 `Blender` / `StructureAccessor` / sampler，风险远高于阶段 2，暂不做。
 
 **0.1.7+ 待办**
-- [ ] **让 external payload 随批次携带**（而非走进程级 `world.external_data`）。
-  目前 `WgpuBatchCoordinator.pipeline = externalNodes.isEmpty()`：有 external
+- [x] **让 external payload 随批次携带**（而非走进程级 `world.external_data`）。
+  原先 `WgpuBatchCoordinator.pipeline = externalNodes.isEmpty()`：有 external
   节点时强制串行提交。这不只是省内存，更是**防数据竞争**——`submit_async`
   入队即返回，executor 稍后才在 prepare 阶段读全局数据，多批次在途时下一批
-  的 upload 会覆盖前一批尚未消费的内容。
-  代价：external 少的维度（如暮色森林，4 个节点）拿不到流水线化收益，
-  按 §9 的 A/B 大约是端到端 10%、CPU 占用 70%→50% 的损失。
-  **（注：10% / 70%→50% 为 §9 的 0.1.5 数据；0.1.6 引入有界队列后
-  未复测，实施前需重新 A/B。）**
-  修法是把 payload 从共享可变状态改成按批次传递（要动 FFI 签名与 Rust 侧
-  缓冲区分配），属于结构性改动。
+  的 upload 会覆盖前一批尚未消费的内容。修法即把 payload 从共享可变状态改成
+  按批次传递：`request_chunks(world, positions, external_count, external_ptr,
+  external_len)` → `Batch.externals = Some(ExternalInputs { per_chunk, data })`
+  → `prepare` 只写这一批自己的 buffer（池化的 `external` buffer 仍按需增长，
+  小批次只写前缀）。FFI 签名变更，旧 native 会链接失败（模块报 symbol
+  mismatch），随版本号一起升级。
+  **收益未复测**：0.1.5 的 A/B 是端到端 10%、CPU 70%→50%；0.1.6 引入有界队列
+  后未重跑，external 维度的真实收益仍待实机 A/B。
 
 ### 待测与验证计划（不属于版本功能）
 
@@ -817,7 +844,9 @@ Loom 不重映射字符串常量，运行期类名是 intermediary（`class_6916
 
 ### 3.2 序列化协议（blob 布局）
 下行（Java → Rust）是固定参数的 C 函数，外加 `c2me_wgpu_set_aquifer_table` /
-`c2me_wgpu_set_beard_table` / `c2me_wgpu_set_external_inputs` 推入的整表数据；
+`c2me_wgpu_set_beard_table` 推入的整表数据；external（CPU 外置节点）的值不再
+走单独 setter，而是作为 `c2me_wgpu_request_chunks` 的参数随该批次一起传入
+（0.1.7-alpha.7，见教训 #54）；
 上行（GPU → Java）只有一个聚合 blob，布局见 §3.4。旧的 per-chunk `ResultBlob`
 map 已不在生产路径上（§12）。
 
@@ -957,6 +986,9 @@ BlockOut shard 首次跑通（GPU 输出 per-block 状态字节），16s。
    `finish` 时归还。
    `output_buf`/`block_buf` **刻意不池化**：每批写入后在同一 command buffer 内
    copy 到 staging，GPU 的提交顺序本身就保证了安全。
+   注（0.1.7-alpha.7）：external 的**数据源**不再是被覆盖的进程级全局，而是
+   `Batch.externals`（随请求拷入）；池化的 `external` buffer 只是承载它的容器，
+   因此有 CPU 外置节点的维度也能安全地多批次在途（教训 #54）。
 
 **实测（Chunky r=500，原版地形，RADV RENOIR）**：
 

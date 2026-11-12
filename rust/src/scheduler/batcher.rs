@@ -33,14 +33,45 @@ pub enum Priority {
     Background = 2,
 }
 
+impl Default for Priority {
+    fn default() -> Self {
+        // Only used by `Batch::default()`, i.e. test fixtures and the
+        // empty-request path; the queue always overwrites it with the real
+        // minimum priority of the pending positions.
+        Priority::Background
+    }
+}
+
+/// CPU-evaluated external-input values travelling with one batch.
+///
+/// The shader reads binding 6 as `[chunk][slot][cell]`, so the payload's
+/// lifetime must match the batch that needs it. It used to live in a
+/// process-global `WorldContext` field instead, which forced external worlds
+/// to submit serially: `submit_async` returns as soon as the batch is queued,
+/// but the executor only reads the global later, during prepare — a second
+/// batch would overwrite data the first had not consumed yet. Owning the
+/// payload here removes that constraint (DEVELOPMENT §9).
+#[derive(Debug, Clone, Default)]
+pub struct ExternalInputs {
+    /// Slots per chunk — the index space the serializer assigned to
+    /// CPU-evaluated subtrees (`NoiseRouterBlobifier.EXTERNAL_NODES` size).
+    pub per_chunk: u32,
+    /// `[chunk][slot][cell]`, `per_chunk * cells_per_chunk` values per chunk.
+    pub data: Vec<f32>,
+}
+
 /// A batch of chunk requests, ready for GPU dispatch.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Batch {
     /// Sorted list of (cx, cz) positions in this batch.
     pub positions: Vec<(i32, i32)>,
     /// Priority of the highest-priority chunk in the batch (used for
     /// scheduler ordering).
     pub max_priority: Priority,
+    /// Values for binding 6 for exactly these chunks, or `None` when the
+    /// dimension has no CPU-evaluated subtrees. Owned by the batch so that
+    /// several batches can be in flight or queued at once.
+    pub externals: Option<ExternalInputs>,
 }
 
 /// Accumulates chunk requests until a batch is full or a timeout expires.
@@ -135,6 +166,7 @@ impl PendingQueue {
         Some(Batch {
             positions,
             max_priority,
+            externals: None,
         })
     }
 

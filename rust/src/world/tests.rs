@@ -823,7 +823,7 @@ fn block_out_executor_smoke() {
     let world = Arc::new(ctx);
     let exec = ExecutorThread::spawn(
         Arc::new(inst.device.clone()), Arc::new(inst.queue.clone()), Default::default()).unwrap();
-    let batch = Batch { positions: vec![(0, 0), (1, 0), (0, 1)], max_priority: Priority::Normal };
+    let batch = Batch { positions: vec![(0, 0), (1, 0), (0, 1)], max_priority: Priority::Normal, ..Batch::default() };
     let r = exec.request_chunks(world.clone(), batch).unwrap();
     println!("results={} block_data_len={}", r.results.len(), r.block_data.len());
     let mut hist = std::collections::BTreeMap::<u32, usize>::new();
@@ -900,6 +900,7 @@ fn gpu_end_to_end_test() {
     let batch = Batch {
         positions: vec![(0, 0)],
         max_priority: Priority::Normal,
+        ..Batch::default()
     };
 
     let result = executor.request_chunks(world_arc, batch).unwrap();
@@ -1029,6 +1030,7 @@ fn gpu_performance_benchmark() {
         let batch = Batch {
             positions: chunk_slice.to_vec(),
             max_priority: Priority::Normal,
+        ..Batch::default()
         };
 
         let result = executor.request_chunks(world_arc.clone(), batch).unwrap();
@@ -1370,6 +1372,7 @@ fn build_run_blob(
     let batch = Batch {
         positions: vec![(0, 0)],
         max_priority: Priority::Normal,
+        ..Batch::default()
     };
     let result = executor.request_chunks(world_arc, batch).unwrap();
     let blob_result = result.results.values().next().unwrap();
@@ -1378,6 +1381,97 @@ fn build_run_blob(
     (0..2425)
         .map(|i| f32::from_le_bytes(payload[i * 4..i * 4 + 4].try_into().unwrap()))
         .collect()
+}
+
+/// A blob shaped like a dimension whose density tree contains one node the
+/// serializer cannot translate: `finalDensity` (ch11) is a bare
+/// `ExternalInput{0}` on the 13-channel sharded layout.
+///
+/// Channels 0..10 and 12 are constants because sharded mode only evaluates
+/// ch11 / ch12; the Pass E split moves the external node into a corner shard,
+/// so the GPU has exactly one binding-6 read and no other source of values.
+fn external_only_blob() -> Vec<u8> {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&[0x4D, 0x43, 0x32, 0x57, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    blob.push(0xFE); // Root
+    blob.extend_from_slice(&13u16.to_le_bytes()); // 13 channels
+    for _ in 0..11 {
+        blob.push(0x01); // Constant(0.0)
+        blob.extend_from_slice(&0.0f32.to_le_bytes());
+    }
+    blob.push(0xFD); // ch11 = ExternalInput{ index: 0 }
+    blob.extend_from_slice(&0i32.to_le_bytes());
+    blob.push(0x01); // ch12 = Constant(0.0)
+    blob.extend_from_slice(&0.0f32.to_le_bytes());
+    // SHAPE_CONFIG: vanilla overworld, 4×4 cells.
+    blob.extend_from_slice(&(-64i32).to_le_bytes());
+    blob.extend_from_slice(&384i32.to_le_bytes());
+    blob.extend_from_slice(&4i32.to_le_bytes());
+    blob.extend_from_slice(&4i32.to_le_bytes());
+    blob.push(0xF0); // BiomeTree
+    blob.extend_from_slice(&123456789i64.to_le_bytes());
+    blob
+}
+
+/// The external payload belongs to the batch, not to the world: two batches
+/// carrying different values must come back with their own values, even
+/// though they reuse the same pooled input buffers.
+#[test]
+fn external_payload_travels_with_batch() {
+    use crate::instance::WgpuInstance;
+    use crate::scheduler::batcher::{Batch, ExternalInputs, Priority};
+    use crate::scheduler::executor::ExecutorThread;
+    use crate::world::WorldContext;
+    use std::sync::Arc;
+
+    let mut ctx = WorldContext::new(&external_only_blob()).unwrap();
+    let cells = ctx.cells_per_chunk();
+    assert_eq!(cells, 2425, "5 × 97 × 5 corner lattice");
+
+    let instance = WgpuInstance::instance().unwrap();
+    ctx.compile_pipeline(&instance.device).unwrap();
+    let world = Arc::new(ctx);
+    let executor = ExecutorThread::spawn(
+        Arc::new(instance.device.clone()),
+        Arc::new(instance.queue.clone()),
+        Default::default(),
+    )
+    .unwrap();
+
+    // Distinct per-cell patterns, so a stale buffer (or a shifted index) shows
+    // up as a mismatch rather than as a plausible constant.
+    let pattern = |base: f32| -> Vec<f32> {
+        (0..cells).map(|i| base + (i % 37) as f32 * 0.125).collect()
+    };
+
+    let run = |data: Vec<f32>| -> Vec<f32> {
+        let batch = Batch {
+            positions: vec![(0, 0)],
+            max_priority: Priority::Normal,
+            externals: Some(ExternalInputs { per_chunk: 1, data }),
+        };
+        let result = executor.request_chunks(world.clone(), batch).unwrap();
+        let bytes = result.results.values().next().unwrap().as_bytes();
+        // ResultBlob header (8 B) + 16 channel offsets (128 B).
+        let payload = &bytes[0x88..];
+        (0..cells)
+            .map(|i| f32::from_le_bytes(payload[i * 4..i * 4 + 4].try_into().unwrap()))
+            .collect()
+    };
+
+    for base in [0.25f32, -0.75] {
+        let sent = pattern(base);
+        let got = run(sent.clone());
+        let max_diff = sent
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-5,
+            "batch payload (base {base}) not consumed: max_diff={max_diff:e}"
+        );
+    }
 }
 
 #[test]
@@ -1608,6 +1702,7 @@ fn numerical_validation_double_stack_multioctave() {
     let batch = Batch {
         positions: vec![(0, 0)],
         max_priority: Priority::Normal,
+        ..Batch::default()
     };
     let result = executor.request_chunks(world_arc, batch).unwrap();
     let blob_result = result.results.values().next().unwrap();
@@ -1750,6 +1845,7 @@ fn build_run_blob_origin(
     let batch = Batch {
         positions: vec![(0, 0)],
         max_priority: Priority::Normal,
+        ..Batch::default()
     };
     let result = executor.request_chunks(world_arc, batch).unwrap();
     let br = result.results.values().next().unwrap();
@@ -1883,6 +1979,7 @@ fn cross_end_mc_reference() {
     let batch = Batch {
         positions: vec![(0, 0)],
         max_priority: Priority::Normal,
+        ..Batch::default()
     };
     let result = executor.request_chunks(world_arc, batch).unwrap();
     let br = result.results.values().next().unwrap();
@@ -1992,6 +2089,7 @@ fn numerical_validation_shifted_noise() {
     let batch = Batch {
         positions: vec![(1, 0)],
         max_priority: Priority::Normal,
+        ..Batch::default()
     };
     let result = executor.request_chunks(world_arc, batch).unwrap();
     let br = result.results.values().next().unwrap();
@@ -2116,6 +2214,7 @@ fn numerical_validation_spline() {
     let batch = Batch {
         positions: vec![(1, 0)],
         max_priority: Priority::Normal,
+        ..Batch::default()
     };
     let result = executor.request_chunks(world_arc, batch).unwrap();
     let br = result.results.values().next().unwrap();
@@ -2315,6 +2414,7 @@ fn numerical_validation_noise_vs_gpu() {
     let batch = Batch {
         positions: vec![(0, 0)],
         max_priority: Priority::Normal,
+        ..Batch::default()
     };
     let result = executor.request_chunks(world_arc, batch).unwrap();
     let blob_result = result.results.values().next().unwrap();
@@ -2494,6 +2594,7 @@ fn real_router_vs_vanilla() {
     let batch = Batch {
         positions: vec![chunk],
         max_priority: Priority::Normal,
+        ..Batch::default()
     };
     let result = executor.request_chunks(world_arc, batch).unwrap();
     let br = result.results.values().next().unwrap();
@@ -2708,7 +2809,7 @@ fn cpu_f32_vs_gpu() {
     let world_arc = Arc::new(ctx);
     let executor = ExecutorThread::spawn(
         Arc::new(instance.device.clone()), Arc::new(instance.queue.clone()), Default::default()).unwrap();
-    let batch = Batch { positions: vec![(cx, cz)], max_priority: Priority::Normal };
+    let batch = Batch { positions: vec![(cx, cz)], max_priority: Priority::Normal, ..Batch::default() };
     let result = executor.request_chunks(world_arc, batch).unwrap();
     let br = result.results.values().next().unwrap();
     let payload = &br.as_bytes()[0x88..];
@@ -2870,7 +2971,7 @@ fn end_islands_cpu_vs_gpu() {
     println!("EndIslands: hitting chunk = {:?} (cpu={:.4})",
              cpos, cpu_end_islands(&perm, cpos.0 * 16, cpos.1 * 16));
 
-    let batch = Batch { positions: vec![cpos], max_priority: Priority::Normal };
+    let batch = Batch { positions: vec![cpos], max_priority: Priority::Normal, ..Batch::default() };
     let result = executor.request_chunks(world_arc, batch).unwrap();
     let br = result.results.get(&(((cpos.0 as i64) << 32) | (cpos.1 as i64 & 0xFFFFFFFF)))
         .unwrap();

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use crate::error::write_err;
 use crate::instance::WgpuInstance;
 use crate::result::ResultBlob;
-use crate::scheduler::batcher::{Batch, ChunkPos, Priority};
+use crate::scheduler::batcher::{ChunkPos, Priority};
 use crate::scheduler::executor::{ExecutorThread, ExecutorConfig};
 use crate::scheduler::PendingQueue;
 use crate::world::WorldContext;
@@ -549,14 +549,25 @@ pub extern "C" fn c2me_wgpu_compile_progress() -> i64 {
 /// the executor thread. Returns a BatchRequest handle that can be
 /// polled for completion status.
 ///
+/// `external_count` / `external_ptr` carry the CPU-evaluated external-input
+/// values **for this batch**, laid out `[chunk][slot][cell]` in the same
+/// chunk order as `positions_ptr`. They travel with the batch instead of
+/// going through a process-global, so several batches can be in flight at
+/// once (DEVELOPMENT §9). Pass a null pointer and 0 when the dimension has no
+/// external subtrees.
+///
 /// # Safety
 /// `positions_ptr` must point to `position_count * 2` packed i32 values:
-/// [cx0, cz0, cx1, cz1, ...].
+/// [cx0, cz0, cx1, cz1, ...]. `external_ptr` must point to `external_len`
+/// readable f32 values, or be null with `external_len == 0`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2me_wgpu_request_chunks(
     world_h: i64,
     positions_ptr: *const i32,
     position_count: i32,
+    external_count: i32,
+    external_ptr: *const f32,
+    external_len: usize,
     err_buf: *mut c_char,
     err_buf_len: usize,
 ) -> i64 {
@@ -579,9 +590,22 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
         unsafe { std::slice::from_raw_parts(positions_ptr, n) }
     };
 
+    // External-input payload for exactly this batch (borrowed; copied into the
+    // batch below so it outlives this call).
+    let externals: &[f32] = if external_ptr.is_null() {
+        if external_len != 0 {
+            unsafe { write_err(err_buf, err_buf_len,
+                "external_ptr null but external_len>0") };
+            return 0;
+        }
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(external_ptr, external_len) }
+    };
+
     // 1. Push each chunk into the pending queue.
     let queue = get_pending_queue();
-    let batch = {
+    let mut batch = {
         let mut queue_guard = match queue.lock() {
             Ok(g) => g,
             Err(e) => {
@@ -603,11 +627,35 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
         }
 
         // 2. Flush the queue into a batch.
-        queue_guard.flush().unwrap_or_else(|| Batch {
-            positions: Vec::new(),
-            max_priority: Priority::Background,
-        })
+        queue_guard.flush().unwrap_or_default()
     };
+
+    // 2b. Attach the payload to the batch that was actually flushed, and
+    //     verify it lines up. `positions` is sorted + deduped by `flush()`, so
+    //     the chunk-major payload the caller built for its own sorted list
+    //     matches only when nothing else was pending. Anything else means the
+    //     shader would read shifted values — silently wrong terrain — so fail
+    //     loudly instead.
+    {
+        let per_chunk = external_count.max(0) as usize;
+        let n_chunks = batch.positions.len();
+        let expected = per_chunk * n_chunks * world_arc.cells_per_chunk();
+        if externals.len() != expected {
+            let msg = format!(
+                "external payload mismatch: got {} f32, expected {} \
+                 ({} chunks x {} slots x {} cells)",
+                externals.len(), expected, n_chunks, per_chunk,
+                world_arc.cells_per_chunk());
+            unsafe { write_err(err_buf, err_buf_len, &msg) };
+            return 0;
+        }
+        if per_chunk > 0 && expected > 0 {
+            batch.externals = Some(crate::scheduler::ExternalInputs {
+                per_chunk: per_chunk as u32,
+                data: externals.to_vec(),
+            });
+        }
+    }
 
     if batch.positions.is_empty() {
         let req = Box::new(BatchRequest {
@@ -820,31 +868,7 @@ pub unsafe extern "C" fn c2me_wgpu_free_result_blob(ptr: *mut u8, len: usize) {
 }
 
 // ---------------------------------------------------------------------------
-// ⑦ Set CPU-evaluated external-input values for the given world.
-//
-/// # Safety
-/// `data_ptr` must point to `data_len` f32 values (or be null with len 0).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn c2me_wgpu_set_external_inputs(
-    world_h: i64,
-    count: i32,
-    data_ptr: *const f32,
-    data_len: usize,
-) -> i32 {
-    let world_arc = match resolve_world(world_h) {
-        Ok(arc) => arc,
-        Err(_) => return STATUS_INVALID_HANDLE,
-    };
-    let data: Vec<f32> = if data_ptr.is_null() {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(data_ptr, data_len) }.to_vec()
-    };
-    world_arc.set_external_inputs(count.max(0) as usize, data);
-    0
-}
-
-// ⑧ Set a per-chunk aquifer table (called by Java before a request).
+// ⑦ Set a per-chunk aquifer table (called by Java before a request).
 //
 /// `table_ptr` points to `table_len` bytes of the Java-serialized compact
 /// table (magic + n + seedLo/Hi + per-cell lvl_y/state). Copied into the

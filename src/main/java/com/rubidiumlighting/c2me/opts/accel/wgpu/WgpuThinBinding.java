@@ -67,7 +67,6 @@ public class WgpuThinBinding {
     private static MethodHandle MH_take_result_blob;
     private static MethodHandle MH_take_block_blob;
     private static MethodHandle MH_free_result_blob;
-    private static MethodHandle MH_set_external_inputs;
     private static MethodHandle MH_set_aquifer_table;
     private static MethodHandle MH_set_beard_table;
     private static MethodHandle MH_set_aquifer_mode;
@@ -281,6 +280,9 @@ public class WgpuThinBinding {
                             ValueLayout.JAVA_LONG,       // world_h: i64
                             ValueLayout.ADDRESS,         // positions_ptr: *const i32 (packed cx,cz)
                             ValueLayout.JAVA_INT,        // position_count: i32
+                            ValueLayout.JAVA_INT,        // external_count: i32 (slots per chunk)
+                            ValueLayout.ADDRESS,         // external_ptr: *const f32
+                            ValueLayout.JAVA_LONG,       // external_len: usize
                             ValueLayout.ADDRESS,         // err_buf: *mut c_char
                             ValueLayout.JAVA_LONG        // err_buf_len: usize
                     )
@@ -319,17 +321,6 @@ public class WgpuThinBinding {
                     FunctionDescriptor.ofVoid(
                             ValueLayout.ADDRESS,         // ptr: *mut u8
                             ValueLayout.JAVA_LONG        // len: usize
-                    )
-            );
-
-            MH_set_external_inputs = NativeLoader.linker.downcallHandle(
-                    NativeLoader.lookup.find("c2me_wgpu_set_external_inputs").orElseThrow(),
-                    FunctionDescriptor.of(
-                            ValueLayout.JAVA_INT,        // -> i32 status
-                            ValueLayout.JAVA_LONG,       // world_h: i64
-                            ValueLayout.JAVA_INT,        // count: i32
-                            ValueLayout.ADDRESS,         // data_ptr: *const f32
-                            ValueLayout.JAVA_LONG        // data_len: usize
                     )
             );
 
@@ -755,35 +746,38 @@ public class WgpuThinBinding {
         }
     }
 
-    public static void setExternalInputs(long worldH, int count, float[] data) {
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment dataSeg = (data != null && data.length > 0)
-                    ? arena.allocateFrom(ValueLayout.JAVA_FLOAT, data)
-                    : MemorySegment.NULL;
-            long len = (data != null) ? data.length : 0;
-            int st = (int) MH_set_external_inputs.invokeExact(
-                    worldH,
-                    count,
-                    dataSeg,
-                    len
-            );
-            if (st != 0) {
-                throw new RuntimeException("[c2me-wgpu] set_external_inputs status=" + st);
-            }
-        } catch (Throwable t) {
-            if (t instanceof RuntimeException re) throw re;
-            throw new RuntimeException(t);
-        }
-    }
-
-    public static long requestChunks(long worldH, int[] positions) {
+    /**
+     * Submit a batch of chunks plus the CPU-evaluated external-input values
+     * that belong to exactly this batch.
+     *
+     * <p>The payload travels with the request instead of through a
+     * process-global setter, so several batches can be in flight: the native
+     * side copies it into the batch and the executor only reads that copy.
+     *
+     * @param positions  packed chunk coords `[cx0, cz0, cx1, cz1, ...]`,
+     *                   already sorted the way the native queue sorts them
+     * @param externalCount slots per chunk (0 when the dimension has no
+     *                      CPU-evaluated subtrees)
+     * @param externals  `[chunk][slot][cell]` values matching {@code positions},
+     *                   or {@code null} when {@code externalCount == 0}
+     */
+    public static long requestChunks(long worldH, int[] positions,
+                                     int externalCount, float[] externals) {
         try (Arena arena = Arena.ofConfined(); Arena errArena = Arena.ofConfined()) {
             MemorySegment posSeg = arena.allocateFrom(ValueLayout.JAVA_INT, positions);
+            boolean hasExt = externalCount > 0 && externals != null && externals.length > 0;
+            MemorySegment extSeg = hasExt
+                    ? arena.allocateFrom(ValueLayout.JAVA_FLOAT, externals)
+                    : MemorySegment.NULL;
+            long extLen = hasExt ? externals.length : 0L;
             MemorySegment errBuf = errArena.allocate(1024);
             long h = (long) MH_request_chunks.invokeExact(
                     worldH,
                     posSeg,
                     positions.length / 2,
+                    hasExt ? externalCount : 0,
+                    extSeg,
+                    extLen,
                     errBuf,
                     errBuf.byteSize()
             );

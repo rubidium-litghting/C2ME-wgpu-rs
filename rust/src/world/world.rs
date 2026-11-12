@@ -59,11 +59,6 @@ pub struct WorldContext {
     pub(crate) beard_weight_buffer: Option<wgpu::Buffer>,
     /// GPU-side per-entry origin buffer (binding 3), f32 x3 per entry.
     pub(crate) origin_buffer: Option<wgpu::Buffer>,
-    /// Number of CPU-evaluated (external) subtrees in this world's AST.
-    pub(crate) external_count: std::sync::atomic::AtomicUsize,
-    /// CPU-computed values for those subtrees, laid out
-    /// [chunk][ext][cell]. Uploaded to binding 6 before each dispatch.
-    pub(crate) external_data: std::sync::Mutex<Vec<f32>>,
     /// §8.4 Step B: per-chunk aquifer tables, keyed by (cx, cz). Each value is
     /// the compact Java-serialized table (magic + n + seedLo/Hi + per-cell
     /// lvl_y/state). Set via `c2me_wgpu_set_aquifer_table` before a request.
@@ -252,8 +247,6 @@ impl WorldContext {
             simplex_buffer: None,
             beard_weight_buffer: None,
             origin_buffer: None,
-            external_count: std::sync::atomic::AtomicUsize::new(0),
-            external_data: std::sync::Mutex::new(Vec::new()),
             aquifer_tables: std::sync::Mutex::new(std::collections::HashMap::new()),
             beard_tables: std::sync::Mutex::new(std::collections::HashMap::new()),
             aquifer_mode: std::sync::Mutex::new(AquiferMode::default()),
@@ -417,14 +410,6 @@ impl WorldContext {
 
     /// Borrow the uploaded permutation buffer (binding 1), if
     /// `compile_pipeline` has been called.
-    /// Record CPU-computed external-input values (flat [chunk][ext][cell]).
-    /// Called by Java right before a batch dispatch.
-    pub fn set_external_inputs(&self, count: usize, data: Vec<f32>) {
-        self.external_count
-            .store(count, std::sync::atomic::Ordering::Relaxed);
-        *self.external_data.lock().unwrap() = data;
-    }
-
     /// Corner-grid cells per chunk for this world's shape:
     /// cell_count_x * cell_count_y * cell_count_z, where
     ///   cell_count = 16/cell_width + 1  (x, z)  and
@@ -459,14 +444,6 @@ impl WorldContext {
         let gy = self.shape.height / ch + 1;
         let gz = 16 / cw + 1;
         (gx * gy * gz) as usize
-    }
-
-    pub fn external_count(&self) -> usize {
-        self.external_count.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub fn external_data(&self) -> Vec<f32> {
-        self.external_data.lock().unwrap().clone()
     }
 
     pub fn perm_buffer(&self) -> Option<&wgpu::Buffer> {
