@@ -1,6 +1,6 @@
 # C2ME WGPU 加速模块 — 开发文档
 
-> 最后更新：2026-11-13
+> 最后更新：2026-11-14
 > 状态：**0.1.5、0.1.6 已发布；0.1.7 已通过 Fabric 与 NeoForge（+Connector，含 Tectonic）实机验证，tag `v0.1.7` 已推送（Release 页面由维护者发布）**。
 >
 > **已发布 / 已打 tag**
@@ -60,7 +60,7 @@
 >   表现为悬空板块、被切断的悬崖（教训 #56）。顺带把原版形状（高度 384）的缓冲
 >   占用降下来：block buffer 32 MiB→25 MB，每份 staging ≈145→≈115 MB。
 >   遗留：批次上限（64）与 external 节点上限（64）仍是代码里的魔数，没有按
->   设备实际限额反推，见下方 0.1.7+ 待办（同一形状下 cell 高=4 时 `b2_out`
+>   设备实际限额反推，见下方 0.1.8+ 待办（同一形状下 cell 高=4 时 `b2_out`
 >   会超 128 MiB）。
 > - `0.1.7` 收尾：可读性整理 + 一处泄漏修复。`executor.rs`
 >   的缓冲尺寸算术集中到 `BufferSizes::for_config`，bind group 改用
@@ -76,6 +76,10 @@
 > 0.1.7 的全部改动都已合入 `main` 并打了 tag `v0.1.7`；
 > `feature/chunk-status-integration` 只是历史分支（比 `main` 落后 18 个提交、
 > 无独有提交）。
+>
+> **0.1.8（开发中）**
+> - aquifer 预留量改为按 shape 推导：原版 384 高从写死的 1200 降到 315
+>   cells/chunk，Tectonic 832 高为 657，修掉约 2000+ 高维度上传时的写越界。
 >
 > **实测基线**（细节见 §9 / §10 / §11 / §13.7；跨组数据不可直接比较，见教训 #45）
 > - 桌面端端到端反超纯 CPU（Chunky r=500，RADV RENOIR）：**18 s vs 23 s**
@@ -531,7 +535,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     - 结论被推翻时，把**更正**写回原处（教训 #39/#44、NF-1 表、README），
       而不是只在新版本里加一句——否则读旧章节的人仍会得到错误结论。
 
-### 版本记录与 0.1.7+ 待办
+### 版本记录与 0.1.8+ 待办
 
 **0.1.4 已完全解决的历史遗留（存档记录）**
 - ✅ **interpolated 边界 bug**（§15.2.2）：通过 Pass E 架构（拆解 nonlinear outer 树与 InnerRef 角点）解决，Epic Terrain/Tectonic 地形完全正常。
@@ -703,7 +707,20 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   收敛调度依赖，每个成员仍各自构建 `ChunkNoiseSampler`；要进一步必须自己
   持有 `Blender` / `StructureAccessor` / sampler，风险远高于阶段 2，暂不做。
 
-**0.1.7+ 待办**
+**0.1.8（未发版）**
+- [x] **aquifer 预留量按 shape 推导**：binding 8 原先写死
+  `AQ_MAX_CELLS_PER_CHUNK = 1200`（按原版 512 高估），维度到约 2000+ 高时
+  `upload_aquifer_tables` 会写越界。现在 `ShapeConfig::aquifer_cells_per_chunk()`
+  由 `size_y = (min_y+height)/12 - min_y/12 + 3` 推出（×9），`ExecutorConfig`
+  携带该值，`fits()` 把它纳入 executor 重建条件；同时 `upload_aquifer_tables`
+  和缓冲分配共用同一个函数，不会再各算一份。原版 384 高从 1200 降到
+  315/chunk，Tectonic 832 高为 657/chunk；日志的 `sized_for` 增加 aquifer cells。
+  单测：`aquifer_cells_follow_the_shape`、`aquifer_reservation_tracks_the_shape`。
+  实机验证（2026-11-14，Fabric 与 NeoForge+Connector，均 Tectonic 832 高）：
+  两边的 `sized_for` 都是 `2625 cells/chunk / 212992 blocks/chunk / 657
+  aquifer cells/chunk`，executor 只创建一次，无 validation error、无回退。
+
+**0.1.8+ 待办**
 - [ ] **能力上限从设备实际限额反推，别写死在代码里**（alpha.9 遗留的口子）。
   alpha.9 让缓冲尺寸跟着形状走，等于把"能用/不能用"变成形状的函数，但代码里
   仍有一批魔数在替设备做决定：
@@ -722,12 +739,6 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   buffer_limit / 每 chunk 总字节)`，按形状和设备限额算；Java 通过一个只读
   FFM 查询拿到这个上限再攒批（否则 `prepare_batch` 的"容纳不下"会让 Java
   一批一批地失败）。external 的 64 同理，应由每个节点每 chunk 的角点字节数算出。
-  **同一类问题还有一处**：`AQ_MAX_CELLS_PER_CHUNK = 1200`（binding 8 的 aquifer
-  预留量）仍是写死的。它按原版 512 高、12 格高的 aquifer 网格（≈1179/chunk）取的，
-  Tectonic 832 高实际只需 657/chunk，所以现在没暴露；但维度高度到约 2000+ 时
-  单 chunk 的 aquifer 单元数就会超过 1200，`upload_aquifer_tables` 会写越界。
-  应当和 `blocks_per_chunk` 一样由 `shape` 推出：`size_y = (min_y+height)/12 -
-  min_y/12 + 3`，再乘以 9。
   **关键前提**：必须用 **device** 的限额，不是 adapter 的。设备是用
   `required_limits = wgpu::Limits::default()` 创建的，adapter 报 2047 MiB 也
   不起作用，真正的 ceiling 就是 WebGPU 默认的 128/256 MiB。
@@ -750,7 +761,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   NeoForge+Connector 下都已实测能正常跑 GPU（alpha.8，2026-11-13，教训 #55/#57）。
   去重后 65–200 这个区间还没有任何实测样本：需要构造 65–200 个**不同实例**的
   世界来验证上限与性能。上限本身应当由设备限额与每节点每 chunk 的角点字节数
-  算出，而不是固定 64（见 0.1.7+ 待办 ·「能力上限从设备实际限额反推」）。
+  算出，而不是固定 64（见 0.1.8+ 待办 ·「能力上限从设备实际限额反推」）。
 - [x] ~~**Connector 下 shader 膨胀的来源未查清**~~ **已结案（2026-11-13）**：
   膨胀就是 732 个 external 槽位造成的。同一台机器、同一 Tectonic 3.0.28、
   同一 832 高维度，去重到 2 个槽位后 shader 与 Fabric 原生**逐字节相同**
@@ -767,7 +778,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   CPU 对照（暮色森林或 Tectonic）。在此之前不要对外引用 external 维度的
   提速百分比。
 
-### 借鉴官方 OpenCL 模块的优化点（0.1.7+ 任务池）
+### 借鉴官方 OpenCL 模块的优化点（0.1.8+ 任务池）
 
 官方 CL 模块（见本地 `~/Documents/C2ME/C2ME-fabric/c2me-opts-accel-opencl`）
 在架构上比我们走得更远（4x4 空间批处理、全链路 GPU 化）。结合 ARR 协议与

@@ -406,6 +406,28 @@ pub struct ShapeConfig {
     pub cell_height: i32,
 }
 
+impl ShapeConfig {
+    /// Vertical aquifer layers needed to cover the world at vanilla's 12-block
+    /// vertical spacing, plus the three layers it reserves around the range.
+    ///
+    /// This is the `size_y` of the staged aquifer table (see
+    /// `AquiferTable::parse`), not the density grid's `height / cell_height`.
+    pub fn aquifer_layers(&self) -> i32 {
+        let top = self.min_y.saturating_add(self.height);
+        top.div_euclid(12) - self.min_y.div_euclid(12) + 3
+    }
+
+    /// Aquifer table cells per chunk: a 3×3 grid in X/Z (48 blocks at vanilla
+    /// 16-block columns) times [`Self::aquifer_layers`].
+    ///
+    /// Must track the shape rather than a fixed 1200 reservation: the table is
+    /// uploaded into a buffer sized for `cells × max_batch`, and a dimension
+    /// taller than ~2000 blocks has more cells than that.
+    pub fn aquifer_cells_per_chunk(&self) -> usize {
+        (self.aquifer_layers().max(1) as usize) * 9
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,5 +848,22 @@ mod tests {
             0xF0, 0x00, 0x15, 0xCD, 0x5B, 0x07, 0x00, 0x00, 0x00,
         ];
         assert_eq!(built, manual, "mod blob no longer matches the wire format");
+    }
+
+    /// Aquifer reservations the executor used to hardcode as 1200.
+    #[test]
+    fn aquifer_cells_follow_the_shape() {
+        let vanilla = ShapeConfig { min_y: -64, height: 384, cell_width: 4, cell_height: 4 };
+        // (320 / 12) - (-64 / 12) + 3 = 26 + 6 + 3 = 35 layers, 3×3 per layer.
+        assert_eq!(vanilla.aquifer_layers(), 35);
+        assert_eq!(vanilla.aquifer_cells_per_chunk(), 315);
+
+        let tectonic = ShapeConfig { min_y: -64, height: 832, cell_width: 4, cell_height: 8 };
+        // 768 / 12 = 64, minus floor(-64/12) = -6, plus 3 => 73.
+        assert_eq!(tectonic.aquifer_cells_per_chunk(), 657);
+
+        // Tall enough that the old fixed 1200 would have overrun the buffer.
+        let tall = ShapeConfig { min_y: -64, height: 2048, cell_width: 4, cell_height: 4 };
+        assert!(tall.aquifer_cells_per_chunk() > 1200);
     }
 }

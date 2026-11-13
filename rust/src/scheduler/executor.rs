@@ -48,10 +48,10 @@ const BEARD_STRIDE: usize = 4096;
 /// ahead of the per-batch `pj` section.
 const BEARD_WEIGHT_WORDS: usize = 24 * 24 * 24;
 
-/// Aquifer cells per chunk reserved in the binding-8 buffer. Vanilla tops out
-/// near 1179 (`3 * 131 * 3` at height 512 with 12-block cells); this is a
-/// memory reservation, not a validation limit.
-const AQ_MAX_CELLS_PER_CHUNK: usize = 1200;
+/// Aquifer cells per chunk assumed by [`ExecutorConfig::default`]. Only the
+/// test/offline path uses it; production derives the real value from the shape
+/// via [`ShapeConfig::aquifer_cells_per_chunk`].
+const AQ_DEFAULT_CELLS_PER_CHUNK: usize = 1200;
 
 /// Height in blocks for this world's shape (`16 * H * 16` blocks/chunk).
 fn shape_height(world: &WorldContext) -> u32 { world.shape().height.max(1) as u32 }
@@ -82,6 +82,14 @@ pub struct ExecutorConfig {
     /// Blocks per chunk (`16 * height * 16`) for the BlockOut buffer (binding
     /// 7, u32 per block). Same rebuild-on-growth rule as `cells_per_chunk`.
     pub blocks_per_chunk: usize,
+    /// Aquifer cells per chunk (binding 8) of this shape, from
+    /// [`ShapeConfig::aquifer_cells_per_chunk`].
+    ///
+    /// The buffer holds one `vec4` pair per cell per batch. A fixed
+    /// reservation (1200) covered vanilla and Tectonic but overran once the
+    /// dimension reached ~2000 blocks, so this follows the shape like the
+    /// other buffer sizes.
+    pub aquifer_cells_per_chunk: usize,
 }
 
 impl Default for ExecutorConfig {
@@ -98,6 +106,7 @@ impl Default for ExecutorConfig {
             // offline blobs, which use a 384-block, cell_height=4 grid.
             cells_per_chunk: 5 * 129 * 5,
             blocks_per_chunk: 16 * 512 * 16,
+            aquifer_cells_per_chunk: AQ_DEFAULT_CELLS_PER_CHUNK,
         }
     }
 }
@@ -256,6 +265,7 @@ impl BufferSizes {
         let max_batch = config.max_batch_size.max(1);
         let cells_per_chunk = config.cells_per_chunk.max(1);
         let blocks_per_chunk = config.blocks_per_chunk.max(1);
+        let aquifer_cells_per_chunk = config.aquifer_cells_per_chunk.max(1);
         let output = TOTAL_CHANNELS * cells_per_chunk * 4 * max_batch;
         let block = blocks_per_chunk * 4 * max_batch;
         Self {
@@ -264,7 +274,7 @@ impl BufferSizes {
             output,
             block,
             staging: output + block,
-            aquifer_entries: AQ_MAX_CELLS_PER_CHUNK * max_batch,
+            aquifer_entries: aquifer_cells_per_chunk * max_batch,
             beard: ((BEARD_WEIGHT_WORDS + BEARD_STRIDE * max_batch) * 4) as u64,
         }
     }
@@ -314,7 +324,7 @@ impl SingleBatchExecutor {
         crate::debug_log_line(&format!(
             "[c2me-wgpu-rs] executor buffers: output={} MiB, block={} MiB, staging={} MiB x{}, \
              input_sets={} x (aquifer={} KiB, beard={} KiB), max_batch={}, \
-             sized_for={} cells/chunk / {} blocks/chunk",
+             sized_for={} cells/chunk / {} blocks/chunk / {} aquifer cells/chunk",
             mib(sizes.output),
             mib(sizes.block),
             mib(sizes.staging),
@@ -325,6 +335,7 @@ impl SingleBatchExecutor {
             config.max_batch_size,
             sizes.cells_per_chunk,
             sizes.blocks_per_chunk,
+            config.aquifer_cells_per_chunk,
         ));
 
         Ok(Self {
@@ -931,10 +942,9 @@ impl SingleBatchExecutor {
         let mut aq_s: Vec<u32> = Vec::new();
         if let Ok(mut tables) = world.aquifer_tables.lock() {
             let min_y = shape.min_y;
-            let height = shape.height;
             let start_y = min_y.div_euclid(12) - 1;
-            let size_y = (min_y + height).div_euclid(12) - min_y.div_euclid(12) + 3;
-            let cells_per_chunk = (size_y * 9) as usize;
+            let size_y = shape.aquifer_layers();
+            let cells_per_chunk = shape.aquifer_cells_per_chunk();
             for &(cx, cz) in &batch.positions {
                 let before = aq_p.len();
                 // Consume: remove so the map does not grow unboundedly.
@@ -1058,6 +1068,10 @@ pub struct ExecutorThread {
     /// more must rebuild the executor; see `c_api::get_or_create_executor`.
     cells_per_chunk: usize,
     blocks_per_chunk: usize,
+    /// Aquifer cells per chunk, tracked separately: a shape can keep the same
+    /// density grid while needing a different aquifer table (different min_y
+    /// at the same height), and the binding-8 buffer must still hold it.
+    aquifer_cells_per_chunk: usize,
 }
 
 enum ExecutorMessage {
@@ -1085,8 +1099,9 @@ impl ExecutorThread {
         config: ExecutorConfig,
     ) -> Result<Self, String> {
         let (sender, receiver) = channel::bounded(4);
-        let (cells_per_chunk, blocks_per_chunk) =
-            (config.cells_per_chunk.max(1), config.blocks_per_chunk.max(1));
+        let cells_per_chunk = config.cells_per_chunk.max(1);
+        let blocks_per_chunk = config.blocks_per_chunk.max(1);
+        let aquifer_cells_per_chunk = config.aquifer_cells_per_chunk.max(1);
 
         // Startup handshake: the worker owns buffer allocation, which can fail
         // (OOM, unsupported limit). Without this, spawn() would return Ok while
@@ -1119,6 +1134,7 @@ impl ExecutorThread {
                 sender,
                 cells_per_chunk,
                 blocks_per_chunk,
+                aquifer_cells_per_chunk,
             }),
             Ok(Err(e)) => {
                 let _ = handle.join();
@@ -1133,8 +1149,15 @@ impl ExecutorThread {
 
     /// True when the persistent buffers cover a grid of this shape, so a batch
     /// from that world can be prepared without reallocating.
-    pub fn fits(&self, cells_per_chunk: usize, blocks_per_chunk: usize) -> bool {
-        cells_per_chunk <= self.cells_per_chunk && blocks_per_chunk <= self.blocks_per_chunk
+    pub fn fits(
+        &self,
+        cells_per_chunk: usize,
+        blocks_per_chunk: usize,
+        aquifer_cells_per_chunk: usize,
+    ) -> bool {
+        cells_per_chunk <= self.cells_per_chunk
+            && blocks_per_chunk <= self.blocks_per_chunk
+            && aquifer_cells_per_chunk <= self.aquifer_cells_per_chunk
     }
 
     /// Submit a batch synchronously (blocking) and return the result.
@@ -1345,5 +1368,28 @@ mod tests {
             ..Batch::default()
         };
         assert_eq!(batch.positions.len(), 3);
+    }
+
+    /// The binding-8 reservation must follow the shape, not the old 1200 cap.
+    #[test]
+    fn aquifer_reservation_tracks_the_shape() {
+        let vanilla = ShapeConfig { min_y: -64, height: 384, cell_width: 4, cell_height: 4 };
+        let cfg = ExecutorConfig {
+            max_batch_size: 8,
+            aquifer_cells_per_chunk: vanilla.aquifer_cells_per_chunk(),
+            ..ExecutorConfig::default()
+        };
+        assert_eq!(BufferSizes::for_config(&cfg).aquifer_entries, 315 * 8);
+
+        let tall = ShapeConfig { min_y: -64, height: 2048, cell_width: 4, cell_height: 4 };
+        let cfg = ExecutorConfig {
+            max_batch_size: 8,
+            aquifer_cells_per_chunk: tall.aquifer_cells_per_chunk(),
+            ..ExecutorConfig::default()
+        };
+        assert!(
+            BufferSizes::for_config(&cfg).aquifer_entries > AQ_DEFAULT_CELLS_PER_CHUNK * 8,
+            "a 2048-block dimension needs more room than the old fixed reservation"
+        );
     }
 }

@@ -77,9 +77,10 @@ static EXECUTOR: parking_lot::RwLock<Option<Arc<ExecutorThread>>> =
 fn get_or_create_executor(
     cells_per_chunk: usize,
     blocks_per_chunk: usize,
+    aquifer_cells_per_chunk: usize,
 ) -> Result<Arc<ExecutorThread>, String> {
     if let Some(e) = EXECUTOR.read().as_ref() {
-        if e.fits(cells_per_chunk, blocks_per_chunk) {
+        if e.fits(cells_per_chunk, blocks_per_chunk, aquifer_cells_per_chunk) {
             return Ok(Arc::clone(e));
         }
     }
@@ -90,12 +91,13 @@ fn get_or_create_executor(
     let config = ExecutorConfig {
         cells_per_chunk: cells_per_chunk.max(1),
         blocks_per_chunk: blocks_per_chunk.max(1),
+        aquifer_cells_per_chunk: aquifer_cells_per_chunk.max(1),
         ..ExecutorConfig::default()
     };
 
     let mut guard = EXECUTOR.write();
     if let Some(existing) = guard.as_ref() {
-        if existing.fits(cells_per_chunk, blocks_per_chunk) {
+        if existing.fits(cells_per_chunk, blocks_per_chunk, aquifer_cells_per_chunk) {
             return Ok(Arc::clone(existing));
         }
     }
@@ -712,8 +714,15 @@ pub unsafe extern "C" fn c2me_wgpu_request_chunks(
     let cells_per_chunk = world_arc.cells_per_chunk();
     // BlockOut writes one u32 per block, `16 * height * 16` per chunk.
     let blocks_per_chunk = 16usize * world_arc.shape().height.max(1) as usize * 16;
+    // The aquifer table is a 3×3 grid of 12-block layers, so it scales with
+    // min_y/height rather than with the density cell size.
+    let aquifer_cells_per_chunk = world_arc.shape().aquifer_cells_per_chunk();
 
-    let executor = match get_or_create_executor(cells_per_chunk, blocks_per_chunk) {
+    let executor = match get_or_create_executor(
+        cells_per_chunk,
+        blocks_per_chunk,
+        aquifer_cells_per_chunk,
+    ) {
         Ok(e) => e,
         Err(_e) => {
             req.status.store(STATUS_ERROR, Ordering::Release);
