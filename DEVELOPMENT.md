@@ -1,9 +1,12 @@
 # C2ME WGPU 加速模块 — 开发文档
 
 > 最后更新：2026-11-13
-> 状态：**0.1.5、0.1.6 已发布；0.1.7 已通过 Fabric 与 NeoForge（+Connector，含 Tectonic）实机验证，版本号已提升为 `0.1.7`，待打 tag 发布**。
+> 状态：**0.1.5、0.1.6 已发布；0.1.7 已通过 Fabric 与 NeoForge（+Connector，含 Tectonic）实机验证，tag `v0.1.7` 已推送（Release 页面由维护者发布）**。
 >
-> **已发布**
+> **已发布 / 已打 tag**
+> - **0.1.7**：对齐批次（同种子 4×4 13 s）、shader 编译覆盖层、external 按实例
+>   去重、NeoForge + Connector 下的 Tectonic 修正为可走 GPU、批次解码失败的
+>   资源泄漏修复。tag `v0.1.7` 已推送；Release 页面由维护者另行发布。
 > - **0.1.6**：修掉 modded 世界（暮色森林 / Tectonic）的死锁与全虚空问题，并把
 >   shader/pipeline 编译失败从"静默死锁"改为"该维度回退 CPU + 玩家可读提示"。
 > - **0.1.5**：完整实现 Pass E、GPU 矿脉、100% 对齐原版的 AquiferSampler 逻辑，
@@ -59,7 +62,7 @@
 >   遗留：批次上限（64）与 external 节点上限（64）仍是代码里的魔数，没有按
 >   设备实际限额反推，见下方 0.1.7+ 待办（同一形状下 cell 高=4 时 `b2_out`
 >   会超 128 MiB）。
-> - `alpha.9` 之后（未单独发 alpha）：可读性整理 + 两处健壮性修正。`executor.rs`
+> - `0.1.7` 收尾：可读性整理 + 一处泄漏修复。`executor.rs`
 >   的缓冲尺寸算术集中到 `BufferSizes::for_config`，bind group 改用
 >   `binding(index, buf)` 简写，beard/aquifer 的重复魔数提为具名常量；
 >   `StagingChain::consume` 换成可重入的 `recycle`（任意阶段都可归还，未完成的
@@ -67,9 +70,12 @@
 >   input set。原先 `read_results` 的 `?` 会把两者永久借出——shutdown 超时那条
 >   路径正好会走到，raw 模式还会对未就绪的 slot 调 `consume`。Java 侧
 >   `MAX_EXTERNAL_NODES` 提为类常量并清理全限定名。
+>   验证：`cargo test` 91 passed / 7 ignored；五平台 native 全部重建；
+>   Fabric 与 NeoForge+Connector 实机通过。
 >
-> 0.1.7 的全部改动都已合入 `main`；`feature/chunk-status-integration` 只是历史
-> 分支（比 `main` 落后 18 个提交、无独有提交），发版从 `main` 打 tag 即可。
+> 0.1.7 的全部改动都已合入 `main` 并打了 tag `v0.1.7`；
+> `feature/chunk-status-integration` 只是历史分支（比 `main` 落后 18 个提交、
+> 无独有提交）。
 >
 > **实测基线**（细节见 §9 / §10 / §11 / §13.7；跨组数据不可直接比较，见教训 #45）
 > - 桌面端端到端反超纯 CPU（Chunky r=500，RADV RENOIR）：**18 s vs 23 s**
@@ -644,8 +650,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 > 含修复的真正压力验证是 NF-3。大规模 GPU vs CPU 对照（B-5，同 4225/400c 口径）
 > 尚未跑。
 
-**0.1.7：C2ME chunk-status 接入**（原 `feature/chunk-status-integration` 分支已
-全部合入 `main`，发版以 `main` 为准）
+**0.1.7（tag `v0.1.7` 已推送）：C2ME chunk-status 接入**（原
+`feature/chunk-status-integration` 分支已全部合入 `main`）
 
 - [x] **阶段 1：打通官方扩展点（透明委托）**。通过 `MixinNewStatusHook` 在 C2ME
   注册原版 `NOISE` delegate 之前插入 `WgpuNoiseStatus`；该状态的
@@ -679,23 +685,25 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   实机验证方式：清空磁盘管线缓存（`rm -rf ~/.cache/c2me/wgpu_pipelines`）后
   进新维度，覆盖层持续 1–3 s；日志里 `compile overlay shown` / `hidden`
   成对出现。**热缓存下只有约 50 ms，看不见是正常的**，不要据此判断功能失效。
+- [x] **external payload 随批次携带（alpha.7）**，不再走进程级
+  `world.external_data`。原先只有 `pipeline = externalNodes.isEmpty()` 时才流水线：
+  有 CPU 外置节点就强制串行。串行不只是慢，更是**数据竞争**——`submit_async`
+  入队即返回，executor 稍后才在 prepare 阶段读全局数据，多批次在途时下一批的
+  upload 会覆盖前一批尚未消费的内容。现在 payload 随
+  `request_chunks(world, positions, external_count, external_ptr, external_len)`
+  进入 `Batch.externals`，executor 只读自己这一份（池化的 external buffer 仍
+  按需增长，小批次只写前缀）；进程级接口与串行分支均已删除。FFI 签名变更，
+  旧 native 会链接失败（模块报 symbol mismatch），随版本号升级。Rust e2e 测试
+  `external_payload_travels_with_batch` 覆盖。
+- [x] **收尾整理与泄漏修复**：`executor.rs` 的缓冲尺寸算术集中到
+  `BufferSizes::for_config`、bind group 改用 `binding()` 简写、beard/aquifer
+  魔数提为具名常量；`StagingChain::recycle` 让解码失败时也归还 staging slot 与
+  input set，修掉 shutdown 超时路径的泄漏。行为不变，详见顶部 0.1.7 记录。
 - [ ] **阶段 3：批内真正共享采样上下文**（官方 CL 的剩余收益）。当前批次只
   收敛调度依赖，每个成员仍各自构建 `ChunkNoiseSampler`；要进一步必须自己
   持有 `Blender` / `StructureAccessor` / sampler，风险远高于阶段 2，暂不做。
 
 **0.1.7+ 待办**
-- [x] **让 external payload 随批次携带**（而非走进程级 `world.external_data`）。
-  原先 `WgpuBatchCoordinator.pipeline = externalNodes.isEmpty()`：有 external
-  节点时强制串行提交。这不只是省内存，更是**防数据竞争**——`submit_async`
-  入队即返回，executor 稍后才在 prepare 阶段读全局数据，多批次在途时下一批
-  的 upload 会覆盖前一批尚未消费的内容。修法即把 payload 从共享可变状态改成
-  按批次传递：`request_chunks(world, positions, external_count, external_ptr,
-  external_len)` → `Batch.externals = Some(ExternalInputs { per_chunk, data })`
-  → `prepare` 只写这一批自己的 buffer（池化的 `external` buffer 仍按需增长，
-  小批次只写前缀）。FFI 签名变更，旧 native 会链接失败（模块报 symbol
-  mismatch），随版本号一起升级。
-  **收益未复测**：0.1.5 的 A/B 是端到端 10%、CPU 70%→50%；0.1.6 引入有界队列
-  后未重跑，external 维度的真实收益仍待实机 A/B。
 - [ ] **能力上限从设备实际限额反推，别写死在代码里**（alpha.9 遗留的口子）。
   alpha.9 让缓冲尺寸跟着形状走，等于把"能用/不能用"变成形状的函数，但代码里
   仍有一批魔数在替设备做决定：
@@ -737,11 +745,12 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 - [ ] Android 实机回归：0.1.6 引入的 external 上限、barrier split、通知时机都
   只在桌面验证过，移动端未测。
 - [ ] external 节点数 65–200 的中间地带：阈值 64 原本是拿"4 正常 / 732 回退"
-  两端之间拍的，但 732 其实是**引用数**，按实例去重后 Tectonic 只有 7 个
-  （alpha.8，教训 #55；能否真跑 GPU 待实机确认）。去重后这个区间还没有任何
-  实测样本：需要构造 65–200 个**不同实例**的世界来验证上限与性能。上限本身
-  应当由设备限额与每节点每 chunk 的角点字节数算出，而不是固定 64（见 0.1.7+
-  待办 ·「能力上限从设备实际限额反推」）。
+  两端之间拍的，但 732 其实是**引用数**：按实例去重后，Tectonic 3.0.28 在本维度
+  只有 2 个槽位（jar 里定义 7 个 `config_noise`，其余不参与该维度），Fabric 与
+  NeoForge+Connector 下都已实测能正常跑 GPU（alpha.8，2026-11-13，教训 #55/#57）。
+  去重后 65–200 这个区间还没有任何实测样本：需要构造 65–200 个**不同实例**的
+  世界来验证上限与性能。上限本身应当由设备限额与每节点每 chunk 的角点字节数
+  算出，而不是固定 64（见 0.1.7+ 待办 ·「能力上限从设备实际限额反推」）。
 - [x] ~~**Connector 下 shader 膨胀的来源未查清**~~ **已结案（2026-11-13）**：
   膨胀就是 732 个 external 槽位造成的。同一台机器、同一 Tectonic 3.0.28、
   同一 832 高维度，去重到 2 个槽位后 shader 与 Fabric 原生**逐字节相同**
@@ -751,6 +760,12 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   于是错误地排除了 external 这个原因；实测每个槽位在 inner shard 里带的是一整段
   取值表达式（≈26 行/槽），732 × 26 ≈ 1.9 万行，吻合。
   **教训**：估算"某类节点只占 O(1) 行"之前，先量一行到底有多长。
+- [ ] external 维度的吞吐复测：0.1.5 那次 A/B 是端到端 +10%、CPU 占用
+  70%→50%；之后 0.1.6 换成有界队列、0.1.7-alpha.7 又把 payload 改成随批次
+  携带并删掉了"有外置节点就串行提交"的分支，两次都没重跑。现在 external
+  维度也能流水线，理论上收益应大于 0.1.5 那次，需要同种子、同视距的 GPU vs
+  CPU 对照（暮色森林或 Tectonic）。在此之前不要对外引用 external 维度的
+  提速百分比。
 
 ### 借鉴官方 OpenCL 模块的优化点（0.1.7+ 任务池）
 
