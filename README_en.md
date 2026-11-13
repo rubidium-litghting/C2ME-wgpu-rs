@@ -6,6 +6,8 @@ This is a companion mod for [C2ME](https://modrinth.com/mod/c2me-fabric) that of
 
 > **English** | [简体中文](README.md)
 
+> Repository: [GitHub](https://github.com/rubidium-litghting/C2ME-wgpu-rs) · Gitee mirror: [rubidium-lighting/C2ME-wgpu-rs](https://gitee.com/rubidium-lighting/C2ME-wgpu-rs) (please file issues and PRs on GitHub)
+
 > ⚠️ **Experimental — read before installing.**
 > The mod now offloads the entire density pipeline (noise, aquifer, beardifier) to the GPU and emits block states directly; the CPU only writes the chunk palette.
 > On a desktop AMD integrated GPU (RADV), the end-to-end Chunky test (r=500, 4225 chunks) takes about 18 s, against roughly 23 s for C2ME on CPU alone.

@@ -6,6 +6,8 @@
 
 > [English](README_en.md) | **简体中文**
 
+> 仓库：[GitHub](https://github.com/rubidium-litghting/C2ME-wgpu-rs) · Gitee 镜像：[rubidium-lighting/C2ME-wgpu-rs](https://gitee.com/rubidium-lighting/C2ME-wgpu-rs)（issue 与 PR 请提到 GitHub）
+
 > ⚠️ **实验性功能 — 安装前请阅读。** 
 > 本模组现已将整个密度管线（噪声、含水层、结构地基）卸载至 GPU 并直接输出方块状态；CPU 仅负责写入区块调色板。
 > 在桌面端 AMD 核显 (RADV) 上，Chunky 端到端测试 (r=500, 4225 区块) 耗时约 18 秒，而纯 CPU 跑 C2ME 约需 23 秒。

@@ -8,9 +8,9 @@
     "RubidiumLighting"
   ],
   "contact": {
-    "homepage": "https://gitee.com/rubidium-lighting/C2ME-wgpu-rs",
-    "sources": "https://gitee.com/rubidium-lighting/C2ME-wgpu-rs",
-    "issues": "https://gitee.com/rubidium-lighting/C2ME-wgpu-rs/issues"
+    "homepage": "https://github.com/rubidium-litghting/C2ME-wgpu-rs",
+    "sources": "https://github.com/rubidium-litghting/C2ME-wgpu-rs",
+    "issues": "https://github.com/rubidium-litghting/C2ME-wgpu-rs/issues"
   },
   "license": "MIT",
   "icon": "assets/c2me-opts-accel-wgpu/icon.png",
