@@ -4,7 +4,7 @@
 //! State machine per staging buffer:
 //!   A = GPU computation in flight (buffer locked as OUTPUT)
 //!   B = dispatch completed, data copied to CPU
-//!   C = CPU consumed → return to buffer_pool.
+//!   C = CPU consumed → returned to the executor's free list.
 //!
 //! In wgpu 30 (no more explicit Fence), we use `device.poll(PollType::Wait)`
 //! to synchronize, and we copy the GPU buffer contents to a CPU-side Vec

@@ -80,6 +80,8 @@
 > **0.1.8（开发中）**
 > - aquifer 预留量改为按 shape 推导：原版 384 高从写死的 1200 降到 315
 >   cells/chunk，Tectonic 832 高为 657，修掉约 2000+ 高维度上传时的写越界。
+> - aquifer 上传加显式越界检查（失败整批，不再交给 wgpu 校验后丢命令）。
+> - 删除从未被引用的 `resources::buffer_pool`，缓冲复用只剩定槽位模型。
 >
 > **实测基线**（细节见 §9 / §10 / §11 / §13.7；跨组数据不可直接比较，见教训 #45）
 > - 桌面端端到端反超纯 CPU（Chunky r=500，RADV RENOIR）：**18 s vs 23 s**
@@ -719,6 +721,14 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   实机验证（2026-11-14，Fabric 与 NeoForge+Connector，均 Tectonic 832 高）：
   两边的 `sized_for` 都是 `2625 cells/chunk / 212992 blocks/chunk / 657
   aquifer cells/chunk`，executor 只创建一次，无 validation error、无回退。
+- [x] **aquifer 上传加显式越界检查**：`upload_aquifer_tables` 改为返回
+  `Result`，写入前用 `aq_p + aq_s` 的实际字节数比对 binding 8 的容量，越界就
+  失败整批，而不是交给 wgpu 校验——校验失败会丢掉整条 command buffer，症状是
+  脏地形而不是报错。`prepare_batch` 原有的容量检查同时把 aquifer cells/chunk
+  纳入。单测：`aquifer_upload_matches_the_buffer_at_max_batch`。
+- [x] **删除未被引用的 `resources::buffer_pool`**：核查发现它从未被任何代码
+  使用（真正的复用是定槽位的 `InputBufferSet` 与 `StagingChain`），详见下方
+  “显存池按用途分类”一条的结论。
 
 **0.1.8+ 待办**
 - [ ] **能力上限从设备实际限额反推，别写死在代码里**（alpha.9 遗留的口子）。
@@ -821,11 +831,16 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     在 coordinator 里调参数没用。
 
 #### 🟡 中难度：逻辑重构（需要严格实机验证）
-- [ ] **显存池按“用途”分类隔离**
-  * 官方 `CLBufferCache` 严格按用途（如 Biome、BlockState 等）分桶，不混用。
-  * 咱们 Rust 侧的 `BufferPool` 目前按 `(usage, size)` 做 LRU。可以借鉴其
-    “严格分类”的思路，确保高频输入（external/aquifer）与输出（block_out）
-    绝不会因为尺寸碰巧一致而被错误复用，进一步杜绝数据串流 bug。
+- [x] ~~**显存池按“用途”分类隔离**~~ **核查后不适用（2026-11-14）**：
+  * 这条原判断基于 `resources/buffer_pool.rs` 的 `(usage, size)` 键控 LRU 池，
+    但该模块自建库起**从未被任何代码引用**（`git log -S` 只找到它自己的创建
+    提交，executor 里也从未导入），属于残留的死代码，文档把它当成了在用的实现。
+  * 真正在用的复用全是**定槽位**：`executor::InputBufferSet`（params / positions /
+    aquifer / beard / external 各是独立字段，尺寸在 executor 建好时定死）和
+    `StagingChain` 的 fence 链。任何缓冲都不会按尺寸跨用途传递，所以"输出缓冲
+    被当成输入复用"在当前架构里不可能发生，不需要额外分桶。
+  * 处理：删除该死模块（`resources/mod.rs` 里写清现在的复用模型）。若以后真要
+    引入按尺寸的池，再按用途分桶——别恢复这个键。
 - [x] **表面高度估算预计算（Estimate Surface Height）——已实测，结案（§14）**
   * 实测（`debug_height_probe`，同种子 r=500）：**696 次调用 / 1.58 s**，
     0.165 次/区块，单次 2.2 ms，重复率 6%，约一半与在途 GPU 批次重叠。

@@ -488,6 +488,10 @@ impl SingleBatchExecutor {
             (num_chunks as usize) * blocks_per_chunk * 4
         } else { 0 };
         let total_bytes = density_bytes + block_bytes;
+        // Binding 8 is sized for `aquifer_cells_per_chunk × max_batch`, so the
+        // per-chunk count is the part that has to fit here; the per-batch
+        // product is checked again in `upload_aquifer_tables` itself.
+        let aquifer_cells_per_chunk = world.shape().aquifer_cells_per_chunk();
 
         // The buffers were sized from this dimension's grid when the executor
         // was built (see `get_or_create_executor`). If a batch ever needs
@@ -497,14 +501,17 @@ impl SingleBatchExecutor {
         // terrain with 832-block Tectonic worlds).
         if cells_per_chunk > self.config.cells_per_chunk
             || blocks_per_chunk > self.config.blocks_per_chunk
+            || aquifer_cells_per_chunk > self.config.aquifer_cells_per_chunk
             || total_bytes > self.staging.slot_size()
         {
             return Err(format!(
-                "batch does not fit the executor buffers: need {} cells/chunk and {} blocks/chunk \
-                 (density {} B + block {} B), executor sized for {} cells/chunk and {} blocks/chunk \
-                 ({} B staging)",
-                cells_per_chunk, blocks_per_chunk, density_bytes, block_bytes,
+                "batch does not fit the executor buffers: need {} cells/chunk, {} blocks/chunk \
+                 and {} aquifer cells/chunk (density {} B + block {} B), executor sized for \
+                 {} cells/chunk, {} blocks/chunk and {} aquifer cells/chunk ({} B staging)",
+                cells_per_chunk, blocks_per_chunk, aquifer_cells_per_chunk,
+                density_bytes, block_bytes,
                 self.config.cells_per_chunk, self.config.blocks_per_chunk,
+                self.config.aquifer_cells_per_chunk,
                 self.staging.slot_size()));
         }
 
@@ -517,8 +524,9 @@ impl SingleBatchExecutor {
         let ext_buf = Self::ensure_external_buffer(
             &self.device, &self.queue, &mut self.pool.sets[buf_set],
             batch.externals.as_ref());
-        if let Some(aq_n) = Self::upload_aquifer_tables(
-            &self.queue, &mut self.pool.sets[buf_set], world, batch, shape) {
+        let aquifer_cells = Self::upload_aquifer_tables(
+            &self.queue, &mut self.pool.sets[buf_set], world, batch, shape)?;
+        if let Some(aq_n) = aquifer_cells {
             // aq_s half-offset: only the first `aq_n` vec4 entries were
             // written, so the state half starts at index `aq_n`.
             params._pad[10] = aq_n as u32;
@@ -924,27 +932,31 @@ impl SingleBatchExecutor {
     /// Expand and upload the per-chunk aquifer tables (binding 8). Returns
     /// `Some(n)` with the `aq_p` cell count written, or `None` if no table was
     /// staged for any chunk in the batch.
+    ///
+    /// Fails instead of overrunning the buffer: wgpu would otherwise discard
+    /// the whole command buffer, which shows up as stale terrain rather than
+    /// as an error.
     fn upload_aquifer_tables(
         queue: &wgpu::Queue,
         set: &mut InputBufferSet,
         world: &WorldContext,
         batch: &Batch,
         shape: &ShapeConfig,
-    ) -> Option<usize> {
+    ) -> Result<Option<usize>, String> {
         // Dimensions without aquifers (Nether/End) legitimately have no
         // tables. Skip the whole expansion: writing padded zero cells would
         // only make the shader fall through to "no cell found" for every
         // block, and logging it would spam once per chunk.
         if !world.aquifer_mode().has_aquifers {
-            return None;
+            return Ok(None);
         }
+        let cells_per_chunk = shape.aquifer_cells_per_chunk();
         let mut aq_p: Vec<[i32; 4]> = Vec::new();
         let mut aq_s: Vec<u32> = Vec::new();
         if let Ok(mut tables) = world.aquifer_tables.lock() {
             let min_y = shape.min_y;
             let start_y = min_y.div_euclid(12) - 1;
             let size_y = shape.aquifer_layers();
-            let cells_per_chunk = shape.aquifer_cells_per_chunk();
             for &(cx, cz) in &batch.positions {
                 let before = aq_p.len();
                 // Consume: remove so the map does not grow unboundedly.
@@ -977,15 +989,24 @@ impl SingleBatchExecutor {
             }
         }
         if aq_p.is_empty() {
-            return None;
+            return Ok(None);
         }
         // [ aq_p (vec4) | aq_s padded to vec4 (state in .x) ]
         let n = aq_p.len();
         let mut merged: Vec<[i32; 4]> = Vec::with_capacity(n * 2);
         merged.extend_from_slice(&aq_p);
         merged.extend(aq_s.iter().map(|&st| [st as i32, 0, 0, 0]));
+        let needed = merged.len() * 16;
+        let capacity = set.aquifer.size() as usize;
+        if needed > capacity {
+            return Err(format!(
+                "aquifer tables do not fit the input buffer: {} chunks need {} cells \
+                 ({needed} B), buffer holds {} cells ({capacity} B); executor was sized \
+                 for {cells_per_chunk} aquifer cells/chunk",
+                batch.positions.len(), n, capacity / 32));
+        }
         queue.write_buffer(&set.aquifer, 0, bytemuck::cast_slice(&merged));
-        Some(n)
+        Ok(Some(n))
     }
 
     /// Pack and upload the per-chunk Beardifier data (binding 9). Each chunk
@@ -1368,6 +1389,30 @@ mod tests {
             ..Batch::default()
         };
         assert_eq!(batch.positions.len(), 3);
+    }
+
+    /// `upload_aquifer_tables` copies `cells × chunks` pairs of vec4, while the
+    /// buffer is sized from `max_batch`. The upload now fails the batch rather
+    /// than letting wgpu discard it; this pins the two formulas together at the
+    /// largest legal batch, which is the case that must still fit.
+    #[test]
+    fn aquifer_upload_matches_the_buffer_at_max_batch() {
+        let vanilla = ShapeConfig { min_y: -64, height: 384, cell_width: 4, cell_height: 4 };
+        let max_batch = 8;
+        let per_chunk = vanilla.aquifer_cells_per_chunk();
+        let cfg = ExecutorConfig {
+            max_batch_size: max_batch,
+            aquifer_cells_per_chunk: per_chunk,
+            ..ExecutorConfig::default()
+        };
+        let buffer_bytes = BufferSizes::for_config(&cfg).aquifer_entries * 2 * 16;
+        // aq_p + aq_s, both padded to vec4.
+        let needed = per_chunk * max_batch * 2 * 16;
+        assert_eq!(needed, buffer_bytes, "a full batch must fit exactly");
+        assert!(
+            needed + per_chunk * 2 * 16 > buffer_bytes,
+            "the guard must trigger before a batch one chunk larger"
+        );
     }
 
     /// The binding-8 reservation must follow the shape, not the old 1200 cap.
