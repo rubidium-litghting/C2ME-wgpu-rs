@@ -1,6 +1,6 @@
 # C2ME WGPU 加速模块 — 开发文档
 
-> 最后更新：2026-11-12
+> 最后更新：2026-11-13
 > 状态：**0.1.5、0.1.6 已发布；0.1.7 已通过 Fabric 与 NeoForge（+Connector，含 Tectonic）实机验证，版本号已提升为 `0.1.7`，待打 tag 发布**。
 >
 > **已发布**
@@ -59,6 +59,14 @@
 >   遗留：批次上限（64）与 external 节点上限（64）仍是代码里的魔数，没有按
 >   设备实际限额反推，见下方 0.1.7+ 待办（同一形状下 cell 高=4 时 `b2_out`
 >   会超 128 MiB）。
+> - `alpha.9` 之后（未单独发 alpha）：可读性整理 + 两处健壮性修正。`executor.rs`
+>   的缓冲尺寸算术集中到 `BufferSizes::for_config`，bind group 改用
+>   `binding(index, buf)` 简写，beard/aquifer 的重复魔数提为具名常量；
+>   `StagingChain::consume` 换成可重入的 `recycle`（任意阶段都可归还，未完成的
+>   map 由 `unmap` 取消），`finish_batch` 在解码失败时也归还 staging slot 与
+>   input set。原先 `read_results` 的 `?` 会把两者永久借出——shutdown 超时那条
+>   路径正好会走到，raw 模式还会对未就绪的 slot 调 `consume`。Java 侧
+>   `MAX_EXTERNAL_NODES` 提为类常量并清理全限定名。
 >
 > 0.1.7 的全部改动都已合入 `main`；`feature/chunk-status-integration` 只是历史
 > 分支（比 `main` 落后 18 个提交、无独有提交），发版从 `main` 打 tag 即可。
@@ -706,6 +714,12 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   buffer_limit / 每 chunk 总字节)`，按形状和设备限额算；Java 通过一个只读
   FFM 查询拿到这个上限再攒批（否则 `prepare_batch` 的"容纳不下"会让 Java
   一批一批地失败）。external 的 64 同理，应由每个节点每 chunk 的角点字节数算出。
+  **同一类问题还有一处**：`AQ_MAX_CELLS_PER_CHUNK = 1200`（binding 8 的 aquifer
+  预留量）仍是写死的。它按原版 512 高、12 格高的 aquifer 网格（≈1179/chunk）取的，
+  Tectonic 832 高实际只需 657/chunk，所以现在没暴露；但维度高度到约 2000+ 时
+  单 chunk 的 aquifer 单元数就会超过 1200，`upload_aquifer_tables` 会写越界。
+  应当和 `blocks_per_chunk` 一样由 `shape` 推出：`size_y = (min_y+height)/12 -
+  min_y/12 + 3`，再乘以 9。
   **关键前提**：必须用 **device** 的限额，不是 adapter 的。设备是用
   `required_limits = wgpu::Limits::default()` 创建的，adapter 报 2047 MiB 也
   不起作用，真正的 ceiling 就是 WebGPU 默认的 128/256 MiB。

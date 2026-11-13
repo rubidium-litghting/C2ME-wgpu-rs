@@ -319,47 +319,47 @@ public final class WgpuBatchCoordinator {
 
     private void run() {
         try {
-        while (running) {
-            try {
-                Job first = queue.poll(50, TimeUnit.MILLISECONDS);
-                if (first == null) continue;
+            while (running) {
+                try {
+                    Job first = queue.poll(50, TimeUnit.MILLISECONDS);
+                    if (first == null) continue;
 
-                List<Job> batch = new ArrayList<>();
-                batch.add(first);
-                // Brief window for other workers to pile on. If the queue is
-                // already non-empty, poll() returns immediately, so this only
-                // actually waits when there is nothing more to take.
-                long deadline = System.nanoTime() + MAX_WAIT_MS * 1_000_000L;
-                while (batch.size() < MAX_BATCH) {
-                    long remain = deadline - System.nanoTime();
-                    if (remain <= 0) break;
-                    Job j = queue.poll(remain, TimeUnit.NANOSECONDS);
-                    if (j == null) break;
-                    batch.add(j);
+                    List<Job> batch = new ArrayList<>();
+                    batch.add(first);
+                    // Brief window for other workers to pile on. If the queue is
+                    // already non-empty, poll() returns immediately, so this only
+                    // actually waits when there is nothing more to take.
+                    long deadline = System.nanoTime() + MAX_WAIT_MS * 1_000_000L;
+                    while (batch.size() < MAX_BATCH) {
+                        long remain = deadline - System.nanoTime();
+                        if (remain <= 0) break;
+                        Job j = queue.poll(remain, TimeUnit.NANOSECONDS);
+                        if (j == null) break;
+                        batch.add(j);
+                    }
+
+                    // Same ordering the Rust side applies (sort by cx, then cz).
+                    batch.sort((a, b) -> {
+                        int c = Integer.compare(a.cx, b.cx);
+                        return c != 0 ? c : Integer.compare(a.cz, b.cz);
+                    });
+
+                    int n = batch.size();
+                    int[] positions = new int[n * 2];
+                    for (int i = 0; i < n; i++) {
+                        Job job = batch.get(i);
+                        positions[i * 2] = job.cx;
+                        positions[i * 2 + 1] = job.cz;
+                    }
+
+                    submit(batch, positions);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                } catch (Throwable t) {
+                    LOGGER.error("[c2me-wgpu] batch coordinator loop error", t);
                 }
-
-                // Same ordering the Rust side applies (sort by cx, then cz).
-                batch.sort((a, b) -> {
-                    int c = Integer.compare(a.cx, b.cx);
-                    return c != 0 ? c : Integer.compare(a.cz, b.cz);
-                });
-
-                int n = batch.size();
-                int[] positions = new int[n * 2];
-                for (int i = 0; i < n; i++) {
-                    Job job = batch.get(i);
-                    positions[i * 2] = job.cx;
-                    positions[i * 2 + 1] = job.cz;
-                }
-
-                submit(batch, positions);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                return;
-            } catch (Throwable t) {
-                LOGGER.error("[c2me-wgpu] batch coordinator loop error", t);
             }
-        }
         } finally {
             runDone = true;
         }

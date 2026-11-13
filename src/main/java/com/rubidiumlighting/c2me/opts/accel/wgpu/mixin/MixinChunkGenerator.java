@@ -25,7 +25,6 @@
 package com.rubidiumlighting.c2me.opts.accel.wgpu.mixin;
 
 import com.rubidiumlighting.c2me.opts.accel.wgpu.ChunkDumper;
-import com.rubidiumlighting.c2me.opts.accel.wgpu.config.Config;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.DimState;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.ErrorTranslator;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.ModuleEntryPoint;
@@ -33,20 +32,41 @@ import com.rubidiumlighting.c2me.opts.accel.wgpu.NoiseRouterBlobifier;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuBatchCoordinator;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuDimensionRegistry;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuFallbackNotice;
+import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuStatus;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuThinBinding;
+import com.rubidiumlighting.c2me.opts.accel.wgpu.config.Config;
+
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.registry.entry.RegistryEntry;
+import net.minecraft.server.world.ServerChunkLoadingManager;
+import net.minecraft.server.world.ServerChunkManager;
+import net.minecraft.server.world.ServerWorld;
+import net.minecraft.structure.JigsawJunction;
+import net.minecraft.util.Formatting;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.random.RandomSplitter;
+import net.minecraft.util.math.random.Xoroshiro128PlusPlusRandom;
+import net.minecraft.world.ChunkRegion;
+import net.minecraft.world.Heightmap;
 import net.minecraft.world.chunk.Chunk;
 import net.minecraft.world.chunk.ChunkSection;
-import net.minecraft.world.Heightmap;
 import net.minecraft.world.gen.StructureAccessor;
+import net.minecraft.world.gen.StructureTerrainAdaptation;
 import net.minecraft.world.gen.StructureWeightSampler;
+import net.minecraft.world.gen.chunk.AquiferSampler;
 import net.minecraft.world.gen.chunk.Blender;
 import net.minecraft.world.gen.chunk.ChunkGeneratorSettings;
+import net.minecraft.world.gen.chunk.ChunkNoiseSampler;
+import net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler;
+import net.minecraft.world.gen.chunk.GenerationShapeConfig;
 import net.minecraft.world.gen.chunk.NoiseChunkGenerator;
+import net.minecraft.world.gen.densityfunction.DensityFunction;
+import net.minecraft.world.gen.densityfunction.DensityFunctionTypes;
 import net.minecraft.world.gen.noise.NoiseConfig;
 import net.minecraft.world.gen.noise.NoiseRouter;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.spongepowered.asm.mixin.Mixin;
@@ -55,12 +75,26 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Mixin(NoiseChunkGenerator.class)
 public abstract class MixinChunkGenerator {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu");
+
+    /**
+     * Hard cap on distinct CPU-evaluated density subtrees per dimension.
+     *
+     * <p>Each slot costs a per-chunk CPU sampling pass and one entry in the
+     * binding-6 storage buffer, so the cap bounds both time and memory. Above
+     * it the dimension falls back to vanilla generation instead of generating
+     * at a few chunks per second.
+     */
+    private static final int MAX_EXTERNAL_NODES = 64;
     // Per-dimension state now lives in WgpuDimensionRegistry: the save-switch
     // teardown has to iterate and destroy all of it from outside the mixin,
     // which is impossible for fields declared here.
@@ -106,11 +140,11 @@ public abstract class MixinChunkGenerator {
             final Blender fBlender = blender;
             final StructureAccessor fSa = structureAccessor;
             final NoiseConfig fNc = noiseConfig;
-            net.minecraft.world.gen.chunk.ChunkNoiseSampler sampler =
+            ChunkNoiseSampler sampler =
                     chunk.getOrCreateChunkNoiseSampler(cs ->
                             ((NoiseChunkGeneratorInvoker) (Object) gen)
                                     .callCreateChunkNoiseSampler(cs, fSa, fBlender, fNc));
-            final net.minecraft.world.gen.chunk.AquiferSampler aquifer = sampler.getAquiferSampler();
+            final AquiferSampler aquifer = sampler.getAquiferSampler();
             // Aquifer table is mandatory: the BlockOut shader classifies
             // water/lava/stone from these cells. Without it every block below
             // sea level falls through to the "no cell found -> stone" branch.
@@ -148,10 +182,10 @@ public abstract class MixinChunkGenerator {
                     boolean hasStruct = !structureAccessor
                             .getStructureStarts(chunk.getPos(),
                                     s2 -> s2.getTerrainAdaptation()
-                                            != net.minecraft.world.gen.StructureTerrainAdaptation.NONE)
+                                            != StructureTerrainAdaptation.NONE)
                             .isEmpty();
                     if (hasStruct) {
-                        ChunkDumper.dumpBeard(chunk, net.minecraft.world.gen.StructureWeightSampler
+                        ChunkDumper.dumpBeard(chunk, StructureWeightSampler
                                 .createStructureWeightSampler(structureAccessor, chunk.getPos()));
                     } else {
                         ChunkDumper.clearBeardDumped(); // keep looking
@@ -377,17 +411,17 @@ public abstract class MixinChunkGenerator {
             schedulingManagerOf(StructureAccessor sa) {
         try {
             Object w = sa.world;   // widened by accesswidener
-            net.minecraft.server.world.ServerWorld sw;
-            if (w instanceof net.minecraft.world.ChunkRegion cr) {
+            ServerWorld sw;
+            if (w instanceof ChunkRegion cr) {
                 sw = cr.toServerWorld();
-            } else if (w instanceof net.minecraft.server.world.ServerWorld s) {
+            } else if (w instanceof ServerWorld s) {
                 sw = s;
             } else {
                 return null;
             }
-            net.minecraft.server.world.ServerChunkManager scm =
-                    (net.minecraft.server.world.ServerChunkManager) sw.getChunkManager();
-            net.minecraft.server.world.ServerChunkLoadingManager sclm = scm.chunkLoadingManager;
+            ServerChunkManager scm =
+                    (ServerChunkManager) sw.getChunkManager();
+            ServerChunkLoadingManager sclm = scm.chunkLoadingManager;
             if (sclm instanceof com.ishland.c2me.base.common.scheduler.IVanillaChunkManager vm) {
                 return vm.c2me$getSchedulingManager();
             }
@@ -402,22 +436,22 @@ public abstract class MixinChunkGenerator {
      *  (non-interpolated) density, which can wrongly return air/water and
      *  clobber our solid result. Pull the ore-vein element out instead.
      *  Returns null when there is no separate vein sampler (oreVeins off). */
-    private static net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler
+    private static BlockStateSampler
             extractOreVeinSampler(
-                    net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler full) {
+                    BlockStateSampler full) {
         if (full == null) return null;
         try {
             for (java.lang.reflect.Field f : full.getClass().getDeclaredFields()) {
-                if (java.util.List.class.isAssignableFrom(f.getType())) {
+                if (List.class.isAssignableFrom(f.getType())) {
                     f.setAccessible(true);
-                    java.util.List<?> list = (java.util.List<?>) f.get(full);
+                    List<?> list = (List<?>) f.get(full);
                     if (list == null) continue;
                     // Find the OreVein sampler by lambda enclosing class name;
                     // do NOT assume it is the last element (datapacks/mods can
                     // add more sources to the chain).
                     for (Object o : list) {
                         if (o != null && o.getClass().getName().contains("OreVein")) {
-                            return (net.minecraft.world.gen.chunk.ChunkNoiseSampler.BlockStateSampler) o;
+                            return (BlockStateSampler) o;
                         }
                     }
                     // Not found: no separate vein sampler in this chain.
@@ -491,7 +525,7 @@ public abstract class MixinChunkGenerator {
         // per non-air block (~67k calls for a typical chunk). The vanilla
         // helper walks the sections column-wise, which is far cheaper.
         Heightmap.populateHeightmaps(chunk,
-                java.util.Set.of(Heightmap.Type.OCEAN_FLOOR_WG,
+                Set.of(Heightmap.Type.OCEAN_FLOOR_WG,
                                  Heightmap.Type.WORLD_SURFACE_WG));
     }
 
@@ -510,10 +544,10 @@ public abstract class MixinChunkGenerator {
     // Aggregated CPU write-back timing (the last stage: copying the GPU's
     // block bytes into the chunk). One averaged line every 128 chunks, so the
     // log is not flooded at ~100 chunks/s. Gated by debug_stage_timing.
-    private static final java.util.concurrent.atomic.AtomicLong CPUPROF_N =
-            new java.util.concurrent.atomic.AtomicLong();
-    private static final java.util.concurrent.atomic.AtomicLong CPUPROF_US =
-            new java.util.concurrent.atomic.AtomicLong();
+    private static final AtomicLong CPUPROF_N =
+            new AtomicLong();
+    private static final AtomicLong CPUPROF_US =
+            new AtomicLong();
 
     private static void profileCpuAccumulate(long us) {
         // Synchronized: with two independent atomics, two threads could both
@@ -565,19 +599,19 @@ public abstract class MixinChunkGenerator {
             StructureAccessor sa) {
         boolean hasStruct = !sa.getStructureStarts(chunk.getPos(),
                 s2 -> s2.getTerrainAdaptation()
-                        != net.minecraft.world.gen.StructureTerrainAdaptation.NONE)
+                        != StructureTerrainAdaptation.NONE)
                 .isEmpty();
         if (!hasStruct) return;
-        var sw = net.minecraft.world.gen.StructureWeightSampler
+        var sw = StructureWeightSampler
                 .createStructureWeightSampler(sa, chunk.getPos());
         var pit = sw.pieceIterator;
-        java.util.List<net.minecraft.world.gen.StructureWeightSampler.Piece> pieces =
-                new java.util.ArrayList<>();
+        List<StructureWeightSampler.Piece> pieces =
+                new ArrayList<>();
         while (pit.hasNext()) pieces.add(pit.next());
         pit.back(Integer.MAX_VALUE);
         var jit = sw.junctionIterator;
-        java.util.List<net.minecraft.structure.JigsawJunction> juncs =
-                new java.util.ArrayList<>();
+        List<JigsawJunction> juncs =
+                new ArrayList<>();
         while (jit.hasNext()) juncs.add(jit.next());
         jit.back(Integer.MAX_VALUE);
         if (pieces.isEmpty() && juncs.isEmpty()) return;
@@ -606,14 +640,14 @@ public abstract class MixinChunkGenerator {
 
 
     private static void stageAquiferForGpu(DimState ds, Chunk chunk,
-            net.minecraft.world.gen.chunk.AquiferSampler aquifer) {
-        if (!(aquifer instanceof net.minecraft.world.gen.chunk.AquiferSampler.Impl impl)) {
+            AquiferSampler aquifer) {
+        if (!(aquifer instanceof AquiferSampler.Impl impl)) {
             return;
         }
         AquiferImplAccessor a = (AquiferImplAccessor) (Object) impl;
         int startX = a.getStartX(), startY = a.getStartY(), startZ = a.getStartZ();
         int sizeX = a.getSizeX(), sizeZ = a.getSizeZ();
-        net.minecraft.world.gen.chunk.AquiferSampler.FluidLevel[] wl = a.getWaterLevels();
+        AquiferSampler.FluidLevel[] wl = a.getWaterLevels();
 
         // Read the splitter's seed words directly instead of parsing
         // addDebugInfo()'s string: the formatter is a debug-command detail
@@ -629,12 +663,12 @@ public abstract class MixinChunkGenerator {
             int ck = (idx / sizeX) % sizeZ;
             int cj = idx / (sizeX * sizeZ);
             int cx = startX + ci, cy = startY + cj, cz = startZ + ck;
-            long h = net.minecraft.util.math.MathHelper.hashCode(cx, cy, cz);
-            var rr = new net.minecraft.util.math.random.Xoroshiro128PlusPlusRandom(h ^ sLo, sHi);
+            long h = MathHelper.hashCode(cx, cy, cz);
+            var rr = new Xoroshiro128PlusPlusRandom(h ^ sLo, sHi);
             int bx = cx * 16 + rr.nextInt(10);
             int by = cy * 12 + rr.nextInt(9);
             int bz = cz * 16 + rr.nextInt(10);
-            a.invokeGetWaterLevel(net.minecraft.util.math.BlockPos.asLong(bx, by, bz));
+            a.invokeGetWaterLevel(BlockPos.asLong(bx, by, bz));
         }
 
         java.nio.ByteBuffer tb = java.nio.ByteBuffer.allocate(24 + wl.length * 8)
@@ -648,8 +682,8 @@ public abstract class MixinChunkGenerator {
             int sc = 0;
             if (lvl != null) {
                 var blk = lvl.state.getBlock();
-                if (blk == net.minecraft.block.Blocks.WATER) sc = 2;
-                else if (blk == net.minecraft.block.Blocks.LAVA) sc = 3;
+                if (blk == Blocks.WATER) sc = 2;
+                else if (blk == Blocks.LAVA) sc = 3;
             }
             tb.putInt(ly); tb.putInt(sc);
         }
@@ -671,7 +705,7 @@ public abstract class MixinChunkGenerator {
                 LOGGER.warn("[c2me-wgpu] NoiseRouter is null, falling back to CPU");
                 return null;
             }
-            net.minecraft.world.gen.chunk.GenerationShapeConfig gsc =
+            GenerationShapeConfig gsc =
                     settings.generationShapeConfig();
             int hc = gsc.horizontalCellBlockCount();
             int vc = gsc.verticalCellBlockCount();
@@ -703,8 +737,8 @@ public abstract class MixinChunkGenerator {
             {
                 int dfl = 0;
                 var fb = settings.defaultFluid();
-                if (fb.isOf(net.minecraft.block.Blocks.WATER)) dfl = 2;
-                else if (fb.isOf(net.minecraft.block.Blocks.LAVA)) dfl = 3;
+                if (fb.isOf(Blocks.WATER)) dfl = 2;
+                else if (fb.isOf(Blocks.LAVA)) dfl = 3;
                 WgpuThinBinding.setAquiferMode(world, settings.hasAquifers(),
                         settings.seaLevel(), dfl, -54);
             }
@@ -717,10 +751,10 @@ public abstract class MixinChunkGenerator {
                     // wording of a debug formatter that Minecraft does not
                     // guarantee -- the same hazard already fixed for the
                     // aquifer seed.
-                    net.minecraft.util.math.random.RandomSplitter deriver =
+                    RandomSplitter deriver =
                             noiseConfig.getOreRandomDeriver();
                     if (deriver instanceof
-                            net.minecraft.util.math.random.Xoroshiro128PlusPlusRandom.Splitter sp) {
+                            Xoroshiro128PlusPlusRandom.Splitter sp) {
                         XoroshiroSplitterAccessor acc = (XoroshiroSplitterAccessor) (Object) sp;
                         WgpuThinBinding.setOreSeed(world, acc.c2me$getSeedLo(), acc.c2me$getSeedHi());
                         LOGGER.info("[c2me-wgpu] ore-vein seed staged");
@@ -732,8 +766,8 @@ public abstract class MixinChunkGenerator {
                     LOGGER.warn("[c2me-wgpu] ore seed staging failed", t);
                 }
             }
-            java.util.List<net.minecraft.world.gen.densityfunction.DensityFunction> extNodes =
-                    new java.util.ArrayList<>(NoiseRouterBlobifier.EXTERNAL_NODES);
+            List<DensityFunction> extNodes =
+                    new ArrayList<>(NoiseRouterBlobifier.EXTERNAL_NODES);
             if (!extNodes.isEmpty()) {
                 // References vs distinct instances: the tree is a DAG and the
                 // serializer inlines it, so the same node is written many
@@ -748,7 +782,6 @@ public abstract class MixinChunkGenerator {
             // the GPU as one storage buffer. Both cost and memory scale with
             // the number of *distinct* nodes, so the cap below counts slots.
             // Refuse up front instead of generating at 2 chunks/s.
-            final int MAX_EXTERNAL_NODES = 64;
             if (extNodes.size() > MAX_EXTERNAL_NODES) {
                 throw new IllegalStateException(
                         "too many external density subtrees (" + extNodes.size()
@@ -763,9 +796,9 @@ public abstract class MixinChunkGenerator {
             // so a failed dimension showed both "fell back to CPU" and
             // "GPU acceleration enabled".
             WgpuFallbackNotice.report("dim-active",
-                    net.minecraft.util.Formatting.GREEN,
+                    Formatting.GREEN,
                     "c2me-opts-accel-wgpu.notify.enabled",
-                    com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuStatus.gpuName());
+                    WgpuStatus.gpuName());
             return new DimState(seed, world, coord, gx, gy, gz, hc, vc, minY, height, router,
                     settings.defaultBlock());
         } catch (Throwable t) {
@@ -783,22 +816,16 @@ public abstract class MixinChunkGenerator {
         }
     }
 
-
-
-
-
-
-
     /** Get the raw (un-compiled) tree behind a c2me-opts-dfc compiled node.
      *  CompiledDensityFunction keeps the original DensityFunction in its
      *  blendingFallback; JIT evaluation is numerically identical to it. */
-    private static net.minecraft.world.gen.densityfunction.DensityFunction decompileOne(
-            net.minecraft.world.gen.densityfunction.DensityFunction df) {
+    private static DensityFunction decompileOne(
+            DensityFunction df) {
         if (df == null) return null;
-        net.minecraft.world.gen.densityfunction.DensityFunction cur = df;
+        DensityFunction cur = df;
         for (int guard = 0; guard < 8; guard++) {
             if (cur instanceof
-                    net.minecraft.world.gen.densityfunction.DensityFunctionTypes.RegistryEntryHolder h) {
+                    DensityFunctionTypes.RegistryEntryHolder h) {
                 cur = h.function().value();
                 continue;
             }
@@ -811,7 +838,7 @@ public abstract class MixinChunkGenerator {
                 if (m == null) break;
                 m.setAccessible(true);
                 Object o = m.invoke(cur);
-                if (o instanceof net.minecraft.world.gen.densityfunction.DensityFunction d && d != cur) {
+                if (o instanceof DensityFunction d && d != cur) {
                     cur = d;
                     continue;
                 }

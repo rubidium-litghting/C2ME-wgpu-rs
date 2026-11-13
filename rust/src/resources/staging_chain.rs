@@ -211,13 +211,33 @@ impl StagingChain {
         slot.cpu_data.as_deref()
     }
 
-    pub fn consume(&mut self, handle: SlotHandle) {
+    /// Return a slot to the free list.
+    ///
+    /// Safe from any phase and idempotent, so error paths may call it without
+    /// checking whether the mapping finished first:
+    ///   * `InFlight` — a pending map is cancelled (`unmap` is what drops it;
+    ///     the late callback then targets a closed channel and is ignored) and
+    ///     the in-flight counter is decremented.
+    ///   * `ReadyForRead` — the CPU copy is dropped.
+    ///   * `Free` / `Consumed` — already in the free list; return without
+    ///     queueing the index twice, which would hand one slot to two batches.
+    pub fn recycle(&mut self, handle: SlotHandle) {
         let slot = &mut self.slots[handle.index];
-        debug_assert!(slot.phase == StagingPhase::ReadyForRead,
-            "consume called on non-Ready slot (phase = {:?})", slot.phase);
+        match slot.phase {
+            StagingPhase::Free | StagingPhase::Consumed => return,
+            StagingPhase::InFlight => {
+                self.inflight_count = self.inflight_count.saturating_sub(1);
+                slot.pending_map = None;
+                // A pending map would make the buffer unmappable for the next
+                // batch, so cancel it explicitly.
+                slot.buffer.unmap();
+            }
+            StagingPhase::ReadyForRead => {
+                self.ready_count = self.ready_count.saturating_sub(1);
+            }
+        }
         slot.phase = StagingPhase::Consumed;
         slot.cpu_data = None;
-        self.ready_count = self.ready_count.saturating_sub(1);
         self.free_queue.push_back(handle.index);
     }
 

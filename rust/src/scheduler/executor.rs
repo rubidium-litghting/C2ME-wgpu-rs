@@ -22,21 +22,38 @@ use crate::scheduler::batcher::Batch;
 use crate::scheduler::batcher::Priority;
 use crate::resources::staging_chain::{StagingChain, SlotHandle};
 use crate::ast::deserialize::ShapeConfig;
+use crate::codegen::wgsl_gen::Pass;
 use crate::world::WorldContext;
 use crate::world::constants::WorldgenParams;
 use crate::world::bind_group;
 
-/// Number of channels Java actually reads back. Only finalDensity (global
-/// ch11) and veinToggle (global ch12) are consumed (see
-/// `wgsl_gen::plan_shards`); the shader still writes a 16-channel out_buf,
-/// we just copy these two out, shrinking the readback 8x.
+/// Channels the shader evaluates for vanilla itself.
+const BASE_CHANNELS: usize = 16;
+
 /// Maximum number of `InnerRef` subtrees (from the Pass E split, §15.2.2).
-/// Total channels = 16 (original) + this.
 pub const MAX_INNER_COUNT: usize = 128;
 
-/// Global channel index of the first read-back channel (finalDensity).
+/// Channels the shader writes per cell. Java only reads back a few of them
+/// (finalDensity ch11, veinToggle ch12 for the real router), and
+/// `prepare_batch` copies just those into staging, so the unused width costs
+/// GPU memory but not readback bandwidth.
+const TOTAL_CHANNELS: usize = BASE_CHANNELS + MAX_INNER_COUNT;
 
-/// Block height in blocks for this world's shape (16*H*16 blocks/chunk).
+/// Per-chunk slot of the Beardifier `pj` table, in u32 words. The shader
+/// indexes `beard_pj[chunk * BEARD_STRIDE + i]`, so the executor and
+/// `upload_beard_data` must agree on this number.
+const BEARD_STRIDE: usize = 4096;
+
+/// `24^3` Beardifier weight table, in u32 words. Written once per input set,
+/// ahead of the per-batch `pj` section.
+const BEARD_WEIGHT_WORDS: usize = 24 * 24 * 24;
+
+/// Aquifer cells per chunk reserved in the binding-8 buffer. Vanilla tops out
+/// near 1179 (`3 * 131 * 3` at height 512 with 12-block cells); this is a
+/// memory reservation, not a validation limit.
+const AQ_MAX_CELLS_PER_CHUNK: usize = 1200;
+
+/// Height in blocks for this world's shape (`16 * H * 16` blocks/chunk).
 fn shape_height(world: &WorldContext) -> u32 { world.shape().height.max(1) as u32 }
 
 /// 执行器配置。
@@ -131,6 +148,18 @@ struct PreparedBatch {
     submit_ms: f64,
 }
 
+/// Readback of one batch, in whichever form the caller asked for.
+///
+/// `raw` batches fill the two `raw_*` vectors and leave `results`/`block_data`
+/// empty; decoded (test) batches do the opposite.
+#[derive(Default)]
+struct DecodedBatch {
+    results: FxHashMap<i64, ResultBlob>,
+    block_data: Vec<u32>,
+    raw_density: Vec<u8>,
+    raw_block: Vec<u8>,
+}
+
 /// One set of per-batch input buffers.
 ///
 /// Everything the GPU reads while a batch is in flight lives here. Pooling
@@ -168,6 +197,14 @@ impl BufferPool {
     }
 }
 
+/// Shorthand for a whole-buffer bind group entry.
+fn binding(index: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding: index,
+        resource: buffer.as_entire_binding(),
+    }
+}
+
 /// 负责单次 GPU 命令提交的执行器。
 pub struct SingleBatchExecutor {
     device: Arc<wgpu::Device>,
@@ -193,97 +230,70 @@ pub struct SingleBatchExecutor {
     config: ExecutorConfig,
 }
 
+/// Byte sizes of the persistent buffers, derived once from the config.
+///
+/// Kept apart from allocation so all the shape arithmetic lives in one place:
+/// lesson #56 was exactly a buffer size drifting away from the shape it has to
+/// hold (`blocks_per_chunk` was a constant while the world got taller).
+struct BufferSizes {
+    cells_per_chunk: usize,
+    blocks_per_chunk: usize,
+    /// Density output (binding 2), `TOTAL_CHANNELS` wide per cell.
+    output: usize,
+    /// Block-state output (binding 7), one u32 per block.
+    block: usize,
+    /// One staging slot: density readback followed by the block bytes.
+    staging: usize,
+    /// Aquifer entries reserved per batch; the buffer holds `aq_p` then `aq_s`.
+    aquifer_entries: usize,
+    /// Beardifier buffer: weight table followed by one `BEARD_STRIDE` slot per
+    /// chunk.
+    beard: u64,
+}
+
+impl BufferSizes {
+    fn for_config(config: &ExecutorConfig) -> Self {
+        let max_batch = config.max_batch_size.max(1);
+        let cells_per_chunk = config.cells_per_chunk.max(1);
+        let blocks_per_chunk = config.blocks_per_chunk.max(1);
+        let output = TOTAL_CHANNELS * cells_per_chunk * 4 * max_batch;
+        let block = blocks_per_chunk * 4 * max_batch;
+        Self {
+            cells_per_chunk,
+            blocks_per_chunk,
+            output,
+            block,
+            staging: output + block,
+            aquifer_entries: AQ_MAX_CELLS_PER_CHUNK * max_batch,
+            beard: ((BEARD_WEIGHT_WORDS + BEARD_STRIDE * max_batch) * 4) as u64,
+        }
+    }
+}
+
 impl SingleBatchExecutor {
     pub fn new(
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
         config: ExecutorConfig,
     ) -> Result<Self, String> {
-        // Size persistent buffers for the shape this config was built for.
-        // `cells_per_chunk` comes from the world's own grid (cell width and
-        // height), so a modded dimension cannot fall outside the allocation;
-        // a world that needs more rebuilds the executor instead.
-        let max_cells_per_chunk = config.cells_per_chunk.max(1);
-        // Pass E (§15.2.2): the outer tree needs per-block evaluation, which reads
-        // all the split `inners` from extra channels. Reserve up to 128 inner
-        // channels (144 total). Memory cost per chunk is ~700 KB, so a batch of
-        // 100 chunks is ~70 MB — fine for desktop and modern mobile.
-        let total_channels = 16 + MAX_INNER_COUNT;
-        let out_bytes_per_chunk: usize = total_channels * max_cells_per_chunk * 4;
-        // staging receives only the read-back channels, but the executor is
-        // shared across worlds (real router = 2 channels, Single-mode test
-        // blobs = up to N), so reserve the full 16-channel width. Only
-        // `total_bytes` is actually mapped/copied per batch, so the 8x
-        // readback saving is unaffected by this slack.
-        let max_buffer_size = out_bytes_per_chunk * config.max_batch_size.max(1);
-        // §3.5: block-state output (u32/block), `16 * height * 16` per chunk.
-        let max_blocks_per_chunk = config.blocks_per_chunk.max(1);
-        let block_max = max_blocks_per_chunk * config.max_batch_size.max(1) * 4;
-        // Staging holds density readback + block bytes.
-        let staging_size = max_buffer_size + block_max;
-        let staging = StagingChain::new(&device, config.staging_capacity, staging_size);
+        // Sized for the shape this config was built for: `cells_per_chunk` and
+        // `blocks_per_chunk` come from the world's own grid, and a world that
+        // needs more rebuilds the executor (see `c_api`).
+        let sizes = BufferSizes::for_config(&config);
+        let staging = StagingChain::new(&device, config.staging_capacity, sizes.staging);
+        let (output_buf, block_buf) = Self::create_output_buffers(&device, &sizes);
 
-        // Persistent output buffers. These are NOT pooled: each batch writes
-        // them and copies the result to staging inside one command buffer, so
-        // the GPU's ordering already prevents a later batch from overwriting
-        // data an earlier one still needs.
-        let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("c2me_wgpu_out_buf"),
-            size: max_buffer_size as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let block_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("c2me_wgpu_block_buf"),
-            size: block_max as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        // §8.4 B-2: aquifer cell tables. Max cells/chunk ≈ 3*131*3 = 1179 for
-        // height=512, cell_height=4; round to 1200. vec4<i32>/cell + u32/cell.
-        const MAX_AQ_CELLS: usize = 1200;
-        let aq_stride = MAX_AQ_CELLS * config.max_batch_size.max(1);
-        // §8.4: 24^3 weight table (13824 u32) followed by 4096-u32/chunk pj.
-        const BEARD_W_LEN: usize = 24 * 24 * 24;
-        let beard_size = ((BEARD_W_LEN + 4096 * config.max_batch_size.max(1)) * 4) as u64;
-
-        // Static Beardifier weight table, written once per set. Identical in
-        // every set; the per-batch upload only touches the pj section after it.
+        // Static Beardifier weight table, written into every input set at
+        // creation. The per-batch upload only rewrites the `pj` section after
+        // it.
         let weight_table: Vec<u32> = crate::world::beard::build_weight_table()
             .iter().map(|f| f.to_bits()).collect();
 
         let depth = config.pipeline_depth.max(1);
-        let mut sets = Vec::with_capacity(depth);
-        for i in 0..depth {
-            let params = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("c2me_wgpu_params_{i}")),
-                size: std::mem::size_of::<WorldgenParams>() as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let positions = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("c2me_wgpu_positions_{i}")),
-                size: (config.max_batch_size.max(1) * 2 * 4) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            // aq_p half + aq_s half; aq_s is padded to vec4 so one array type works.
-            let aquifer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("c2me_wgpu_aquifer_{i}")),
-                size: (aq_stride * 16 * 2) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let beard = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("c2me_wgpu_beard_{i}")),
-                size: beard_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            queue.write_buffer(&beard, 0, bytemuck::cast_slice(&weight_table));
-            sets.push(InputBufferSet { params, positions, aquifer, beard, external: None });
-        }
+        let sets = (0..depth)
+            .map(|i| Self::create_input_set(
+                &device, &queue, &config, &sizes, i, &weight_table))
+            .collect();
         let pool = BufferPool {
             sets,
             free: (0..depth).collect(),
@@ -305,16 +315,16 @@ impl SingleBatchExecutor {
             "[c2me-wgpu-rs] executor buffers: output={} MiB, block={} MiB, staging={} MiB x{}, \
              input_sets={} x (aquifer={} KiB, beard={} KiB), max_batch={}, \
              sized_for={} cells/chunk / {} blocks/chunk",
-            mib(max_buffer_size as usize),
-            mib(block_max as usize),
-            mib(staging_size as usize),
+            mib(sizes.output),
+            mib(sizes.block),
+            mib(sizes.staging),
             config.staging_capacity,
             depth,
-            aq_stride * 16 * 2 / 1024,
-            beard_size as usize / 1024,
+            sizes.aquifer_entries * 16 * 2 / 1024,
+            sizes.beard as usize / 1024,
             config.max_batch_size,
-            max_cells_per_chunk,
-            max_blocks_per_chunk,
+            sizes.cells_per_chunk,
+            sizes.blocks_per_chunk,
         ));
 
         Ok(Self {
@@ -331,7 +341,65 @@ impl SingleBatchExecutor {
         })
     }
 
-    /// 执行一个 batch：编码 + 提交 + 回读。
+    /// Create the density and block-state output buffers.
+    ///
+    /// These are NOT pooled: each batch writes them and copies the result to
+    /// staging inside one command buffer, so the GPU's own ordering prevents a
+    /// later batch from overwriting data an earlier one still needs.
+    fn create_output_buffers(
+        device: &wgpu::Device,
+        sizes: &BufferSizes,
+    ) -> (wgpu::Buffer, wgpu::Buffer) {
+        let create = |label: &str, size: usize| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        (create("c2me_wgpu_out_buf", sizes.output),
+         create("c2me_wgpu_block_buf", sizes.block))
+    }
+
+    /// Create one per-batch input buffer set (bindings 0, 3/4, 8 and 9).
+    ///
+    /// Everything the GPU reads while a batch is in flight lives here, so
+    /// having `pipeline_depth` of them is what allows the next batch to be
+    /// prepared without overwriting the one still being read.
+    fn create_input_set(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: &ExecutorConfig,
+        sizes: &BufferSizes,
+        index: usize,
+        weight_table: &[u32],
+    ) -> InputBufferSet {
+        let create = |label: String, size: u64| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&label),
+                size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let params = create(
+            format!("c2me_wgpu_params_{index}"),
+            std::mem::size_of::<WorldgenParams>() as u64);
+        // Two i32 per chunk: cx, cz.
+        let positions = create(
+            format!("c2me_wgpu_positions_{index}"),
+            (config.max_batch_size.max(1) * 2 * 4) as u64);
+        // `aq_p` half + `aq_s` half; `aq_s` is padded to vec4 so one array
+        // type serves both.
+        let aquifer = create(
+            format!("c2me_wgpu_aquifer_{index}"),
+            (sizes.aquifer_entries * 16 * 2) as u64);
+        let beard = create(format!("c2me_wgpu_beard_{index}"), sizes.beard);
+        queue.write_buffer(&beard, 0, bytemuck::cast_slice(weight_table));
+        InputBufferSet { params, positions, aquifer, beard, external: None }
+    }
+
     /// Run one batch end to end, blocking until it completes.
     ///
     /// Serial convenience path used by tests and [`Self::request_chunks`].
@@ -364,9 +432,9 @@ impl SingleBatchExecutor {
     /// Returns without waiting for the GPU. Callers must drive the mapping to
     /// completion before calling [`Self::finish_batch`].
     ///
-    /// Only one prepared batch may be outstanding: the input buffers written
-    /// here are shared, so a second prepare would overwrite them while the
-    /// first batch's GPU work is still reading.
+    /// Each call takes its own input buffer set from the pool, so several
+    /// prepared batches may be outstanding (up to `pipeline_depth`); running
+    /// out of sets is the backpressure that bounds the pipeline.
     fn prepare_batch(
         &mut self,
         world: &WorldContext,
@@ -403,8 +471,7 @@ impl SingleBatchExecutor {
         // Bytes copied into staging: only the read-back channels.
         let density_bytes = (num_chunks as usize) * out_channels * cells_per_chunk * 4;
         // §3.5 BlockOut shard present? (reads ch11 corners, writes block bytes)
-        let has_block = world.shards().iter()
-            .any(|sh| sh.pass == crate::codegen::wgsl_gen::Pass::BlockOut);
+        let has_block = world.shards().iter().any(|sh| sh.pass == Pass::BlockOut);
         let blocks_per_chunk = 16usize * (shape_height(world) as usize) * 16;
         let block_bytes = if has_block {
             (num_chunks as usize) * blocks_per_chunk * 4
@@ -468,9 +535,6 @@ impl SingleBatchExecutor {
         let simplex_buf = world.simplex_buffer()
             .ok_or_else(|| "simplex buffer not uploaded".to_string())?;
 
-        // Reuse the persistent output buffer (binding 2).
-
-
         // Acquire staging slot
         let (staging_buf, slot_handle) = self
             .staging
@@ -506,59 +570,38 @@ impl SingleBatchExecutor {
             }
         }
 
-        // Create bind group
+        // Bindings 0-7: params, per-world tables, this batch's inputs, and the
+        // two persistent outputs. See `bind_group::create_layout` for the
+        // contract each one has with the shader.
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("c2me_wgpu_batch_bg"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.pool.sets[buf_set].params.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: perm_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.output_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: origin_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: self.pool.sets[buf_set].positions.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: simplex_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: ext_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: self.block_buf.as_entire_binding(),
-                },
+                binding(0, &self.pool.sets[buf_set].params),
+                binding(1, &perm_buf),
+                binding(2, &self.output_buf),
+                binding(3, &origin_buf),
+                binding(4, &self.pool.sets[buf_set].positions),
+                binding(5, &simplex_buf),
+                binding(6, &ext_buf),
+                binding(7, &self.block_buf),
             ],
         });
 
-        // §3.5: BlockOut shard gets its own bind group (6 buffers).
+        // §3.5: the BlockOut shard gets its own layout and bind group.
+        let set = &self.pool.sets[buf_set];
         let block_out_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("c2me_wgpu_block_out_bg"),
             layout: &self.block_out_bg_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.pool.sets[buf_set].params.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.output_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: self.pool.sets[buf_set].positions.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: self.block_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 8, resource: self.pool.sets[buf_set].aquifer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: self.pool.sets[buf_set].beard.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 10, resource: perm_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: origin_buf.as_entire_binding() },
+                binding(0, &set.params),
+                binding(2, &self.output_buf),
+                binding(4, &set.positions),
+                binding(7, &self.block_buf),
+                binding(8, &set.aquifer),
+                binding(9, &set.beard),
+                binding(10, &perm_buf),
+                binding(11, &origin_buf),
             ],
         });
 
@@ -582,7 +625,6 @@ impl SingleBatchExecutor {
             let ccy = (shape.height as u32) / chh + 1;
             // Multi-chunk: the z axis carries (cells_z × num_chunks)
             // invocations so one dispatch covers the whole batch.
-            let num_chunks = batch.positions.len() as u32;
             let wg_x = (ccx + 3) / 4;
             let wg_y = (ccy + 3) / 4;
             let wg_z = (ccz * num_chunks + 3) / 4;
@@ -595,7 +637,7 @@ impl SingleBatchExecutor {
             let bw_x = (16u32 + 3) / 4;              // 4
             let bw_y = (height + 3) / 4;
             let bw_z = (16u32 * num_chunks + 3) / 4;
-            
+
             for (i, pipeline) in pipelines.iter().enumerate() {
                 // IMPORTANT: Each shard gets its own compute pass. WebGPU only
                 // guarantees memory synchronization (barriers) between distinct
@@ -608,7 +650,7 @@ impl SingleBatchExecutor {
                     timestamp_writes: None,
                 });
                 cpass.set_pipeline(pipeline);
-                if shards[i].pass == crate::codegen::wgsl_gen::Pass::BlockOut {
+                if shards[i].pass == Pass::BlockOut {
                     cpass.set_bind_group(0, &block_out_bg, &[]);
                     cpass.dispatch_workgroups(bw_x, bw_y, bw_z);
                 } else {
@@ -619,18 +661,17 @@ impl SingleBatchExecutor {
         }
 
         // Copy only the read-back channels into staging. output_buf keeps
-        // the full 16-channel layout the shader writes; we pluck each
-        // consumed channel out of every chunk into a compact chunk-major
+        // the full `TOTAL_CHANNELS`-wide layout the shader writes; we pluck
+        // each consumed channel out of every chunk into a compact chunk-major
         // staging layout. For the real router that is ch11+ch12 (adjacent,
         // so effectively one 2*CPC run per chunk) — an 8x smaller readback.
-        let cpc = cells_per_chunk;
+        let cell_bytes = (cells_per_chunk * 4) as u64;
         for ci in 0..num_chunks as usize {
             for (k, &ch) in readback.iter().enumerate() {
-                let src_off = ((ci * (16 + MAX_INNER_COUNT) + ch) * cpc) as u64 * 4;
-                let dst_off = ((ci * out_channels + k) * cpc) as u64 * 4;
-                let len = cpc as u64 * 4;
+                let src_off = ((ci * TOTAL_CHANNELS + ch) * cells_per_chunk) as u64 * 4;
+                let dst_off = ((ci * out_channels + k) * cells_per_chunk) as u64 * 4;
                 encoder.copy_buffer_to_buffer(
-                    &self.output_buf, src_off, &staging_buf, dst_off, len);
+                    &self.output_buf, src_off, &staging_buf, dst_off, cell_bytes);
             }
         }
 
@@ -665,9 +706,9 @@ impl SingleBatchExecutor {
             submit_ms,
         })
     }
-    /// Read back a batch prepared by [`Self::prepare_batch`]. The caller must
+
+    /// Consume a batch prepared by [`Self::prepare_batch`]. The caller must
     /// have driven its mapping to completion first.
-    /// Consume a completed batch.
     ///
     /// `raw = true` is the production path: the staging buffer already holds
     /// exactly the bytes the Java-facing blob needs, so they are sliced out
@@ -687,41 +728,20 @@ impl SingleBatchExecutor {
         let readback_ms = t_submit.elapsed().as_secs_f64() * 1e3;
 
         let t_decode0 = std::time::Instant::now();
-        let mut result_map = FxHashMap::default();
-        let mut raw_density: Vec<u8> = Vec::new();
-        let mut block_data: Vec<u32> = Vec::new();
-        let mut raw_block: Vec<u8> = Vec::new();
-
-        if raw {
-            // One copy out of the mapped staging buffer, then one more for the
-            // block half. Nothing is decoded.
-            if let Some(d) = self.staging.get_data(slot_handle) {
-                let den_end = density_bytes.min(d.len());
-                raw_density = d[..den_end].to_vec();
-                if has_block && d.len() >= density_bytes + block_bytes {
-                    raw_block = d[density_bytes..density_bytes + block_bytes].to_vec();
-                }
-            }
-        } else {
-            result_map = self.read_results(&batch, slot_handle, out_channels)?;
-            if has_block {
-                if let Some(d) = self.staging.get_data(slot_handle) {
-                    if d.len() >= density_bytes + block_bytes {
-                        block_data = d[density_bytes..density_bytes + block_bytes]
-                            .chunks_exact(4)
-                            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                            .collect();
-                    }
-                }
-            }
-        }
+        let decoded = self.decode_batch(
+            &batch, slot_handle, raw, out_channels, density_bytes, block_bytes, has_block);
         let decode_ms = t_decode0.elapsed().as_secs_f64() * 1e3;
 
-        self.staging.consume(slot_handle);
+        // Recycle before propagating a decode error. Both are one-shot loans:
+        // a slot or input set dropped on the error path would be lost for the
+        // rest of the session, permanently shrinking the pipeline.
+        self.staging.recycle(slot_handle);
         // The GPU work for this batch is complete (its output has been read
-        // back), so its input buffers are free for the next prepare.
+        // back, or the batch is being failed), so its input buffers are free
+        // for the next prepare.
         self.pool.release(buf_set);
 
+        let decoded = decoded?;
         let dispatch_time = t0.elapsed();
 
         if prof {
@@ -734,11 +754,53 @@ impl SingleBatchExecutor {
             batch,
             dispatch_time,
             out_channels,
-            results: result_map,
-            block_data,
-            raw_density,
-            raw_block,
+            results: decoded.results,
+            block_data: decoded.block_data,
+            raw_density: decoded.raw_density,
+            raw_block: decoded.raw_block,
         }))
+    }
+
+    /// Turn the mapped staging bytes into the shape [`ExecutedBatch`] needs.
+    ///
+    /// Split from [`Self::finish_batch`] so the latter can recycle its slot and
+    /// input set before this can fail.
+    fn decode_batch(
+        &mut self,
+        batch: &Batch,
+        slot_handle: SlotHandle,
+        raw: bool,
+        out_channels: usize,
+        density_bytes: usize,
+        block_bytes: usize,
+        has_block: bool,
+    ) -> Result<DecodedBatch, String> {
+        let mut decoded = DecodedBatch::default();
+        if raw {
+            // One copy out of the mapped staging buffer, then one more for the
+            // block half. Nothing is decoded.
+            if let Some(d) = self.staging.get_data(slot_handle) {
+                let den_end = density_bytes.min(d.len());
+                decoded.raw_density = d[..den_end].to_vec();
+                if has_block && d.len() >= density_bytes + block_bytes {
+                    decoded.raw_block =
+                        d[density_bytes..density_bytes + block_bytes].to_vec();
+                }
+            }
+        } else {
+            decoded.results = self.read_results(batch, slot_handle, out_channels)?;
+            if has_block {
+                if let Some(d) = self.staging.get_data(slot_handle) {
+                    if d.len() >= density_bytes + block_bytes {
+                        decoded.block_data = d[density_bytes..density_bytes + block_bytes]
+                            .chunks_exact(4)
+                            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                            .collect();
+                    }
+                }
+            }
+        }
+        Ok(decoded)
     }
 
     /// Build the per-batch [`WorldgenParams`]. Every `_pad` slot is filled
@@ -789,7 +851,7 @@ impl SingleBatchExecutor {
             params._pad[9] = if world.ore_veins.load(std::sync::atomic::Ordering::Relaxed) { 1 } else { 0 };
         }
         // _pad[11] is the total channel count, used by WGSL chunk strides.
-        params._pad[11] = (16 + MAX_INNER_COUNT) as u32;
+        params._pad[11] = TOTAL_CHANNELS as u32;
         params
     }
 
@@ -917,22 +979,20 @@ impl SingleBatchExecutor {
     }
 
     /// Pack and upload the per-chunk Beardifier data (binding 9). Each chunk
-    /// gets a fixed `STRIDE`-u32 slot; empty chunks get a zeroed stride so
-    /// `beard_pj[base] == 0` disables beard.
+    /// gets a fixed `BEARD_STRIDE`-u32 slot; empty chunks get a zeroed stride
+    /// so `beard_pj[base] == 0` disables beard.
     fn upload_beard_data(
         queue: &wgpu::Queue,
         set: &mut InputBufferSet,
         world: &WorldContext,
         batch: &Batch,
     ) {
-        const STRIDE: usize = 4096;
-        const BEARD_W_BYTES: u64 = (24 * 24 * 24) as u64 * 4;
-        let mut pj = vec![0u32; STRIDE * batch.positions.len()];
+        let mut pj = vec![0u32; BEARD_STRIDE * batch.positions.len()];
         if let Ok(mut tables) = world.beard_tables.lock() {
             for (ci, &(cx, cz)) in batch.positions.iter().enumerate() {
                 if let Some(bytes) = tables.remove(&(cx, cz)) {
-                    let n = (bytes.len() / 4).min(STRIDE);
-                    let dst = ci * STRIDE;
+                    let n = (bytes.len() / 4).min(BEARD_STRIDE);
+                    let dst = ci * BEARD_STRIDE;
                     for i in 0..n {
                         pj[dst + i] = u32::from_le_bytes(
                             bytes[i*4..i*4+4].try_into().unwrap());
@@ -942,7 +1002,8 @@ impl SingleBatchExecutor {
         }
         // Weight table is written once at construction; only pj changes per
         // batch, so write straight past it.
-        queue.write_buffer(&set.beard, BEARD_W_BYTES, bytemuck::cast_slice(&pj));
+        let weight_bytes = (BEARD_WEIGHT_WORDS * 4) as u64;
+        queue.write_buffer(&set.beard, weight_bytes, bytemuck::cast_slice(&pj));
     }
 
     fn read_results(
@@ -964,7 +1025,7 @@ impl SingleBatchExecutor {
         // Derive cells-per-channel from the staging size so this stays in
         // sync with the shader's shape (5*97*5 before, 5*49*5 after the
         // vertical-cell-height fix). total = num_chunks*16*CPC*4 bytes.
-                let nc = batch.positions.len().max(1);
+        let nc = batch.positions.len().max(1);
         let cells_per_channel = (f32s.len() / (nc * out_channels)).max(1);
         // offsets[0..out_channels] describe the compact per-chunk layout.
         let mut channel_offsets = [0u64; 16];
