@@ -74,8 +74,8 @@
 >   Fabric 与 NeoForge+Connector 实机通过。
 >
 > 0.1.7 的全部改动都已合入 `main` 并打了 tag `v0.1.7`；
-> `feature/chunk-status-integration` 只是历史分支（比 `main` 落后 18 个提交、
-> 无独有提交）。
+> `feature/chunk-status-integration` 已全部合入 `main`，该分支于 2026-11-14
+> 从本地和 GitHub 删除（内容仍在 `main` 历史里）。
 >
 > **0.1.8（开发中）**
 > - aquifer 预留量改为按 shape 推导：原版 384 高从写死的 1200 降到 315
