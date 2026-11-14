@@ -162,7 +162,7 @@ These options are for troubleshooting; leave them at their defaults for normal p
 | Field | Default | Description |
 |---|---|---|
 | `debug_verbose_logging` | `false` | Enables detailed diagnostics: shader compile times, pipeline-cache hits, adapter workarounds, and periodic chunks-per-second (`CPS=`) stats (also printed to chat). |
-| `debug_stage_timing` | `false` | Writes per-stage timings to the log: GPU side (encode / submit / readback / decode) and CPU side (block write-back into the chunk). |
+| `debug_stage_timing` | `false` | Writes per-stage timings to the log: GPU side (encode / submit / readback / decode) and CPU side (block write-back into the chunk). Also emits the 2-second `[pipe]` pipeline probe (queue / fill / permit / external sampling / submit / GPU idle share) and, on dimensions with external nodes, cross-checks the first 8 parallel-sampled batches against a serial recompute (all should read 0 mismatches). |
 | `debug_height_probe` | `false` | Counts vanilla `ChunkGenerator.getHeight` calls, their cost, distinct columns and calling threads, and whether GPU batches were still in flight. Used to decide whether caching surface height is worth it (see `DEVELOPMENT.md` §14). Read once at class load; a change needs a restart. |
 
 ### Offline diagnostics
