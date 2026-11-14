@@ -1,9 +1,15 @@
 # C2ME WGPU 加速模块 — 开发文档
 
 > 最后更新：2026-11-14
-> 状态：**0.1.5、0.1.6 已发布；0.1.7 已通过 Fabric 与 NeoForge（+Connector，含 Tectonic）实机验证，tag `v0.1.7` 已推送（Release 页面由维护者发布）**。
+> 状态：**0.1.5、0.1.6、0.1.7、0.1.8 已发布；0.1.8 的 external 并行采样与
+> Tectonic 832 高形状已实机验证（Fabric、NeoForge + Connector），tag `v0.1.8`
+> 已推送（Release 页面由维护者发布）**。
 >
 > **已发布 / 已打 tag**
+> - **0.1.8**：aquifer 预留量按 shape 推导（修掉 832 高维度的写越界）、external
+>   密度子树按 chunk 4 线程并行采样（Tectonic 384 高 26 → 21/22 s，832 高
+>   43 → 36/38 s）、aquifer 上传显式越界检查、删除未使用的 `buffer_pool`。
+>   tag `v0.1.8` 已推送；Release 页面由维护者另行发布。
 > - **0.1.7**：对齐批次（同种子 4×4 13 s）、shader 编译覆盖层、external 按实例
 >   去重、NeoForge + Connector 下的 Tectonic 修正为可走 GPU、批次解码失败的
 >   资源泄漏修复。tag `v0.1.7` 已推送；Release 页面由维护者另行发布。
@@ -77,7 +83,7 @@
 > `feature/chunk-status-integration` 已全部合入 `main`，该分支于 2026-11-14
 > 从本地和 GitHub 删除（内容仍在 `main` 历史里）。
 >
-> **0.1.8（开发中）**
+> **0.1.8**
 > - aquifer 预留量改为按 shape 推导：原版 384 高从写死的 1200 降到 315
 >   cells/chunk，Tectonic 832 高为 657，修掉约 2000+ 高维度上传时的写越界。
 > - aquifer 上传加显式越界检查（失败整批，不再交给 wgpu 校验后丢命令）。
@@ -85,6 +91,9 @@
 > - external（CPU 求值）密度子树改为按 chunk 4 线程并行采样：Tectonic 384 高
 >   4×4 下 26 → 21/22 s（**1.20×**），832 高 43 → 36/38 s（1.14–1.19×）；
 >   并发正确性由前 8 批的串行重算自检覆盖（两个高度都是 8/8 逐位一致）。
+> - 发版前做了一轮可读性整理（注释与实测对齐、死代码、行尾空白、两处 unchecked
+>   泛型数组），无行为变更：`cargo test` 90 passed / 7 ignored，`-Xlint:unchecked`
+>   警告归零。
 >
 > **实测基线**（细节见 §9 / §10 / §11 / §13.7；跨组数据不可直接比较，见教训 #45）
 > - 桌面端端到端反超纯 CPU（Chunky r=500，RADV RENOIR）：**18 s vs 23 s**
@@ -745,7 +754,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   收敛调度依赖，每个成员仍各自构建 `ChunkNoiseSampler`；要进一步必须自己
   持有 `Blender` / `StructureAccessor` / sampler，风险远高于阶段 2，暂不做。
 
-**0.1.8（未发版）**
+**0.1.8（tag `v0.1.8` 已推送）：external 采样并行化与高度安全的 shape 推导**
 - [x] **aquifer 预留量按 shape 推导**：binding 8 原先写死
   `AQ_MAX_CELLS_PER_CHUNK = 1200`（按原版 512 高估），维度到约 2000+ 高时
   `upload_aquifer_tables` 会写越界。现在 `ShapeConfig::aquifer_cells_per_chunk()`
