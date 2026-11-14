@@ -828,6 +828,44 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   刚好把两者重叠。并行采样后 CPU 腿降为约 1/3，GPU 空转 32–34% → 24%；
   剩余空转是 C2ME 供货空窗（`qwait` 38–81 ms/批、`qdepth` 多为 0），加
   `STAGING=3` 不会改善。下一步若还要提速，方向在 C2ME 的提交节奏，不在协调器。
+- [ ] **external 采样不复用 MC 的噪声缓存 —— Tectonic 高世界下落后 CL 的主因（2026-11-14 实机定位）**。
+  当前实现（`WgpuBatchCoordinator.uploadExternalInputs`）对每个 external 节点、
+  每个 chunk、每个角点都调一次 `ext.sample(new UnblendedNoisePos(wx, wy, wz))`，
+  **裸采样**：既不经过 `ChunkNoiseSampler` 的 `CacheOnce`/`Cache2D`/`FlatCache`/
+  `CellCache` 包装，也不共享任何已算过的中间值。vanilla 生成同一个
+  `ConfigNoise` 时是在 `ChunkNoiseSampler` 上下文里跑的，会被 flat cache 从
+  per-block 降到 per-cell；官方 CL 模块则把 `NoiseConfig` 与
+  `NoiseChunkGenerator` 直接传进 `CLServerBatchedBiomeNoiseContext`
+  （`dev/26.2.0` 的 `CLServerBatchedBiomeNoiseContext` 构造签名可查），复用 MC
+  的采样上下文——这也是它敢做 4×4 对齐批次的前提之一。我们两头都没占。
+  **A/B 证据**（种子 `-836645977851536298`，Tectonic 3.0.28 `max_y=1024`
+  （min_y=-64，总高 1088），r=500 = 4225 chunks，默认地形，GPU/CPU 交替）：
+
+  | 变体 | 耗时 | 样本数 |
+  |---|---|---|
+  | OpenCL 0.4.0-alpha.0.30 | **28 / 27 s**（中位 27.5） | 2 |
+  | wgpu 0.1.8 `chunk_batch_size=1` | 30 / 32 s（中位 31） | 2 |
+  | wgpu 0.1.8 `chunk_batch_size=2` | 32 s | 1 |
+  | wgpu 0.1.8 `chunk_batch_size=4` | 37 s | 1 |
+
+  wgpu 1×1 落后约 **12%**，且**批次越大越慢，与无 mod 地形时的规律相反**。
+  原版 384 高地形上 4×4 是最优（21/22 s vs 1×1 的 25 s），因为那时 2 个 external
+  实例的处理成本低、批处理收益能兑现；Tectonic 1088 高下每 chunk 的角点采样量
+  翻倍（`sized_for=3425 cells/chunk`），2 个 `ConfigNoise` 的裸采样成本随批次
+  线性增长，把对齐批次的固定开销收益吃掉还倒扣。日志里
+  `external sampling: 4 thread(s) per batch` 说明采样并行化在位，瓶颈不是线程数，
+  而是**总采样量**。
+  **改法方向**（按难度）：
+  1. 给 external 子树套上与 vanilla 相同的 cache 包装（至少 `FlatCache` 把
+     per-block 降到 per-cell、`CacheOnce` 避免同一角点重复求值）；
+  2. 或者不再直接对 `DensityFunction` 裸 sample，而是复用
+     `chunk.getOrCreateChunkNoiseSampler` 已建立的采样器上下文；
+  3. 最彻底的是给 `ConfigNoise` 这类 modded 节点写 WGSL emitter，但那与
+     `§6 混合执行` 的边界冲突，列为远期。
+  **验证方式**：改完后同种子、同 Tectonic 配置、同 r=500 复测并与此表对比；
+  同时开 `debug_stage_timing` 看 `ext` 毫秒/批是否下降。
+  关联：「能力上限从设备实际限额反推」同属吞吐方向，两者都会改变 Java 侧的
+  每批工作量，改完需要一起复测。
 
 ### 待测与验证计划（不属于版本功能）
 
