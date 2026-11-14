@@ -721,6 +721,9 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   实机验证（2026-11-14，Fabric 与 NeoForge+Connector，均 Tectonic 832 高）：
   两边的 `sized_for` 都是 `2625 cells/chunk / 212992 blocks/chunk / 657
   aquifer cells/chunk`，executor 只创建一次，无 validation error、无回退。
+  原版 384 高补测（同一天，专用服务器实例、无 Tectonic、Chunky 1681 chunks）：
+  `1225 cells/chunk（5×49×5）/ 98304 blocks/chunk / 315 aquifer cells/chunk`，
+  `b8_aquifer=630 KiB`，同样只创建一次 executor、无 validation error。
 - [x] **aquifer 上传加显式越界检查**：`upload_aquifer_tables` 改为返回
   `Result`，写入前用 `aq_p + aq_s` 的实际字节数比对 binding 8 的容量，越界就
   失败整批，而不是交给 wgpu 校验——校验失败会丢掉整条 command buffer，症状是
