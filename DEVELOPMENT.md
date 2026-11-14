@@ -813,9 +813,10 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   约 10 s 来自按 shape 定 buffer、12 s 来自 external 流水线；对齐批次在 external
   维度没有收益。细节见 `.agents/reports/2026-11-14-tectonic-external-ab.md`。
   对外引用时需同时写明"384 高 / 2 个 external 实例"这两个条件。
-- [ ] 832 高（Tectonic 默认）的 external 复测（暂缓，2026-11-14 决定先不做）：
-  本轮测的是顶部 320（总高 384），高度翻倍后外部角点采样量与 buffer 都会变，
-  流水线的相对收益可能更高。
+- [ ] 832 高的 external 复测（暂缓，2026-11-14 决定先不做）：832 不是 Tectonic
+  的默认值，要在它的配置里手动调，且 GUI 里允许的上限比 832 更高。本轮测的是
+  顶部 320（总高 384），高度翻倍后外部角点采样量与 buffer 都会变，流水线的
+  相对收益可能更高。
 
 ### 借鉴官方 OpenCL 模块的优化点（0.1.8+ 任务池）
 
