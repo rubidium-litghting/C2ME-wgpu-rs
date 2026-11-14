@@ -153,18 +153,18 @@ public class NativeLoader {
                 if (targetPath.getParent() != null) {
                     Files.createDirectories(targetPath.getParent());
                 }
-                
+
                 extractResource(libName, targetPath);
-                
+
                 if (isTmp && !Boolean.getBoolean("c2me.wgpu.preserveNative")) {
                     targetPath.toFile().deleteOnExit();
                 }
-                
+
                 // Try to load. If this throws (e.g., noexec mount), we fall through to the next candidate.
                 SymbolLookup lookup = SymbolLookup.libraryLookup(targetPath, arena);
                 LOGGER.info("[c2me-wgpu] Successfully loaded native library from {}", targetPath);
                 return lookup;
-                
+
             } catch (Throwable e) {
                 LOGGER.warn("[c2me-wgpu] Failed to extract/load native library from " + targetPath + ", trying next fallback...", e);
                 // Clean up the failed file so the next attempt starts fresh
@@ -182,7 +182,7 @@ public class NativeLoader {
                 throw new IllegalStateException("Cannot find native library " + libName);
             }
             Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
-            
+
             // On POSIX systems (Linux, Android, OHOS), dlopen usually only requires
             // read access. However, some strict SELinux policies or directories
             // mounted with `noexec` might reject loading a library without the

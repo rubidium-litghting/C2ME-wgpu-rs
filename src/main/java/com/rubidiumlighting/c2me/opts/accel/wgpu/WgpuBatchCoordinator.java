@@ -41,9 +41,11 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * Coalesces per-chunk GPU requests into a single dispatch.
@@ -62,8 +64,13 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class WgpuBatchCoordinator {
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu-batch");
 
-
-    /** Max chunks coalesced into one GPU dispatch. */
+    /** Max chunks coalesced into one GPU dispatch.
+     *
+     *  <p>Must not exceed `ExecutorConfig::max_batch_size` on the Rust side
+     *  (`rust/src/scheduler/executor.rs`), which sizes every buffer by it and
+     *  rejects larger batches outright. The two are duplicated rather than
+     *  queried: the cap is a compile-time property of the buffer layout.
+     *  See the 0.1.8+ backlog on deriving it from the device limits. */
     private static final int MAX_BATCH = 64;
 
     /** Batches submitted to the GPU and not yet read back, summed over every
@@ -155,6 +162,8 @@ public final class WgpuBatchCoordinator {
      *  are regenerated on the CPU. */
     private volatile boolean gpuFailed = false;
 
+    /** True once a batch failed. Callers stop submitting: the affected chunks
+     *  are already regenerated on the vanilla CPU path. */
     public boolean hasFailed() {
         return gpuFailed;
     }
@@ -176,8 +185,7 @@ public final class WgpuBatchCoordinator {
      * buffers are pooled, and a second one there fails with
      * "another batch is already in flight".
      */
-    private final java.util.concurrent.Semaphore submitPermits =
-            new java.util.concurrent.Semaphore(STAGING);
+    private final Semaphore submitPermits = new Semaphore(STAGING);
     // Pipelining is unconditional: the external-input payload (binding 6) is
     // carried by each batch, so a later batch can no longer overwrite data a
     // queued one still needs. See computeExternalInputs().
@@ -205,12 +213,14 @@ public final class WgpuBatchCoordinator {
     private final int cellW, cellH;    // cell size in blocks
     private final int minY;
 
+    /** Horizontal chunk size in blocks; the corpus grid starts at chunk×16. */
+    private static final int CHUNK_WIDTH = 16;
+
     /** Threads used to sample external subtrees. Sampling dominates the batch
-     *  thread on external worlds (2.7–5.4 ms/chunk on Tectonic, versus ~4.6
-     *  ms/chunk of GPU time), so it is split across chunks — one batch is 16
-     *  chunks at 4×4, which divides evenly. Capped at 4: the point is to get
-     *  the CPU leg below the GPU leg without starving C2ME's own workers or
-     *  the driver thread. */
+     *  thread on external worlds (3.5 ms/chunk on Tectonic at 384 height,
+     *  6.7 at 832, versus ~4.6 and ~10 ms/chunk of GPU time), so it is split
+     *  across chunks. Capped at 4: the point is to get the CPU leg below the
+     *  GPU leg without starving C2ME's own workers or the driver thread. */
     private static final int EXTERNAL_THREADS =
             Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 4));
 
@@ -295,7 +305,7 @@ public final class WgpuBatchCoordinator {
      *  ready. Does NOT block the caller — the C2ME-scheduling path (§3.5)
      *  uses this so the worker is freed to submit more chunks and batches can
      *  grow. This is the only request entry point. */
-    public java.util.concurrent.CompletableFuture<GpuChunk> requestAsync(int cx, int cz) {
+    public CompletableFuture<GpuChunk> requestAsync(int cx, int cz) {
         Job job = new Job(cx, cz);
         // Bounded queue: block the calling C2ME worker (never the main thread)
         // until there is room, so the GPU is never starved by a huge backlog.
@@ -370,6 +380,8 @@ public final class WgpuBatchCoordinator {
         }
     }
 
+    /** Batch thread: take chunks off the queue, coalesce them into a batch,
+     *  sample the external subtrees, and hand the batch to the pipeline. */
     private void run() {
         try {
             while (running) {
@@ -452,11 +464,11 @@ public final class WgpuBatchCoordinator {
             return null;
         }
         int cellsPerChunk = gx * gy * gz;
+        int stride = numExt * cellsPerChunk;   // floats per chunk slice
         int n = batch.size();
-        float[] data = new float[n * numExt * cellsPerChunk];
+        float[] data = new float[n * stride];
         lastExternalBytes = (long) data.length * 4L; // f32
         if (n > 1 && EXTERNAL_THREADS > 1) {
-            int stride = numExt * cellsPerChunk;
             int threads = Math.min(EXTERNAL_THREADS, n);
             int per = (n + threads - 1) / threads;
             List<Future<?>> tasks = new ArrayList<>(threads);
@@ -466,8 +478,7 @@ public final class WgpuBatchCoordinator {
                 if (from >= to) break;
                 tasks.add(ExternalPool.INSTANCE.submit(() -> {
                     for (int c = from; c < to; c++) {
-                        fillExternalChunk(batch.get(c), data, c * stride,
-                                numExt, cellsPerChunk);
+                        fillExternalChunk(batch.get(c), data, c * stride);
                     }
                 }));
             }
@@ -484,13 +495,11 @@ public final class WgpuBatchCoordinator {
             }
             if (Config.get().debugStageTiming && selfChecksLeft > 0) {
                 selfChecksLeft--;
-                selfCheckExternal(data, batch, numExt, cellsPerChunk);
+                selfCheckExternal(data, batch, stride);
             }
         } else {
-            int stride = numExt * cellsPerChunk;
             for (int c = 0; c < n; c++) {
-                fillExternalChunk(batch.get(c), data, c * stride,
-                        numExt, cellsPerChunk);
+                fillExternalChunk(batch.get(c), data, c * stride);
             }
         }
         return data;
@@ -498,14 +507,13 @@ public final class WgpuBatchCoordinator {
 
     /** Recompute {@code parallel} serially and compare bit-for-bit. Logged
      *  once per batch for the first {@link #SELF_CHECK_BATCHES} batches of a
-     *  dimension; runs on the batch thread only, so it cannot perturb the
-     *  measurement it is validating. */
-    private void selfCheckExternal(float[] parallel, List<Job> batch,
-                                   int numExt, int cellsPerChunk) {
+     *  dimension. Runs on the batch thread, so it adds one extra serial pass
+     *  to those first batches' `ext` time — hence the low batch count and the
+     *  debug-only gate, which keeps it out of any measurement it would skew. */
+    private void selfCheckExternal(float[] parallel, List<Job> batch, int stride) {
         float[] serial = new float[parallel.length];
-        int stride = numExt * cellsPerChunk;
         for (int c = 0; c < batch.size(); c++) {
-            fillExternalChunk(batch.get(c), serial, c * stride, numExt, cellsPerChunk);
+            fillExternalChunk(batch.get(c), serial, c * stride);
         }
         int mismatches = 0;
         float maxDiff = 0f;
@@ -527,10 +535,9 @@ public final class WgpuBatchCoordinator {
      *  Chunk slices are independent, so this is safe to run concurrently —
      *  vanilla samples the same density-function instances from several chunk
      *  generation workers at once. */
-    private void fillExternalChunk(Job job, float[] data, int offset,
-                                   int numExt, int cellsPerChunk) {
-        int sx = job.cx * 16;
-        int sz = job.cz * 16;
+    private void fillExternalChunk(Job job, float[] data, int offset) {
+        int sx = job.cx * CHUNK_WIDTH;
+        int sz = job.cz * CHUNK_WIDTH;
         int idx = offset;
         for (DensityFunction ext : externalNodes) {
             for (int j = 0; j < gy; j++) {
@@ -623,6 +630,8 @@ public final class WgpuBatchCoordinator {
         }
     }
 
+    /** Completion thread: drain finished batches and complete their chunk
+     *  futures, in submission order so C2ME's locks are released promptly. */
     private void completeLoop() {
         // Keep draining after `running` clears: each Inflight holds a Rust-side
         // request handle that only take_*_blob releases. Exiting early would
@@ -641,10 +650,10 @@ public final class WgpuBatchCoordinator {
                 try {
                     org.apache.logging.log4j.LogManager.shutdown();
                 } catch (Throwable ignored) {}
-                
+
                 // System.exit can deadlock if shutdown hooks wait on the deadlocked main thread.
                 // halt(1) is the only safe way to kill the process.
-                Runtime.getRuntime().halt(1); 
+                Runtime.getRuntime().halt(1);
             }
         }
     }
@@ -673,7 +682,7 @@ public final class WgpuBatchCoordinator {
                     Runtime.getRuntime().halt(1);
                     return;
                 }
-                java.util.concurrent.locks.LockSupport.parkNanos(backoff);
+                LockSupport.parkNanos(backoff);
                 if (backoff < POLL_MAX_NS) {
                     backoff = Math.min(backoff * 2, POLL_MAX_NS);
                 }
@@ -825,6 +834,7 @@ public final class WgpuBatchCoordinator {
                 sub / 1e6 / perBatch, idlePct, qdSum / perBatch, qdMax, b));
     }
 
+    /** Fail every job's future; C2ME then regenerates those chunks on the CPU. */
     private static void failAll(List<Job> batch, Throwable t) {
         for (Job job : batch) job.future.completeExceptionally(t);
     }

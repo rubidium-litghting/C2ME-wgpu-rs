@@ -253,7 +253,6 @@ public class WgpuThinBinding {
                     )
             );
 
-
             MH_world_destroy = NativeLoader.linker.downcallHandle(
                     NativeLoader.lookup.find("c2me_wgpu_world_destroy").orElseThrow(),
                     FunctionDescriptor.of(
@@ -871,7 +870,6 @@ public class WgpuThinBinding {
             throw new RuntimeException(t);
         }
     }
-
 
     /**
      * Cached results of the JSON listing queries.

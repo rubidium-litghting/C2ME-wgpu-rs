@@ -131,7 +131,12 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
      * Build the dependency set a batch anchor must satisfy. For a single
      * chunk this reproduces the vanilla {@code NOISE} generation dependencies
      * exactly; for a batch it is the union over all members.
+     *
+     * <p>The list is built here, so every element really is a {@code
+     * KeyStatusPair<ChunkPos, ChunkState, ChunkLoadingContext>}; only the
+     * array type itself is erased.
      */
+    @SuppressWarnings("unchecked")
     private static KeyStatusPair<ChunkPos, ChunkState, ChunkLoadingContext>[] buildBatchDependencies(int size) {
         GenerationDependencies direct =
                 ChunkGenerationSteps.GENERATION.get(ChunkStatus.NOISE).directDependencies();
@@ -265,7 +270,15 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
         return Completable.merge(work);
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>The generic array type is part of C2ME's own interface, so creating
+     * and returning it is unavoidably unchecked; every element is built here
+     * as a {@code KeyStatusPair<ChunkPos, ChunkState, ChunkLoadingContext>}.
+     */
     @Override
+    @SuppressWarnings("unchecked")
     public KeyStatusPair<ChunkPos, ChunkState, ChunkLoadingContext>[] getDependencies(
             ItemHolder<ChunkPos, ChunkState, ChunkLoadingContext, ?> holder) {
         ChunkState state = holder.getItem().get();

@@ -39,8 +39,11 @@ import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class NoiseRouterBlobifier {
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu");
@@ -48,10 +51,9 @@ public class NoiseRouterBlobifier {
     // ── Permutation resource collection ─────────────────────────────
     private static final int PERM_MAGIC = 0x4D525750; // "PWPM"
     private static final int SIMPLEX_MAGIC = 0x4D525358; // "SXRM"
-    private static final java.util.List<Object> SIMPLEX_SAMPLERS = new java.util.ArrayList<>();
+    private static final List<Object> SIMPLEX_SAMPLERS = new ArrayList<>();
     private static final IdentityHashMap<Object, Void> SEEN_PERM = new IdentityHashMap<>();
     private static final List<Object> PERM_SAMPLERS = new ArrayList<>();
-    private static Object lastDperlin = null;
     /** IdentityHashMap: DoublePerlinNoiseSampler -> structured stack info. */
     private static final IdentityHashMap<Object, DpsInfo> DPS_INFO = new IdentityHashMap<>();
 
@@ -77,17 +79,17 @@ public class NoiseRouterBlobifier {
     }
     private static NoiseConfig CURRENT_NOISE_CONFIG = null;
     /** Every InterpolatedNoiseSampler encountered while serializing. */
-    public static final java.util.List<Object> SEEN_INS = new java.util.ArrayList<>();
-    private static final java.util.Map<String, Boolean> PLACEHOLDER_SEEN =
-            new java.util.concurrent.ConcurrentHashMap<>();
+    public static final List<Object> SEEN_INS = new ArrayList<>();
+    private static final Map<String, Boolean> PLACEHOLDER_SEEN =
+            new ConcurrentHashMap<>();
     /** Dedup for UNSUPPORTED NODE field-dumps: one full dump per node class. */
-    private static final java.util.Map<String, Boolean> UNSUPPORTED_SEEN =
-            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final Map<String, Boolean> UNSUPPORTED_SEEN =
+            new ConcurrentHashMap<>();
 
     /** Density subtrees we could not translate, evaluated on the CPU and fed
      *  to the GPU as external inputs (binding 6). Cleared per blobify(). */
-    public static final java.util.List<DensityFunction> EXTERNAL_NODES =
-            new java.util.ArrayList<>();
+    public static final List<DensityFunction> EXTERNAL_NODES =
+            new ArrayList<>();
     /** Identity index backing {@link #EXTERNAL_NODES}.
      *
      *  <p>The density tree is a DAG: the same subtree instance is reachable
@@ -101,8 +103,8 @@ public class NoiseRouterBlobifier {
      *  <p>Sharing a slot is exact, not an approximation: `sample(pos)` is pure,
      *  so two occurrences of the same instance at the same corner lattice
      *  produce identical values. Cleared per blobify(). */
-    private static final java.util.IdentityHashMap<DensityFunction, Integer> EXTERNAL_INDEX =
-            new java.util.IdentityHashMap<>();
+    private static final IdentityHashMap<DensityFunction, Integer> EXTERNAL_INDEX =
+            new IdentityHashMap<>();
     /** Occurrences seen, including ones folded into an existing slot by
      *  {@link #EXTERNAL_INDEX}; cleared per blobify(). */
     public static int EXTERNAL_REFS = 0;
@@ -528,7 +530,7 @@ public class NoiseRouterBlobifier {
             buf.putFloat(impl.max());
             float[] locs = impl.locations();
             float[] ders = impl.derivatives();
-            java.util.List<?> vals = impl.values();
+            List<?> vals = impl.values();
             buf.putInt(locs.length);
             for (float l : locs) buf.putFloat(l);
             for (float d : ders) buf.putFloat(d);
@@ -629,7 +631,6 @@ public class NoiseRouterBlobifier {
             buf.putInt(0); buf.putInt(0);
         }
     }
-
 
     private static void writeStack(ByteBuffer buf, StackInfo st) {
         buf.putInt(st.permOffset);
@@ -747,7 +748,7 @@ public class NoiseRouterBlobifier {
             }
         }
         float[] out = new float[Math.max(1, expectedLen)];
-        java.util.Arrays.fill(out, 1.0f);
+        Arrays.fill(out, 1.0f);
         return out;
     }
 

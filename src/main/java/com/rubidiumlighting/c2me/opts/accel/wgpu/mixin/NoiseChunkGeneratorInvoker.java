@@ -24,7 +24,6 @@
 
 package com.rubidiumlighting.c2me.opts.accel.wgpu.mixin;
 
-import net.minecraft.util.math.ChunkPos;
 import net.minecraft.world.chunk.Chunk;
 import net.minecraft.world.gen.StructureAccessor;
 import net.minecraft.world.gen.chunk.Blender;

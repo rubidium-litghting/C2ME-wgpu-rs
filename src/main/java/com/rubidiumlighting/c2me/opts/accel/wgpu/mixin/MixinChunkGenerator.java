@@ -38,7 +38,6 @@ import com.rubidiumlighting.c2me.opts.accel.wgpu.config.Config;
 
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
-import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.server.world.ServerChunkLoadingManager;
 import net.minecraft.server.world.ServerChunkManager;
 import net.minecraft.server.world.ServerWorld;
@@ -152,9 +151,6 @@ public abstract class MixinChunkGenerator {
                 stageAquiferForGpu(ds, chunk, aquifer);
             } catch (Throwable t) {
                 LOGGER.warn("[c2me-wgpu] aquifer stage failed", t);
-            }
-            if (ChunkDumper.DUMP_AQUIFER) {
-                LOGGER.info("[c2me-wgpu] stageAquiferForGpu called for chunk: {}, DUMP_CHUNK: {},{}", chunk.getPos(), ChunkDumper.DUMP_CHUNK[0], ChunkDumper.DUMP_CHUNK[1]);
             }
             // §8.4 diagnostic: dump this chunk's aquifer table if requested.
             if (ChunkDumper.DUMP_AQUIFER
@@ -394,13 +390,8 @@ public abstract class MixinChunkGenerator {
         }));
     }
 
-
-
-
-
     // Aggregated CPU write-back timing: one averaged line every 128 chunks,
     // so the log isn't flooded (was ~1 line/chunk).
-
 
     /** Resolve C2ME's SchedulingManager from the worldgen StructureAccessor:
      *  world (ChunkRegion during worldgen) -> ServerWorld -> ServerChunkManager
@@ -463,7 +454,6 @@ public abstract class MixinChunkGenerator {
         }
         return null;
     }
-
 
     /**
      * Write the GPU finalDensity channel (channel 11) to {@code chunk} as
@@ -638,7 +628,6 @@ public abstract class MixinChunkGenerator {
                 chunk.getPos().x, chunk.getPos().z, tb.array());
     }
 
-
     private static void stageAquiferForGpu(DimState ds, Chunk chunk,
             AquiferSampler aquifer) {
         if (!(aquifer instanceof AquiferSampler.Impl impl)) {
@@ -690,10 +679,6 @@ public abstract class MixinChunkGenerator {
         WgpuThinBinding.setAquiferTable(ds.worldHandle,
                 chunk.getPos().x, chunk.getPos().z, tb.array());
     }
-
-
-    /** Strip RegistryEntryHolder + Wrapper(cache) layers so a router
-     *  node can be single-shot sampled for diagnostics. */
 
     /** Build a WorldContext for one dimension's noise settings. Returns null
      *  on any failure so the caller can fall back to the vanilla CPU path. */
