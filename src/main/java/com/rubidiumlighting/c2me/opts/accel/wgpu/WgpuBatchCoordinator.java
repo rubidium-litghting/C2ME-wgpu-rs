@@ -36,6 +36,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -201,6 +205,33 @@ public final class WgpuBatchCoordinator {
     private final int cellW, cellH;    // cell size in blocks
     private final int minY;
 
+    /** Threads used to sample external subtrees. Sampling dominates the batch
+     *  thread on external worlds (2.7–5.4 ms/chunk on Tectonic, versus ~4.6
+     *  ms/chunk of GPU time), so it is split across chunks — one batch is 16
+     *  chunks at 4×4, which divides evenly. Capped at 4: the point is to get
+     *  the CPU leg below the GPU leg without starving C2ME's own workers or
+     *  the driver thread. */
+    private static final int EXTERNAL_THREADS =
+            Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 4));
+
+    /** Lazily created so worlds without external nodes never spawn a thread.
+     *  Daemon threads: they are pure compute over caller-owned buffers. */
+    private static final class ExternalPool {
+        static final ExecutorService INSTANCE = Executors.newFixedThreadPool(
+                EXTERNAL_THREADS, r -> {
+                    Thread t = new Thread(r, "c2me-wgpu-external");
+                    t.setDaemon(true);
+                    return t;
+                });
+    }
+
+    /** Number of batches to cross-check parallel sampling against a serial
+     *  recompute (only with debug_stage_timing). This is evidence that the
+     *  shared density-function instances are safe to sample concurrently;
+     *  sampling is deterministic, so any difference means state pollution. */
+    private static final int SELF_CHECK_BATCHES = 8;
+    private int selfChecksLeft = SELF_CHECK_BATCHES;
+
     // ── throughput stats (logged every STATS_INTERVAL_NS) ──────────
     private static final long STATS_INTERVAL_NS = 2_000_000_000L;
     private final AtomicLong statBatches = new AtomicLong();
@@ -217,6 +248,24 @@ public final class WgpuBatchCoordinator {
      *  max_storage_buffer_binding_size. Reported in the 2-second stats line. */
     private volatile long lastExternalBytes;
 
+    // ── pipeline probe (debug_stage_timing only) ──────────────────
+    // Splits the batch thread's wall time by where it went. The two-sided
+    // split is the point: queue/fill wait means the coordinator had no work
+    // (C2ME-bound), permit wait means the pipeline was full (GPU-bound).
+    private final AtomicLong probeQueueWaitNs = new AtomicLong();
+    private final AtomicLong probeFillWaitNs = new AtomicLong();
+    private final AtomicLong probePermitWaitNs = new AtomicLong();
+    private final AtomicLong probeExternalNs = new AtomicLong();
+    private final AtomicLong probeSubmitNs = new AtomicLong();
+    /** Sum of positive gaps between "a batch completed" and "the next one was
+     *  submitted" — time the pipeline held zero batches. Gaps over 1 s are
+     *  dropped as world loads / dimension switches, not pipeline bubbles. */
+    private final AtomicLong probeIdleNs = new AtomicLong();
+    private final AtomicLong probeQueueDepthSum = new AtomicLong();
+    private final AtomicLong probeQueueDepthMax = new AtomicLong();
+    /** Completion time of the last batch, 0 until the first one lands. */
+    private volatile long probeLastCompleteNs;
+
     public WgpuBatchCoordinator(long worldHandle,
                                 List<DensityFunction> externalNodes,
                                 int gx, int gy, int gz, int cellW, int cellH, int minY) {
@@ -225,6 +274,10 @@ public final class WgpuBatchCoordinator {
         this.gx = gx; this.gy = gy; this.gz = gz;
         this.cellW = cellW; this.cellH = cellH;
         this.minY = minY;
+        if (!externalNodes.isEmpty()) {
+            LOGGER.info("[c2me-wgpu] external sampling: {} thread(s) per batch",
+                    EXTERNAL_THREADS);
+        }
         // External payloads used to force serial submission because they went
         // through a process-global `world.external_data` that `submit_async`
         // only reads later, during prepare. They now travel inside the request
@@ -321,21 +374,40 @@ public final class WgpuBatchCoordinator {
         try {
             while (running) {
                 try {
+                    final boolean probe = Config.get().debugStageTiming;
+                    long pollT0 = probe ? System.nanoTime() : 0L;
                     Job first = queue.poll(50, TimeUnit.MILLISECONDS);
-                    if (first == null) continue;
+                    // Always needed: the fill window starts here, not at 0
+                    // (using 0 would make it break immediately without the
+                    // probe enabled).
+                    long pollT1 = System.nanoTime();
+                    if (first == null) {
+                        // Nothing to attribute the wait to, but it is still
+                        // time the batch thread sat idle: count it so the
+                        // per-window share stays honest.
+                        if (probe) probeQueueWaitNs.addAndGet(pollT1 - pollT0);
+                        continue;
+                    }
+                    if (probe) probeQueueWaitNs.addAndGet(pollT1 - pollT0);
 
                     List<Job> batch = new ArrayList<>();
                     batch.add(first);
                     // Brief window for other workers to pile on. If the queue is
                     // already non-empty, poll() returns immediately, so this only
                     // actually waits when there is nothing more to take.
-                    long deadline = System.nanoTime() + MAX_WAIT_MS * 1_000_000L;
+                    long deadline = pollT1 + MAX_WAIT_MS * 1_000_000L;
                     while (batch.size() < MAX_BATCH) {
                         long remain = deadline - System.nanoTime();
                         if (remain <= 0) break;
                         Job j = queue.poll(remain, TimeUnit.NANOSECONDS);
                         if (j == null) break;
                         batch.add(j);
+                    }
+                    if (probe) {
+                        probeFillWaitNs.addAndGet(System.nanoTime() - pollT1);
+                        int qd = queue.size();
+                        probeQueueDepthSum.addAndGet(qd);
+                        probeQueueDepthMax.accumulateAndGet(qd, Math::max);
                     }
 
                     // Same ordering the Rust side applies (sort by cx, then cz).
@@ -380,35 +452,118 @@ public final class WgpuBatchCoordinator {
             return null;
         }
         int cellsPerChunk = gx * gy * gz;
-        float[] data = new float[batch.size() * numExt * cellsPerChunk];
+        int n = batch.size();
+        float[] data = new float[n * numExt * cellsPerChunk];
         lastExternalBytes = (long) data.length * 4L; // f32
-        int idx = 0;
-        for (Job job : batch) {
-            int sx = job.cx * 16;
-            int sz = job.cz * 16;
-            for (DensityFunction ext : externalNodes) {
-                for (int j = 0; j < gy; j++) {
-                    int wy = minY + j * cellH;
-                    for (int k = 0; k < gz; k++) {
-                        int wz = sz + k * cellW;
-                        for (int i = 0; i < gx; i++) {
-                            int wx = sx + i * cellW;
-                            double v = ext.sample(
-                                    new DensityFunction.UnblendedNoisePos(wx, wy, wz));
-                            data[idx++] = (float) v;
-                        }
+        if (n > 1 && EXTERNAL_THREADS > 1) {
+            int stride = numExt * cellsPerChunk;
+            int threads = Math.min(EXTERNAL_THREADS, n);
+            int per = (n + threads - 1) / threads;
+            List<Future<?>> tasks = new ArrayList<>(threads);
+            for (int t = 0; t < threads; t++) {
+                final int from = t * per;
+                final int to = Math.min(n, from + per);
+                if (from >= to) break;
+                tasks.add(ExternalPool.INSTANCE.submit(() -> {
+                    for (int c = from; c < to; c++) {
+                        fillExternalChunk(batch.get(c), data, c * stride,
+                                numExt, cellsPerChunk);
+                    }
+                }));
+            }
+            try {
+                for (Future<?> f : tasks) f.get();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("external sampling interrupted", ie);
+            } catch (ExecutionException ee) {
+                Throwable c = ee.getCause();
+                if (c instanceof RuntimeException re) throw re;
+                if (c instanceof Error e) throw e;
+                throw new RuntimeException(c);
+            }
+            if (Config.get().debugStageTiming && selfChecksLeft > 0) {
+                selfChecksLeft--;
+                selfCheckExternal(data, batch, numExt, cellsPerChunk);
+            }
+        } else {
+            int stride = numExt * cellsPerChunk;
+            for (int c = 0; c < n; c++) {
+                fillExternalChunk(batch.get(c), data, c * stride,
+                        numExt, cellsPerChunk);
+            }
+        }
+        return data;
+    }
+
+    /** Recompute {@code parallel} serially and compare bit-for-bit. Logged
+     *  once per batch for the first {@link #SELF_CHECK_BATCHES} batches of a
+     *  dimension; runs on the batch thread only, so it cannot perturb the
+     *  measurement it is validating. */
+    private void selfCheckExternal(float[] parallel, List<Job> batch,
+                                   int numExt, int cellsPerChunk) {
+        float[] serial = new float[parallel.length];
+        int stride = numExt * cellsPerChunk;
+        for (int c = 0; c < batch.size(); c++) {
+            fillExternalChunk(batch.get(c), serial, c * stride, numExt, cellsPerChunk);
+        }
+        int mismatches = 0;
+        float maxDiff = 0f;
+        for (int i = 0; i < serial.length; i++) {
+            float a = parallel[i], b = serial[i];
+            if (Float.floatToRawIntBits(a) != Float.floatToRawIntBits(b)) {
+                mismatches++;
+                float d = Math.abs(a - b);
+                if (d > maxDiff) maxDiff = d;
+            }
+        }
+        LOGGER.info("[c2me-wgpu] external sampling self-check {}/{}: "
+                        + "{} mismatches, max|delta|={}",
+                SELF_CHECK_BATCHES - selfChecksLeft, SELF_CHECK_BATCHES,
+                mismatches, maxDiff);
+    }
+
+    /** Sample one chunk's slice: {@code [ext][cell]} at {@code data[offset..]}.
+     *  Chunk slices are independent, so this is safe to run concurrently —
+     *  vanilla samples the same density-function instances from several chunk
+     *  generation workers at once. */
+    private void fillExternalChunk(Job job, float[] data, int offset,
+                                   int numExt, int cellsPerChunk) {
+        int sx = job.cx * 16;
+        int sz = job.cz * 16;
+        int idx = offset;
+        for (DensityFunction ext : externalNodes) {
+            for (int j = 0; j < gy; j++) {
+                int wy = minY + j * cellH;
+                for (int k = 0; k < gz; k++) {
+                    int wz = sz + k * cellW;
+                    for (int i = 0; i < gx; i++) {
+                        int wx = sx + i * cellW;
+                        double v = ext.sample(
+                                new DensityFunction.UnblendedNoisePos(wx, wy, wz));
+                        data[idx++] = (float) v;
                     }
                 }
             }
         }
-        return data;
     }
 
     /** Evaluate externals and submit the batch to Rust.
      *  Returns the in-flight record, or null if the request could not be
      *  issued — in that case the batch's futures have already been failed. */
     private Inflight submitRequest(List<Job> batch, int[] positions) {
-        float[] externals = computeExternalInputs(batch);
+        final boolean probe = Config.get().debugStageTiming;
+        long extT0 = probe ? System.nanoTime() : 0L;
+        float[] externals;
+        try {
+            externals = computeExternalInputs(batch);
+        } catch (Throwable t) {
+            // Sampling runs on worker threads now; a failure there must fail
+            // the batch's futures, otherwise C2ME holds the chunk locks.
+            failAll(batch, t);
+            return null;
+        }
+        long extT1 = probe ? System.nanoTime() : 0L;
         long req;
         try {
             req = WgpuThinBinding.requestChunks(
@@ -416,6 +571,10 @@ public final class WgpuBatchCoordinator {
         } catch (Throwable t) {
             failAll(batch, t);
             return null;
+        }
+        if (probe) {
+            probeExternalNs.addAndGet(extT1 - extT0);
+            probeSubmitNs.addAndGet(System.nanoTime() - extT1);
         }
         if (req == 0L) {
             failAll(batch, new RuntimeException("requestChunks returned 0"));
@@ -430,7 +589,10 @@ public final class WgpuBatchCoordinator {
      *  (backpressure). */
     private void submit(List<Job> batch, int[] positions) throws InterruptedException {
         // Wait for a free slot before submitting, not after: see submitPermits.
+        final boolean probe = Config.get().debugStageTiming;
+        long permitT0 = probe ? System.nanoTime() : 0L;
         submitPermits.acquire();
+        if (probe) probePermitWaitNs.addAndGet(System.nanoTime() - permitT0);
         Inflight ib;
         try {
             ib = submitRequest(batch, positions);
@@ -441,6 +603,16 @@ public final class WgpuBatchCoordinator {
         if (ib == null) {
             submitPermits.release();
             return;
+        }
+        if (probe) {
+            long prev = probeLastCompleteNs;
+            // Only a real bubble if this is the only batch in flight: with two
+            // batches pipelined, `now - lastComplete` is positive even though
+            // the GPU is busy with the other one.
+            if (prev != 0L && ACTIVE_REQUESTS.get() == 1) {
+                long gap = ib.submitT0 - prev;
+                if (gap > 0L && gap < 1_000_000_000L) probeIdleNs.addAndGet(gap);
+            }
         }
         try {
             inflight.put(ib);
@@ -572,6 +744,7 @@ public final class WgpuBatchCoordinator {
      */
     private synchronized void recordStats(int chunks, long submitT0, long now) {
         long gpuNanos = now - submitT0;
+        probeLastCompleteNs = now;
         statBatches.incrementAndGet();
         statChunks.addAndGet(chunks);
         statGpuNanos.addAndGet(gpuNanos);
@@ -625,6 +798,31 @@ public final class WgpuBatchCoordinator {
         // Mirror to the chat HUD when the client can show it; the queue keeps
         // only the newest line, so headless/paused sessions do not build up.
         WgpuFallbackNotice.reportStats(line);
+        if (Config.get().debugStageTiming) {
+            emitPipelineProbe(win, b);
+        }
+    }
+
+    /** Second debug line: where the batch thread's time went this window.
+     *  All figures are ms per batch; `idle` is the share of the window with
+     *  zero batches occupying the pipeline. See the probe field comments. */
+    private void emitPipelineProbe(long win, long b) {
+        double perBatch = b > 0 ? b : 1;
+        long qw = probeQueueWaitNs.getAndSet(0);
+        long fill = probeFillWaitNs.getAndSet(0);
+        long perm = probePermitWaitNs.getAndSet(0);
+        long ext = probeExternalNs.getAndSet(0);
+        long sub = probeSubmitNs.getAndSet(0);
+        long idle = probeIdleNs.getAndSet(0);
+        long qdSum = probeQueueDepthSum.getAndSet(0);
+        long qdMax = probeQueueDepthMax.getAndSet(0);
+        double idlePct = win > 0 ? 100.0 * idle / win : 0.0;
+        LOGGER.info(String.format(
+                "[pipe] qwait=%.1f fill=%.1f perm=%.1f ext=%.1f submit=%.1f ms/batch  "
+                + "idle=%.0f%%  qdepth=%.1f/%d  b=%d",
+                qw / 1e6 / perBatch, fill / 1e6 / perBatch,
+                perm / 1e6 / perBatch, ext / 1e6 / perBatch,
+                sub / 1e6 / perBatch, idlePct, qdSum / perBatch, qdMax, b));
     }
 
     private static void failAll(List<Job> batch, Throwable t) {
