@@ -81,6 +81,13 @@ public class WgpuThinBinding {
      * disabling GPU acceleration entirely.
      */
     private static MethodHandle MH_compile_progress;
+    /**
+     * Optional: largest batch the live device can dispatch for a shape.
+     * Resolved separately for the same reason as {@link #MH_compile_progress}:
+     * a native library from before this query should degrade to the caller's
+     * own cap, not disable GPU acceleration.
+     */
+    private static MethodHandle MH_batch_limit;
 
     /** Non-null when the FFM downcall linking failed (e.g. a symbol is
      *  missing from the native library). Lets callers report the real cause
@@ -373,6 +380,18 @@ public class WgpuThinBinding {
             } catch (Throwable t) {
                 MH_compile_progress = null;
             }
+            try {
+                MH_batch_limit = NativeLoader.linker.downcallHandle(
+                        NativeLoader.lookup.find("c2me_wgpu_batch_limit").orElseThrow(),
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,        // -> i32 chunks, -1 unknown
+                                ValueLayout.JAVA_INT,        // cells_per_chunk
+                                ValueLayout.JAVA_INT         // blocks_per_chunk
+                        )
+                );
+            } catch (Throwable t) {
+                MH_batch_limit = null;
+            }
         } catch (Throwable t) {
             System.err.println("[c2me-wgpu] FFM link failed: " + t);
             linkError = String.valueOf(t);
@@ -622,6 +641,30 @@ public class WgpuThinBinding {
             return (long) mh.invokeExact();
         } catch (Throwable t) {
             return -1L;
+        }
+    }
+
+    /**
+     * Largest batch the live device can dispatch for this shape, in chunks.
+     *
+     * <p>Read-only: the Rust side derives it from the device's own buffer
+     * limits (128 MiB storage binding / 256 MiB buffer by default) and the
+     * per-chunk cell/block counts, without creating or resizing anything.
+     * The executor clamps its buffers with the same derivation, so a batch at
+     * or below this number is guaranteed to fit.
+     *
+     * @return the limit, or {@code -1} when no device exists or the native
+     *         library predates the query (callers should use a conservative
+     *         fallback)
+     */
+    public static int batchLimit(int cellsPerChunk, int blocksPerChunk) {
+        MethodHandle mh = MH_batch_limit;
+        if (mh == null) return -1;
+        try {
+            return (int) mh.invokeExact(cellsPerChunk, blocksPerChunk);
+        } catch (Throwable t) {
+            LOGGER.warn("[c2me-wgpu] batch_limit query failed", t);
+            return -1;
         }
     }
 

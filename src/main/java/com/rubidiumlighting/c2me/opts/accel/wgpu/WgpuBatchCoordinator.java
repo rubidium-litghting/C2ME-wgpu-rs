@@ -64,13 +64,16 @@ import java.util.concurrent.locks.LockSupport;
 public final class WgpuBatchCoordinator {
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu-batch");
 
-    /** Max chunks coalesced into one GPU dispatch.
+    /** Max chunks coalesced into one GPU dispatch when the device query is
+     *  unavailable.
      *
-     *  <p>Must not exceed `ExecutorConfig::max_batch_size` on the Rust side
-     *  (`rust/src/scheduler/executor.rs`), which sizes every buffer by it and
-     *  rejects larger batches outright. The two are duplicated rather than
-     *  queried: the cap is a compile-time property of the buffer layout.
-     *  See the 0.1.8+ backlog on deriving it from the device limits. */
+     *  <p>`WgpuThinBinding.batchLimit(cells, blocks)` returns the real ceiling
+     *  for a dimension, derived on the Rust side from the device's buffer
+     *  limits and the per-chunk shape; the executor clamps its own buffers
+     *  with the same number. This constant is the fallback for a native
+     *  library that predates the query. It must never exceed the Rust side's
+     *  requested cap (`ExecutorConfig::max_batch_size`), which sizes every
+     *  buffer and rejects larger batches outright. */
     private static final int MAX_BATCH = 64;
 
     /** Batches submitted to the GPU and not yet read back, summed over every
@@ -212,6 +215,11 @@ public final class WgpuBatchCoordinator {
     private final int gx, gy, gz;      // corner counts per axis
     private final int cellW, cellH;    // cell size in blocks
     private final int minY;
+    /** Device-derived ceiling for this dimension's shape, or -1 when the
+     *  native query is unavailable. The batching loop still uses
+     *  {@link #MAX_BATCH}; this field exists to exercise the query and make
+     *  its result visible in the log before the loop is switched over. */
+    private final int deviceBatchLimit;
 
     /** Horizontal chunk size in blocks; the corpus grid starts at chunk×16. */
     private static final int CHUNK_WIDTH = 16;
@@ -284,6 +292,19 @@ public final class WgpuBatchCoordinator {
         this.gx = gx; this.gy = gy; this.gz = gz;
         this.cellW = cellW; this.cellH = cellH;
         this.minY = minY;
+
+        // Read-only probe of the device's batch ceiling. The Rust executor
+        // derives the same number from the same shape and clamps its buffers
+        // with it; logging both sides is how a mismatch (wrong cell/block
+        // arithmetic, stale native) becomes visible before it turns into a
+        // rejected batch.
+        int cellsPerChunk = gx * gy * gz;
+        int height = Math.max(1, (gy - 1) * cellH);
+        int blocksPerChunk = CHUNK_WIDTH * height * CHUNK_WIDTH;
+        this.deviceBatchLimit = WgpuThinBinding.batchLimit(cellsPerChunk, blocksPerChunk);
+        LOGGER.info("[c2me-wgpu] batch limit: device={} (fallback MAX_BATCH={}, "
+                        + "shape={} cells / {} blocks per chunk)",
+                deviceBatchLimit, MAX_BATCH, cellsPerChunk, blocksPerChunk);
         if (!externalNodes.isEmpty()) {
             LOGGER.info("[c2me-wgpu] external sampling: {} thread(s) per batch",
                     EXTERNAL_THREADS);

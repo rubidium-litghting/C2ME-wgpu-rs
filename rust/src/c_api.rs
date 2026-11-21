@@ -17,7 +17,7 @@ use crate::error::write_err;
 use crate::instance::WgpuInstance;
 use crate::result::ResultBlob;
 use crate::scheduler::batcher::{ChunkPos, Priority};
-use crate::scheduler::executor::{ExecutorThread, ExecutorConfig};
+use crate::scheduler::executor::{BatchLimit, ExecutorConfig, ExecutorThread};
 use crate::scheduler::PendingQueue;
 use crate::world::WorldContext;
 
@@ -573,6 +573,32 @@ pub extern "C" fn c2me_wgpu_compile_progress() -> i64 {
     ((active as i64) << 32)
         | (((done & 0xFFFF) as i64) << 16)
         | ((total & 0xFFFF) as i64)
+}
+
+/// Largest batch the live device can dispatch for a shape, in chunks.
+///
+/// Read-only: it neither creates nor resizes the executor. Java needs this
+/// before it flushes a batch, because the executor sizes its persistent
+/// buffers from the shape and silently rejects anything larger — discovering
+/// the ceiling from failed batches would waste a whole dispatch each time.
+///
+/// The number is `min(requested cap, BatchLimit::derive(...))`; the executor
+/// clamps itself with the same derivation, so the two cannot drift.
+///
+/// Returns `-1` when no device exists yet (the caller falls back to its own
+/// conservative cap) or when the limit does not fit an `i32`.
+#[unsafe(no_mangle)]
+pub extern "C" fn c2me_wgpu_batch_limit(cells_per_chunk: u32, blocks_per_chunk: u32) -> i32 {
+    let Ok(instance) = WgpuInstance::instance() else {
+        return -1;
+    };
+    let limit = BatchLimit::derive(
+        &instance.device.limits(),
+        cells_per_chunk.max(1) as usize,
+        blocks_per_chunk.max(1) as usize,
+    );
+    let capped = ExecutorConfig::default().max_batch_size.min(limit.allows);
+    if capped > i32::MAX as usize { -1 } else { capped as i32 }
 }
 
 // ---------------------------------------------------------------------------

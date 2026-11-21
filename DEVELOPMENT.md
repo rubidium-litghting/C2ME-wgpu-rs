@@ -3,8 +3,9 @@
 > 最后更新：2026-11-22
 > 状态：**0.1.5、0.1.6、0.1.7、0.1.8 已发布；0.1.8 的 external 并行采样与
 > Tectonic 832 高形状已实机验证（Fabric、NeoForge + Connector），tag `v0.1.8`
-> 已推送（Release 页面由维护者发布）。0.1.9 开发中：能力上限链的 Rust 侧（4a）
-> 已实机验证（Tectonic 1088 高，地形正常），继续 4b/4d/4c**。
+> 已推送（Release 页面由维护者发布）。0.1.9 开发中：能力上限链的 4a（Rust 推导）
+> 已实机验证（Tectonic 1088 高，地形正常），4b（Java 只读查询）待实机验证，
+> 随后做 4d/4c**。
 >
 > **已发布 / 已打 tag**
 > - **0.1.8**：aquifer 预留量按 shape 推导（修掉 832 高维度的写越界）、external
@@ -817,12 +818,28 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   **行为变化**：仅在设备/形状装不下 64 时把执行器缓冲改小；Java 尚未接线
   （4b/4c），仍按 64 攒批。当前已验证形状的推导结果都是 64，所以实际行为
   与 0.1.8 一致，日志里多出的那行是唯一可见差异。
+- [x] **能力上限 4b：Java 只读查询口**（2026-11-22，待实机验证）。
+  - Rust 新增 `c2me_wgpu_batch_limit(cells_per_chunk, blocks_per_chunk) -> i32`：
+    只读，不创建/重建 executor；返回 `min(ExecutorConfig::default().max_batch_size,
+    BatchLimit::derive(device.limits(), …))`，没有设备或装不下 `i32` 时返回 `-1`。
+  - Java 新增 `WgpuThinBinding.batchLimit(cells, blocks)`。符号按 `compile_progress`
+    的方式**可选解析**：旧 native 没有这个符号时返回 `-1`，由调用方回退到
+    `MAX_BATCH`，不会整条 FFM 链接失败。
+  - `WgpuBatchCoordinator` 构造时由 `gx*gy*gz` 与 `16*((gy-1)*cellH)*16` 算出
+    每 chunk 的 cells / blocks，查询并打印
+    `batch limit: device=N (fallback MAX_BATCH=64, shape=… cells / … blocks per chunk)`。
+  - **本步不改攒批**：`run()` 仍用 `MAX_BATCH`，所以 Java 侧日志应与 Rust 的
+    `batch limit:` 那一行数值一致；4c 才把循环切到查询值。
+  **实机验证**：Tectonic 1088 形状下 `latest.log` 应出现
+  `device=64 (fallback MAX_BATCH=64, shape=3425 cells / 278528 blocks per chunk)`，
+  与 `c2me-wgpu.log` 的 `binding allows 68` 推导一致。
 
 **0.1.8+ 待办**
 - [ ] **能力上限从设备实际限额反推，别写死在代码里**（alpha.9 遗留的口子）。
   - [x] **4a** Rust 侧按设备限额与形状推导 `batch_limit`，创建缓冲前生效并打日志
     （0.1.9，2026-11-22；见上，待实机验证）。
-  - [ ] **4b** Java 通过只读 FFM 查询拿到设备实际限额 / 已推导的批次上限。
+  - [x] **4b** Java 通过只读 FFM 查询拿到设备实际限额 / 已推导的批次上限
+    （0.1.9，2026-11-22；见上，待实机验证）。
   - [ ] **4d** `features.rs` 的 128 MiB 门槛改为按形状推导，而不是固定常量。
   - [ ] **4c** Java 用查询到的上限攒批（唯一改变行为的一步；需与实机测试一起）。
   alpha.9 让缓冲尺寸跟着形状走，等于把"能用/不能用"变成形状的函数，但代码里
