@@ -1,9 +1,10 @@
 # C2ME WGPU 加速模块 — 开发文档
 
-> 最后更新：2026-11-14
+> 最后更新：2026-11-22
 > 状态：**0.1.5、0.1.6、0.1.7、0.1.8 已发布；0.1.8 的 external 并行采样与
 > Tectonic 832 高形状已实机验证（Fabric、NeoForge + Connector），tag `v0.1.8`
-> 已推送（Release 页面由维护者发布）**。
+> 已推送（Release 页面由维护者发布）。0.1.9 开发中：能力上限链的 Rust 侧（4a）
+> 已实机验证（Tectonic 1088 高，地形正常），继续 4b/4d/4c**。
 >
 > **已发布 / 已打 tag**
 > - **0.1.8**：aquifer 预留量按 shape 推导（修掉 832 高维度的写越界）、external
@@ -790,8 +791,40 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   都是 8/8 全 0）证明共享节点实例可并发采样。另加 `[pipe]` 探针
   （qwait/fill/perm/ext/submit/idle/qdepth），同上开关。
 
+**0.1.9（开发中）**
+- [x] **能力上限 4a：Rust 按设备限额与形状推导批次上限**（2026-11-22，已实机验证）。
+  `BatchLimit::derive(&device.limits(), cells_per_chunk, blocks_per_chunk)` 在创建
+  任何缓冲之前计算上限，再与请求值（默认 64）取小：
+  - `b2_out` 与 `b7_block` 是两个独立的 storage binding，各自受
+    `max_storage_buffer_binding_size` 约束；
+  - staging 槽是两者之和的普通 buffer（`COPY_DST | MAP_READ`），受
+    `max_buffer_size` 约束；
+  - 用 **device** 限额而不是 adapter 限额（设备以 `Limits::default()` 创建，
+    真正的 ceiling 是 WebGPU 默认的 128 / 256 MiB）。
+  新增日志：
+  `[c2me-wgpu-rs] batch limit: N chunks (requested 64, binding allows X, staging buffer allows Y)`。
+  **实机验证（2026-11-22，Tectonic `max_y=1024`，总高 1088，cell 4×8）**：
+  `sized_for=3425 cells/chunk / 278528 blocks/chunk / 846 aquifer cells/chunk`，
+  adapter 报 2047 MiB，但日志推导出
+  `batch limit: 64 chunks (requested 64, binding allows 68, staging buffer allows 86)`。
+  `binding allows 68` 正好等于 `128 MiB ÷ (144 × 3425 × 4)`，证明用的是 device
+  限额而不是 adapter 的 2047 MiB；`output=120 MiB / block=68 MiB / staging=188 MiB`
+  也都在实际 device 限额内。该形状离触发上限只差 4 个 chunk（68 vs 64），
+  若把 cell 高改成 4 就会降到 34（`b2_out` 240 MiB），正是这条链要修的路径。
+  地形目视正常，无回退提示。
+  Rust 单测 `batch_limit_follows_the_shape_and_the_device_limits` 与
+  `batch_limit_never_drops_below_one` 通过。
+  **行为变化**：仅在设备/形状装不下 64 时把执行器缓冲改小；Java 尚未接线
+  （4b/4c），仍按 64 攒批。当前已验证形状的推导结果都是 64，所以实际行为
+  与 0.1.8 一致，日志里多出的那行是唯一可见差异。
+
 **0.1.8+ 待办**
 - [ ] **能力上限从设备实际限额反推，别写死在代码里**（alpha.9 遗留的口子）。
+  - [x] **4a** Rust 侧按设备限额与形状推导 `batch_limit`，创建缓冲前生效并打日志
+    （0.1.9，2026-11-22；见上，待实机验证）。
+  - [ ] **4b** Java 通过只读 FFM 查询拿到设备实际限额 / 已推导的批次上限。
+  - [ ] **4d** `features.rs` 的 128 MiB 门槛改为按形状推导，而不是固定常量。
+  - [ ] **4c** Java 用查询到的上限攒批（唯一改变行为的一步；需与实机测试一起）。
   alpha.9 让缓冲尺寸跟着形状走，等于把"能用/不能用"变成形状的函数，但代码里
   仍有一批魔数在替设备做决定：
   - `ExecutorConfig.max_batch_size = 64`（Rust/Java 两侧各一份 `MAX_BATCH`）；
@@ -862,6 +895,22 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
      `chunk.getOrCreateChunkNoiseSampler` 已建立的采样器上下文；
   3. 最彻底的是给 `ConfigNoise` 这类 modded 节点写 WGSL emitter，但那与
      `§6 混合执行` 的边界冲突，列为远期。
+  **调研结论（2026-11-22，对 1.21.1 yarn 源码）**：vanilla 的 cache **不是**
+  可复用的公共 API。`flatCache` / `cacheOnce` 等在 1.21.1 里只是 codec 标记，
+  运行时是纯透传；真正的 `FlatCache` / `CacheOnce` / `Cache2D` / `CellCache`
+  都由 `ChunkNoiseSampler` 构造函数里的 `protected getActualDensityFunction`
+  生成，构造器是包级私有，且缓存绑定在那个 sampler 的
+  `startBiomeX/Z`、`sampleUniqueIndex`、`isInInterpolationLoop` 等可变状态上。
+  `ChunkNoiseSampler` 也不暴露 router 通道，没有"在任意角点采样包装后函数"的
+  公共入口。因此：
+  - 不能把 vanilla cache 实例拿给 external 线程跨 chunk 复用（会串数据）；
+  - 自己 `apply(visitor)` 得到的 `CacheOnce` / `CellCache` / `INTERPOLATED`
+    在 `pos != sampler` 时会退回裸采样，只有 `FlatCache` / `Cache2D` 能生效；
+  - 对 external 子树，最小正确改法是：每个 worker 复用一个
+    `MutableNoisePos`（当前是每个角点 `new UnblendedNoisePos`）；若仍不够，
+    再按序列化时看到的 enclosing wrapper 给 `FLAT_CACHE` / `CACHE2D` 加
+    **线程本地**列缓存（4-block 列、`y=0` 采样后广播），不要碰
+    `CACHE_ONCE` / `CACHE_ALL_IN_CELL` / `INTERPOLATED`。
   **验证方式**：改完后同种子、同 Tectonic 配置、同 r=500 复测并与此表对比；
   同时开 `debug_stage_timing` 看 `ext` 毫秒/批是否下降。
   关联：「能力上限从设备实际限额反推」同属吞吐方向，两者都会改变 Java 侧的

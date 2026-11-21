@@ -260,6 +260,61 @@ struct BufferSizes {
     beard: u64,
 }
 
+/// How many chunks the device's buffer limits can hold for a given shape.
+///
+/// The persistent buffers scale with the batch size, so the largest batch the
+/// device can actually serve is a function of the shape:
+///
+/// * `b2_out` is one storage buffer of `TOTAL_CHANNELS × cells × 4` bytes per
+///   chunk, so `max_storage_buffer_binding_size` bounds the first term;
+/// * `b7_block` is one storage buffer of `blocks × 4` bytes per chunk;
+/// * one staging slot is `b2_out + b7_block` per chunk and is a regular
+///   buffer, so `max_buffer_size` bounds the sum.
+///
+/// The device is created with `required_limits = Limits::default()`, so these
+/// are the WebGPU defaults (128 MiB / 256 MiB) even when the adapter reports
+/// more. The result does not include the configured hard cap; callers clamp
+/// their requested batch size with [`BatchLimit::allows`].
+#[derive(Debug, Clone, Copy)]
+pub struct BatchLimit {
+    /// Largest batch the device limits allow for this shape.
+    pub allows: usize,
+    /// What the storage-buffer binding limit alone allows.
+    pub binding_allows: usize,
+    /// What the whole-buffer limit alone allows.
+    pub buffer_allows: usize,
+}
+
+impl BatchLimit {
+    /// Derive the limit for a shape from the *device* limits.
+    ///
+    /// Must use the device's limits, not the adapter's: the device is requested
+    /// with `Limits::default()`, so that is the real ceiling no matter what the
+    /// adapter advertises.
+    pub fn derive(limits: &wgpu::Limits, cells_per_chunk: usize, blocks_per_chunk: usize) -> Self {
+        let per_chunk_out = (TOTAL_CHANNELS * cells_per_chunk.max(1) * 4) as u64;
+        let per_chunk_block = (blocks_per_chunk.max(1) * 4) as u64;
+
+        let binding = limits.max_storage_buffer_binding_size;
+        let buffer = limits.max_buffer_size;
+
+        // Both outputs are separate bindings, so each has to fit on its own.
+        let binding_allows = (binding / per_chunk_out)
+            .min(binding / per_chunk_block)
+            .max(1);
+        // The staging slot holds the two outputs back to back.
+        let buffer_allows = (buffer / (per_chunk_out + per_chunk_block)).max(1);
+        let allows = binding_allows.min(buffer_allows).max(1);
+
+        let to_usize = |v: u64| v.min(usize::MAX as u64) as usize;
+        Self {
+            allows: to_usize(allows),
+            binding_allows: to_usize(binding_allows),
+            buffer_allows: to_usize(buffer_allows),
+        }
+    }
+}
+
 impl BufferSizes {
     fn for_config(config: &ExecutorConfig) -> Self {
         let max_batch = config.max_batch_size.max(1);
@@ -284,8 +339,20 @@ impl SingleBatchExecutor {
     pub fn new(
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
-        config: ExecutorConfig,
+        mut config: ExecutorConfig,
     ) -> Result<Self, String> {
+        // A batch larger than the device's buffer limits cannot be allocated,
+        // let alone dispatched. Derive the ceiling from the shape and the
+        // device's own limits, then clamp the requested size before any buffer
+        // is created. On today's shapes this leaves 64 intact; on a denser
+        // 832-block grid it would otherwise allocate a 192 MiB `b2_out` and
+        // fail inside wgpu, which discards the command buffer and returns
+        // garbage block data.
+        let requested_batch = config.max_batch_size.max(1);
+        let limit = BatchLimit::derive(
+            &device.limits(), config.cells_per_chunk, config.blocks_per_chunk);
+        config.max_batch_size = requested_batch.min(limit.allows);
+
         // Sized for the shape this config was built for: `cells_per_chunk` and
         // `blocks_per_chunk` come from the world's own grid, and a world that
         // needs more rebuilds the executor (see `c_api`).
@@ -336,6 +403,14 @@ impl SingleBatchExecutor {
             sizes.cells_per_chunk,
             sizes.blocks_per_chunk,
             config.aquifer_cells_per_chunk,
+        ));
+        // Separate line so a capped batch is visible even when the buffer
+        // footprint itself looks fine: the binding ceiling is the one that
+        // fails first, and it depends on the shape, not on the batch alone.
+        crate::debug_log_line(&format!(
+            "[c2me-wgpu-rs] batch limit: {} chunks (requested {}, binding allows {}, \
+             staging buffer allows {})",
+            config.max_batch_size, requested_batch, limit.binding_allows, limit.buffer_allows,
         ));
 
         Ok(Self {
@@ -1436,5 +1511,44 @@ mod tests {
             BufferSizes::for_config(&cfg).aquifer_entries > AQ_DEFAULT_CELLS_PER_CHUNK * 8,
             "a 2048-block dimension needs more room than the old fixed reservation"
         );
+    }
+
+    /// The binding ceiling depends on the shape, not just the batch size: the
+    /// default 128 MiB `b2_out` binding fits 64 vanilla chunks but only 44
+    /// chunks of an 832-block world sampled with cell_height=4.
+    #[test]
+    fn batch_limit_follows_the_shape_and_the_device_limits() {
+        let limits = wgpu::Limits::default();
+
+        // Vanilla 384: 5×97×5 corner cells, 16×384×16 blocks. 64 chunks need
+        // 85 MiB for b2_out, so the default limits leave the configured 64.
+        let vanilla = BatchLimit::derive(&limits, 5 * 97 * 5, 16 * 384 * 16);
+        assert_eq!(vanilla.binding_allows, 96);
+        assert!(vanilla.buffer_allows >= 64);
+        assert_eq!(vanilla.allows, 96);
+
+        // Tectonic 832 with cell_height=8: 5×105×5 cells. 64 chunks need
+        // 92 MiB, still under 128.
+        let tectonic = BatchLimit::derive(&limits, 5 * 105 * 5, 16 * 832 * 16);
+        assert!(tectonic.allows >= 64, "{}", tectonic.allows);
+
+        // The same height with cell_height=4: 5×209×5 cells makes b2_out
+        // 192 MB at 64 chunks. The binding limit now binds at 44.
+        let tall = BatchLimit::derive(&limits, 5 * 209 * 5, 16 * 832 * 16);
+        assert_eq!(tall.allows, 44);
+        assert_eq!(tall.allows, tall.binding_allows);
+        assert!(tall.allows < 64);
+    }
+
+    /// A device that reports exactly the WebGPU minimums must still be able to
+    /// dispatch a single chunk; the derivation clamps to 1 instead of 0.
+    #[test]
+    fn batch_limit_never_drops_below_one() {
+        let tiny = wgpu::Limits {
+            max_storage_buffer_binding_size: 1024,
+            max_buffer_size: 1024,
+            ..wgpu::Limits::default()
+        };
+        assert_eq!(BatchLimit::derive(&tiny, 5225, 212_992).allows, 1);
     }
 }
