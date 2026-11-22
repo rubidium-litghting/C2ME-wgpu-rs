@@ -17,7 +17,7 @@ use crate::error::write_err;
 use crate::instance::WgpuInstance;
 use crate::result::ResultBlob;
 use crate::scheduler::batcher::{ChunkPos, Priority};
-use crate::scheduler::executor::{BatchLimit, ExecutorConfig, ExecutorThread};
+use crate::scheduler::executor::{clamp_batch_limit, BatchLimit, ExecutorConfig, ExecutorThread};
 use crate::scheduler::PendingQueue;
 use crate::world::WorldContext;
 
@@ -582,8 +582,9 @@ pub extern "C" fn c2me_wgpu_compile_progress() -> i64 {
 /// buffers from the shape and silently rejects anything larger — discovering
 /// the ceiling from failed batches would waste a whole dispatch each time.
 ///
-/// The number is `min(requested cap, BatchLimit::derive(...))`; the executor
-/// clamps itself with the same derivation, so the two cannot drift.
+/// The number is `min(requested cap, BatchLimit::derive(...), any existing
+/// executor's ceiling)`; the executor clamps itself with the same derivation,
+/// so the two cannot drift.
 ///
 /// Returns `-1` when no device exists yet (the caller falls back to its own
 /// conservative cap) or when the limit does not fit an `i32`.
@@ -597,7 +598,10 @@ pub extern "C" fn c2me_wgpu_batch_limit(cells_per_chunk: u32, blocks_per_chunk: 
         cells_per_chunk.max(1) as usize,
         blocks_per_chunk.max(1) as usize,
     );
-    let capped = ExecutorConfig::default().max_batch_size.min(limit.allows);
+    let existing = EXECUTOR.read().as_ref().map(|e| e.max_batch_size());
+    let capped = clamp_batch_limit(
+        ExecutorConfig::default().max_batch_size, limit.allows, existing);
+
     if capped > i32::MAX as usize { -1 } else { capped as i32 }
 }
 

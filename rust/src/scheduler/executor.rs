@@ -315,6 +315,20 @@ impl BatchLimit {
     }
 }
 
+/// Final batch size from the requested cap, the shape's device-derived limit
+/// and (when an executor already exists) that executor's fixed ceiling.
+///
+/// The last term matters across dimensions: switching from a dense shape that
+/// sized the executor for 34 chunks to a smaller one does not rebuild it
+/// (`fits` only grows), so the smaller shape's derivation can exceed what the
+/// existing buffers can dispatch.
+pub fn clamp_batch_limit(requested: usize, derived: usize, existing: Option<usize>) -> usize {
+    requested
+        .min(derived)
+        .min(existing.unwrap_or(usize::MAX))
+        .max(1)
+}
+
 impl BufferSizes {
     fn for_config(config: &ExecutorConfig) -> Self {
         let max_batch = config.max_batch_size.max(1);
@@ -351,7 +365,7 @@ impl SingleBatchExecutor {
         let requested_batch = config.max_batch_size.max(1);
         let limit = BatchLimit::derive(
             &device.limits(), config.cells_per_chunk, config.blocks_per_chunk);
-        config.max_batch_size = requested_batch.min(limit.allows);
+        config.max_batch_size = clamp_batch_limit(requested_batch, limit.allows, None);
 
         // Sized for the shape this config was built for: `cells_per_chunk` and
         // `blocks_per_chunk` come from the world's own grid, and a world that
@@ -484,6 +498,12 @@ impl SingleBatchExecutor {
         let beard = create(format!("c2me_wgpu_beard_{index}"), sizes.beard);
         queue.write_buffer(&beard, 0, bytemuck::cast_slice(weight_table));
         InputBufferSet { params, positions, aquifer, beard, external: None }
+    }
+
+    /// Effective batch size after the device-limit clamp. Buffers are sized
+    /// by it, so it is also the largest batch `prepare_batch` accepts.
+    pub fn max_batch_size(&self) -> usize {
+        self.config.max_batch_size
     }
 
     /// Run one batch end to end, blocking until it completes.
@@ -1168,6 +1188,12 @@ pub struct ExecutorThread {
     /// density grid while needing a different aquifer table (different min_y
     /// at the same height), and the binding-8 buffer must still hold it.
     aquifer_cells_per_chunk: usize,
+    /// Effective batch ceiling of this executor (requested size clamped by the
+    /// device limits for this shape). The buffers are sized by it and
+    /// `prepare_batch` rejects anything larger, so it is the hard ceiling for
+    /// every dimension that reuses this executor — even one whose own shape
+    /// would derive a bigger value.
+    max_batch_size: usize,
 }
 
 enum ExecutorMessage {
@@ -1219,18 +1245,20 @@ impl ExecutorThread {
                         return;
                     }
                 };
-                let _ = init_tx.send(Ok(()));
+                let effective_batch = executor.max_batch_size();
+                let _ = init_tx.send(Ok(effective_batch));
                 Self::run_loop(&mut executor, &receiver);
             })
             .map_err(|e| format!("failed to spawn executor thread: {e}"))?;
 
         match init_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(max_batch_size)) => Ok(Self {
                 handle: std::sync::Mutex::new(Some(handle)),
                 sender,
                 cells_per_chunk,
                 blocks_per_chunk,
                 aquifer_cells_per_chunk,
+                max_batch_size,
             }),
             Ok(Err(e)) => {
                 let _ = handle.join();
@@ -1241,6 +1269,16 @@ impl ExecutorThread {
                 Err("executor thread died during init".to_string())
             }
         }
+    }
+
+    /// Effective batch ceiling of the persistent buffer layout.
+    ///
+    /// Java clamps to this even when a dimension's own shape would derive a
+    /// larger value: switching from a dense shape (e.g. 832 high, cell 4) to a
+    /// smaller one reuses the same executor, whose `b2_out` binding was sized
+    /// for the denser grid.
+    pub fn max_batch_size(&self) -> usize {
+        self.max_batch_size
     }
 
     /// True when the persistent buffers cover a grid of this shape, so a batch
@@ -1550,5 +1588,22 @@ mod tests {
             ..wgpu::Limits::default()
         };
         assert_eq!(BatchLimit::derive(&tiny, 5225, 212_992).allows, 1);
+    }
+
+    /// The requested cap, the shape derivation and a reused executor's fixed
+    /// ceiling all apply; the smallest wins, and a zero from any term still
+    /// leaves one chunk dispatchable.
+    #[test]
+    fn effective_batch_limit_takes_every_ceiling() {
+        // Default shape: both the request and the device leave 64.
+        assert_eq!(clamp_batch_limit(64, 96, None), 64);
+        // Dense shape: the device binds first.
+        assert_eq!(clamp_batch_limit(64, 34, None), 34);
+        // A reused executor built for a denser shape is a hard ceiling even
+        // though this shape's own derivation would allow 64.
+        assert_eq!(clamp_batch_limit(64, 96, Some(34)), 34);
+        // Never larger than requested, even if the executor reports more.
+        assert_eq!(clamp_batch_limit(8, 96, Some(64)), 8);
+        assert_eq!(clamp_batch_limit(64, 0, Some(0)), 1);
     }
 }

@@ -215,11 +215,11 @@ public final class WgpuBatchCoordinator {
     private final int gx, gy, gz;      // corner counts per axis
     private final int cellW, cellH;    // cell size in blocks
     private final int minY;
-    /** Device-derived ceiling for this dimension's shape, or -1 when the
-     *  native query is unavailable. The batching loop still uses
-     *  {@link #MAX_BATCH}; this field exists to exercise the query and make
-     *  its result visible in the log before the loop is switched over. */
-    private final int deviceBatchLimit;
+    /** Effective cap for this dimension: the queried device/product limit,
+     *  clamped to {@link #MAX_BATCH}, or {@link #MAX_BATCH} when the query is
+     *  unavailable. This is what the batching loop uses, so a shape that
+     *  cannot hold 64 chunks is never asked to. */
+    private final int batchLimit;
 
     /** Horizontal chunk size in blocks; the corpus grid starts at chunk×16. */
     private static final int CHUNK_WIDTH = 16;
@@ -293,18 +293,18 @@ public final class WgpuBatchCoordinator {
         this.cellW = cellW; this.cellH = cellH;
         this.minY = minY;
 
-        // Read-only probe of the device's batch ceiling. The Rust executor
-        // derives the same number from the same shape and clamps its buffers
-        // with it; logging both sides is how a mismatch (wrong cell/block
-        // arithmetic, stale native) becomes visible before it turns into a
-        // rejected batch.
+        // Query the ceiling once, before any batch is accumulated. The Rust
+        // executor derives the same number from this shape and its device
+        // limits and rejects anything larger, so accumulating to MAX_BATCH
+        // first would fail whole batches on a constrained shape.
         int cellsPerChunk = gx * gy * gz;
         int height = Math.max(1, (gy - 1) * cellH);
         int blocksPerChunk = CHUNK_WIDTH * height * CHUNK_WIDTH;
-        this.deviceBatchLimit = WgpuThinBinding.batchLimit(cellsPerChunk, blocksPerChunk);
-        LOGGER.info("[c2me-wgpu] batch limit: device={} (fallback MAX_BATCH={}, "
+        int queried = WgpuThinBinding.batchLimit(cellsPerChunk, blocksPerChunk);
+        this.batchLimit = queried > 0 ? Math.min(queried, MAX_BATCH) : MAX_BATCH;
+        LOGGER.info("[c2me-wgpu] batch limit: using={} (queried={}, fallback MAX_BATCH={}, "
                         + "shape={} cells / {} blocks per chunk)",
-                deviceBatchLimit, MAX_BATCH, cellsPerChunk, blocksPerChunk);
+                batchLimit, queried, MAX_BATCH, cellsPerChunk, blocksPerChunk);
         if (!externalNodes.isEmpty()) {
             LOGGER.info("[c2me-wgpu] external sampling: {} thread(s) per batch",
                     EXTERNAL_THREADS);
@@ -429,7 +429,7 @@ public final class WgpuBatchCoordinator {
                     // already non-empty, poll() returns immediately, so this only
                     // actually waits when there is nothing more to take.
                     long deadline = pollT1 + MAX_WAIT_MS * 1_000_000L;
-                    while (batch.size() < MAX_BATCH) {
+                    while (batch.size() < batchLimit) {
                         long remain = deadline - System.nanoTime();
                         if (remain <= 0) break;
                         Job j = queue.poll(remain, TimeUnit.NANOSECONDS);

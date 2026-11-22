@@ -3,9 +3,8 @@
 > 最后更新：2026-11-22
 > 状态：**0.1.5、0.1.6、0.1.7、0.1.8 已发布；0.1.8 的 external 并行采样与
 > Tectonic 832 高形状已实机验证（Fabric、NeoForge + Connector），tag `v0.1.8`
-> 已推送（Release 页面由维护者发布）。0.1.9 开发中：能力上限链的 4a/4b 已实机验证
-> （Tectonic 1088 高，两侧日志一致），4d（门槛与设备请求同源）待实机验证，
-> 随后做 4c（Java 按查询值攒批）**。
+> 已推送（Release 页面由维护者发布）。0.1.9 开发中：能力上限链的 4a/4b/4d 已实机
+> 验证，4c（Java 按查询值攒批）已实现，待实机验证**。
 >
 > **已发布 / 已打 tag**
 > - **0.1.8**：aquifer 预留量按 shape 推导（修掉 832 高维度的写越界）、external
@@ -851,7 +850,22 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   Rust 单测 `required_limits_are_the_webgpu_defaults` /
   `pipeline_cache_is_only_required_when_enabled` 通过（总计 94 passed / 7 ignored）。
   **实机验证**：启动日志仍应显示 `adapter limits: … 2047 MiB`，维度初始化成功、
-  无回退提示；门槛数值与 0.1.8 相同，因此行为应完全不变。
+  无回退提示；门槛数值与 0.1.8 相同，因此行为应完全不变。**已实测**（2026-11-22）。
+- [x] **能力上限 4c：Java 按查询值攒批**（2026-11-22，待实机验证）。
+  - `WgpuBatchCoordinator.batchLimit = min(查询值, MAX_BATCH)`；查询失败（`-1`）
+    时回退 `MAX_BATCH`。攒批循环从 `while (batch.size() < MAX_BATCH)` 改为
+    `while (batch.size() < batchLimit)`。
+  - Rust 查询现在再取 `min(…, 当前 executor 的 max_batch_size)`：executor 只在
+    形状变大时重建，从"密集形状（例如 1088 高 + cell 4，上限 34）"切到较小维度时
+    会复用它，Java 不能按新形状的 64 去攒批。核心算术提成纯函数
+    `clamp_batch_limit(requested, derived, existing)`，单测
+    `effective_batch_limit_takes_every_ceiling` 覆盖 64/34/8/0 四种组合。
+  - 日志改为 `batch limit: using=N (queried=M, fallback MAX_BATCH=64, shape=…)`。
+  **实机验证**：当前 Tectonic 1088（cell 4×8）推导值为 64，所以
+  `using=64 (queried=64, …)`，行为应与 0.1.8 逐字节一致；地形正常、无回退。
+  `cap < 64` 的分支在现有已装形状上不可达（要 1088 高 + cell 4 才会降到 34），
+  由上述纯函数单测覆盖；如需实机证明，可用临时把 `ExecutorConfig` 默认上限
+  降到 2 的测量 jar 跑一轮（提交前还原）。
 
 **0.1.8+ 待办**
 - [ ] **能力上限从设备实际限额反推，别写死在代码里**（alpha.9 遗留的口子）。
@@ -862,7 +876,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   - [x] **4d** `features.rs` 的 128 MiB 门槛改为与实际 `request_device` 的
     `required_limits` 同源，并补上 `max_buffer_size` 校验（0.1.9，2026-11-22；
     见上，待实机验证）。
-  - [ ] **4c** Java 用查询到的上限攒批（唯一改变行为的一步；需与实机测试一起）。
+  - [x] **4c** Java 用查询到的上限攒批（唯一改变行为的一步；0.1.9，2026-11-22；
+    见上，待实机验证）。
   alpha.9 让缓冲尺寸跟着形状走，等于把"能用/不能用"变成形状的函数，但代码里
   仍有一批魔数在替设备做决定：
   - `ExecutorConfig.max_batch_size = 64`（Rust/Java 两侧各一份 `MAX_BATCH`）；
