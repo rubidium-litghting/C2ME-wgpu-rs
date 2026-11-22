@@ -269,12 +269,8 @@ impl WgpuInstance {
 
         let (device, queue) = pollster::block_on(
         adapter.request_device(&DeviceDescriptor{
-            required_features: if cold.disable_pipeline_cache {
-                wgpu::Features::empty()
-            } else {
-                wgpu::Features::PIPELINE_CACHE
-            },
-            required_limits: wgpu::Limits::default(),
+            required_features: features::required_features(cold.disable_pipeline_cache),
+            required_limits: features::required_limits(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             label: None,
             memory_hints: wgpu::MemoryHints::Performance,

@@ -3,9 +3,9 @@
 > 最后更新：2026-11-22
 > 状态：**0.1.5、0.1.6、0.1.7、0.1.8 已发布；0.1.8 的 external 并行采样与
 > Tectonic 832 高形状已实机验证（Fabric、NeoForge + Connector），tag `v0.1.8`
-> 已推送（Release 页面由维护者发布）。0.1.9 开发中：能力上限链的 4a（Rust 推导）
-> 已实机验证（Tectonic 1088 高，地形正常），4b（Java 只读查询）待实机验证，
-> 随后做 4d/4c**。
+> 已推送（Release 页面由维护者发布）。0.1.9 开发中：能力上限链的 4a/4b 已实机验证
+> （Tectonic 1088 高，两侧日志一致），4d（门槛与设备请求同源）待实机验证，
+> 随后做 4c（Java 按查询值攒批）**。
 >
 > **已发布 / 已打 tag**
 > - **0.1.8**：aquifer 预留量按 shape 推导（修掉 832 高维度的写越界）、external
@@ -832,15 +832,36 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     `batch limit:` 那一行数值一致；4c 才把循环切到查询值。
   **实机验证**：Tectonic 1088 形状下 `latest.log` 应出现
   `device=64 (fallback MAX_BATCH=64, shape=3425 cells / 278528 blocks per chunk)`，
-  与 `c2me-wgpu.log` 的 `binding allows 68` 推导一致。
+  与 `c2me-wgpu.log` 的 `binding allows 68` 推导一致。**已实测一致**（2026-11-22）。
+- [x] **能力上限 4d：能力门槛与实际设备请求同源**（2026-11-22，待实机验证）。
+  `features.rs` 不再写 `128 * 1024 * 1024` / `65535` 这类字面量：
+  - 新增 `required_limits()`（= `wgpu::Limits::default()`）与
+    `required_features(disable_pipeline_cache)`；
+  - `check_required` 与 `instance/mod.rs` 的 `request_device` 都调用这两个函数，
+    门槛和真实请求不会再各写一份；
+  - 补上 backlog 指出的 `max_buffer_size` 校验（staging 槽是普通 buffer，
+    原先只查了 binding 限额）；
+  - 删掉文档里早已不存在的 `max_buffer_address_space_bits` 检查（wgpu 30 已移除
+    该字段），并把注释改成"门槛 = 设备请求的下限"。
+  **为什么不是按某个维度形状推导**：device 是进程级、在知道任何 shape 之前创建，
+  必须覆盖会话里最坏的形状；按单个维度算会把上限降得过低，之后加载高维度又无法
+  提升（除非重建 device）。所以这里保留 WebGPU 规范默认下限 128/256 MiB，
+  **"某形状到底用多少" 由 4a 的 `BatchLimit::derive` 在每维度决定**——它只会
+  把批次调小，不会抬高设备门槛。这与教训 #43 "不低于规范默认下限"一致。
+  Rust 单测 `required_limits_are_the_webgpu_defaults` /
+  `pipeline_cache_is_only_required_when_enabled` 通过（总计 94 passed / 7 ignored）。
+  **实机验证**：启动日志仍应显示 `adapter limits: … 2047 MiB`，维度初始化成功、
+  无回退提示；门槛数值与 0.1.8 相同，因此行为应完全不变。
 
 **0.1.8+ 待办**
 - [ ] **能力上限从设备实际限额反推，别写死在代码里**（alpha.9 遗留的口子）。
   - [x] **4a** Rust 侧按设备限额与形状推导 `batch_limit`，创建缓冲前生效并打日志
     （0.1.9，2026-11-22；见上，待实机验证）。
   - [x] **4b** Java 通过只读 FFM 查询拿到设备实际限额 / 已推导的批次上限
-    （0.1.9，2026-11-22；见上，待实机验证）。
-  - [ ] **4d** `features.rs` 的 128 MiB 门槛改为按形状推导，而不是固定常量。
+    （0.1.9，2026-11-22；见上，已实测一致）。
+  - [x] **4d** `features.rs` 的 128 MiB 门槛改为与实际 `request_device` 的
+    `required_limits` 同源，并补上 `max_buffer_size` 校验（0.1.9，2026-11-22；
+    见上，待实机验证）。
   - [ ] **4c** Java 用查询到的上限攒批（唯一改变行为的一步；需与实机测试一起）。
   alpha.9 让缓冲尺寸跟着形状走，等于把"能用/不能用"变成形状的函数，但代码里
   仍有一批魔数在替设备做决定：
