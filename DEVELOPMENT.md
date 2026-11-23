@@ -1,11 +1,12 @@
 # C2ME WGPU 加速模块 — 开发文档
 
-> 最后更新：2026-11-22
+> 最后更新：2026-11-23
 > 状态：**0.1.5、0.1.6、0.1.7、0.1.8 已发布；0.1.8 的 external 并行采样与
 > Tectonic 832 高形状已实机验证（Fabric、NeoForge + Connector），tag `v0.1.8`
-> 已推送（Release 页面由维护者发布）。0.1.9 开发中：能力上限链 4a–4d 已全部实机
-> 验证（Tectonic 1088，两侧日志一致、地形正常）；剩余 external 节点上限与其它
-> backlog 项**。
+> 已推送（Release 页面由维护者发布）。0.1.9 开发中：能力上限链 4a–4d 与
+> external 采样复用 Y 独立缓存均已实机验证（Tectonic 1088，`ext` 降到
+> 0.2–0.3 ms/批、自检 0 mismatch）；剩余 external 节点上限与其它 backlog 项
+> 已按难度重排，见「0.1.10 待办重排」**。
 >
 > **已发布 / 已打 tag**
 > - **0.1.8**：aquifer 预留量按 shape 推导（修掉 832 高维度的写越界）、external
@@ -869,6 +870,36 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   `cap < 64` 的分支在现有已装形状上不可达（要 1088 高 + cell 4 才会降到 34），
   由上述纯函数单测覆盖；如需实机证明，可用临时把 `ExecutorConfig` 默认上限
   降到 2 的测量 jar 跑一轮（提交前还原）。
+- [x] **external 采样复用 MC 的 Y 独立缓存语义**（2026-11-23 已实机验证）。
+  外部子树原先在每个角点都直接 `ext.sample(new UnblendedNoisePos(...))`，既不
+  复用分配，也不利用序列化树里已经存在的 `FLAT_CACHE` / `CACHE2D` 包装。现在：
+  - 序列化时用 `yCacheDepth` 记录当前是否位于 `FLAT_CACHE` / `CACHE2D` 内，
+    并为每个 external 槽位累计 `[总引用数, 缓存内引用数]`。只有**所有**引用都
+    在 Y 独立缓存内时，槽位才标记为 `yCacheable`；只要有一条裸引用，就继续按
+    角点采样，因为那条路径需要随 Y 变化的值。
+  - `fillExternalChunk` 对 `yCacheable` 槽位只算一层（`gx×gz` 个列，`y=0`），
+    再用 `System.arraycopy` 复制到其余 `gy-1` 层。这是 MC 自己的语义，不是
+    启发式：`FlatCache` 就是用 `y=0`、按 4 方块列填充缓存，`Cache2D` 每列只
+    缓存一个值；复制该值正好还原 vanilla 会交给后续节点的结果，同时省掉
+    `(gy-1)/gy` 的子树求值。
+  - 每个采样线程复用一个 `MutableNoisePos`，不再为每个角点 new 一个位置对象。
+  - 机制完全由序列化树驱动，不包含任何数据包/模组名或形状常量：任何使用这两个
+    原版包装的包都自动受益；没有包装的槽位保持原路径。日志新增
+    `…; N sampled once per column (FLAT_CACHE/CACHE2D)`。
+  **实机验证（2026-11-23，Fabric + Tectonic 3.0.28，1088 高，同一存档）**：
+  - 启动日志 `2 external (CPU-evaluated) density subtree(s) from 732
+    reference(s); 2 sampled once per column (FLAT_CACHE/CACHE2D)`：两个槽位都
+    命中列复制路径，说明 732 条引用全部位于 Y 独立缓存内。
+  - `[pipe]` 的 `ext` 中位 **0.2–0.3 ms/批**、最大 1.5 ms/批。同维度改动前基线
+    是 832 高 52–56 ms/批、1088 高更高；外部采样已从关键路径上消失。
+  - 前 8 批自检全部 `0 mismatches, max|delta|=0.0`：并行路径与串行路径逐位
+    一致（自检证明线程安全；增量正确性由下列填充语义与地形对比保证）。
+  - 无 wgpu validation error、无回退、无 panic，地形正常。
+  这一轮是玩家在世界上活动时的窗口数据（CPS 110–128、`chunkMs` 7.8–9.0），
+  不是隔离的 Chunky r=500，所以**没有**和 0.1.8 的 30/32 s 直接对比。窗口里
+  `perm=16–55 ms/批`、`inflight≈1.8/4`，瓶颈已转到 GPU 提交侧，符合"external
+  不再是瓶颈"的预期。批次放大的决定性 A/B（`chunk_batch_size=4` 对 `1`）尚未
+  做；需要时可复测，`ext` 量级已说明它不会再随批次线性增长。
 
 **0.1.8+ 待办**
 - [ ] **能力上限从设备实际限额反推，别写死在代码里**（alpha.9 遗留的口子）。
@@ -920,7 +951,12 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   刚好把两者重叠。并行采样后 CPU 腿降为约 1/3，GPU 空转 32–34% → 24%；
   剩余空转是 C2ME 供货空窗（`qwait` 38–81 ms/批、`qdepth` 多为 0），加
   `STAGING=3` 不会改善。下一步若还要提速，方向在 C2ME 的提交节奏，不在协调器。
-- [ ] **external 采样不复用 MC 的噪声缓存 —— Tectonic 高世界下落后 CL 的主因（2026-11-14 实机定位）**。
+- [x] **external 采样不复用 MC 的噪声缓存 —— Tectonic 高世界下落后 CL 的主因（2026-11-14 实机定位）**。
+  **0.1.9 已实现并实机验证（2026-11-23）**：不针对 Tectonic，而是读取序列化树
+  里**已经存在的** `FLAT_CACHE` / `CACHE2D` 包装：一个槽位的全部引用都在这些
+  Y 独立缓存内时，CPU 只按列采一次并复制到所有 Y；否则保持逐角点采样。机制与
+  模组名、节点类、形状常量无关，任何使用这两个原版包装的数据包都会自动走这条
+  路径。详见 0.1.9 记录「external 采样复用 MC 的 Y 独立缓存语义」。
   当前实现（`WgpuBatchCoordinator.uploadExternalInputs`）对每个 external 节点、
   每个 chunk、每个角点都调一次 `ext.sample(new UnblendedNoisePos(wx, wy, wz))`，
   **裸采样**：既不经过 `ChunkNoiseSampler` 的 `CacheOnce`/`Cache2D`/`FlatCache`/
@@ -974,6 +1010,57 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   同时开 `debug_stage_timing` 看 `ext` 毫秒/批是否下降。
   关联：「能力上限从设备实际限额反推」同属吞吐方向，两者都会改变 Java 侧的
   每批工作量，改完需要一起复测。
+
+### 0.1.10 待办重排（2026-11-23，按实施难度，不含验证类）
+
+0.1.9 的能力上限链（4a–4d）与 external Y 缓存语义都已落地。剩余条目按
+"改动范围 / 是否需要改接口或数学 / 能否独立回滚"排序；验证类（Android 实机、
+65–200 external 实例）单列在下一节。
+
+#### 🟢 低难度：纯搬运或小修，行为不变，可单文件回滚
+
+- [ ] **删掉 `requestChunks` 的 `req == 0` 不可达分支**（最小的一条）。
+  `requestChunks` 在 `h == 0` 时已经抛异常，协调器里的
+  `failAll("requestChunks returned 0")` 只剩防御价值，容易让人以为存在这条
+  运行时路径。直接去掉，或改成 `assert` 并注明前置条件。
+- [ ] **`Config.get()` 每批缓存一次**（可选）。它是 `synchronized` 静态方法，
+  攒批循环每轮调 2 次；当前量级可忽略，但热路径再变密就会显形。在一个批次
+  开始时读一次配置，后续用局部变量即可。
+- [ ] **拆 `WgpuBatchCoordinator`**（841 行，四件事：队列、攒批、external
+  采样、探针统计）。可抽出 `ExternalSampler`（约 90 行）与 `PipelineProbe`
+  （约 70 行）。纯搬运，不动线程模型与缓冲布局；拆完跑一次
+  `external sampling self-check` 即可确认。
+- [ ] **拆 `MixinChunkGenerator.onPopulateNoise`**（约 215 行，混了状态获取、
+  sampler/aquifer/矿脉准备、异步完成回调、失败回退）。可拆成
+  `prepareChunkState(...)` 与 `onBatchDone(...)`。0.1.9 的 Y 缓存改动又往这个
+  注入方法里加了行，优先级比上一轮高一点；仍是纯搬运，但注入点对方法签名敏感，
+  改完必须实机进一次世界（不能只靠编译通过）。
+- [ ] **Java 侧第一个 JVM 单测**：现在 `test` 任务是 NO-SOURCE，external 的
+  `[chunk][ext][cell]` 布局、stride、单 chunk / 多 chunk 两条路径只靠实机日志
+  验证。用 `DensityFunction` 的假实现（返回可预测的值）覆盖这两种批次形态，
+  不需要加载 Minecraft。做完这条，后续改 external 采样才有回归网。
+
+#### 🟡 中难度：改接口或改采样数学，需要 A/B 复测
+
+- [ ] **`MAX_EXTERNAL_NODES` 按设备限额推导**（能力上限链的最后一半）。
+  批次上限已经按设备限额与形状推导，external 的 64 仍是写死的。改法与 4a/4b
+  同源：Rust 侧按"每节点每 chunk 角点字节数 × binding 限额"算出上限，Java 通过
+  只读 FFM 查询拿到后再决定 external 槽位数。注意它与 batch limit 相互制约
+  （`external_bytes = nodes × cells × batch`），要一起解，不能各算各的。
+  详见上文「能力上限从设备实际限额反推」与「65–200 的中间地带」。
+- [ ] **阶段 3：批内真正共享采样上下文**（官方 CL 的剩余收益）。当前批次只
+  收敛调度依赖，每个成员仍各自构建 `ChunkNoiseSampler`；要进一步必须自己持有
+  `Blender` / `StructureAccessor` / sampler。收益上限尚未量化，风险远高于阶段 2，
+  要动先写清楚生命周期与线程归属。
+
+#### 🔴 高难度：核心功能突破，需先改架构前提
+
+- [ ] **把生物群系（Biome）拉上 GPU**。必须走"合并进同一批次、同一次提交"，
+  绝不能重走 `experiment/biome-gpu` 的独立路径（那条已被实测证伪）。补充实测
+  显示计算量本身不是瓶颈（跳过 `populateBiomes` 仅 +4% CPS），所以收益上限
+  不高，优先级低于上面两条。
+- [ ] **多 Kernel 流水线（仅评估）**。除非实机探针发现某个 Shard 明显拖后腿，
+  否则维持单 Compute Pass；Vulkan 的提交/同步开销可能吃掉拆分收益。
 
 ### 待测与验证计划（不属于版本功能）
 
