@@ -1048,17 +1048,30 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   只读 FFM 查询拿到后再决定 external 槽位数。注意它与 batch limit 相互制约
   （`external_bytes = nodes × cells × batch`），要一起解，不能各算各的。
   详见上文「能力上限从设备实际限额反推」与「65–200 的中间地带」。
-- [ ] **阶段 3：批内真正共享采样上下文**（官方 CL 的剩余收益）。当前批次只
+- [ ] **阶段 3：批内真正共享采样上下文**（官方 CL 的剩余收益，即和 C2ME 的
+  生成流程共用同一份 sampler，而不是每个批次成员各建一份）。当前批次只
   收敛调度依赖，每个成员仍各自构建 `ChunkNoiseSampler`；要进一步必须自己持有
   `Blender` / `StructureAccessor` / sampler。收益上限尚未量化，风险远高于阶段 2，
-  要动先写清楚生命周期与线程归属。
+  要动先写清楚生命周期与线程归属；前置是下面 🔴 第一条「状态内拿到采样上下文」。
 
 #### 🔴 高难度：核心功能突破，需先改架构前提
 
+- [ ] **在自定义 `NewChunkStatus` 内拿到与 vanilla / C2ME 等价的采样上下文**。
+  这是 §13.5 当时明确回避掉的第一条前提（原文：「在状态内拿到与 vanilla 等价的
+  `ChunkNoiseSampler`（或复刻其采样上下文）」），至今没有做：现在 GPU 工作仍挂在
+  `populateNoise`，上下文由 vanilla 的 `createChunkNoiseSampler` 建立、
+  `MixinChunkGenerator` 只是借用；状态要自己提交批次，就没有这个入口。两条路：
+  - 在状态内通过 `NoiseChunkGeneratorInvoker` 建同样的 `ChunkNoiseSampler`；
+    还要一并解决原前提第 2 条——`Blender` / `StructureAccessor` 在 C2ME worker
+    上的线程安全获取。
+  - 或者复刻采样上下文（aquifer / beard / 插值状态），但那等于写第二份世界
+    生成器，§13.5 已判定不可取。
+  完成这条之前，下面两条都无从谈起：biome 与 NOISE 同批需要同一个上下文，
+  阶段 3 批内共享 sampler 也需要一个状态内可持有的 sampler。
 - [ ] **把生物群系（Biome）拉上 GPU**。必须走"合并进同一批次、同一次提交"，
   绝不能重走 `experiment/biome-gpu` 的独立路径（那条已被实测证伪）。补充实测
   显示计算量本身不是瓶颈（跳过 `populateBiomes` 仅 +4% CPS），所以收益上限
-  不高，优先级低于上面两条。
+  不高，优先级低于上面两条中难度项与上面的采样上下文前提。
 - [ ] **多 Kernel 流水线（仅评估）**。除非实机探针发现某个 Shard 明显拖后腿，
   否则维持单 Compute Pass；Vulkan 的提交/同步开销可能吃掉拆分收益。
 
@@ -1859,6 +1872,10 @@ Chunky r=1000（16129 chunks），同种子、同预热：
 
 这样任何批次逻辑的 bug 都只可能表现为**慢**或**回退到逐块生成**，而不是错地形。
 `MixinChunkGenerator` 的写回路径继续保留，不删除。
+
+`§13.2` 列出的第一条前提「在状态内拿到与 vanilla 等价的 `ChunkNoiseSampler`
+（或复刻其采样上下文）」并没有消失，只是被推迟了：它现在是「0.1.10 待办重排」
+里 🔴 高难度那条，也是 biome 同批与阶段 3 的共同前置。
 
 ### 13.6 对齐批次设计（`chunk_batch_size`）
 
