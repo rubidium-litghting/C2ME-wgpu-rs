@@ -108,6 +108,18 @@ public class NoiseRouterBlobifier {
     /** Occurrences seen, including ones folded into an existing slot by
      *  {@link #EXTERNAL_INDEX}; cleared per blobify(). */
     public static int EXTERNAL_REFS = 0;
+    /** Per-slot reference accounting, same order as {@link #EXTERNAL_NODES}:
+     *  {@code [0]} = total references, {@code [1]} = references encountered
+     *  inside a FLAT_CACHE / CACHE2D wrapper. Cleared per blobify(). */
+    private static final List<int[]> EXTERNAL_CACHE_REFS = new ArrayList<>();
+    /** Slot i is true when every reference to it was inside a FLAT_CACHE or
+     *  CACHE2D wrapper. Both are Y-independent by MC's contract (FlatCache
+     *  samples its input at y=0, Cache2D caches the first value per column),
+     *  so the CPU can sample one column and repeat it across Y. Filled at the
+     *  end of blobify(), same order as {@link #EXTERNAL_NODES}. */
+    public static final List<Boolean> EXTERNAL_Y_CACHEABLE = new ArrayList<>();
+    /** Nesting depth of FLAT_CACHE / CACHE2D while serializing. */
+    private static int yCacheDepth = 0;
 
     // ── Tags ────────────────────────────────────────────────────────
     private static final byte TAG_CONSTANT = 0x01;
@@ -159,6 +171,9 @@ public class NoiseRouterBlobifier {
         EXTERNAL_NODES.clear();
         EXTERNAL_INDEX.clear();
         EXTERNAL_REFS = 0;
+        EXTERNAL_CACHE_REFS.clear();
+        EXTERNAL_Y_CACHEABLE.clear();
+        yCacheDepth = 0;
         // ── HEADER (10B) ─────────────────────────────────────────
         buf.put((byte) 0x4D);
         buf.put((byte) 0x43);
@@ -200,6 +215,14 @@ public class NoiseRouterBlobifier {
         // ── PERM_RESOURCE (appended; Rust stores for later use) ─
         writePermResource(buf);
         writeSimplexResource(buf);
+
+        // A slot may be reached through several paths of the DAG. It is safe
+        // to sample once per column only when *every* reference was inside a
+        // Y-independent cache: a bare reference elsewhere still needs the
+        // per-corner value at each Y.
+        for (int[] refs : EXTERNAL_CACHE_REFS) {
+            EXTERNAL_Y_CACHEABLE.add(refs[0] > 0 && refs[1] == refs[0]);
+        }
 
         buf.flip();
         return buf;
@@ -332,9 +355,16 @@ public class NoiseRouterBlobifier {
 
         // ── Wrapping (caches) ───────────────────────────────────
         if (df instanceof DensityFunctionTypes.Wrapping w) {
+            boolean yIndependent = false;
             switch (w.type()) {
-                case FLAT_CACHE -> buf.put(TAG_CACHE_FLAT);
-                case CACHE2D -> buf.put(TAG_CACHE_2D);
+                case FLAT_CACHE -> {
+                    buf.put(TAG_CACHE_FLAT);
+                    yIndependent = true;
+                }
+                case CACHE2D -> {
+                    buf.put(TAG_CACHE_2D);
+                    yIndependent = true;
+                }
                 // CACHE_ONCE / CACHE_ALL_IN_CELL are pure memoisation in MC:
                 // they return the same value as their inner at the same
                 // position. Treating them as INTERPOLATED (corner-blend)
@@ -346,7 +376,15 @@ public class NoiseRouterBlobifier {
                 }
                 case INTERPOLATED -> buf.put(TAG_INTERP_NOISE);
             }
-            writeDF(buf, w.wrapped());
+            // Track whether an external subtree sits under a Y-independent
+            // cache. Only FLAT_CACHE / CACHE2D qualify: INTERPOLATED is a
+            // corner sample, and the CACHE_* types still depend on Y.
+            if (yIndependent) yCacheDepth++;
+            try {
+                writeDF(buf, w.wrapped());
+            } finally {
+                if (yIndependent) yCacheDepth--;
+            }
             return;
         }
 
@@ -496,14 +534,20 @@ public class NoiseRouterBlobifier {
         EXTERNAL_REFS++;
         Integer shared = EXTERNAL_INDEX.get(df);
         int extIndex;
+        int[] refs;
         if (shared != null) {
             // Same instance reached again through another path of the DAG.
             extIndex = shared;
+            refs = EXTERNAL_CACHE_REFS.get(extIndex);
         } else {
             extIndex = EXTERNAL_NODES.size();
             EXTERNAL_INDEX.put(df, extIndex);
             EXTERNAL_NODES.add(df);
+            refs = new int[2];
+            EXTERNAL_CACHE_REFS.add(refs);
         }
+        refs[0]++;
+        if (yCacheDepth > 0) refs[1]++;
         buf.put(TAG_EXTERNAL_INPUT);
         buf.putInt(extIndex);
     }

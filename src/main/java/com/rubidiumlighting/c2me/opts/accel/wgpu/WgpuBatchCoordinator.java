@@ -212,6 +212,11 @@ public final class WgpuBatchCoordinator {
     /** Nodes the GPU serializer could not translate. Their values are
      *  computed here on the CPU at the corner grid and uploaded to binding 6. */
     private final List<DensityFunction> externalNodes;
+    /** Per slot: every reference was under FLAT_CACHE / CACHE2D, so MC's
+     *  own cache semantics make the value Y-independent. One sample per
+     *  column is then enough; {@link #fillExternalChunk} repeats it across Y.
+     *  False means the slot needs a sample at every corner. */
+    private final boolean[] yCacheable;
     private final int gx, gy, gz;      // corner counts per axis
     private final int cellW, cellH;    // cell size in blocks
     private final int minY;
@@ -286,9 +291,11 @@ public final class WgpuBatchCoordinator {
 
     public WgpuBatchCoordinator(long worldHandle,
                                 List<DensityFunction> externalNodes,
+                                boolean[] yCacheable,
                                 int gx, int gy, int gz, int cellW, int cellH, int minY) {
         this.worldHandle = worldHandle;
         this.externalNodes = externalNodes;
+        this.yCacheable = yCacheable;
         this.gx = gx; this.gy = gy; this.gz = gz;
         this.cellW = cellW; this.cellH = cellH;
         this.minY = minY;
@@ -498,8 +505,13 @@ public final class WgpuBatchCoordinator {
                 final int to = Math.min(n, from + per);
                 if (from >= to) break;
                 tasks.add(ExternalPool.INSTANCE.submit(() -> {
+                    // One mutable position per worker: samples read x/y/z
+                    // immediately and never retain it, so this removes any
+                    // per-corner allocation (millions per second at tall
+                    // shapes) without sharing state between threads.
+                    MutableNoisePos pos = new MutableNoisePos();
                     for (int c = from; c < to; c++) {
-                        fillExternalChunk(batch.get(c), data, c * stride);
+                        fillExternalChunk(batch.get(c), data, c * stride, pos);
                     }
                 }));
             }
@@ -519,8 +531,9 @@ public final class WgpuBatchCoordinator {
                 selfCheckExternal(data, batch, stride);
             }
         } else {
+            MutableNoisePos pos = new MutableNoisePos();
             for (int c = 0; c < n; c++) {
-                fillExternalChunk(batch.get(c), data, c * stride);
+                fillExternalChunk(batch.get(c), data, c * stride, pos);
             }
         }
         return data;
@@ -533,8 +546,9 @@ public final class WgpuBatchCoordinator {
      *  debug-only gate, which keeps it out of any measurement it would skew. */
     private void selfCheckExternal(float[] parallel, List<Job> batch, int stride) {
         float[] serial = new float[parallel.length];
+        MutableNoisePos pos = new MutableNoisePos();
         for (int c = 0; c < batch.size(); c++) {
-            fillExternalChunk(batch.get(c), serial, c * stride);
+            fillExternalChunk(batch.get(c), serial, c * stride, pos);
         }
         int mismatches = 0;
         float maxDiff = 0f;
@@ -552,24 +566,56 @@ public final class WgpuBatchCoordinator {
                 mismatches, maxDiff);
     }
 
-    /** Sample one chunk's slice: {@code [ext][cell]} at {@code data[offset..]}.
+    /** Sample one chunk's slice: {@code [ext][j][k][i]} at {@code data[offset..]}.
      *  Chunk slices are independent, so this is safe to run concurrently —
      *  vanilla samples the same density-function instances from several chunk
-     *  generation workers at once. */
-    private void fillExternalChunk(Job job, float[] data, int offset) {
+     *  generation workers at once.
+     *
+     *  <p>Slots marked {@code yCacheable} are sampled once per (x,z) column at
+     *  y=0 and the slice is copied across Y. That is exact under MC's own
+     *  cache semantics, not a heuristic: every reference to such a slot sits
+     *  inside a {@code FlatCache} or {@code Cache2D}. {@code FlatCache} fills
+     *  its cache by sampling its input at y=0 on 4-block columns, and
+     *  {@code Cache2D} caches one value per column. Repeating that value
+     *  therefore reproduces what vanilla would hand to the rest of the tree,
+     *  and it removes {@code gy-1} of the {@code gy} subtree evaluations.
+     *
+     *  <p>This is driven entirely by the serialized tree, so it applies to
+     *  any data pack or mod that uses these wrappers — there is no
+     *  pack-specific knowledge here. Slots with even one bare reference are
+     *  still sampled at every corner, because that path needs the Y-varying
+     *  value. */
+    private void fillExternalChunk(Job job, float[] data, int offset,
+                                   MutableNoisePos pos) {
         int sx = job.cx * CHUNK_WIDTH;
         int sz = job.cz * CHUNK_WIDTH;
+        int plane = gx * gz;   // one Y slice per external node
         int idx = offset;
-        for (DensityFunction ext : externalNodes) {
-            for (int j = 0; j < gy; j++) {
-                int wy = minY + j * cellH;
+        for (int e = 0; e < externalNodes.size(); e++) {
+            DensityFunction ext = externalNodes.get(e);
+            boolean column = e < yCacheable.length && yCacheable[e];
+            if (column) {
                 for (int k = 0; k < gz; k++) {
                     int wz = sz + k * cellW;
                     for (int i = 0; i < gx; i++) {
                         int wx = sx + i * cellW;
-                        double v = ext.sample(
-                                new DensityFunction.UnblendedNoisePos(wx, wy, wz));
-                        data[idx++] = (float) v;
+                        data[idx + k * gx + i] =
+                                (float) ext.sample(pos.set(wx, 0, wz));
+                    }
+                }
+                for (int j = 1; j < gy; j++) {
+                    System.arraycopy(data, idx, data, idx + j * plane, plane);
+                }
+                idx += gy * plane;
+            } else {
+                for (int j = 0; j < gy; j++) {
+                    int wy = minY + j * cellH;
+                    for (int k = 0; k < gz; k++) {
+                        int wz = sz + k * cellW;
+                        for (int i = 0; i < gx; i++) {
+                            int wx = sx + i * cellW;
+                            data[idx++] = (float) ext.sample(pos.set(wx, wy, wz));
+                        }
                     }
                 }
             }

@@ -753,14 +753,27 @@ public abstract class MixinChunkGenerator {
             }
             List<DensityFunction> extNodes =
                     new ArrayList<>(NoiseRouterBlobifier.EXTERNAL_NODES);
+            // Slots whose every reference sits under FLAT_CACHE / CACHE2D can
+            // be sampled once per column and repeated across Y. Copy the flags
+            // now, while the serializer's static state still describes this
+            // dimension.
+            boolean[] extYCacheable = new boolean[extNodes.size()];
+            int yCached = 0;
+            for (int i = 0; i < extYCacheable.length; i++) {
+                extYCacheable[i] = i < NoiseRouterBlobifier.EXTERNAL_Y_CACHEABLE.size()
+                        && Boolean.TRUE.equals(
+                                NoiseRouterBlobifier.EXTERNAL_Y_CACHEABLE.get(i));
+                if (extYCacheable[i]) yCached++;
+            }
             if (!extNodes.isEmpty()) {
                 // References vs distinct instances: the tree is a DAG and the
                 // serializer inlines it, so the same node is written many
                 // times. Only distinct instances cost a slot (see
                 // NoiseRouterBlobifier.EXTERNAL_INDEX).
                 LOGGER.info("[c2me-wgpu] {} external (CPU-evaluated) density subtree(s)"
-                                + " from {} reference(s)",
-                        extNodes.size(), NoiseRouterBlobifier.EXTERNAL_REFS);
+                                + " from {} reference(s); {} sampled once per column"
+                                + " (FLAT_CACHE/CACHE2D)",
+                        extNodes.size(), NoiseRouterBlobifier.EXTERNAL_REFS, yCached);
             }
             // Every external subtree is sampled on the CPU over a corner
             // lattice, once per chunk per node, and the results are shipped to
@@ -774,7 +787,7 @@ public abstract class MixinChunkGenerator {
                                 + ") for GPU acceleration");
             }
             WgpuBatchCoordinator coord = new WgpuBatchCoordinator(world, extNodes,
-                    gx, gy, gz, hc, vc, minY);
+                    extYCacheable, gx, gy, gz, hc, vc, minY);
             // Announce GPU acceleration here, not on world join: "the GPU is
             // active" is only true for a dimension that actually initialised.
             // Reporting it on join raced with the per-dimension fallback notice,
