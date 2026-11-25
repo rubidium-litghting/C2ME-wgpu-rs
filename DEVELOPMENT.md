@@ -1058,16 +1058,46 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
 - [ ] **在自定义 `NewChunkStatus` 内拿到与 vanilla / C2ME 等价的采样上下文**。
   这是 §13.5 当时明确回避掉的第一条前提（原文：「在状态内拿到与 vanilla 等价的
-  `ChunkNoiseSampler`（或复刻其采样上下文）」），至今没有做：现在 GPU 工作仍挂在
-  `populateNoise`，上下文由 vanilla 的 `createChunkNoiseSampler` 建立、
-  `MixinChunkGenerator` 只是借用；状态要自己提交批次，就没有这个入口。两条路：
-  - 在状态内通过 `NoiseChunkGeneratorInvoker` 建同样的 `ChunkNoiseSampler`；
-    还要一并解决原前提第 2 条——`Blender` / `StructureAccessor` 在 C2ME worker
-    上的线程安全获取。
+  `ChunkNoiseSampler`（或复刻其采样上下文）」）。**获取方式已验证（2026-11-25），
+  剩下的是「在状态内提交批次」本身**：现在 GPU 工作仍挂在 `populateNoise`，
+  `MixinChunkGenerator` 只是借用 vanilla 建好的上下文。
+  - **上下文来源**：`((IThreadedAnvilChunkStorage) ctx.tacs()).getGenerationContext()`
+    给出 `ServerWorld` / `ChunkGenerator`；区域数组用
+    `ctx.theChunkSystem().getHolder(new ChunkPos(x, z)).getUserData().get()`
+    填（C2ME 自己的 `VanillaWorldGenerationDelegate` 就是这么做的），再套
+    `new ChunkRegion(world, chunks, step, chunk)` → `Blender.getBlender(region)`
+    → `world.getStructureAccessor().forRegion(region)`，即
+    `ChunkGenerating.populateNoise` 里那四行。实现在
+    `chunkstatus/StatusNoiseContext.java`（`debug_status_sampler` 探针）。
+  - **半径必须是 accumulated**：`ChunkLoader.create` 用的是
+    `step.getAdditionalLevel(ChunkStatus.EMPTY)`，NOISE 下为 **9**，不是
+    `directDependencies().getMaxLevel()` 的 8——BIOMES 占了累积依赖的第 0/1 层，
+    把 STRUCTURE_STARTS 顶到第 9 环。外圈经常没有 holder（实测
+    `missing=0` 为主、偶见 `2`），必须像 `ChunkLoadingManager#acquire` 那样
+    **填 null**，不能抛异常；`ChunkRegion.getChunk` 本身也拒绝距离 ≥ 9 的请求，
+    所以这些 null 永远不会被解引用。
+  - **sampler 其实在 BIOMES 就有了**：`populateBiomes` 会
+    `chunk.getOrCreateChunkNoiseSampler(...)` 并把实例缓存在 chunk 上，NOISE
+    只是复用。实测 5120 个区块里约 97% 在状态内已经能读到实例，约 3%
+    （从磁盘按 BIOMES 加载、跳过了 `populateBiomes`）为空，由状态侧用
+    `NoiseChunkGeneratorInvoker.callCreateChunkNoiseSampler` 补建。
+  - **等价性已证明**：`debug_status_sampler` 下状态侧记录自己看到的实例，
+    `populateNoise` 头部核对身份，实测 `matched 5120/5120`、`sampler differs`
+    为 0，即状态侧上下文与 vanilla 最终使用的是同一个状态载体；那 3% 由状态
+    补建的实例也被 vanilla 直接采用，无生成错误。
+  - **仍未解决的一条**：在状态内**补建** sampler 会走到
+    `Beardifier.forRegion` → `StructureAccessor.getStructureStarts` →
+    `ChunkRegion.getChunk`，实测约 7000 次观测中出现 1 次邻居不可用
+    （`CrashException`，请求距离必然 ≤ 8，因为同一 step 的距离 ≥ 9 一律拒绝）。
+    探针里 catch 后回退原版即可；**真正在状态内提交批次时不能只回退**，要么
+    等邻居就绪重试，要么只在 sampler 已存在时接手——这正是原前提第 2 条
+    「`Blender` / `StructureAccessor` 在 C2ME worker 上的线程安全获取」。
+  - 另一条已知的实现细节：`upgradeToThis` 会被重复进入（实测 5120 次
+    `populateNoise` 对应 6656 次状态观测），状态内建上下文必须按 chunk 去重。
   - 或者复刻采样上下文（aquifer / beard / 插值状态），但那等于写第二份世界
     生成器，§13.5 已判定不可取。
-  完成这条之前，下面两条都无从谈起：biome 与 NOISE 同批需要同一个上下文，
-  阶段 3 批内共享 sampler 也需要一个状态内可持有的 sampler。
+  完成「在状态内提交批次」之前，下面两条都无从谈起：biome 与 NOISE 同批需要
+  同一个上下文，阶段 3 批内共享 sampler 也需要一个状态内可持有的 sampler。
 - [ ] **把生物群系（Biome）拉上 GPU**。必须走"合并进同一批次、同一次提交"，
   绝不能重走 `experiment/biome-gpu` 的独立路径（那条已被实测证伪）。补充实测
   显示计算量本身不是瓶颈（跳过 `populateBiomes` 仅 +4% CPS），所以收益上限

@@ -164,6 +164,7 @@ These options are for troubleshooting; leave them at their defaults for normal p
 | `debug_verbose_logging` | `false` | Enables detailed diagnostics: shader compile times, pipeline-cache hits, adapter workarounds, and periodic chunks-per-second (`CPS=`) stats (also printed to chat). |
 | `debug_stage_timing` | `false` | Writes per-stage timings to the log: GPU side (encode / submit / readback / decode) and CPU side (block write-back into the chunk). Also emits the 2-second `[pipe]` pipeline probe (queue / fill / permit / external sampling / submit / GPU idle share) and, on dimensions with external nodes, cross-checks the first 8 parallel-sampled batches against a serial recompute (all should read 0 mismatches). |
 | `debug_height_probe` | `false` | Counts vanilla `ChunkGenerator.getHeight` calls, their cost, distinct columns and calling threads, and whether GPU batches were still in flight. Used to decide whether caching surface height is worth it (see `DEVELOPMENT.md` §14). Read once at class load; a change needs a restart. |
+| `debug_status_sampler` | `false` | Rebuilds vanilla's sampling context (`ChunkRegion` / `Blender` / `NoiseConfig` / `StructureAccessor`) inside our `NOISE` status, then checks that the `ChunkNoiseSampler` `populateNoise` actually uses is the same instance the status saw (`matched N/N` in the log). Verifies the "sampling context inside the status" prerequisite (see `DEVELOPMENT.md` §0.1.10, first red item). Does not change generation; failures fall back to the vanilla path. |
 
 ### Offline diagnostics
 
