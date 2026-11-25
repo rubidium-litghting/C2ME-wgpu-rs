@@ -1060,6 +1060,18 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   也就是说阶段 3 可以直接从这里出发：把 `Cache` 里已就绪的上下文收集成批，
   未就绪的成员留在 vanilla 路径，不需要再解决线程归属或重试机制。
 
+  **第一片（批内组成测量）已完成**（2026-11-26，`chunk_batch_size=4`）：
+  锚点通过状态时给同组全部 16 个成员各建一次上下文，只统计不改生成路径。
+  1088 个批次里 **1082 个是 16/16 全就绪**，只有 6 个不满（15/14/12/8），
+  且 `regions not ready` 为 0 —— 也就是说**批内上下文几乎总能凑满**，
+  阶段 3 的收益上限按满批计算是成立的。那 6 个不满的批次全部来自同一个
+  C2ME 类型假设：`MixinBlender` 把 `ChunkRegion.needsBlending` 重定向成
+  `((ProtoChunkExtension) region.getChunk(pos)).getNeedBlending()`，成员若是
+  已经是 `WorldChunk`（不是 C2ME 的 proto chunk）就抛 `ClassCastException`
+  （实测 3 次，全部出现在成员、锚点 0 次）。现在这种情况按「就绪判定不可用」
+  跳过并交回 vanilla，不再打异常栈。结论：**批内共享的前提在数据上成立**，
+  下一片可以做「提交已就绪子集」。
+
 #### 🔴 高难度：核心功能突破，需先改架构前提
 
 - [ ] **在自定义 `NewChunkStatus` 内拿到与 vanilla / C2ME 等价的采样上下文**。
