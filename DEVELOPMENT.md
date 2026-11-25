@@ -1054,6 +1054,12 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   `Blender` / `StructureAccessor` / sampler。收益上限尚未量化，风险远高于阶段 2，
   要动先写清楚生命周期与线程归属；前置是下面 🔴 第一条「状态内拿到采样上下文」。
 
+  该前置的**两个工程前提已完成**（2026-11-26，`StatusNoiseContext`）：上下文按
+  「世界 + chunk」只建一次（重复进入 `upgradeToThis` 复用），以及不取锁的
+  「只查真正会被读的位置」就绪自检（不可用就跳过、交回 vanilla，实测 1.2%）。
+  也就是说阶段 3 可以直接从这里出发：把 `Cache` 里已就绪的上下文收集成批，
+  未就绪的成员留在 vanilla 路径，不需要再解决线程归属或重试机制。
+
 #### 🔴 高难度：核心功能突破，需先改架构前提
 
 - [ ] **在自定义 `NewChunkStatus` 内拿到与 vanilla / C2ME 等价的采样上下文**。
@@ -1085,15 +1091,37 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     `populateNoise` 头部核对身份，实测 `matched 5120/5120`、`sampler differs`
     为 0，即状态侧上下文与 vanilla 最终使用的是同一个状态载体；那 3% 由状态
     补建的实例也被 vanilla 直接采用，无生成错误。
-  - **仍未解决的一条**：在状态内**补建** sampler 会走到
-    `Beardifier.forRegion` → `StructureAccessor.getStructureStarts` →
-    `ChunkRegion.getChunk`，实测约 7000 次观测中出现 1 次邻居不可用
-    （`CrashException`，请求距离必然 ≤ 8，因为同一 step 的距离 ≥ 9 一律拒绝）。
-    探针里 catch 后回退原版即可；**真正在状态内提交批次时不能只回退**，要么
-    等邻居就绪重试，要么只在 sampler 已存在时接手——这正是原前提第 2 条
-    「`Blender` / `StructureAccessor` 在 C2ME worker 上的线程安全获取」。
+  - **补建 sampler 的竞态已解决（2026-11-26），两次实验两负一正**：
+    - 在状态内补建会走到 `StructureWeightSampler` →
+      `StructureAccessor.getStructureStarts` → `ChunkRegion.getChunk`，实测约
+      7000 次观测出现 1 次 `CrashException`。
+    - 第一版修法是照抄 C2ME
+      `VanillaWorldGenerationDelegate.runTaskWithLockRadius`，把 19×19 区域的
+      worldgen 锁全拿下来再建。**错**：361 个位置的全有或全无锁集和每个邻居
+      自己的生成任务互斥，等于把 worldgen 串行化。实测 CPS 中位数 83 → **35.7**，
+      吞吐砍半。
+    - 最终做法：**不取锁**，建之前把「真正会被读的位置」按 vanilla 的读取路径
+      精确自检一遍——区块自己、它结构引用指向的区块（与 vanilla 一样按
+      `getTerrainAdaptation() != NONE` 过滤）、需要 blending 时才展开半径 3
+      （`Blender` 自己扫 2 环，再读每个区块的 8 邻）。每个位置都问
+      `getUncheckedOrNull(step.directDependencies().get(距离))`，和
+      `ChunkRegion.getChunk` 逐字一致。没就绪就跳过本次构建，记
+      `context at .. skipped, region not ready: <坐标> (distance N) needs <status>`
+      ，交给 vanilla。
+    - **关键坑：`getActualStatus()` 不是就绪信号**。实测大量
+      `needs structure_starts but is structure_starts`（甚至 `is full`）——
+      区块状态已经过了，`getUncheckedOrNull(早先 status)` 依然是 null，因为
+      holder 是按 status 索引的 future 数组。把 19×19 全查一遍时会误伤 26% 的
+      构建（`regions not ready: 4178 / ~20050`），改成只查真正会被读的位置后
+      降到 `435 / 35328`（约 1.2%，全是边界处确实还在推进的区块）。
+    - 最终实测（27648 区块）：`matched 27648/27648`、`differs` 0、无
+      `CrashException`，CPS 中位数 **98.2**（p75 106.5，基线 83.1）。
   - 另一条已知的实现细节：`upgradeToThis` 会被重复进入（实测 5120 次
-    `populateNoise` 对应 6656 次状态观测），状态内建上下文必须按 chunk 去重。
+    `populateNoise` 对应 6656 次状态观测）。现在上下文按「世界 + chunk」缓存
+    一次构建，重复进入直接复用；`postUpgradeToThis` / `downgradeFromThis`
+    时驱逐。注意 `WgpuNoiseStatus` 只在 C2ME 建全局状态表时实例化**一次**，
+    一个实例服务所有维度，缓存必须自己按世界分桶（用
+    `ctx.tacs()`，即 `ServerChunkLoadingManager`，弱引用，世界卸载即整桶消失）。
   - 或者复刻采样上下文（aquifer / beard / 插值状态），但那等于写第二份世界
     生成器，§13.5 已判定不可取。
   完成「在状态内提交批次」之前，下面两条都无从谈起：biome 与 NOISE 同批需要
