@@ -34,6 +34,7 @@ import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuDimensionRegistry;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuFallbackNotice;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuStatus;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuThinBinding;
+import com.rubidiumlighting.c2me.opts.accel.wgpu.chunkstatus.StatusNoiseContext;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.config.Config;
 
 import net.minecraft.block.BlockState;
@@ -97,6 +98,16 @@ public abstract class MixinChunkGenerator {
     // Per-dimension state now lives in WgpuDimensionRegistry: the save-switch
     // teardown has to iterate and destroy all of it from outside the mixin,
     // which is impossible for fields declared here.
+
+    @Inject(method = "populateNoise", at = @At("HEAD"))
+    private void c2me_wgpu$observeStatusSampler(Blender blender, NoiseConfig noiseConfig,
+                                                StructureAccessor structureAccessor, Chunk chunk,
+                                                CallbackInfoReturnable<CompletableFuture<Chunk>> cir) {
+        // Debug probe for the status-side sampling context: compare the sampler
+        // this call will use with the one the NOISE status observed. No-op
+        // unless debug_status_sampler is on, and never touches generation.
+        StatusNoiseContext.notePopulateNoise(chunk);
+    }
 
     @Inject(method = "populateNoise", at = @At("HEAD"), cancellable = true)
     private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,

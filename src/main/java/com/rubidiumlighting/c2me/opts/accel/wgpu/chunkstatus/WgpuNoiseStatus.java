@@ -203,6 +203,7 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
 
         ChunkPos pos = ctx.holder().getKey();
         if (batchSize == 1) {
+            StatusNoiseContext.observe(ctx);
             return vanilla.upgradeToThis(ctx, cancellable);
         }
         if (!isAnchor(pos)) {
@@ -225,6 +226,8 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
             // generated are handled one by one by the next status.
             return Completable.complete();
         }
+
+        StatusNoiseContext.observe(ctx);
 
         List<Completable> work = new ArrayList<>(batchSize * batchSize);
         for (int dx = 0; dx < batchSize; dx++) {

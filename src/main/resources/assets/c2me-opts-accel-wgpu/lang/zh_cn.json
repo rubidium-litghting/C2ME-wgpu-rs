@@ -16,6 +16,7 @@
   "c2me-opts-accel-wgpu.config.verbose": "详细日志",
   "c2me-opts-accel-wgpu.config.stage_timing": "分阶段计时",
   "c2me-opts-accel-wgpu.config.height_probe": "高度查询打点",
+  "c2me-opts-accel-wgpu.config.status_sampler": "状态内采样上下文打点",
   "c2me-opts-accel-wgpu.config.tristate.auto": "自动",
   "c2me-opts-accel-wgpu.config.tristate.on": "开",
   "c2me-opts-accel-wgpu.config.tristate.off": "关",

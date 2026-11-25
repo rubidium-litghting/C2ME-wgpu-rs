@@ -38,6 +38,12 @@ public class ItemHolder<K, V, Ctx, Ext> {
         throw new UnsupportedOperationException("stub");
     }
 
+    /** C2ME stores the vanilla-side {@code AbstractChunkHolder} here; it is
+     *  how the scheduler exposes a chunk to {@code BoundedRegionArray}. */
+    public AtomicReference<Ext> getUserData() {
+        throw new UnsupportedOperationException("stub");
+    }
+
     public ItemStatus<K, V, Ctx> getStatus() {
         throw new UnsupportedOperationException("stub");
     }

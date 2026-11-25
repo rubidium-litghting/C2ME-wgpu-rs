@@ -111,6 +111,16 @@ public final class Config {
     @ConfigOption(label = "c2me-opts-accel-wgpu.config.height_probe", order = 65)
     public boolean debugHeightProbe = false;
 
+    /** Probe the "sampling context inside the NOISE status" step: build the
+     *  ChunkRegion / Blender / NoiseConfig / StructureAccessor vanilla would
+     *  build, observe the chunk's {@code ChunkNoiseSampler} (creating it only
+     *  when BIOMES left none), and log whether the later {@code populateNoise}
+     *  callback uses that same instance. Off by default; any failure falls
+     *  back to the vanilla path. */
+    @SerializedName("debug_status_sampler")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.status_sampler", order = 66)
+    public boolean debugStatusSampler = false;
+
     /** Override the buffer-upload path. null = platform default (mapped on
      *  desktop; write_buffer on Android, where some Mali drivers abort on the
      *  mapped path). This is a compatibility setting, not a diagnostic: it is
