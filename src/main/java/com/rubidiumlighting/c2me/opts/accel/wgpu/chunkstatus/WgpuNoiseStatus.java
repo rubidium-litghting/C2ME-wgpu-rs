@@ -262,6 +262,7 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
         ChunkPos anchor = ctx.holder().getKey();
         int total = 0;
         int ready = 0;
+        int noState = 0;
         StringBuilder missing = new StringBuilder();
         for (int dx = 0; dx < batchSize; dx++) {
             for (int dz = 0; dz < batchSize; dz++) {
@@ -280,6 +281,7 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
                     // No state means the member cannot be prepared here at all;
                     // count it as unusable rather than hiding it from the ratio.
                     total++;
+                    noState++;
                     appendMissing(missing, memberPos);
                     continue;
                 }
@@ -303,9 +305,9 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
         if (groups > 4 && groups % 64 != 0) {
             return;
         }
-        LOGGER.info("[c2me-wgpu-status] batch at {}: contexts {}/{} of {} groups "
-                        + "with ready-contexts histogram {}",
-                anchor, ready, total, groups, histogram());
+        LOGGER.info("[c2me-wgpu-status] batch at {}: contexts {}/{} ({} without a "
+                        + "ChunkState) of {} groups with ready-contexts histogram {}",
+                anchor, ready, total, noState, groups, histogram());
         if (ready < total) {
             LOGGER.info("[c2me-wgpu-status] batch at {}: not ready:{}", anchor, missing);
         }

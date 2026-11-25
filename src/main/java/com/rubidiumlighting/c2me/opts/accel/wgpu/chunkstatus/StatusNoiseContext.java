@@ -91,6 +91,16 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <h2>Why the build checks readiness instead of taking locks</h2>
  *
+ * <p>In practice this status almost never creates the sampler: vanilla's
+ * {@code BIOMES} step calls {@code NoiseChunkGenerator.populateBiomes}, which
+ * does {@code chunk.getOrCreateChunkNoiseSampler(...)} with the biome-level
+ * region, so by {@code NOISE} the chunk already carries one (measured in game:
+ * 67 created out of 5632 contexts). {@code Chunk.getOrCreateChunkNoiseSampler}
+ * therefore returns the existing instance here and the context adopts it — the
+ * region, sampler-creator and accessor are only built because the batch submit
+ * will read through them, and because the sampler really is created here when
+ * it is absent.
+ *
  * <p>Creating the sampler walks the region: {@code StructureWeightSampler}
  * reads the chunk's structure references through {@code ChunkRegion.getChunk},
  * which throws a crash report when a neighbour is not <em>actually</em> at the
@@ -240,7 +250,22 @@ public final class StatusNoiseContext {
             return null;
         }
 
-        Blender blender = Blender.getBlender(region);
+        Blender blender;
+        try {
+            blender = Blender.getBlender(region);
+        } catch (ClassCastException e) {
+            // C2ME's Blender mixin replaces the needsBlending call with
+            // `((ProtoChunkExtension) region.getChunk(pos)).getNeedBlending()`,
+            // so it only accepts its own proto chunks. Reached ~3 times in
+            // 17000 builds, always for a batch member whose chunk is still a
+            // WorldChunk; by the time vanilla's populateNoise runs it is no
+            // longer one, so this is simply "too early" rather than a problem
+            // with the chunk. Our own needsBlending check above is not
+            // redirected, which is why it can pass and this still throws.
+            noteNotReady(pos, "C2ME Blender cannot handle this chunk yet ("
+                    + e.getMessage() + ")");
+            return null;
+        }
         NoiseConfig noiseConfig = world.getChunkManager().getNoiseConfig();
         StructureAccessor structureAccessor = world.getStructureAccessor().forRegion(region);
 
@@ -362,7 +387,9 @@ public final class StatusNoiseContext {
 
     private static void noteNotReady(ChunkPos pos, String detail) {
         long n = NOT_READY.incrementAndGet();
-        if (n <= 3 || n % 256 == 0) {
+        // First few attempts, then a sparse sample: enough to see which causes
+        // are common without flooding the log when a whole area is behind.
+        if (n <= 8 || n % 64 == 0) {
             LOGGER.info("[c2me-wgpu-status] context at {} skipped, region not ready: {} "
                     + "({} total; vanilla builds the sampler in populateNoise)", pos, detail, n);
         }
