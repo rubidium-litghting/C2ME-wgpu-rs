@@ -60,6 +60,7 @@ import org.slf4j.LoggerFactory;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -290,9 +291,22 @@ public final class StatusNoiseContext {
                 }
             }
         }
-        // Same radius Blender.getBlender uses for its own decision. Needs no
-        // chunk reads itself (it asks the chunk loading manager).
-        if (region.needsBlending(center, 2)) {
+        // Same radius Blender.getBlender uses for its own decision.
+        boolean blending;
+        try {
+            blending = region.needsBlending(center, 2);
+        } catch (ClassCastException e) {
+            // C2ME redirects ChunkRegion#needsBlending to
+            // `((ProtoChunkExtension) region.getChunk(pos)).getNeedBlending()`,
+            // and that cast fails when the chunk is already a WorldChunk
+            // instead of one of C2ME's proto chunks. Observed for a handful of
+            // batch members (~3 in 17000 builds), never for an anchor. Without
+            // the answer we cannot bound what Blender will read, so leave the
+            // chunk to vanilla rather than guess.
+            return "blending state unavailable (" + e.getClass().getSimpleName()
+                    + "; C2ME expects its own proto chunk there)";
+        }
+        if (blending) {
             for (int dx = -BLENDING_READ_RADIUS; dx <= BLENDING_READ_RADIUS; dx++) {
                 for (int dz = -BLENDING_READ_RADIUS; dz <= BLENDING_READ_RADIUS; dz++) {
                     problem = unreadyAt(center,
@@ -383,14 +397,13 @@ public final class StatusNoiseContext {
         ChunkNoiseSampler sampler = ((ChunkAccessor) (Object) chunk).getChunkNoiseSampler();
         boolean matched = sampler != null && OBSERVED.containsKey(sampler);
         long total = POPULATE_CALLS.incrementAndGet();
-        if (matched) {
-            POPULATE_MATCHED.incrementAndGet();
-        }
+        long matchedTotal = matched
+                ? POPULATE_MATCHED.incrementAndGet() : POPULATE_MATCHED.get();
         if (total <= 4 || total % 512 == 0) {
             LOGGER.info("[c2me-wgpu-status] populateNoise at {}: sampler {}, "
                             + "matched {}/{} (created by status: {}, regions not ready: {})",
                     chunk.getPos(), matched ? "is the status one" : "differs",
-                    POPULATE_MATCHED.get(), total, SAMPLERS_CREATED.get(), NOT_READY.get());
+                    matchedTotal, total, SAMPLERS_CREATED.get(), NOT_READY.get());
         }
     }
 
@@ -444,6 +457,15 @@ public final class StatusNoiseContext {
             return Completable.complete();
         }
 
+        /** @return whether {@code pos} currently has a built context in
+         *          {@code world}; the probe uses this to describe a batch */
+        public boolean isReady(ServerChunkLoadingManager world, ChunkPos pos) {
+            synchronized (worlds) {
+                World bucket = worlds.get(world);
+                return bucket != null && bucket.entries.containsKey(pos);
+            }
+        }
+
         /** Drop the cached context for {@code pos} in {@code world}. */
         public void evict(ServerChunkLoadingManager world, ChunkPos pos) {
             synchronized (worlds) {
@@ -458,12 +480,28 @@ public final class StatusNoiseContext {
         private static final class World {
             private final ConcurrentHashMap<ChunkPos, StatusNoiseContext> entries =
                     new ConcurrentHashMap<>();
+            /**
+             * Positions whose build is running on some thread right now.
+             * Creating the sampler is not reentrant (it mutates the chunk), and
+             * a batch anchor and the member's own status could otherwise race
+             * for the same chunk. A second caller simply skips this round: the
+             * finished context is there for the next one.
+             */
+            private final Set<ChunkPos> building = ConcurrentHashMap.newKeySet();
 
             private void prepare(ChunkLoadingContext ctx) {
                 ChunkPos pos = ctx.holder().getKey();
-                if (entries.containsKey(pos)) {
+                if (entries.containsKey(pos) || !building.add(pos)) {
                     return;
                 }
+                try {
+                    prepare0(ctx, pos);
+                } finally {
+                    building.remove(pos);
+                }
+            }
+
+            private void prepare0(ChunkLoadingContext ctx, ChunkPos pos) {
                 ChunkState state = ctx.holder().getItem().get();
                 Chunk chunk = state == null ? null : state.chunk();
                 if (chunk == null) {

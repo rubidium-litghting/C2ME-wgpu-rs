@@ -42,6 +42,8 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongArray;
 
 /**
  * C2ME chunk-system integration at the {@code NOISE} boundary.
@@ -111,6 +113,14 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
      */
     private final StatusNoiseContext.Cache contexts = new StatusNoiseContext.Cache();
 
+    /**
+     * Probe only: how many members of each batch got a usable context, indexed
+     * by that count. Tells us the batch size Stage 3 can actually submit, and
+     * whether the limit is the edge of the group or the state of the world.
+     */
+    private final AtomicLongArray readyHistogram;
+    private final AtomicLong batchGroups = new AtomicLong();
+
     public WgpuNoiseStatus(int ordinal) {
         super(ordinal, ChunkStatus.NOISE);
         int configured = Config.get().chunkBatchSize;
@@ -121,6 +131,7 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
                 ? configured : 1;
         this.batchMask = this.batchSize - 1;
         this.batchDeps = buildBatchDependencies(this.batchSize);
+        this.readyHistogram = new AtomicLongArray(this.batchSize * this.batchSize + 1);
     }
 
     private static NewChunkStatus vanillaNoise() {
@@ -233,7 +244,93 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
         }
 
         contexts.prepare(ctx);
+        noteBatchComposition(ctx);
         return upgradeGroup(ctx, cancellable, vanilla);
+    }
+
+    /**
+     * Probe for the first Stage 3 slice: build every group member's sampling
+     * context in the status and report how many of them are usable, i.e. how
+     * much of the batch could be submitted together. Generation is unaffected:
+     * a member with a context simply hands it to the vanilla delegate through
+     * the chunk, a member without one is built by that delegate as usual.
+     */
+    private void noteBatchComposition(ChunkLoadingContext ctx) {
+        if (!Config.get().debugStatusSampler) {
+            return;
+        }
+        ChunkPos anchor = ctx.holder().getKey();
+        int total = 0;
+        int ready = 0;
+        StringBuilder missing = new StringBuilder();
+        for (int dx = 0; dx < batchSize; dx++) {
+            for (int dz = 0; dz < batchSize; dz++) {
+                ChunkPos memberPos = new ChunkPos(anchor.x + dx, anchor.z + dz);
+                if (dx == 0 && dz == 0) {
+                    total++; // prepared by the caller
+                    if (contexts.isReady(ctx.tacs(), memberPos)) {
+                        ready++;
+                    }
+                    continue;
+                }
+                ItemHolder<ChunkPos, ChunkState, ChunkLoadingContext, ?> holder =
+                        ctx.theChunkSystem().getHolder(memberPos);
+                ChunkState state = holder == null ? null : holder.getItem().get();
+                if (state == null) {
+                    // No state means the member cannot be prepared here at all;
+                    // count it as unusable rather than hiding it from the ratio.
+                    total++;
+                    appendMissing(missing, memberPos);
+                    continue;
+                }
+                total++;
+                ChunkLoadingContext memberCtx = new ChunkLoadingContext(
+                        holder, ctx.tacs(), ctx.schedulingManager(),
+                        ctx.theChunkSystem(), ctx.dependencies());
+                // Same call the member's own upgradeToThis will make later; the
+                // cache makes the second one a no-op instead of a rebuild.
+                contexts.prepare(memberCtx);
+                if (contexts.isReady(ctx.tacs(), memberPos)) {
+                    ready++;
+                } else {
+                    appendMissing(missing, memberPos);
+                }
+            }
+        }
+
+        readyHistogram.incrementAndGet(ready);
+        long groups = batchGroups.incrementAndGet();
+        if (groups > 4 && groups % 64 != 0) {
+            return;
+        }
+        LOGGER.info("[c2me-wgpu-status] batch at {}: contexts {}/{} of {} groups "
+                        + "with ready-contexts histogram {}",
+                anchor, ready, total, groups, histogram());
+        if (ready < total) {
+            LOGGER.info("[c2me-wgpu-status] batch at {}: not ready:{}", anchor, missing);
+        }
+    }
+
+    private static void appendMissing(StringBuilder missing, ChunkPos pos) {
+        if (missing.length() < 96) {
+            missing.append(' ').append(pos.x).append(',').append(pos.z);
+        }
+    }
+
+    /** Compact histogram, e.g. {@code 16:12 15:3 14:1}. */
+    private String histogram() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = readyHistogram.length() - 1; i >= 0; i--) {
+            long n = readyHistogram.get(i);
+            if (n == 0) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(' ');
+            }
+            sb.append(i).append(':').append(n);
+        }
+        return sb.toString();
     }
 
     /** Run the vanilla {@code NOISE} delegate for every member of the group. */
