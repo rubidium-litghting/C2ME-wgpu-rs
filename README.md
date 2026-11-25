@@ -173,7 +173,7 @@
 | `debug_verbose_logging` | `false` | 启用详细诊断日志：着色器编译耗时、管线缓存命中、适配器 workaround，以及定期的每秒区块数（`CPS=`）统计（同时打印到聊天栏）。 |
 | `debug_stage_timing` | `false` | 将分阶段计时写入日志：GPU 侧（encode / submit / readback / decode）和 CPU 侧（方块写回区块）。同时输出每 2 秒一行的 `[pipe]` 流水线探针（等队列 / 攒批 / 等空位 / external 采样 / 提交 / GPU 空转占比），并在含 external 节点的维度上对前 8 批做并行采样的串行重算自检（应全为 0 mismatches）。 |
 | `debug_height_probe` | `false` | 统计原版 `ChunkGenerator.getHeight` 的调用次数、耗时、去重列数、调用线程，以及调用时 GPU 是否仍有批次在途。用来评估「表面高度缓存」值不值得做（见 `DEVELOPMENT.md` §14）。类加载时读一次，改值需重启。 |
-| `debug_status_sampler` | `false` | 在自定义 `NOISE` 状态内重建 vanilla 的采样上下文（`ChunkRegion` / `Blender` / `NoiseConfig` / `StructureAccessor`），并核对 `populateNoise` 实际使用的 `ChunkNoiseSampler` 是否就是状态侧看到的那一个（日志里的 `matched N/N`）。用于验证「状态内拿到采样上下文」这条前提（见 `DEVELOPMENT.md` §0.1.10 🔴 第一条）。不改生成结果，失败时自动回退原版路径。 |
+| `debug_status_sampler` | `false` | 在自定义 `NOISE` 状态内拿到 vanilla 会用的采样上下文（`ChunkRegion` / `Blender` / `NoiseConfig` / `StructureAccessor`），并核对 `populateNoise` 实际使用的 `ChunkNoiseSampler` 是否就是状态侧看到的那一个（日志里的 `matched N/N`）。采样器通常由原版 `BIOMES` 步建好，这里取用同一个实例。用于验证「状态内拿到采样上下文」这条前提（见 `DEVELOPMENT.md` §0.1.10 🔴 第一条）。不改生成结果，失败时自动回退原版路径。 |
 
 ### 离线诊断
 

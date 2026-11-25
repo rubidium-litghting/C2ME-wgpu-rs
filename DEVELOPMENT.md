@@ -1048,11 +1048,20 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   只读 FFM 查询拿到后再决定 external 槽位数。注意它与 batch limit 相互制约
   （`external_bytes = nodes × cells × batch`），要一起解，不能各算各的。
   详见上文「能力上限从设备实际限额反推」与「65–200 的中间地带」。
-- [ ] **阶段 3：批内真正共享采样上下文**（官方 CL 的剩余收益，即和 C2ME 的
-  生成流程共用同一份 sampler，而不是每个批次成员各建一份）。当前批次只
-  收敛调度依赖，每个成员仍各自构建 `ChunkNoiseSampler`；要进一步必须自己持有
-  `Blender` / `StructureAccessor` / sampler。收益上限尚未量化，风险远高于阶段 2，
-  要动先写清楚生命周期与线程归属；前置是下面 🔴 第一条「状态内拿到采样上下文」。
+- [ ] **阶段 3：在状态内提前提交批次**（原表述「批内真正共享采样上下文」已被
+  实测证伪，2026-11-26）。原假设是「每个批次成员各建一份 sampler，改成批内共用
+  一份」，实测两条都不成立：
+  - vanilla 的 `BIOMES` 步（`NoiseChunkGenerator.populateBiomes`）里就有
+    `chunk.getOrCreateChunkNoiseSampler(...)`，到 `NOISE` 时 sampler 已经在区块
+    身上（实测 `created=67 / contexts=5632`，约 1%），`populateNoise` 用的就是
+    同一个对象。所以这里从来不是「重建出等价上下文」，而是**借用**；
+  - 更根本的是 sampler 与区块坐标、aquifer、插值状态绑定，**一个区块一份**，
+    不存在跨区块共用。能共享的只有「一次提交装多个区块的列」，而阶段 2 已经在做。
+
+  于是阶段 3 剩下的真实收益只有一个：**把提交从 `populateNoise` 提前到状态里**
+  ——同组 16 个区块可以在任何一块走到 `populateNoise` 之前就全部进入 GPU 队列，
+  批次更深，每块少一次阻塞等待。前置（按 chunk 去重、不取锁的就绪自检、批内
+  组成 98–99% 满批）已完成，见下面两条。
 
   该前置的**两个工程前提已完成**（2026-11-26，`StatusNoiseContext`）：上下文按
   「世界 + chunk」只建一次（重复进入 `upgradeToThis` 复用），以及不取锁的
@@ -1081,7 +1090,17 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     `matched 100%`：状态侧和 `populateNoise` 用的是**同一个对象**。建区域、
     blender、`StructureAccessor` 仍然要做，因为下一片在状态内提交 GPU 时
     要靠它们读结构/beard，而且那 1% 确实是真创建。
-  - 结论：**批内共享的前提在数据上成立**，下一片可以做「提交已就绪子集」。
+  - 结论：**提前提交的前提在数据上成立**（满批可凑齐），下一片做「提交已就绪子集」。
+
+  **执行计划（A：状态内提交）**：
+  1. 把 `MixinChunkGenerator.onPopulateNoise` 里「取 `DimState` →
+     sampler / aquifer → aquifer 表 → beard 表 → `requestAsync`」这段 setup
+     原样搬进一个静态方法，**不改行为、不改注入点语义**，跑一次确认输出与
+     搬之前逐字节一致；
+  2. 状态侧对同组已就绪的成员调用同一个方法，把返回的 future 挂在上下文上；
+  3. `onPopulateNoise` 命中已挂 future 时直接返回，不再重复 setup。
+  第 1 步是纯搬运，风险在注入点对方法签名敏感，必须实机进世界验证；第 2、3 步
+  才改生成路径。
 
 #### 🔴 高难度：核心功能突破，需先改架构前提
 
