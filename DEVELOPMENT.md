@@ -1062,15 +1062,26 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
   **第一片（批内组成测量）已完成**（2026-11-26，`chunk_batch_size=4`）：
   锚点通过状态时给同组全部 16 个成员各建一次上下文，只统计不改生成路径。
-  1088 个批次里 **1082 个是 16/16 全就绪**，只有 6 个不满（15/14/12/8），
-  且 `regions not ready` 为 0 —— 也就是说**批内上下文几乎总能凑满**，
-  阶段 3 的收益上限按满批计算是成立的。那 6 个不满的批次全部来自同一个
-  C2ME 类型假设：`MixinBlender` 把 `ChunkRegion.needsBlending` 重定向成
-  `((ProtoChunkExtension) region.getChunk(pos)).getNeedBlending()`，成员若是
-  已经是 `WorldChunk`（不是 C2ME 的 proto chunk）就抛 `ClassCastException`
-  （实测 3 次，全部出现在成员、锚点 0 次）。现在这种情况按「就绪判定不可用」
-  跳过并交回 vanilla，不再打异常栈。结论：**批内共享的前提在数据上成立**，
-  下一片可以做「提交已就绪子集」。
+  两轮实测（1088 组 / 960 组）里 **98–99% 的批次是 16/16 全就绪**，不满的
+  批次只有个位数 —— 也就是说**批内上下文几乎总能凑满**，阶段 3 的收益上限
+  按满批计算是成立的。
+  - 不满的原因之一是 C2ME 的类型假设：`MixinBlender` 把
+    `ChunkRegion.needsBlending` 重定向成
+    `((ProtoChunkExtension) region.getChunk(pos)).getNeedBlending()`，成员若是
+    已经是 `WorldChunk` 就抛 `ClassCastException`（实测 3 次，全部是成员、
+    锚点 0 次）。**注意它只重定向 `Blender` 内部的调用点**，我们自己的
+    `region.needsBlending(...)` 走的是 vanilla 逻辑，所以第一版把 try/catch
+    加在自己的探测上完全没拦住——真正的抛出点在 `Blender.getBlender` 内部，
+    现在包在那里，按「无法确认 blending 状态」跳过并交回 vanilla，不再打栈。
+  - **一个改变理解的事实：状态侧其实几乎不「创建」sampler。**
+    vanilla 的 `BIOMES` 步会调 `NoiseChunkGenerator.populateBiomes`，里面就有
+    `chunk.getOrCreateChunkNoiseSampler(...)`，所以到 `NOISE` 时区块身上已经
+    有 sampler 了（实测 `created=67 / contexts=5632`，约 1%）。
+    `getOrCreateChunkNoiseSampler` 因此只是把现成实例取出来，这也解释了
+    `matched 100%`：状态侧和 `populateNoise` 用的是**同一个对象**。建区域、
+    blender、`StructureAccessor` 仍然要做，因为下一片在状态内提交 GPU 时
+    要靠它们读结构/beard，而且那 1% 确实是真创建。
+  - 结论：**批内共享的前提在数据上成立**，下一片可以做「提交已就绪子集」。
 
 #### 🔴 高难度：核心功能突破，需先改架构前提
 
