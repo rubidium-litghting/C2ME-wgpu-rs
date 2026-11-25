@@ -27,6 +27,7 @@ package com.rubidiumlighting.c2me.opts.accel.wgpu.mixin;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.ChunkDumper;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.DimState;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.ErrorTranslator;
+import com.rubidiumlighting.c2me.opts.accel.wgpu.GpuNoiseSubmitter;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.ModuleEntryPoint;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.NoiseRouterBlobifier;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.WgpuBatchCoordinator;
@@ -82,7 +83,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Mixin(NoiseChunkGenerator.class)
-public abstract class MixinChunkGenerator {
+public abstract class MixinChunkGenerator implements GpuNoiseSubmitter {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu");
 
@@ -113,6 +114,25 @@ public abstract class MixinChunkGenerator {
     private void onPopulateNoise(Blender blender, NoiseConfig noiseConfig,
                                  StructureAccessor structureAccessor, Chunk chunk,
                                  CallbackInfoReturnable<CompletableFuture<Chunk>> cir) {
+        CompletableFuture<Chunk> submitted = c2me_wgpu$submitGpuNoise(
+                blender, noiseConfig, structureAccessor, chunk);
+        if (submitted != null) {
+            cir.setReturnValue(submitted);
+        }
+    }
+
+    /**
+     * The body of the {@code populateNoise} HEAD injection, callable from the
+     * {@code NOISE} status (Stage 3) without duplicating the setup.
+     *
+     * <p>Verbatim the previous injection body: only the control flow changed
+     * ({@code return;} became {@code return null;} because "no submission" is
+     * now expressed by a null future instead of by not cancelling).
+     */
+    @Override
+    public CompletableFuture<Chunk> c2me_wgpu$submitGpuNoise(
+            Blender blender, NoiseConfig noiseConfig,
+            StructureAccessor structureAccessor, Chunk chunk) {
         // 检测当前维度的世界种子是否发生变化（例如玩家切换了存档）。
         // 每个维度（通过 settings 区分）独立记录种子，多玩家在不同维度并发时不会互相干扰。
         long currentSeed = noiseConfig.getOreRandomDeriver().split(0L).nextLong();
@@ -122,14 +142,14 @@ public abstract class MixinChunkGenerator {
         // class <clinit>; though now failure-safe, ModuleEntryPoint is the
         // single source of truth and also reports the reason to the player.
         if (!ModuleEntryPoint.isEnabled()) {
-            return;
+            return null;
         }
 
         // Vanilla-reference mode: skip the GPU and let MC generate normally.
         // The RETURN injection below dumps the resulting blocks so we can
         // compare GPU terrain against true vanilla terrain offline.
         if (Config.get().debugVanillaRef) {
-            return;
+            return null;
         }
 
         try {
@@ -138,7 +158,7 @@ public abstract class MixinChunkGenerator {
             final ChunkGeneratorSettings settings = selfGen.getSettings().value();
             final DimState ds = acquireDimState(settings, noiseConfig, chunk, currentSeed);
             if (ds == null) {
-                return; // already failed, or init failed -> vanilla CPU path
+                return null; // already failed, or init failed -> vanilla CPU path
             }
 
             // ── GPU compute via the batch coordinator ────────────
@@ -289,8 +309,7 @@ public abstract class MixinChunkGenerator {
                                 }
                             });
                         });
-                cir.setReturnValue(result);
-                return;
+                return result;
             }
 
             // ── no async scheduling available ────────────────────
@@ -300,10 +319,11 @@ public abstract class MixinChunkGenerator {
             // (desktop ~144 CPS) faster than our synchronous GPU path
             // (~80-110 CPS). Returning without cancelling lets vanilla/C2ME
             // CPU generation run.
-            return;
+            return null;
         } catch (Throwable t) {
             LOGGER.error("[c2me-wgpu] GPU populateNoise failed, falling back to CPU", t);
         }
+        return null;
     }
 
     /**
