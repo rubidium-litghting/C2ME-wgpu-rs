@@ -105,6 +105,11 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
      * itself. Precomputed because it is immutable for this status instance.
      */
     private final KeyStatusPair<ChunkPos, ChunkState, ChunkLoadingContext>[] batchDeps;
+    /**
+     * Status-side sampling contexts, one per chunk currently inside this
+     * status. Evicted on {@code postUpgradeToThis} / {@code downgradeFromThis}.
+     */
+    private final StatusNoiseContext.Cache contexts = new StatusNoiseContext.Cache();
 
     public WgpuNoiseStatus(int ordinal) {
         super(ordinal, ChunkStatus.NOISE);
@@ -203,7 +208,7 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
 
         ChunkPos pos = ctx.holder().getKey();
         if (batchSize == 1) {
-            StatusNoiseContext.observe(ctx);
+            contexts.prepare(ctx);
             return vanilla.upgradeToThis(ctx, cancellable);
         }
         if (!isAnchor(pos)) {
@@ -227,8 +232,14 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
             return Completable.complete();
         }
 
-        StatusNoiseContext.observe(ctx);
+        contexts.prepare(ctx);
+        return upgradeGroup(ctx, cancellable, vanilla);
+    }
 
+    /** Run the vanilla {@code NOISE} delegate for every member of the group. */
+    private Completable upgradeGroup(ChunkLoadingContext ctx, Cancellable cancellable,
+                                     NewChunkStatus vanilla) {
+        ChunkPos pos = ctx.holder().getKey();
         List<Completable> work = new ArrayList<>(batchSize * batchSize);
         for (int dx = 0; dx < batchSize; dx++) {
             for (int dz = 0; dz < batchSize; dz++) {
@@ -307,6 +318,7 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
 
     @Override
     public Completable postUpgradeToThis(ChunkLoadingContext ctx) {
+        contexts.evict(ctx.tacs(), ctx.holder().getKey());
         return Completable.complete();
     }
 
@@ -317,6 +329,9 @@ public final class WgpuNoiseStatus extends NewChunkStatus {
 
     @Override
     public Completable downgradeFromThis(ChunkLoadingContext ctx, Cancellable cancellable) {
+        // The chunk left this status (typically unloaded) without passing
+        // postUpgradeToThis; do not keep its context alive.
+        contexts.evict(ctx.tacs(), ctx.holder().getKey());
         return Completable.complete();
     }
 

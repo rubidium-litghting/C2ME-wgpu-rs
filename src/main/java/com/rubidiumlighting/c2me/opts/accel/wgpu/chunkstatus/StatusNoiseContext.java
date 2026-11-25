@@ -31,29 +31,37 @@ import com.ishland.flowsched.scheduler.ItemHolder;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.config.Config;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.mixin.ChunkAccessor;
 import com.rubidiumlighting.c2me.opts.accel.wgpu.mixin.NoiseChunkGeneratorInvoker;
+import io.reactivex.rxjava3.core.Completable;
+import net.minecraft.server.world.ServerChunkLoadingManager;
 import net.minecraft.server.world.ServerWorld;
-import net.minecraft.util.crash.CrashException;
 import net.minecraft.util.collection.BoundedRegionArray;
+import net.minecraft.util.crash.CrashException;
 import net.minecraft.util.math.ChunkPos;
+import net.minecraft.world.ChunkRegion;
 import net.minecraft.world.chunk.AbstractChunkHolder;
 import net.minecraft.world.chunk.Chunk;
 import net.minecraft.world.chunk.ChunkGenerationContext;
 import net.minecraft.world.chunk.ChunkGenerationStep;
 import net.minecraft.world.chunk.ChunkGenerationSteps;
-import net.minecraft.world.ChunkRegion;
 import net.minecraft.world.chunk.ChunkStatus;
 import net.minecraft.world.gen.StructureAccessor;
+import net.minecraft.world.gen.StructureTerrainAdaptation;
 import net.minecraft.world.gen.chunk.Blender;
 import net.minecraft.world.gen.chunk.ChunkGenerator;
 import net.minecraft.world.gen.chunk.ChunkNoiseSampler;
 import net.minecraft.world.gen.chunk.NoiseChunkGenerator;
 import net.minecraft.world.gen.noise.NoiseConfig;
+import net.minecraft.world.gen.structure.Structure;
+import it.unimi.dsi.fastutil.longs.LongIterator;
+import it.unimi.dsi.fastutil.longs.LongSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -72,65 +80,130 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>{@code world.getStructureAccessor().forRegion(region)}.</li>
  * </ol>
  *
- * <p>This class performs the same four steps from the scheduler side, using
- * {@code theChunkSystem().getHolder(..).getUserData().get()} for the region
- * array — the same accessor C2ME's own vanilla delegate uses to expose
- * holders. The generator, world and {@link NoiseConfig} come from
- * {@code IThreadedAnvilChunkStorage.getGenerationContext()}, which is what
- * C2ME hands to every vanilla generation step.
+ * <p>{@link #build} performs the same four steps from the scheduler side, then
+ * asks the chunk for its {@link ChunkNoiseSampler} (creating it only when
+ * {@code BIOMES} left none). The generator, world and {@link NoiseConfig} come
+ * from {@code IThreadedAnvilChunkStorage.getGenerationContext()}, which is what
+ * C2ME hands to every vanilla generation step; the region array is filled from
+ * {@code theChunkSystem().getHolder(..).getUserData().get()}, the same accessor
+ * C2ME's own vanilla delegate uses.
  *
- * <p>Nothing is sampled here. The point is to prove that the status can hold
- * the context <em>before</em> {@code populateNoise} runs, which is the
- * prerequisite for evaluating one batch against one shared context.
+ * <h2>Why the build checks readiness instead of taking locks</h2>
  *
- * <p>Only the {@code debug_status_sampler} probe calls this today. It is off
- * by default and every failure degrades to the vanilla path.
+ * <p>Creating the sampler walks the region: {@code StructureWeightSampler}
+ * reads the chunk's structure references through {@code ChunkRegion.getChunk},
+ * which throws a crash report when a neighbour is not <em>actually</em> at the
+ * status the step allows. The scheduler guarantees that every dependency holds
+ * a ticket at its status, and the centre chunk itself is past {@code BIOMES},
+ * so the read normally succeeds; it failed once in ~7000 observations.
+ *
+ * <p>Pinning the whole 19×19 region with {@code runTaskWithLockRadius} removes
+ * that race but is unusable: an all-or-nothing lock set of 361 positions
+ * overlaps every neighbour's own generation task, which serialises worldgen.
+ * Measured in game, that halved chunk throughput (CPS median 83 → 36), so this
+ * class does the opposite: it takes <em>no</em> locks and instead verifies the
+ * positions the build will actually read before it builds anything.
+ *
+ * <p>Those positions are exactly the ones vanilla reads from the region, and
+ * they are few: the chunk itself ({@code StructureWeightSampler} asks for its
+ * structure references), each chunk its structure references point at, and — on
+ * an old-chunk border — the blending neighbourhood. Checking the whole 19×19
+ * instead skipped roughly a quarter of all builds, because a holder whose
+ * chunk sits at a later status routinely answers {@code null} from
+ * {@code getUncheckedOrNull} for an earlier one: that is why the check asks the
+ * same question {@code ChunkRegion.getChunk} asks, and why
+ * {@code getActualStatus} is useless here (it reports {@code biomes} for a
+ * position that still cannot serve {@code biomes}).
+ *
+ * <p>A position that is not ready is logged and the build is skipped, leaving
+ * the chunk to vanilla, so the crash cannot happen: the failure mode becomes a
+ * skipped optimisation with a diagnostic line naming the position, the status
+ * it needs and the status it has.
+ *
+ * <h2>Lifecycle</h2>
+ *
+ * <p>One context per chunk, cached in {@link Cache} for as long as the chunk is
+ * inside this status. Re-entry into {@code upgradeToThis} therefore reuses the
+ * finished build instead of rebuilding the region, and eviction happens on
+ * {@code postUpgradeToThis} / {@code downgradeFromThis}. A failed or skipped
+ * build is not cached, so a later attempt can try again, and generation always
+ * continues: the vanilla delegate creates the sampler itself.
+ *
+ * <p>Only the {@code debug_status_sampler} probe drives this today.
  */
 public final class StatusNoiseContext {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu-status");
 
-    private static final AtomicBoolean WARNED = new AtomicBoolean();
+    /**
+     * The step whose context {@code populateNoise} runs with. Everything below
+     * (required statuses, region radius) is derived from it rather than from
+     * constants, so a vanilla or modded step change cannot silently skew the
+     * reconstruction.
+     */
+    private static final ChunkGenerationStep STEP =
+            ChunkGenerationSteps.GENERATION.get(ChunkStatus.NOISE);
 
-    /** Samplers the status observed (built, or already cached on the chunk).
-     *  Weak keys: the chunk owns the sampler, so entries vanish with it. */
+    /**
+     * Radius of the region vanilla builds for {@code NOISE}:
+     * {@code ChunkLoader.create} uses {@code step.getAdditionalLevel(EMPTY)},
+     * which is 9 — one ring wider than the direct dependency radius of 8,
+     * because BIOMES occupies levels 0 and 1 of the accumulated set.
+     *
+     * <p>The extra ring is only ever null-filled: {@code ChunkRegion.getChunk}
+     * refuses every request at a distance of {@code directDependencies().size()}
+     * or more, so those slots are never dereferenced.
+     */
+    private static final int REGION_RADIUS = STEP.getAdditionalLevel(ChunkStatus.EMPTY);
+
+    /** Status a position at each Chebyshev distance must actually hold before
+     *  {@code ChunkRegion.getChunk} will serve it. Level 0 is the chunk itself,
+     *  so the array always has at least one entry. */
+    private static final List<ChunkStatus> REQUIRED_AT_DISTANCE =
+            STEP.directDependencies().getDependencies();
+
+    /**
+     * How far the blending path reaches. {@code Blender.getBlender} scans
+     * {@code BLENDING_CHUNK_DISTANCE_THRESHOLD} (= 2) chunks around the centre
+     * and then reads each of those chunks' eight neighbours through
+     * {@code getAdjacentChunksWithNoise}, so one more ring covers every read.
+     */
+    private static final int BLENDING_READ_RADIUS = 3;
+
+    /** Samplers this class has seen. Weak keys: the chunk owns the sampler, so
+     *  entries disappear with it. Only used by the identity check below. */
     private static final Map<ChunkNoiseSampler, Boolean> OBSERVED =
             Collections.synchronizedMap(new WeakHashMap<>());
 
     private static final AtomicLong CONTEXTS = new AtomicLong();
-    private static final AtomicLong SAMPLERS_BUILT = new AtomicLong();
+    private static final AtomicLong SAMPLERS_CREATED = new AtomicLong();
+    private static final AtomicLong FAILURES = new AtomicLong();
+    private static final AtomicLong NOT_READY = new AtomicLong();
     private static final AtomicLong POPULATE_CALLS = new AtomicLong();
     private static final AtomicLong POPULATE_MATCHED = new AtomicLong();
+    private static final AtomicBoolean CACHE_CAP_LOGGED = new AtomicBoolean();
 
     private final ChunkRegion region;
-    private final Blender blender;
-    private final NoiseConfig noiseConfig;
-    private final StructureAccessor structureAccessor;
-    private final ChunkGenerator generator;
-    private final int radius;
-    /** Region slots the scheduler had no holder for (vanilla's outer ring). */
+    private final ChunkNoiseSampler sampler;
     private final int missing;
+    private final boolean createdSampler;
 
-    private StatusNoiseContext(ChunkRegion region, Blender blender,
-                               NoiseConfig noiseConfig,
-                               StructureAccessor structureAccessor,
-                               ChunkGenerator generator, int radius, int missing) {
+    private StatusNoiseContext(ChunkRegion region, ChunkNoiseSampler sampler,
+                               int missing, boolean createdSampler) {
         this.region = region;
-        this.blender = blender;
-        this.noiseConfig = noiseConfig;
-        this.structureAccessor = structureAccessor;
-        this.generator = generator;
-        this.radius = radius;
+        this.sampler = sampler;
         this.missing = missing;
+        this.createdSampler = createdSampler;
     }
 
     /**
-     * Build the context for {@code chunk} without sampling it.
+     * Build the context for {@code chunk}.
      *
-     * @return the context, or {@code null} when the dimension does not use a
-     *         {@link NoiseChunkGenerator} (nothing to pre-build).
+     * @return the context, or {@code null} when nothing should be built: the
+     *         dimension does not use a {@link NoiseChunkGenerator}, or a
+     *         neighbour is not at the status the step requires yet
      */
-    public static StatusNoiseContext create(ChunkLoadingContext ctx, Chunk chunk) {
+    private static StatusNoiseContext build(ChunkLoadingContext ctx, Chunk chunk) {
         ChunkGenerationContext generation =
                 ((IThreadedAnvilChunkStorage) ctx.tacs()).getGenerationContext();
         ChunkGenerator generator = generation.generator();
@@ -140,108 +213,161 @@ public final class StatusNoiseContext {
         ServerWorld world = generation.world();
         ChunkPos pos = chunk.getPos();
 
-        // Same step and radius ChunkLoader.create uses for NOISE: the
-        // accumulated dependency level of EMPTY. For NOISE that is 9, one ring
-        // wider than the direct dependency radius (8) our status declares.
-        ChunkGenerationStep step = ChunkGenerationSteps.GENERATION.get(ChunkStatus.NOISE);
-        int radius = step.getAdditionalLevel(ChunkStatus.EMPTY);
         int[] missing = new int[1];
         BoundedRegionArray<AbstractChunkHolder> chunks = BoundedRegionArray.create(
-                pos.x, pos.z, radius, (x, z) -> {
+                pos.x, pos.z, REGION_RADIUS, (x, z) -> {
                     ItemHolder<ChunkPos, ChunkState, ChunkLoadingContext, ?> holder =
                             ctx.theChunkSystem().getHolder(new ChunkPos(x, z));
                     Object userData = holder == null ? null : holder.getUserData().get();
                     if (!(userData instanceof AbstractChunkHolder abstractHolder)) {
                         // Vanilla's ChunkLoader fills this array through
                         // ChunkLoadingManager#acquire, which yields null for a
-                        // position that is not loaded. The outer ring is only
-                        // needed to size the array: noise sampling touches the
-                        // centre chunk, the beardifier radius (8) and the biome
-                        // radius (1), all of which the status does declare.
+                        // position that is not loaded. Only the outer ring can
+                        // be absent here: ChunkRegion#getChunk refuses any
+                        // request at distance >= 9 anyway, so these nulls are
+                        // never dereferenced.
                         missing[0]++;
                         return null;
                     }
                     return abstractHolder;
                 });
 
-        ChunkRegion region = new ChunkRegion(world, chunks, step, chunk);
-        return new StatusNoiseContext(
-                region,
-                Blender.getBlender(region),
-                world.getChunkManager().getNoiseConfig(),
-                world.getStructureAccessor().forRegion(region),
-                generator,
-                radius,
-                missing[0]);
+        ChunkRegion region = new ChunkRegion(world, chunks, STEP, chunk);
+        String unready = firstUnready(pos, chunk, region, chunks);
+        if (unready != null) {
+            noteNotReady(pos, unready);
+            return null;
+        }
+
+        Blender blender = Blender.getBlender(region);
+        NoiseConfig noiseConfig = world.getChunkManager().getNoiseConfig();
+        StructureAccessor structureAccessor = world.getStructureAccessor().forRegion(region);
+
+        ChunkNoiseSampler before = ((ChunkAccessor) (Object) chunk).getChunkNoiseSampler();
+        ChunkNoiseSampler sampler = chunk.getOrCreateChunkNoiseSampler(cs ->
+                ((NoiseChunkGeneratorInvoker) (Object) generator)
+                        .callCreateChunkNoiseSampler(cs, structureAccessor, blender, noiseConfig));
+        boolean created = before == null && sampler != null;
+        if (sampler != null) {
+            OBSERVED.put(sampler, Boolean.TRUE);
+        }
+        if (created) {
+            SAMPLERS_CREATED.incrementAndGet();
+        }
+        StatusNoiseContext context =
+                new StatusNoiseContext(region, sampler, missing[0], created);
+        context.logBuilt();
+        return context;
     }
 
     /**
-     * Debug probe: build the context for the chunk the status is about to
-     * advance and record the sampler it will hand to {@code populateNoise}.
-     * No-op unless {@code debug_status_sampler} is on.
+     * Checks the positions creating the sampler will read through
+     * {@code ChunkRegion.getChunk}: the chunk itself, the chunks its structure
+     * references point at, and the blending neighbourhood when the chunk sits
+     * on an old-chunk border.
+     *
+     * @return {@code null} when all of them can serve the read, otherwise a
+     *         one-line description of the first position that cannot
      */
-    public static void observe(ChunkLoadingContext ctx) {
-        if (!Config.get().debugStatusSampler) {
+    private static String firstUnready(ChunkPos center, Chunk chunk,
+                                       ChunkRegion region,
+                                       BoundedRegionArray<AbstractChunkHolder> chunks) {
+        String problem = unreadyAt(center, center, chunks);
+        if (problem != null) {
+            return problem;
+        }
+        // StructureWeightSampler ignores structures without terrain adaptation,
+        // so checking those references would skip work for nothing.
+        for (Map.Entry<Structure, LongSet> entry : chunk.getStructureReferences().entrySet()) {
+            if (entry.getKey().getTerrainAdaptation() == StructureTerrainAdaptation.NONE) {
+                continue;
+            }
+            LongIterator it = entry.getValue().iterator();
+            while (it.hasNext()) {
+                problem = unreadyAt(center, new ChunkPos(it.nextLong()), chunks);
+                if (problem != null) {
+                    return problem;
+                }
+            }
+        }
+        // Same radius Blender.getBlender uses for its own decision. Needs no
+        // chunk reads itself (it asks the chunk loading manager).
+        if (region.needsBlending(center, 2)) {
+            for (int dx = -BLENDING_READ_RADIUS; dx <= BLENDING_READ_RADIUS; dx++) {
+                for (int dz = -BLENDING_READ_RADIUS; dz <= BLENDING_READ_RADIUS; dz++) {
+                    problem = unreadyAt(center,
+                            new ChunkPos(center.x + dx, center.z + dz), chunks);
+                    if (problem != null) {
+                        return problem;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Asks the exact question {@code ChunkRegion.getChunk} will ask. */
+    private static String unreadyAt(ChunkPos center, ChunkPos target,
+                                    BoundedRegionArray<AbstractChunkHolder> chunks) {
+        int distance = center.getChebyshevDistance(target.x, target.z);
+        if (distance >= REQUIRED_AT_DISTANCE.size()) {
+            // ChunkRegion#getChunk turns this into a crash report, so vanilla
+            // never asks; a reference this far out is still worth reporting.
+            return target + " (distance " + distance + ") is outside the step's dependency radius";
+        }
+        ChunkStatus required = REQUIRED_AT_DISTANCE.get(distance);
+        AbstractChunkHolder holder = chunks.get(target.x, target.z);
+        if (holder == null) {
+            return target + " (distance " + distance + ", needs " + required.getId()
+                    + ") has no holder";
+        }
+        if (holder.getUncheckedOrNull(required) == null) {
+            ChunkStatus actual = holder.getActualStatus();
+            return target + " (distance " + distance + ") needs " + required.getId()
+                    + " but cannot serve it (status " + (actual == null ? "absent" : actual.getId()) + ")";
+        }
+        return null;
+    }
+
+    private void logBuilt() {
+        long n = CONTEXTS.incrementAndGet();
+        if (n > 4 && n % 512 != 0) {
             return;
         }
-        try {
-            ChunkState state = ctx.holder().getItem().get();
-            if (state == null) {
-                return;
-            }
-            Chunk chunk = state.chunk();
-            if (chunk == null) {
-                return;
-            }
-            StatusNoiseContext context = create(ctx, chunk);
-            if (context == null) {
-                return;
-            }
-            ChunkNoiseSampler sampler = context.observeSampler(chunk);
+        LOGGER.info("[c2me-wgpu-status] context at {}: radius={}, missing={}, "
+                        + "needsBlending={}, sampler={}, aquifer={}, "
+                        + "contexts={}, created={}, notReady={}",
+                region.getCenterPos(), REGION_RADIUS, missing,
+                // 2 = BiomeCoords.toChunk(BLENDING_BIOME_DISTANCE_THRESHOLD + 3),
+                // the check Blender itself performs.
+                region.needsBlending(region.getCenterPos(), 2),
+                sampler == null ? "absent" : "present",
+                sampler != null && sampler.getAquiferSampler() != null,
+                n, SAMPLERS_CREATED.get(), NOT_READY.get());
+    }
 
-            long n = CONTEXTS.incrementAndGet();
-            if (n <= 4 || n % 512 == 0) {
-                LOGGER.info("[c2me-wgpu-status] context at {}: radius={}, missing={}, "
-                                + "needsBlending={}, sampler={}, aquifer={}, contexts={}",
-                        chunk.getPos(), context.radius, context.missing,
-                        // 2 = BiomeCoords.toChunk(BLENDING_BIOME_DISTANCE_THRESHOLD + 3),
-                        // the check Blender itself performs.
-                        context.region.needsBlending(chunk.getPos(), 2),
-                        sampler == null ? "absent" : "present",
-                        sampler != null && sampler.getAquiferSampler() != null,
-                        n);
-            }
-        } catch (Throwable t) {
-            if (WARNED.compareAndSet(false, true)) {
-                // ChunkRegion#getChunk throws a CrashException carrying the
-                // request details (chunk, requested status, distance). Log
-                // them: they say exactly which neighbour the status-side
-                // context needed but the scheduler had not advanced yet.
-                String details = "";
-                if (t instanceof CrashException ce) {
-                    details = "\n" + ce.getReport().getMessage()
-                            + "\n" + ce.getReport().getCauseAsString();
-                }
-                LOGGER.warn("[c2me-wgpu-status] status sampling context unavailable; "
-                        + "vanilla builds it in populateNoise as usual" + details, t);
-            }
+    private static void noteNotReady(ChunkPos pos, String detail) {
+        long n = NOT_READY.incrementAndGet();
+        if (n <= 3 || n % 256 == 0) {
+            LOGGER.info("[c2me-wgpu-status] context at {} skipped, region not ready: {} "
+                    + "({} total; vanilla builds the sampler in populateNoise)", pos, detail, n);
         }
     }
 
-    /** Return the chunk's cached sampler, creating it with this context's
-     *  inputs if the chunk has none yet (in practice BIOMES already made one). */
-    private ChunkNoiseSampler observeSampler(Chunk chunk) {
-        ChunkNoiseSampler existing = ((ChunkAccessor) (Object) chunk).getChunkNoiseSampler();
-        if (existing == null) {
-            existing = chunk.getOrCreateChunkNoiseSampler(cs ->
-                    ((NoiseChunkGeneratorInvoker) (Object) generator)
-                            .callCreateChunkNoiseSampler(cs, structureAccessor, blender, noiseConfig));
-            SAMPLERS_BUILT.incrementAndGet();
+    private static void noteFailure(Throwable t) {
+        long n = FAILURES.incrementAndGet();
+        if (n > 3 && n % 256 != 0) {
+            return;
         }
-        if (existing != null) {
-            OBSERVED.put(existing, Boolean.TRUE);
+        String details = "";
+        if (t instanceof CrashException ce) {
+            // Should be unreachable now that readiness is checked first; if it
+            // ever comes back the report names what was missing.
+            details = "\n" + ce.getReport().getMessage()
+                    + "\n" + ce.getReport().getCauseAsString();
         }
-        return existing;
+        LOGGER.warn("[c2me-wgpu-status] status-side sampling context failed "
+                + "({} total); vanilla builds it in populateNoise{}", n, details, t);
     }
 
     /**
@@ -262,9 +388,105 @@ public final class StatusNoiseContext {
         }
         if (total <= 4 || total % 512 == 0) {
             LOGGER.info("[c2me-wgpu-status] populateNoise at {}: sampler {}, "
-                            + "matched {}/{} (built by status: {})",
+                            + "matched {}/{} (created by status: {}, regions not ready: {})",
                     chunk.getPos(), matched ? "is the status one" : "differs",
-                    POPULATE_MATCHED.get(), total, SAMPLERS_BUILT.get());
+                    POPULATE_MATCHED.get(), total, SAMPLERS_CREATED.get(), NOT_READY.get());
+        }
+    }
+
+    /**
+     * Status-side context cache, split per world.
+     *
+     * <p>{@link WgpuNoiseStatus} is created once while C2ME builds its global
+     * status table, so a single instance serves every dimension: the cache has
+     * to separate them itself. Buckets are keyed by the world's
+     * {@code ServerChunkLoadingManager}, which is identity-stable for a world's
+     * whole lifetime, and held weakly so an unloaded world takes its contexts
+     * with it.
+     *
+     * <p>Within a bucket, a context is built once per chunk: the scheduler can
+     * enter {@code upgradeToThis} several times for the same chunk, and every
+     * entry after the first reuses the finished build instead of rebuilding the
+     * region. Entries are evicted when the chunk leaves the status
+     * ({@code postUpgradeToThis} / {@code downgradeFromThis}).
+     */
+    public static final class Cache {
+        private static final int MAX_ENTRIES_PER_WORLD = 8192;
+
+        private final Map<ServerChunkLoadingManager, World> worlds =
+                Collections.synchronizedMap(new WeakHashMap<>());
+
+        /**
+         * Builds the context for {@code ctx} if it is not built already. Runs
+         * on the calling scheduler thread, which is the same thread the vanilla
+         * delegate would build it on.
+         *
+         * @return a {@link Completable} that is already complete: nothing here
+         *         is asynchronous today, but keeping the shape lets batch
+         *         submission wait on a context later without changing callers
+         */
+        public Completable prepare(ChunkLoadingContext ctx) {
+            if (!Config.get().debugStatusSampler || !C2meCompat.verifySamplingContext()) {
+                return Completable.complete();
+            }
+            ServerChunkLoadingManager world = ctx.tacs();
+            World bucket;
+            synchronized (worlds) {
+                bucket = worlds.computeIfAbsent(world, ignored -> new World());
+            }
+            try {
+                bucket.prepare(ctx);
+            } catch (Throwable t) {
+                // Generation must never stall on the probe; vanilla builds the
+                // sampler itself right after this status.
+                noteFailure(t);
+            }
+            return Completable.complete();
+        }
+
+        /** Drop the cached context for {@code pos} in {@code world}. */
+        public void evict(ServerChunkLoadingManager world, ChunkPos pos) {
+            synchronized (worlds) {
+                World bucket = worlds.get(world);
+                if (bucket != null) {
+                    bucket.entries.remove(pos);
+                }
+            }
+        }
+
+        /** Contexts of one world. */
+        private static final class World {
+            private final ConcurrentHashMap<ChunkPos, StatusNoiseContext> entries =
+                    new ConcurrentHashMap<>();
+
+            private void prepare(ChunkLoadingContext ctx) {
+                ChunkPos pos = ctx.holder().getKey();
+                if (entries.containsKey(pos)) {
+                    return;
+                }
+                ChunkState state = ctx.holder().getItem().get();
+                Chunk chunk = state == null ? null : state.chunk();
+                if (chunk == null) {
+                    return;
+                }
+                StatusNoiseContext context = build(ctx, chunk);
+                if (context == null) {
+                    // Not ready (or not a noise dimension): do not cache, so a
+                    // later attempt can succeed once the region catches up.
+                    return;
+                }
+                if (entries.size() >= MAX_ENTRIES_PER_WORLD) {
+                    // Safety valve, not the normal bound: contexts are evicted
+                    // when the chunk leaves the status. Loud once, so a leak is
+                    // visible instead of silently growing.
+                    if (CACHE_CAP_LOGGED.compareAndSet(false, true)) {
+                        LOGGER.warn("[c2me-wgpu-status] status context cache reached "
+                                + "{} entries; new contexts are not kept", MAX_ENTRIES_PER_WORLD);
+                    }
+                    return;
+                }
+                entries.putIfAbsent(pos, context);
+            }
         }
     }
 }

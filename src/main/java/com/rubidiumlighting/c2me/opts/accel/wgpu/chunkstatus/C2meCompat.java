@@ -74,6 +74,7 @@ public final class C2meCompat {
     };
 
     private static Boolean compatible;
+    private static Boolean samplingContext;
 
     private C2meCompat() {
     }
@@ -98,6 +99,54 @@ public final class C2meCompat {
             }
         }
         return compatible;
+    }
+
+    /**
+     * Non-fatal extra capability: the pieces the status-side sampling context
+     * needs on top of the scheduler API verified by {@link #verify()}.
+     *
+     * <p>These are deliberately not part of {@link #verify()}: if a future
+     * C2ME drops them, only the status-side context (today the
+     * {@code debug_status_sampler} probe, later batch submission) has to stand
+     * down. The aligned {@code NOISE} status itself keeps working, so the
+     * cost of a mismatch is a lost optimisation, not a lost feature.
+     *
+     * @return {@code true} when {@code StatusNoiseContext} may run
+     */
+    public static synchronized boolean verifySamplingContext() {
+        if (samplingContext == null) {
+            String mismatch = samplingContextMismatch();
+            samplingContext = mismatch == null;
+            if (samplingContext) {
+                LOGGER.info("[c2me-wgpu-status] C2ME supports a status-side "
+                        + "sampling context (holder user data)");
+            } else {
+                LOGGER.warn("[c2me-wgpu-status] C2ME cannot provide a status-side "
+                        + "sampling context; the aligned NOISE status keeps delegating "
+                        + "to vanilla and GPU work stays in populateNoise. "
+                        + "Reason: {}", mismatch);
+            }
+        }
+        return samplingContext;
+    }
+
+    /** @return {@code null} when the sampling-context API is present */
+    private static String samplingContextMismatch() {
+        try {
+            Class<?> itemHolder = load(ITEM_HOLDER);
+            Method getUserData = itemHolder.getMethod("getUserData");
+            if (!getUserData.getReturnType().equals(AtomicReference.class)) {
+                return "ItemHolder.getUserData returns "
+                        + getUserData.getReturnType().getName();
+            }
+
+            return null;
+        } catch (ClassNotFoundException | NoSuchMethodException e) {
+            return e.toString();
+        } catch (LinkageError e) {
+            Throwable cause = e.getCause();
+            return cause == null ? e.toString() : e + " caused by " + cause;
+        }
     }
 
     /** @return {@code null} when every checked signature matches */
