@@ -753,9 +753,12 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   `BufferSizes::for_config`、bind group 改用 `binding()` 简写、beard/aquifer
   魔数提为具名常量；`StagingChain::recycle` 让解码失败时也归还 staging slot 与
   input set，修掉 shutdown 超时路径的泄漏。行为不变，详见顶部 0.1.7 记录。
-- [ ] **阶段 3：批内真正共享采样上下文**（官方 CL 的剩余收益）。当前批次只
-  收敛调度依赖，每个成员仍各自构建 `ChunkNoiseSampler`；要进一步必须自己
-  持有 `Blender` / `StructureAccessor` / sampler，风险远高于阶段 2，暂不做。
+- [x] **阶段 3：批内共享采样上下文 —— 已证伪（2026-11-26）**。原表述假设「每个
+  成员各建一份 sampler，改成批内共用」。实测两条都不成立：vanilla 的 `BIOMES`
+  步（`populateBiomes`）就建好了 sampler，`populateNoise` 用的是同一个实例
+  （实测 `created=67 / contexts=5632`）；且 sampler 与区块坐标 / aquifer / 插值
+  状态绑定，**一个区块一份**，不存在跨区块共用。阶段 3 因此改名为「在状态内
+  提前提交批次」，执行结果见 §0.1.10 🟡 同名条目（负结果，已回退）。
 
 **0.1.8（tag `v0.1.8` 已推送）：external 采样并行化与高度安全的 shape 推导**
 - [x] **aquifer 预留量按 shape 推导**：binding 8 原先写死
@@ -951,6 +954,11 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   刚好把两者重叠。并行采样后 CPU 腿降为约 1/3，GPU 空转 32–34% → 24%；
   剩余空转是 C2ME 供货空窗（`qwait` 38–81 ms/批、`qdepth` 多为 0），加
   `STAGING=3` 不会改善。下一步若还要提速，方向在 C2ME 的提交节奏，不在协调器。
+  > **2026-11-26 复核：这条结论需要重开。** 同一世界、`chunk_batch_size=4` 的
+  > 基线（提交在 `populateNoise`）实测 `perm` 中位数 **63.5 ms/批**（等空位比等
+  > GPU 还久）、`inflight` 1.63/2 —— 槽位确实经常打满。注意两处深度不同源：
+  > Java `STAGING=2` 先到顶，Rust `pipeline_depth=3`，所以只能先试 3，试 4 会被
+  > Rust 以 `pipeline depth exceeded` 拒掉。是否真的有效仍需一次 A/B。
 - [x] **external 采样不复用 MC 的噪声缓存 —— Tectonic 高世界下落后 CL 的主因（2026-11-14 实机定位）**。
   **0.1.9 已实现并实机验证（2026-11-23）**：不针对 Tectonic，而是读取序列化树
   里**已经存在的** `FLAT_CACHE` / `CACHE2D` 包装：一个槽位的全部引用都在这些
@@ -1030,11 +1038,11 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   采样、探针统计）。可抽出 `ExternalSampler`（约 90 行）与 `PipelineProbe`
   （约 70 行）。纯搬运，不动线程模型与缓冲布局；拆完跑一次
   `external sampling self-check` 即可确认。
-- [ ] **拆 `MixinChunkGenerator.onPopulateNoise`**（约 215 行，混了状态获取、
-  sampler/aquifer/矿脉准备、异步完成回调、失败回退）。可拆成
-  `prepareChunkState(...)` 与 `onBatchDone(...)`。0.1.9 的 Y 缓存改动又往这个
-  注入方法里加了行，优先级比上一轮高一点；仍是纯搬运，但注入点对方法签名敏感，
-  改完必须实机进一次世界（不能只靠编译通过）。
+- [ ] **把 `c2me_wgpu$submitGpuNoise` 挪出 mixin 类，再拆成
+  `prepareChunkState(...)` / `onBatchDone(...)`**。主体搬家已完成（`81b3bc6`）：
+  注入方法现在只剩「取已挂 future + 调用」，约 215 行的 setup 已经是有名字的
+  方法。剩下的只是换个宿主类、按准备 / 完成回调切开。仍是纯搬运，但注入点对
+  方法签名敏感，改完必须实机进一次世界（不能只靠编译通过）。
 - [ ] **Java 侧第一个 JVM 单测**：现在 `test` 任务是 NO-SOURCE，external 的
   `[chunk][ext][cell]` 布局、stride、单 chunk / 多 chunk 两条路径只靠实机日志
   验证。用 `DensityFunction` 的假实现（返回可预测的值）覆盖这两种批次形态，
@@ -1048,7 +1056,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   只读 FFM 查询拿到后再决定 external 槽位数。注意它与 batch limit 相互制约
   （`external_bytes = nodes × cells × batch`），要一起解，不能各算各的。
   详见上文「能力上限从设备实际限额反推」与「65–200 的中间地带」。
-- [ ] **阶段 3：在状态内提前提交批次**（原表述「批内真正共享采样上下文」已被
+- [ ] **阶段 3：在状态内提前提交批次**（A 已实测为负结果并回退；仅剩「先全部
+  准备、再背靠背提交」这一变体未测。原表述「批内真正共享采样上下文」已被
   实测证伪，2026-11-26）。原假设是「每个批次成员各建一份 sampler，改成批内共用
   一份」，实测两条都不成立：
   - vanilla 的 `BIOMES` 步（`NoiseChunkGenerator.populateBiomes`）里就有
@@ -1101,6 +1110,45 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   3. `onPopulateNoise` 命中已挂 future 时直接返回，不再重复 setup。
   第 1 步是纯搬运，风险在注入点对方法签名敏感，必须实机进世界验证；第 2、3 步
   才改生成路径。
+
+  **A 的结果（2026-11-26）：负结果，代码已回退。** 第 1 步（纯搬家）保留
+  （`81b3bc6`）；第 2、3 步实测后回退，`status_submit` 配置项一并删除。同一世界、
+  `chunk_batch_size=4`、稳态最后 40 个窗口：
+
+  | 指标 | 基线（提交在 `populateNoise`） | 状态内提交 |
+  |---|---|---|
+  | CPS 中位数 | **101.0** | **61.8** |
+  | 批大小中位数 | 9.77 | 1.43 |
+  | `inflight` 中位数 | 1.63 / 2 | 0.91 / 2 |
+  | `[pipe] perm`（等空位） | 63.5 ms/批 | 3.6 ms/批 |
+  | `[pipe] qwait`（等请求） | 27.8 ms/批 | 18.1 ms/批 |
+  | `[pipe] idle` | 12% | 30% |
+
+  功能侧完全正常：`matched 9728/9728`、`differs` 0、`GPU batch failed` /
+  `falling back to CPU` / `status-side submit failed` / 超时全为 0。
+
+  失败机制与最初的假设相反。**不是**「批变小 → 每批固定开销摊不薄」，也不是
+  「多了一份区域构建」（`contexts=6656`，与基线一样每区块一次）：
+
+  - `batchMs` 拆成 `drain`（在 Java 侧队列里等前一批）/ `poll`（等 GPU）/
+    `take`（跨语言取 blob）/ `fan`（完成各区块 future），四段之和与 `batchMs`
+    严格对齐。稳态占比 **drain 42% + poll 53% + take 4.4% + fan 0%**，折算
+    `take` 只有 **0.58 ms/区块**，`requestChunks` 只有 **0.10 ms/批** ——
+    跨语言边界总成本约占区块耗时的 4%，**不是瓶颈**。
+  - 两次的每区块驻留时间几乎相同（16.6 vs 14.8 ms），吞吐差异几乎全部来自
+    `inflight`：`CPS ≈ inflight × batchSize / batchMs`，基线 1.63 × 9.77 / 161.9 ms
+    = 98/s（实测 101），本轮 0.91 × 1.43 / 21.1 ms = 62/s（实测 61.8）。
+  - 瓶颈位置**换了**：`CPS ≈ batchSize / (qwait + fill + perm)`。基线里 `perm`
+    63.5 ms 主导（流水线满，GPU-bound），本轮里 `qwait` 18.1 ms 主导（请求供给
+    不足）。提交被夹在 `prepareGroup` 的逐成员准备之间，攒批线程每约 23 ms 才
+    凑到 1.4 个区块，GPU 有 30% 时间没活干。
+
+  结论：**「提前提交」不是杠杆，「供给节奏与流水线占用」才是。** 基线之所以快，
+  是因为 16 个 `requestAsync` 在 `upgradeGroup` 里背靠背发出、`batchMs` 又长，
+  两个槽位始终占满；把提交拆到逐成员就同时打碎了批大小与占空比。未经实验的变体
+  只剩一个：**先全部准备、再背靠背提交**（`prepareGroup` 只 stage，末尾统一
+  flush），它修的是 `qwait` 与 `inflight`；即便成功也只是追平基线的 101，能否
+  超过未知。
 
 #### 🔴 高难度：核心功能突破，需先改架构前提
 
@@ -1166,12 +1214,15 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     `ctx.tacs()`，即 `ServerChunkLoadingManager`，弱引用，世界卸载即整桶消失）。
   - 或者复刻采样上下文（aquifer / beard / 插值状态），但那等于写第二份世界
     生成器，§13.5 已判定不可取。
-  完成「在状态内提交批次」之前，下面两条都无从谈起：biome 与 NOISE 同批需要
-  同一个上下文，阶段 3 批内共享 sampler 也需要一个状态内可持有的 sampler。
+  **「在状态内提交批次」已于 2026-11-26 实测（方案 A），负结果并回退**，见上文
+  🟡 阶段 3 条目。上下文本身（区域 / blender / sampler / accessor）在状态内已经
+  可用且等价性 100%，失败的是**提交时机**：逐成员提交把攒批窗口打碎，流水线
+  占空比从 1.63 掉到 0.91。下面两条仍以此为前提，但需要的是「状态内把整组一次
+  性交给协调器」，而不是「每个成员各发一个请求」。
 - [ ] **把生物群系（Biome）拉上 GPU**。必须走"合并进同一批次、同一次提交"，
-  绝不能重走 `experiment/biome-gpu` 的独立路径（那条已被实测证伪）。补充实测
-  显示计算量本身不是瓶颈（跳过 `populateBiomes` 仅 +4% CPS），所以收益上限
-  不高，优先级低于上面两条中难度项与上面的采样上下文前提。
+  绝不能重走 `experiment/biome-gpu` 的独立路径（那条已被实测证伪）。收益上限
+  不高（跳过 `populateBiomes` 仅 +4% CPS），因此排在最后。完整论证与前提变化
+  见 §「借鉴官方 OpenCL 模块的优化点」🔴 同名条目。
 - [ ] **多 Kernel 流水线（仅评估）**。除非实机探针发现某个 Shard 明显拖后腿，
   否则维持单 Compute Pass；Vulkan 的提交/同步开销可能吃掉拆分收益。
 
@@ -1535,6 +1586,11 @@ Rust 不认识的密度节点（地形 mod）在 CPU 按同一角点网格求值
 - `debug_verbose_logging`：shader 编译计时、缓存命中、CPS 统计。
 - `debug_stage_timing`：分阶段计时，GPU 侧 `[batch-stage-timing]`（encode/submit/
   readback/decode）与 CPU 侧 `[writeback-timing]`。两组要一起读才有意义。
+  另有两行探针：`[pipe]`（攒批线程的 qwait / fill / perm / ext / submit，以及
+  GPU 空转占比）与 `[batch]`（把批次生命周期拆成 drain / poll / take / fan，
+  四段之和严格等于 `batchMs`）。判读：`perm` 大 = 流水线满（GPU-bound），
+  `qwait` 大 = 请求供给不足，`take` 大才是跨语言搬运成本，`drain` 大是 Java 侧
+  排队。2026-11-26 的实测里 `take` 只有 0.58 ms/区块。
 - `debug_height_probe`：`getHeight` 调用点打点（次数/耗时/重复率/GPU 是否在途），
   输出到 `c2me-wgpu-height`。默认关闭，`HeightProbe` 类加载时读一次，改值需重启。
   用途与判读见 §14.5。
