@@ -280,6 +280,17 @@ public final class WgpuBatchCoordinator {
     private final AtomicLong probePermitWaitNs = new AtomicLong();
     private final AtomicLong probeExternalNs = new AtomicLong();
     private final AtomicLong probeSubmitNs = new AtomicLong();
+    /** Batch lifetime (submit -> blob taken), split into the four stretches
+     *  that a Java-side observer can tell apart. {@code batchMs} alone mixes
+     *  them, which is why a smaller batch looked like "the Rust boundary got
+     *  expensive": it is {@code drain} (this batch waiting in the Java queue
+     *  behind another) plus {@code poll} (waiting for the GPU), and only the
+     *  latter is compute. */
+    private final AtomicLong probeDrainNs = new AtomicLong();
+    private final AtomicLong probePollNs = new AtomicLong();
+    private final AtomicLong probePollCount = new AtomicLong();
+    private final AtomicLong probeTakeNs = new AtomicLong();
+    private final AtomicLong probeFanoutNs = new AtomicLong();
     /** Sum of positive gaps between "a batch completed" and "the next one was
      *  submitted" — time the pipeline held zero batches. Gaps over 1 s are
      *  dropped as world loads / dimension switches, not pipeline bubbles. */
@@ -739,11 +750,18 @@ public final class WgpuBatchCoordinator {
     /** Wait for one submitted batch, take its blob, complete the jobs. */
     private void complete(Inflight ib, long t0) {
         long req = ib.req;
+        final boolean probe = Config.get().debugStageTiming;
+        // How long this batch sat in the Java-side inflight queue before the
+        // completion thread picked it up: pipeline backpressure, not compute.
+        if (probe) probeDrainNs.addAndGet(System.nanoTime() - ib.submitT0);
+        long pollT0 = probe ? System.nanoTime() : 0L;
+        long polls = 0;
         long deadline = System.nanoTime() + REQUEST_TIMEOUT_NS;
         int st;
         try {
             long backoff = POLL_INITIAL_NS;
             while ((st = WgpuThinBinding.pollStatus(req)) == WgpuThinBinding.STATUS_PENDING) {
+                polls++;
                 if (System.nanoTime() > deadline) {
                     LOGGER.error("[c2me-wgpu] FATAL: GPU request timed out after 30s. The native worker is likely deadlocked. Terminating JVM.");
                     Runtime.getRuntime().halt(1);
@@ -758,6 +776,10 @@ public final class WgpuBatchCoordinator {
             LOGGER.error("[c2me-wgpu] FATAL: Exception while polling GPU status.", t);
             Runtime.getRuntime().halt(1);
             return;
+        }
+        if (probe) {
+            probePollNs.addAndGet(System.nanoTime() - pollT0);
+            probePollCount.addAndGet(polls);
         }
         if (st == WgpuThinBinding.STATUS_ERROR) {
             // Recoverable: mark this dimension as GPU-incapable and fail the
@@ -781,6 +803,7 @@ public final class WgpuBatchCoordinator {
 
         // §3.5: take the BLOCK blob FIRST — it borrows the handle, and
         // takeResultBlob below frees it. (Reversed order = use-after-free.)
+        long takeT0 = probe ? System.nanoTime() : 0L;
         MemorySegment blockSeg = null;
         try {
             blockSeg = WgpuThinBinding.takeBlockBlob(req);
@@ -802,11 +825,14 @@ public final class WgpuBatchCoordinator {
         // the permit no longer guards native resources, only the Java-side
         // fan-out below, so the submit chain can start the next batch while
         // this one is still distributing results.
+        if (probe) probeTakeNs.addAndGet(System.nanoTime() - takeT0);
         submitPermits.release();
         int n = ib.batch.size();
+        long fanT0 = probe ? System.nanoTime() : 0L;
         for (int i = 0; i < n; i++) {
             ib.batch.get(i).future.complete(new GpuChunk(seg, i, blockSeg));
         }
+        if (probe) probeFanoutNs.addAndGet(System.nanoTime() - fanT0);
         recordStats(n, t0, System.nanoTime());
     }
 
@@ -889,6 +915,11 @@ public final class WgpuBatchCoordinator {
         long perm = probePermitWaitNs.getAndSet(0);
         long ext = probeExternalNs.getAndSet(0);
         long sub = probeSubmitNs.getAndSet(0);
+        long drain = probeDrainNs.getAndSet(0);
+        long poll = probePollNs.getAndSet(0);
+        long polls = probePollCount.getAndSet(0);
+        long take = probeTakeNs.getAndSet(0);
+        long fan = probeFanoutNs.getAndSet(0);
         long idle = probeIdleNs.getAndSet(0);
         long qdSum = probeQueueDepthSum.getAndSet(0);
         long qdMax = probeQueueDepthMax.getAndSet(0);
@@ -899,6 +930,16 @@ public final class WgpuBatchCoordinator {
                 qw / 1e6 / perBatch, fill / 1e6 / perBatch,
                 perm / 1e6 / perBatch, ext / 1e6 / perBatch,
                 sub / 1e6 / perBatch, idlePct, qdSum / perBatch, qdMax, b));
+        // Batch lifetime, split: drain (queued behind another batch in Java),
+        // poll (waiting for the GPU), take (blob handle + readback), fan-out
+        // (completing chunk futures). Sums to batchMs.
+        LOGGER.info(String.format(
+                "[batch] drain=%.1f poll=%.1f take=%.1f fan=%.1f ms/batch  "
+                + "polls=%.1f/batch  (sum=%.1f ms/batch)",
+                drain / 1e6 / perBatch, poll / 1e6 / perBatch,
+                take / 1e6 / perBatch, fan / 1e6 / perBatch,
+                polls / perBatch,
+                (drain + poll + take + fan) / 1e6 / perBatch));
     }
 
     /** Fail every job's future; C2ME then regenerates those chunks on the CPU. */
