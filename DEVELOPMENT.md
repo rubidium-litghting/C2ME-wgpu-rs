@@ -1027,13 +1027,15 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
 #### 🟢 低难度：纯搬运或小修，行为不变，可单文件回滚
 
-- [ ] **删掉 `requestChunks` 的 `req == 0` 不可达分支**（最小的一条）。
-  `requestChunks` 在 `h == 0` 时已经抛异常，协调器里的
-  `failAll("requestChunks returned 0")` 只剩防御价值，容易让人以为存在这条
-  运行时路径。直接去掉，或改成 `assert` 并注明前置条件。
-- [ ] **`Config.get()` 每批缓存一次**（可选）。它是 `synchronized` 静态方法，
-  攒批循环每轮调 2 次；当前量级可忽略，但热路径再变密就会显形。在一个批次
-  开始时读一次配置，后续用局部变量即可。
+- [x] **删掉 `requestChunks` 的 `req == 0` 不可达分支**（2026-11-28）。
+  `WgpuThinBinding.requestChunks` 在 `h == 0` 时直接抛异常，协调器里那句
+  `failAll("requestChunks returned 0")` 永远到不了，留着只会让人以为存在这条
+  运行时路径。已删除，并在调用点注明「零句柄由绑定层抛出、由上面的 catch 兜住」。
+- [x] **`Config.get()` 每批缓存一次**（2026-11-28）。实测比文档记的更密：
+  一个批次要调 **4 次**（`run` → `submit` → `submitRequest` →
+  `computeExternalInputs`），全是 `synchronized` 静态方法。现在在 `run()` 的
+  循环体开头读一次，把 `probe` 沿调用链传下去，批线程上只剩 1 次；完成线程的
+  `complete()` 与每窗口一次的统计各留 1 次，没有再往下穿。
 - [ ] **拆 `WgpuBatchCoordinator`**（841 行，四件事：队列、攒批、external
   采样、探针统计）。可抽出 `ExternalSampler`（约 90 行）与 `PipelineProbe`
   （约 70 行）。纯搬运，不动线程模型与缓冲布局；拆完跑一次
