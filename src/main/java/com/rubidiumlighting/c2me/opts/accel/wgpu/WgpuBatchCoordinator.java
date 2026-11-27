@@ -425,6 +425,9 @@ public final class WgpuBatchCoordinator {
         try {
             while (running) {
                 try {
+                    // One synchronized config read per batch: the flag is used
+                    // on both sides of the fill window, and this loop is the
+                    // hottest place that touches the config.
                     final boolean probe = Config.get().debugStageTiming;
                     long pollT0 = probe ? System.nanoTime() : 0L;
                     Job first = queue.poll(50, TimeUnit.MILLISECONDS);
@@ -475,7 +478,7 @@ public final class WgpuBatchCoordinator {
                         positions[i * 2 + 1] = job.cz;
                     }
 
-                    submit(batch, positions);
+                    submit(batch, positions, probe);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     return;
@@ -496,7 +499,7 @@ public final class WgpuBatchCoordinator {
      *  {@link WgpuThinBinding#requestChunks} and copied into the Rust batch, so
      *  they stay valid for as long as that batch is queued — no shared state
      *  is involved, which is what lets several batches be in flight. */
-    private float[] computeExternalInputs(List<Job> batch) {
+    private float[] computeExternalInputs(List<Job> batch, boolean probe) {
         int numExt = externalNodes.size();
         if (numExt == 0) {
             // No external subtrees: binding 6 is never read, skip the work.
@@ -537,7 +540,7 @@ public final class WgpuBatchCoordinator {
                 if (c instanceof Error e) throw e;
                 throw new RuntimeException(c);
             }
-            if (Config.get().debugStageTiming && selfChecksLeft > 0) {
+            if (probe && selfChecksLeft > 0) {
                 selfChecksLeft--;
                 selfCheckExternal(data, batch, stride);
             }
@@ -636,12 +639,11 @@ public final class WgpuBatchCoordinator {
     /** Evaluate externals and submit the batch to Rust.
      *  Returns the in-flight record, or null if the request could not be
      *  issued — in that case the batch's futures have already been failed. */
-    private Inflight submitRequest(List<Job> batch, int[] positions) {
-        final boolean probe = Config.get().debugStageTiming;
+    private Inflight submitRequest(List<Job> batch, int[] positions, boolean probe) {
         long extT0 = probe ? System.nanoTime() : 0L;
         float[] externals;
         try {
-            externals = computeExternalInputs(batch);
+            externals = computeExternalInputs(batch, probe);
         } catch (Throwable t) {
             // Sampling runs on worker threads now; a failure there must fail
             // the batch's futures, otherwise C2ME holds the chunk locks.
@@ -649,6 +651,8 @@ public final class WgpuBatchCoordinator {
             return null;
         }
         long extT1 = probe ? System.nanoTime() : 0L;
+        // No zero-handle check here: WgpuThinBinding.requestChunks throws on a
+        // null handle, and the catch above already fails the batch.
         long req;
         try {
             req = WgpuThinBinding.requestChunks(
@@ -661,10 +665,6 @@ public final class WgpuBatchCoordinator {
             probeExternalNs.addAndGet(extT1 - extT0);
             probeSubmitNs.addAndGet(System.nanoTime() - extT1);
         }
-        if (req == 0L) {
-            failAll(batch, new RuntimeException("requestChunks returned 0"));
-            return null;
-        }
         ACTIVE_REQUESTS.incrementAndGet();
         return new Inflight(batch, req, System.nanoTime());
     }
@@ -672,15 +672,14 @@ public final class WgpuBatchCoordinator {
     /** Pipeline mode: hand the submitted batch to the completion thread.
      *  Blocks on `inflight` when STAGING batches are already in flight
      *  (backpressure). */
-    private void submit(List<Job> batch, int[] positions) throws InterruptedException {
+    private void submit(List<Job> batch, int[] positions, boolean probe) throws InterruptedException {
         // Wait for a free slot before submitting, not after: see submitPermits.
-        final boolean probe = Config.get().debugStageTiming;
         long permitT0 = probe ? System.nanoTime() : 0L;
         submitPermits.acquire();
         if (probe) probePermitWaitNs.addAndGet(System.nanoTime() - permitT0);
         Inflight ib;
         try {
-            ib = submitRequest(batch, positions);
+            ib = submitRequest(batch, positions, probe);
         } catch (Throwable t) {
             submitPermits.release();
             throw t;
