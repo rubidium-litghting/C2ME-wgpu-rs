@@ -1040,11 +1040,23 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   采样、探针统计）。可抽出 `ExternalSampler`（约 90 行）与 `PipelineProbe`
   （约 70 行）。纯搬运，不动线程模型与缓冲布局；拆完跑一次
   `external sampling self-check` 即可确认。
-- [ ] **把 `c2me_wgpu$submitGpuNoise` 挪出 mixin 类，再拆成
-  `prepareChunkState(...)` / `onBatchDone(...)`**。主体搬家已完成（`81b3bc6`）：
-  注入方法现在只剩「取已挂 future + 调用」，约 215 行的 setup 已经是有名字的
-  方法。剩下的只是换个宿主类、按准备 / 完成回调切开。仍是纯搬运，但注入点对
-  方法签名敏感，改完必须实机进一次世界（不能只靠编译通过）。
+- [x] **把 `c2me_wgpu$submitGpuNoise` 挪出 mixin 类，再拆成 prepare / onDone**
+  （2026-11-28）。新增 `GpuNoiseSubmission`（862 行，普通类）承接全部提交逻辑与
+  它的私有 helper（`acquireDimState` / `initDimState` / `stageBeardForGpu` /
+  `stageAquiferForGpu` / `writeDensityToChunk` / `writeBlocksFromGpu` /
+  `schedulingManagerOf` / `decompileOne` / `decompileRouter` / CPU 写回计时），
+  `MixinChunkGenerator` 从 **904 行降到 98 行**，只剩三个注入和一个转发方法。
+  提交路径再拆成四段：
+  - `submit(...)`：可用性 / `debugVanillaRef` 检查；
+  - `prepare(...)`：维度状态、sampler（复用 chunk 上已缓存的那个）、aquifer 表、
+    beard 表、调度器查找，返回 `Prepared`（record，含写回回调需要的一切）；
+  - `submitAsync(...)`：`requestAsync` + 回调挂接；
+  - `onDone(...)`：跑在完成线程上，GPU 失败则回退 vanilla，否则把方块写回
+    enqueue 到 C2ME 的 `positionedExecutor`。
+
+  搬家后做过逐行核对：旧注入体的 129 行代码里只有 10 行不逐字出现，全部是预期
+  改动（方法签名、`(NoiseChunkGenerator)(Object)this` 改为参数、`if (sched !=
+  null)` 改为提前返回、回调拆进 `submitAsync`）。行为不变，仍需实机确认。
 - [ ] **Java 侧第一个 JVM 单测**：现在 `test` 任务是 NO-SOURCE，external 的
   `[chunk][ext][cell]` 布局、stride、单 chunk / 多 chunk 两条路径只靠实机日志
   验证。用 `DensityFunction` 的假实现（返回可预测的值）覆盖这两种批次形态，
