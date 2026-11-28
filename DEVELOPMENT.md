@@ -906,9 +906,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
 
 **0.1.8+ 待办**
 - [ ] **能力上限从设备实际限额反推，别写死在代码里**（alpha.9 遗留的口子）。
-  > 批次上限链 **4a–4d 已完成**（0.1.9，2026-11-22）。剩余：external 节点上限
-  > `MAX_EXTERNAL_NODES = 64` 仍固定，尚未按「每节点每 chunk 角点字节数 ×
-  > 设备 binding 限额」推导。
+  > 批次上限链 **4a–4e 已完成**（0.1.9 / 0.1.10，2026-11-22 ~ 11-28）。4e 把
+  > external 槽位容量也接到设备限额上，并与批次上限联立求解。
   - [x] **4a** Rust 侧按设备限额与形状推导 `batch_limit`，创建缓冲前生效并打日志
     （0.1.9，2026-11-22；见上，已实机验证）。
   - [x] **4b** Java 通过只读 FFM 查询拿到设备实际限额 / 已推导的批次上限
@@ -918,6 +917,11 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     见上，已实测）。
   - [x] **4c** Java 用查询到的上限攒批（唯一改变行为的一步；0.1.9，2026-11-22；
     见上，已实机验证）。
+  - [x] **4e** external 槽位容量按设备限额查询，并与批次上限联立求解
+    （2026-11-28）。`c2me_wgpu_external_limit(cells)` 给出单 chunk 的槽位上限，
+    `c2me_wgpu_batch_limit` 增加 `external_nodes` 参数把 binding 6 纳入同一组
+    约束；`MAX_EXTERNAL_NODES` 降级为 CPU 采样成本的政策上限（64 → 256），
+    实际生效值是 `min(设备, 政策)`。详见 0.1.10 待办 🟡 同名条目。
   alpha.9 让缓冲尺寸跟着形状走，等于把"能用/不能用"变成形状的函数，但代码里
   仍有一批魔数在替设备做决定：
   - `ExecutorConfig.max_batch_size = 64`（Rust/Java 两侧各一份 `MAX_BATCH`）；
@@ -1040,6 +1044,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   采样、探针统计）。可抽出 `ExternalSampler`（约 90 行）与 `PipelineProbe`
   （约 70 行）。纯搬运，不动线程模型与缓冲布局；拆完跑一次
   `external sampling self-check` 即可确认。
+  **`ExternalSampler` 已抽出**（2026-11-28，随下面第 9 项一起做，见
+  `ExternalSampler.java`）；`PipelineProbe` 仍未拆。
 - [x] **把 `c2me_wgpu$submitGpuNoise` 挪出 mixin 类，再拆成 prepare / onDone**
   （2026-11-28）。新增 `GpuNoiseSubmission`（862 行，普通类）承接全部提交逻辑与
   它的私有 helper（`acquireDimState` / `initDimState` / `stageBeardForGpu` /
@@ -1057,18 +1063,51 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   搬家后做过逐行核对：旧注入体的 129 行代码里只有 10 行不逐字出现，全部是预期
   改动（方法签名、`(NoiseChunkGenerator)(Object)this` 改为参数、`if (sched !=
   null)` 改为提前返回、回调拆进 `submitAsync`）。行为不变，仍需实机确认。
-- [ ] **Java 侧第一个 JVM 单测**：现在 `test` 任务是 NO-SOURCE，external 的
-  `[chunk][ext][cell]` 布局、stride、单 chunk / 多 chunk 两条路径只靠实机日志
-  验证。用 `DensityFunction` 的假实现（返回可预测的值）覆盖这两种批次形态，
-  不需要加载 Minecraft。做完这条，后续改 external 采样才有回归网。
+- [x] **Java 侧第一个 JVM 单测**（2026-11-28）。`src/test/java` 之前不存在
+  （只有 3 个 resource），`test` 是 NO-SOURCE；JUnit 依赖与 `useJUnitPlatform()`
+  早已在 `build.gradle` 里，缺的是测试本身和一处阻塞：`fabric-loader-junit`
+  会在启动测试前初始化整个 Fabric loader，于是测试环境因「没装 c2me」直接失败。
+  已删除该依赖——纯 Java 类的测试不需要游戏环境，需要 Minecraft 类型的测试
+  应当走 gametest。
+
+  为此把 external 输入编码从协调器里抽成 `ExternalSampler`（见下一条），它是
+  Minecraft 无关的：采样回调接收世界坐标 + 每 worker 自己的 scratch 对象，
+  生产侧用 `MutableNoisePos` 适配。`ExternalSamplerTest` 覆盖：
+  - `[chunk][slot][cell]` 布局（`cell = ((j*gz)+k)*gx+i`）与 chunk stride；
+  - 单 chunk 串行路径、多 chunk 并行路径（5 chunk / 3 worker 这种非整除分组）、
+    两者逐位一致；
+  - chunk 原点来自 `cx*16 / cz*16`，与绝对坐标无关；
+  - `yCacheable` 槽位每列只采样一次（`gx*gz` 次）并在 Y 上复制，未标记的槽位
+    采满 `gx*gy*gz` 次；
+  - `yCacheable` 比槽位短时按「每角点采样」处理；
+  - 每个 worker 拿到独立 scratch（用线程→实例映射断言）；
+  - 采样异常在串行与并行路径都原样抛出；
+  - `slotLimit(device, policy)` 的钳制与 `-1` 回退。
+
+  10 个用例，全部 0.05 s 内跑完，不加载 Minecraft。
 
 #### 🟡 中难度：改接口或改采样数学，需要 A/B 复测
 
-- [ ] **`MAX_EXTERNAL_NODES` 按设备限额推导**（能力上限链的最后一半）。
-  批次上限已经按设备限额与形状推导，external 的 64 仍是写死的。改法与 4a/4b
-  同源：Rust 侧按"每节点每 chunk 角点字节数 × binding 限额"算出上限，Java 通过
-  只读 FFM 查询拿到后再决定 external 槽位数。注意它与 batch limit 相互制约
-  （`external_bytes = nodes × cells × batch`），要一起解，不能各算各的。
+- [x] **`MAX_EXTERNAL_NODES` 按设备限额推导**（能力上限链 4e，2026-11-28）。
+  两半都做了：
+  - **查询口**：Rust `c2me_wgpu_external_limit(cells)` 返回「单 chunk 能装下的
+    槽位数」= `min(binding, buffer) / (cells × 4)`；Java 侧
+    `WgpuThinBinding.externalLimit` 与 `batchLimit` 一样是可缺失的只读查询
+    （返回 `-1` 表示没有设备或旧 native）。
+  - **联立求解**：`c2me_wgpu_batch_limit` 新增 `external_nodes` 参数，
+    `BatchLimit::derive` 把 binding 6 也纳入同一组约束
+    （`slots × cells × batch × 4 ≤ min(binding, buffer)`）。三个上限取最小，
+    不再「各算各的」——这是真正的 bug 修复：此前 64 个槽位在 2048 高的形状上
+    需要 210 MiB，超出 128 MiB 的绑定限额，而批次上限只看了输出缓冲。
+  - **策略上限与设备上限分开**：`MAX_EXTERNAL_NODES` 从 64 提到 **256**，并
+    明确它只是 CPU 采样成本的政策上限，真正的可行性上限由设备查询决定
+    （`min(device, policy)`，`ExternalSampler.slotLimit`）。提上去是为了让
+    65–200 那个区间可以被实测；实测结果如果证明收益为负，这个数可以再降，
+    但设备侧那条约束不受影响。
+  - 新增日志：`external slots: N distinct, limit=… (device allows=…, policy
+    cap=…, … cells/chunk)`，以及 `batch limit: … , N external slot(s)`。
+  - Rust 单测覆盖：200 槽位把 832/4 形状的批次压到 32；`external_slot_limit`
+    随形状变化；不可行的槽位数仍保留 1 chunk 可调度。
   详见上文「能力上限从设备实际限额反推」与「65–200 的中间地带」。
 - [ ] **阶段 3：在状态内提前提交批次**（A 已实测为负结果并回退；仅剩「先全部
   准备、再背靠背提交」这一变体未测。原表述「批内真正共享采样上下文」已被
