@@ -1,6 +1,6 @@
 # C2ME WGPU 加速模块 — 开发文档
 
-> 最后更新：2026-11-23
+> 最后更新：2026-11-28
 > 状态：**0.1.5、0.1.6、0.1.7、0.1.8 已发布；0.1.8 的 external 并行采样与
 > Tectonic 832 高形状已实机验证（Fabric、NeoForge + Connector），tag `v0.1.8`
 > 已推送（Release 页面由维护者发布）。0.1.9 开发中：能力上限链 4a–4d 与
@@ -622,6 +622,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
       `disable_pipeline_cache`）、B 类影响 world 创建（`mapped_at_creation`）、
       C 类只影响行为（`debug_*`）、D 类在 chunk-status 注册时读取一次
       （`chunk_batch_size`，改动需重进游戏/重启，不能靠切存档热重载）。
+      `external_threads` 在维度初始化时读取一次，同样需要重进游戏（线程池本身
+      是进程级的，重启最可靠）。
     - 实现上没有引入任何锁：`debug` / `profile` 是两条 `AtomicBool`（热路径零开销）；
       A/B 两类在重建 instance 时作为 `ColdConfig` 一并替换，因此不存在"全局可变
       配置"这一概念。
@@ -651,7 +653,7 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
     - **界面由注解反射生成**：`Config` 字段上标 `@ConfigOption(label, kind, order)`，
       屏幕遍历这些字段建控件。加一个设置 = 加一个带注解的字段，GUI 不会与文件
       脱节。`Kind` 支持 `BOOL` / `TRI_STATE`（如 `mapped_at_creation` 的三态）/
-      `GPU_INDEX`（自动 + 每张卡的列表）。
+      `GPU_INDEX`（自动 + 每张卡的列表）/ `EXTERNAL_THREADS`（自动 + 1..8）。
 
 - [x] **健壮性**：
   - 增加更多边缘平台（如未测试的 macOS Metal）的预防性回退逻辑。
@@ -993,7 +995,8 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   实例的处理成本低、批处理收益能兑现；Tectonic 1088 高下每 chunk 的角点采样量
   翻倍（`sized_for=3425 cells/chunk`），2 个 `ConfigNoise` 的裸采样成本随批次
   线性增长，把对齐批次的固定开销收益吃掉还倒扣。日志里
-  `external sampling: 4 thread(s) per batch` 说明采样并行化在位，瓶颈不是线程数，
+  `external sampling: 4 thread(s) per batch` 说明采样并行化在位（现由
+  `external_threads` 控制，默认自动仍为 4），瓶颈不是线程数，
   而是**总采样量**。
   **改法方向**（按难度）：
   1. 给 external 子树套上与 vanilla 相同的 cache 包装（至少 `FlatCache` 把
@@ -1040,6 +1043,24 @@ Java 只写 palette。纯 fp32（兼容性优先），Java↔Rust 走 Panama FFM
   `computeExternalInputs`），全是 `synchronized` 静态方法。现在在 `run()` 的
   循环体开头读一次，把 `probe` 沿调用链传下去，批线程上只剩 1 次；完成线程的
   `complete()` 与每窗口一次的统计各留 1 次，没有再往下穿。
+- [x] **外部节点采样线程数配置项 `external_threads`**（2026-11-28）。实机反馈
+  CPS 很高，但 CPU 满载、温度很快到 98 °C。采样池此前固定为
+  `max(1, min(4, cores / 4))`，玩家无法在不改代码的情况下把它降下来。
+  - `0`（默认）= 自动，仍是原来的启发式，未改配置时行为与之前一致；
+  - `1..CPU 逻辑核数` = 指定 worker 数；上限由
+    `Runtime.availableProcessors()` 推导（不再写死 16），运行时同样按核数
+    钳制；`1` 直接在批线程上串行采样，连池线程都不创建；
+  - 只影响有 external（CPU 求值）子树的维度，其它维度不采样也不建线程；
+  - ModMenu 是**自由数字输入框**（只接受数字，空 = 0），服务器管理员可以直接
+    填表内任意值；负数在输入框里打不进去；
+  - 手改文件写入负数时，`clamp()` 会把它改成 0 并**持久化**，并在进入世界时
+    用聊天栏警告一次（专用服务器没有聊天栏，只写 `WARN` 日志）；
+  - 日志 `external sampling: N thread(s) per batch` 直接反映生效值。
+
+  代价是 `ext` 毫秒/批随线程数下降而上升，`1` 最省 CPU 也最慢。这是用户侧的
+  热量 / 流畅度取舍，不是正确性开关。读取时机是维度初始化，线程池本身是
+  进程级，所以可靠生效路径是重启游戏。`ConfigTest` 覆盖：`-3` → 0 且只产生
+  一条聊天修正通知、`>上限` 静默钳到上限、`0` 与合法值原样保留。
 - [ ] **拆 `WgpuBatchCoordinator`**（841 行，四件事：队列、攒批、external
   采样、探针统计）。可抽出 `ExternalSampler`（约 90 行）与 `PipelineProbe`
   （约 70 行）。纯搬运，不动线程模型与缓冲布局；拆完跑一次
