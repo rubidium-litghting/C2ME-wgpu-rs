@@ -213,6 +213,9 @@ public final class WgpuBatchCoordinator {
      *  the layout lives in {@link ExternalSampler}, which is Minecraft-free
      *  and unit-tested. */
     private final ExternalSampler<MutableNoisePos> externalSampler;
+    /** Effective sampling worker count for this dimension; see
+     *  {@link #resolveExternalThreads}. */
+    private final int externalThreads;
     /** Effective cap for this dimension: the queried device/product limit,
      *  clamped to {@link #MAX_BATCH}, or {@link #MAX_BATCH} when the query is
      *  unavailable. This is what the batching loop uses, so a shape that
@@ -222,19 +225,43 @@ public final class WgpuBatchCoordinator {
     /** Horizontal chunk size in blocks; the corpus grid starts at chunk×16. */
     private static final int CHUNK_WIDTH = ExternalSampler.CHUNK_WIDTH;
 
-    /** Threads used to sample external subtrees. Sampling dominates the batch
-     *  thread on external worlds (3.5 ms/chunk on Tectonic at 384 height,
-     *  6.7 at 832, versus ~4.6 and ~10 ms/chunk of GPU time), so it is split
-     *  across chunks. Capped at 4: the point is to get the CPU leg below the
-     *  GPU leg without starving C2ME's own workers or the driver thread. */
-    private static final int EXTERNAL_THREADS =
-            Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 4));
+    /** Absolute ceiling for the sampling pool: one worker per logical
+     *  processor, the same machine-derived cap as
+     *  {@link Config#MAX_EXTERNAL_THREADS}. Threads are created on demand, so
+     *  a pool sized for this ceiling costs nothing when fewer workers are
+     *  configured.
+     *
+     *  <p>Sampling dominates the batch thread on external worlds (3.5 ms/chunk
+     *  on Tectonic at 384 height, 6.7 at 832, versus ~4.6 and ~10 ms/chunk of
+     *  GPU time), so it is split across chunks. The automatic value stays at
+     *  the pre-setting heuristic (at most 4): enough to keep the CPU leg
+     *  below the GPU leg without starving C2ME's workers or the driver. */
+    private static final int MAX_SAMPLING_THREADS =
+            Math.max(1, Math.min(Config.MAX_EXTERNAL_THREADS,
+                    Runtime.getRuntime().availableProcessors()));
+
+    /** The value used when {@code external_threads} is 0, unchanged from
+     *  before the setting existed. */
+    private static int autoExternalThreads() {
+        return Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 4));
+    }
+
+    /** Worker count for this dimension: 0 = automatic, otherwise the
+     *  configured value capped at the CPU count. Read when a dimension
+     *  starts, so a change takes effect on the next world load. */
+    private static int resolveExternalThreads() {
+        int configured = Config.get().externalThreads;
+        int threads = configured > 0 ? configured : autoExternalThreads();
+        return Math.max(1, Math.min(threads, MAX_SAMPLING_THREADS));
+    }
 
     /** Lazily created so worlds without external nodes never spawn a thread.
-     *  Daemon threads: they are pure compute over caller-owned buffers. */
+     *  Daemon threads: they are pure compute over caller-owned buffers.
+     *  {@code newFixedThreadPool} creates threads on demand, so a pool sized
+     *  for the ceiling costs nothing when fewer workers are configured. */
     private static final class ExternalPool {
         static final ExecutorService INSTANCE = Executors.newFixedThreadPool(
-                EXTERNAL_THREADS, r -> {
+                MAX_SAMPLING_THREADS, r -> {
                     Thread t = new Thread(r, "c2me-wgpu-external");
                     t.setDaemon(true);
                     return t;
@@ -300,6 +327,7 @@ public final class WgpuBatchCoordinator {
         this.worldHandle = worldHandle;
         this.externalSampler = externalSamplerOf(
                 externalNodes, yCacheable, gx, gy, gz, cellW, cellH, minY);
+        this.externalThreads = resolveExternalThreads();
 
         // Query the ceiling once, before any batch is accumulated. The Rust
         // executor derives the same number from this shape and its device
@@ -319,7 +347,7 @@ public final class WgpuBatchCoordinator {
                 batchLimit, queried, MAX_BATCH, cellsPerChunk, blocksPerChunk, nodes);
         if (externalSampler.nodeCount() > 0) {
             LOGGER.info("[c2me-wgpu] external sampling: {} thread(s) per batch",
-                    EXTERNAL_THREADS);
+                    externalThreads);
         }
         // External payloads used to force serial submission because they went
         // through a process-global `world.external_data` that `submit_async`
@@ -512,13 +540,15 @@ public final class WgpuBatchCoordinator {
     private float[] computeExternalInputs(List<Job> batch, int[] positions, boolean probe) {
         int n = batch.size();
         float[] data = externalSampler.sampleBatch(
-                positions, n, ExternalPool.INSTANCE, EXTERNAL_THREADS);
+                positions, n,
+                externalThreads > 1 ? ExternalPool.INSTANCE : null,
+                externalThreads);
         if (data == null) {
             // No external subtrees: binding 6 is never read, skip the work.
             return null;
         }
         lastExternalBytes = (long) data.length * 4L; // f32
-        if (probe && selfChecksLeft > 0 && n > 1 && EXTERNAL_THREADS > 1) {
+        if (probe && selfChecksLeft > 0 && n > 1 && externalThreads > 1) {
             selfChecksLeft--;
             selfCheckExternal(data, positions, n);
         }

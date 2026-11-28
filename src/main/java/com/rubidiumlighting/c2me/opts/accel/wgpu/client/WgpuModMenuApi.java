@@ -188,6 +188,7 @@ public class WgpuModMenuApi implements ModMenuApi {
                     case GPU_INDEX -> buildGpuWidget(f, ctrlX, y, ctrlW);
                     case BACKEND -> buildBackendWidget(f, ctrlX, y, ctrlW);
                     case BATCH_SIZE -> buildBatchWidget(f, ctrlX, y, ctrlW);
+                    case EXTERNAL_THREADS -> buildExternalThreadsWidget(f, ctrlX, y, ctrlW);
                     case STRING -> new TextFieldWidget(this.textRenderer, ctrlX, y, ctrlW, ROW_H,
                             Text.empty()) {{
                         setMaxLength(512);
@@ -220,6 +221,40 @@ public class WgpuModMenuApi implements ModMenuApi {
                     .omitKeyText()
                     .build(x, y, w, ROW_H, Text.empty(),
                             (btn, v) -> setField(f, v));
+        }
+
+        /**
+         * External sampling worker count: a free numeric field rather than a
+         * fixed list, so server owners can put any value from the table in
+         * the config. The predicate accepts digits only, so a negative value
+         * cannot be typed here; one that reaches the file by hand is
+         * corrected to 0 with an in-world warning.
+         */
+        private ClickableWidget buildExternalThreadsWidget(Field f, int x, int y, int w)
+                throws ReflectiveOperationException {
+            TextFieldWidget field = new TextFieldWidget(this.textRenderer, x, y, w, ROW_H,
+                    Text.empty());
+            field.setMaxLength(Integer.toString(Config.MAX_EXTERNAL_THREADS).length());
+            field.setTextPredicate(v -> v.isEmpty() || v.chars().allMatch(Character::isDigit));
+            field.setText(Integer.toString(f.getInt(cfg)));
+            field.setChangedListener(v -> {
+                if (v.isEmpty()) {
+                    setField(f, 0);
+                    return;
+                }
+                try {
+                    int n = Integer.parseInt(v);
+                    if (n > Config.MAX_EXTERNAL_THREADS) {
+                        n = Config.MAX_EXTERNAL_THREADS;
+                        field.setText(Integer.toString(n));
+                    }
+                    setField(f, n);
+                } catch (NumberFormatException ignored) {
+                    // The predicate already restricts input to digits; an
+                    // overlong number is rejected instead of wrapping around.
+                }
+            });
+            return field;
         }
 
         private ClickableWidget buildGpuWidget(Field f, int x, int y, int w)
@@ -372,6 +407,14 @@ public class WgpuModMenuApi implements ModMenuApi {
         @Override
         protected boolean accepts(ConfigOption opt, String serializedName) {
             return !serializedName.startsWith("debug_");
+        }
+
+        @Override
+        protected int contentTop() {
+            // Six rows (gpu, backend, pipeline cache, batch size, sampling
+            // threads, upload path). Starting six units higher keeps the last
+            // row clear of the hint lines on a 240-unit-tall window.
+            return TOP - 6;
         }
 
         @Override

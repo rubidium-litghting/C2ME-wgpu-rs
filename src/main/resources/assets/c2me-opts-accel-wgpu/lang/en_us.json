@@ -6,6 +6,7 @@
   "c2me-opts-accel-wgpu.notify.gc_hint": "ZGC is not in use; chunk generation may slow down due to GC pauses.",
   "c2me-opts-accel-wgpu.notify.gc_hint.hint": "\n  Suggested JVM argument: -XX:+UseZGC",
   "c2me-opts-accel-wgpu.notify.dim_fallback": "This dimension fell back to CPU: the GPU cannot handle this terrain (%s)",
+  "c2me-opts-accel-wgpu.notify.external_threads_negative": "external_threads = %s is invalid (negative); using 0 (automatic)",
   "c2me-opts-accel-wgpu.notify.enabled": "GPU acceleration active on: %s",
   "c2me-opts-accel-wgpu.overlay.compiling": "Compiling GPU shaders… %s/%s (%s s)",
   "c2me-opts-accel-wgpu.config.title": "C2ME-wgpu-rs settings",
@@ -48,5 +49,6 @@
   "c2me-opts-accel-wgpu.config.batch.2": "2×2 chunks",
   "c2me-opts-accel-wgpu.config.batch.4": "4×4 chunks (fastest)",
   "c2me-opts-accel-wgpu.config.batch.8": "8×8 chunks",
-  "c2me-opts-accel-wgpu.config.batch_hint": "Batch size takes effect after a full restart"
+  "c2me-opts-accel-wgpu.config.batch_hint": "Batch size and threads need a full restart (0 = auto)",
+  "c2me-opts-accel-wgpu.config.external_threads": "External threads"
 }

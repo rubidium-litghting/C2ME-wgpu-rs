@@ -36,6 +36,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * Persistent user settings, stored at {@code config/c2me-wgpu.json}.
@@ -51,6 +53,14 @@ public final class Config {
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu-config");
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().serializeNulls().create();
     private static final String FILE_NAME = "c2me-wgpu.json";
+
+    /** Ceiling for {@link #externalThreads}, derived from this machine: one
+     *  worker per logical processor. Oversubscribing the CPU cannot make the
+     *  sampling faster; it only takes cores away from C2ME's own generation
+     *  workers. Read once at class init, which fits the setting's restart
+     *  scope. */
+    public static final int MAX_EXTERNAL_THREADS =
+            Math.max(1, Runtime.getRuntime().availableProcessors());
 
     /** Selected GPU index, as returned by {@code c2me_wgpu_list_gpus}.
      *  -1 means "automatic" (integrated GPU first). Not implemented yet. */
@@ -83,6 +93,24 @@ public final class Config {
     @ConfigOption(label = "c2me-opts-accel-wgpu.config.batch_size",
             kind = ConfigOption.Kind.BATCH_SIZE, order = 25)
     public int chunkBatchSize = 1;
+
+    /** Worker threads used to evaluate the CPU-only external density subtrees
+     *  over each batch. Only dimensions that actually have such subtrees
+     *  sample anything, so this does nothing elsewhere.
+     *
+     *  <p>0 = automatic: {@code min(4, availableProcessors / 4)}, the fixed
+     *  heuristic used before this setting existed. A positive value is used
+     *  as-is, capped at the CPU count; negative values are invalid and are
+     *  corrected to 0 with a one-time in-world warning. Lower values reduce
+     *  sustained CPU load and package temperature at the cost of a longer
+     *  {@code ext} time per batch; 1 samples serially on the batch thread.
+     *  Read when a dimension starts, so a change takes effect on the next
+     *  world load (the worker pool itself is process-wide, hence a restart is
+     *  the reliable path). */
+    @SerializedName("external_threads")
+    @ConfigOption(label = "c2me-opts-accel-wgpu.config.external_threads",
+            kind = ConfigOption.Kind.EXTERNAL_THREADS, order = 27)
+    public int externalThreads = 0;
 
     // ── debug ──────────────────────────────────────────────────────────
     // Everything below is for troubleshooting and normally stays off. They
@@ -170,6 +198,18 @@ public final class Config {
     // ── transient state ────────────────────────────────────────────────
     private static Config INSTANCE;
 
+    /** A corrected setting the player should be told about in-world. Stored
+     *  as a translation key plus arguments so this package stays free of game
+     *  types; the save-switch path, which can reach chat, drains it. */
+    public record Correction(String key, Object[] args) {}
+
+    private static final Queue<Correction> CORRECTIONS = new ConcurrentLinkedQueue<>();
+
+    /** Take one pending correction, or {@code null} if none. */
+    public static Correction pollCorrection() {
+        return CORRECTIONS.poll();
+    }
+
     /** Load (or create) the config file. Safe to call from any thread; the
      *  result is cached after the first call. */
     public static synchronized Config get() {
@@ -194,7 +234,11 @@ public final class Config {
             String json = stripComments(Files.readString(path, StandardCharsets.UTF_8));
             Config cfg = GSON.fromJson(json, Config.class);
             if (cfg != null) {
-                cfg.clamp();
+                if (cfg.clamp()) {
+                    // Persist the correction: the file should show what the
+                    // mod is actually using, not the rejected value.
+                    cfg.save();
+                }
                 INSTANCE = cfg;
                 LOGGER.info("[c2me-wgpu] reloaded {}", path);
                 return cfg;
@@ -257,8 +301,12 @@ public final class Config {
      *
      *  @return true if anything was changed, so the caller can persist the
      *          corrected values. Otherwise the file would keep showing a value
-     *          the mod is not actually using. */
-    private boolean clamp() {
+     *          the mod is not actually using.
+     *
+     *  <p>Package-private rather than private so {@code ConfigTest} can drive
+     *  the corrections directly; reading the file needs a Fabric loader, the
+     *  correction rules do not. */
+    boolean clamp() {
         boolean changed = false;
         if (gpuIndex < -1) {
             gpuIndex = -1;
@@ -271,6 +319,18 @@ public final class Config {
         if (chunkBatchSize != 1 && chunkBatchSize != 2
                 && chunkBatchSize != 4 && chunkBatchSize != 8) {
             chunkBatchSize = 1;
+            changed = true;
+        }
+        if (externalThreads < 0) {
+            int bad = externalThreads;
+            externalThreads = 0;
+            changed = true;
+            LOGGER.warn("[c2me-wgpu] external_threads={} is invalid; using 0 (automatic)", bad);
+            CORRECTIONS.add(new Correction(
+                    "c2me-opts-accel-wgpu.notify.external_threads_negative",
+                    new Object[]{bad}));
+        } else if (externalThreads > MAX_EXTERNAL_THREADS) {
+            externalThreads = MAX_EXTERNAL_THREADS;
             changed = true;
         }
         return changed;

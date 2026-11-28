@@ -68,6 +68,8 @@ public @interface ConfigOption {
         /** Graphics backend, from the list of usable ones. */
         BACKEND,
         /** Chunk batch size: 1 (per-chunk) or an aligned N×N square. */
-        BATCH_SIZE
+        BATCH_SIZE,
+        /** External sampling workers: automatic or a fixed count. */
+        EXTERNAL_THREADS
     }
 }

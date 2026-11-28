@@ -144,6 +144,16 @@ public final class WgpuDimensionRegistry {
         // report "unchanged" no matter what the user picked.
         Config cfg = Config.reload();
 
+        // Config.clamp() may have corrected a hand-edited value (currently a
+        // negative external_threads). The file is fixed either way; tell the
+        // player in-world once so a server owner is not left wondering why
+        // their number changed.
+        Config.Correction correction;
+        while ((correction = Config.pollCorrection()) != null) {
+            WgpuFallbackNotice.report("config-correction-" + correction.key(),
+                    correction.key(), correction.args());
+        }
+
         // A backend switch needs a restart rather than a rebuild. Measured on
         // Android, a GLES device frees almost nothing on drop (15 MiB of a
         // ~4 GB RSS) while a Vulkan device frees ~645 MiB, so building the new
