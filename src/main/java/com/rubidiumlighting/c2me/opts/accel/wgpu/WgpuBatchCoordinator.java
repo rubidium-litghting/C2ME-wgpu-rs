@@ -36,10 +36,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -67,13 +65,14 @@ public final class WgpuBatchCoordinator {
     /** Max chunks coalesced into one GPU dispatch when the device query is
      *  unavailable.
      *
-     *  <p>`WgpuThinBinding.batchLimit(cells, blocks)` returns the real ceiling
-     *  for a dimension, derived on the Rust side from the device's buffer
-     *  limits and the per-chunk shape; the executor clamps its own buffers
-     *  with the same number. This constant is the fallback for a native
-     *  library that predates the query. It must never exceed the Rust side's
-     *  requested cap (`ExecutorConfig::max_batch_size`), which sizes every
-     *  buffer and rejects larger batches outright. */
+     *  <p>`WgpuThinBinding.batchLimit(cells, blocks, slots)` returns the real
+     *  ceiling for a dimension, derived on the Rust side from the device's
+     *  buffer limits, the per-chunk shape and the external-slot count; the
+     *  executor clamps its own buffers with the same number. This constant is
+     *  the fallback for a native library that predates the query. It must
+     *  never exceed the Rust side's requested cap
+     *  (`ExecutorConfig::max_batch_size`), which sizes every buffer and rejects
+     *  larger batches outright. */
     private static final int MAX_BATCH = 64;
 
     /** Batches submitted to the GPU and not yet read back, summed over every
@@ -210,16 +209,10 @@ public final class WgpuBatchCoordinator {
 
     // ── external (CPU-evaluated) density subtrees ──────────────────
     /** Nodes the GPU serializer could not translate. Their values are
-     *  computed here on the CPU at the corner grid and uploaded to binding 6. */
-    private final List<DensityFunction> externalNodes;
-    /** Per slot: every reference was under FLAT_CACHE / CACHE2D, so MC's
-     *  own cache semantics make the value Y-independent. One sample per
-     *  column is then enough; {@link #fillExternalChunk} repeats it across Y.
-     *  False means the slot needs a sample at every corner. */
-    private final boolean[] yCacheable;
-    private final int gx, gy, gz;      // corner counts per axis
-    private final int cellW, cellH;    // cell size in blocks
-    private final int minY;
+     *  computed on the CPU at the corner grid and uploaded to binding 6;
+     *  the layout lives in {@link ExternalSampler}, which is Minecraft-free
+     *  and unit-tested. */
+    private final ExternalSampler<MutableNoisePos> externalSampler;
     /** Effective cap for this dimension: the queried device/product limit,
      *  clamped to {@link #MAX_BATCH}, or {@link #MAX_BATCH} when the query is
      *  unavailable. This is what the batching loop uses, so a shape that
@@ -227,7 +220,7 @@ public final class WgpuBatchCoordinator {
     private final int batchLimit;
 
     /** Horizontal chunk size in blocks; the corpus grid starts at chunk×16. */
-    private static final int CHUNK_WIDTH = 16;
+    private static final int CHUNK_WIDTH = ExternalSampler.CHUNK_WIDTH;
 
     /** Threads used to sample external subtrees. Sampling dominates the batch
      *  thread on external worlds (3.5 ms/chunk on Tectonic at 384 height,
@@ -305,25 +298,26 @@ public final class WgpuBatchCoordinator {
                                 boolean[] yCacheable,
                                 int gx, int gy, int gz, int cellW, int cellH, int minY) {
         this.worldHandle = worldHandle;
-        this.externalNodes = externalNodes;
-        this.yCacheable = yCacheable;
-        this.gx = gx; this.gy = gy; this.gz = gz;
-        this.cellW = cellW; this.cellH = cellH;
-        this.minY = minY;
+        this.externalSampler = externalSamplerOf(
+                externalNodes, yCacheable, gx, gy, gz, cellW, cellH, minY);
 
         // Query the ceiling once, before any batch is accumulated. The Rust
         // executor derives the same number from this shape and its device
         // limits and rejects anything larger, so accumulating to MAX_BATCH
-        // first would fail whole batches on a constrained shape.
+        // first would fail whole batches on a constrained shape. The external
+        // slot count is part of the query because binding 6 grows with it
+        // (`slots × cells × batch × 4` bytes) and the two ceilings have to be
+        // solved together.
         int cellsPerChunk = gx * gy * gz;
         int height = Math.max(1, (gy - 1) * cellH);
         int blocksPerChunk = CHUNK_WIDTH * height * CHUNK_WIDTH;
-        int queried = WgpuThinBinding.batchLimit(cellsPerChunk, blocksPerChunk);
+        int nodes = externalSampler.nodeCount();
+        int queried = WgpuThinBinding.batchLimit(cellsPerChunk, blocksPerChunk, nodes);
         this.batchLimit = queried > 0 ? Math.min(queried, MAX_BATCH) : MAX_BATCH;
         LOGGER.info("[c2me-wgpu] batch limit: using={} (queried={}, fallback MAX_BATCH={}, "
-                        + "shape={} cells / {} blocks per chunk)",
-                batchLimit, queried, MAX_BATCH, cellsPerChunk, blocksPerChunk);
-        if (!externalNodes.isEmpty()) {
+                        + "shape={} cells / {} blocks per chunk, {} external slot(s))",
+                batchLimit, queried, MAX_BATCH, cellsPerChunk, blocksPerChunk, nodes);
+        if (externalSampler.nodeCount() > 0) {
             LOGGER.info("[c2me-wgpu] external sampling: {} thread(s) per batch",
                     EXTERNAL_THREADS);
         }
@@ -491,64 +485,42 @@ public final class WgpuBatchCoordinator {
         }
     }
 
+    /** Wrap the dimension's external subtrees for {@link ExternalSampler}.
+     *  Each worker gets its own {@link MutableNoisePos}, so the shared
+     *  density-function instances are sampled concurrently the same way
+     *  vanilla's generation workers sample them. */
+    private static ExternalSampler<MutableNoisePos> externalSamplerOf(
+            List<DensityFunction> externalNodes, boolean[] yCacheable,
+            int gx, int gy, int gz, int cellW, int cellH, int minY) {
+        List<ExternalSampler.CornerSampler<MutableNoisePos>> corners =
+                new ArrayList<>(externalNodes.size());
+        for (DensityFunction df : externalNodes) {
+            corners.add((pos, x, y, z) -> df.sample(pos.set(x, y, z)));
+        }
+        return new ExternalSampler<>(corners, yCacheable,
+                gx, gy, gz, cellW, cellH, minY, MutableNoisePos::new);
+    }
+
     /** Evaluate every external subtree at each chunk's corner grid, in the
-     *  exact [chunk][ext][cell] order the WGSL external_inputs[] index uses.
+     *  exact [chunk][slot][cell] order the WGSL external_inputs[] index uses.
      *
      *  <p>Returns {@code null} when the dimension has no CPU-evaluated
      *  subtrees (binding 6 is never read). The values are passed straight to
      *  {@link WgpuThinBinding#requestChunks} and copied into the Rust batch, so
      *  they stay valid for as long as that batch is queued — no shared state
      *  is involved, which is what lets several batches be in flight. */
-    private float[] computeExternalInputs(List<Job> batch, boolean probe) {
-        int numExt = externalNodes.size();
-        if (numExt == 0) {
+    private float[] computeExternalInputs(List<Job> batch, int[] positions, boolean probe) {
+        int n = batch.size();
+        float[] data = externalSampler.sampleBatch(
+                positions, n, ExternalPool.INSTANCE, EXTERNAL_THREADS);
+        if (data == null) {
             // No external subtrees: binding 6 is never read, skip the work.
             return null;
         }
-        int cellsPerChunk = gx * gy * gz;
-        int stride = numExt * cellsPerChunk;   // floats per chunk slice
-        int n = batch.size();
-        float[] data = new float[n * stride];
         lastExternalBytes = (long) data.length * 4L; // f32
-        if (n > 1 && EXTERNAL_THREADS > 1) {
-            int threads = Math.min(EXTERNAL_THREADS, n);
-            int per = (n + threads - 1) / threads;
-            List<Future<?>> tasks = new ArrayList<>(threads);
-            for (int t = 0; t < threads; t++) {
-                final int from = t * per;
-                final int to = Math.min(n, from + per);
-                if (from >= to) break;
-                tasks.add(ExternalPool.INSTANCE.submit(() -> {
-                    // One mutable position per worker: samples read x/y/z
-                    // immediately and never retain it, so this removes any
-                    // per-corner allocation (millions per second at tall
-                    // shapes) without sharing state between threads.
-                    MutableNoisePos pos = new MutableNoisePos();
-                    for (int c = from; c < to; c++) {
-                        fillExternalChunk(batch.get(c), data, c * stride, pos);
-                    }
-                }));
-            }
-            try {
-                for (Future<?> f : tasks) f.get();
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                throw new RuntimeException("external sampling interrupted", ie);
-            } catch (ExecutionException ee) {
-                Throwable c = ee.getCause();
-                if (c instanceof RuntimeException re) throw re;
-                if (c instanceof Error e) throw e;
-                throw new RuntimeException(c);
-            }
-            if (probe && selfChecksLeft > 0) {
-                selfChecksLeft--;
-                selfCheckExternal(data, batch, stride);
-            }
-        } else {
-            MutableNoisePos pos = new MutableNoisePos();
-            for (int c = 0; c < n; c++) {
-                fillExternalChunk(batch.get(c), data, c * stride, pos);
-            }
+        if (probe && selfChecksLeft > 0 && n > 1 && EXTERNAL_THREADS > 1) {
+            selfChecksLeft--;
+            selfCheckExternal(data, positions, n);
         }
         return data;
     }
@@ -558,11 +530,13 @@ public final class WgpuBatchCoordinator {
      *  dimension. Runs on the batch thread, so it adds one extra serial pass
      *  to those first batches' `ext` time — hence the low batch count and the
      *  debug-only gate, which keeps it out of any measurement it would skew. */
-    private void selfCheckExternal(float[] parallel, List<Job> batch, int stride) {
+    private void selfCheckExternal(float[] parallel, int[] positions, int chunks) {
         float[] serial = new float[parallel.length];
         MutableNoisePos pos = new MutableNoisePos();
-        for (int c = 0; c < batch.size(); c++) {
-            fillExternalChunk(batch.get(c), serial, c * stride, pos);
+        int stride = externalSampler.stride();
+        for (int c = 0; c < chunks; c++) {
+            externalSampler.fillChunk(positions[c * 2], positions[c * 2 + 1],
+                    serial, c * stride, pos);
         }
         int mismatches = 0;
         float maxDiff = 0f;
@@ -580,62 +554,6 @@ public final class WgpuBatchCoordinator {
                 mismatches, maxDiff);
     }
 
-    /** Sample one chunk's slice: {@code [ext][j][k][i]} at {@code data[offset..]}.
-     *  Chunk slices are independent, so this is safe to run concurrently —
-     *  vanilla samples the same density-function instances from several chunk
-     *  generation workers at once.
-     *
-     *  <p>Slots marked {@code yCacheable} are sampled once per (x,z) column at
-     *  y=0 and the slice is copied across Y. That is exact under MC's own
-     *  cache semantics, not a heuristic: every reference to such a slot sits
-     *  inside a {@code FlatCache} or {@code Cache2D}. {@code FlatCache} fills
-     *  its cache by sampling its input at y=0 on 4-block columns, and
-     *  {@code Cache2D} caches one value per column. Repeating that value
-     *  therefore reproduces what vanilla would hand to the rest of the tree,
-     *  and it removes {@code gy-1} of the {@code gy} subtree evaluations.
-     *
-     *  <p>This is driven entirely by the serialized tree, so it applies to
-     *  any data pack or mod that uses these wrappers — there is no
-     *  pack-specific knowledge here. Slots with even one bare reference are
-     *  still sampled at every corner, because that path needs the Y-varying
-     *  value. */
-    private void fillExternalChunk(Job job, float[] data, int offset,
-                                   MutableNoisePos pos) {
-        int sx = job.cx * CHUNK_WIDTH;
-        int sz = job.cz * CHUNK_WIDTH;
-        int plane = gx * gz;   // one Y slice per external node
-        int idx = offset;
-        for (int e = 0; e < externalNodes.size(); e++) {
-            DensityFunction ext = externalNodes.get(e);
-            boolean column = e < yCacheable.length && yCacheable[e];
-            if (column) {
-                for (int k = 0; k < gz; k++) {
-                    int wz = sz + k * cellW;
-                    for (int i = 0; i < gx; i++) {
-                        int wx = sx + i * cellW;
-                        data[idx + k * gx + i] =
-                                (float) ext.sample(pos.set(wx, 0, wz));
-                    }
-                }
-                for (int j = 1; j < gy; j++) {
-                    System.arraycopy(data, idx, data, idx + j * plane, plane);
-                }
-                idx += gy * plane;
-            } else {
-                for (int j = 0; j < gy; j++) {
-                    int wy = minY + j * cellH;
-                    for (int k = 0; k < gz; k++) {
-                        int wz = sz + k * cellW;
-                        for (int i = 0; i < gx; i++) {
-                            int wx = sx + i * cellW;
-                            data[idx++] = (float) ext.sample(pos.set(wx, wy, wz));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /** Evaluate externals and submit the batch to Rust.
      *  Returns the in-flight record, or null if the request could not be
      *  issued — in that case the batch's futures have already been failed. */
@@ -643,7 +561,7 @@ public final class WgpuBatchCoordinator {
         long extT0 = probe ? System.nanoTime() : 0L;
         float[] externals;
         try {
-            externals = computeExternalInputs(batch, probe);
+            externals = computeExternalInputs(batch, positions, probe);
         } catch (Throwable t) {
             // Sampling runs on worker threads now; a failure there must fail
             // the batch's futures, otherwise C2ME holds the chunk locks.
@@ -656,7 +574,7 @@ public final class WgpuBatchCoordinator {
         long req;
         try {
             req = WgpuThinBinding.requestChunks(
-                    worldHandle, positions, externalNodes.size(), externals);
+                    worldHandle, positions, externalSampler.nodeCount(), externals);
         } catch (Throwable t) {
             failAll(batch, t);
             return null;

@@ -101,7 +101,10 @@ dependencies {
     testImplementation platform("org.junit:junit-bom:${junit_version}")
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
-    testImplementation "net.fabricmc:fabric-loader-junit:${project.loader_version}"
+    // No fabric-loader-junit: it bootstraps the whole Fabric loader (and thus
+    // every mod's metadata) for tests that only exercise plain Java classes.
+    // Tests here must stay runnable without a game instance; anything that
+    // needs Minecraft types belongs in a gametest, not a unit test.
 }
 
 test {

@@ -89,14 +89,17 @@ public final class GpuNoiseSubmission {
     private static final Logger LOGGER = LoggerFactory.getLogger("c2me-wgpu");
 
     /**
-     * Hard cap on distinct CPU-evaluated density subtrees per dimension.
+     * Policy cap on distinct CPU-evaluated density subtrees per dimension.
      *
-     * <p>Each slot costs a per-chunk CPU sampling pass and one entry in the
-     * binding-6 storage buffer, so the cap bounds both time and memory. Above
-     * it the dimension falls back to vanilla generation instead of generating
-     * at a few chunks per second.
+     * <p>This is a cost bound, not a device guess: each slot costs a per-chunk
+     * CPU sampling pass ({@code slots × cells} evaluations) and one entry in
+     * the binding-6 storage buffer. The device side of the ceiling is
+     * shape-derived ({@link WgpuThinBinding#externalLimit}); this cap only
+     * applies on top of it. It exists so a pack that explodes into thousands
+     * of slots falls back to vanilla generation instead of generating at a few
+     * chunks per second.
      */
-    private static final int MAX_EXTERNAL_NODES = 64;
+    private static final int MAX_EXTERNAL_NODES = 256;
     // Per-dimension state now lives in WgpuDimensionRegistry: the save-switch
     // teardown has to iterate and destroy all of it from outside the mixin,
     // which is impossible for fields declared here.
@@ -814,11 +817,26 @@ public final class GpuNoiseSubmission {
             // lattice, once per chunk per node, and the results are shipped to
             // the GPU as one storage buffer. Both cost and memory scale with
             // the number of *distinct* nodes, so the cap below counts slots.
-            // Refuse up front instead of generating at 2 chunks/s.
-            if (extNodes.size() > MAX_EXTERNAL_NODES) {
+            // The device side of the ceiling is shape-derived (the payload is
+            // slots × cells × 4 bytes); the policy cap below it bounds the CPU
+            // sampling cost. Refuse up front instead of generating at 2 chunks/s.
+            int cellsPerChunk = gx * gy * gz;
+            int deviceSlots = WgpuThinBinding.externalLimit(cellsPerChunk);
+            int slotLimit = ExternalSampler.slotLimit(deviceSlots, MAX_EXTERNAL_NODES);
+            if (!extNodes.isEmpty()) {
+                LOGGER.info("[c2me-wgpu] external slots: {} distinct, limit={} "
+                                + "(device allows={}, policy cap={}, {} cells/chunk)",
+                        extNodes.size(), slotLimit, deviceSlots,
+                        MAX_EXTERNAL_NODES, cellsPerChunk);
+            }
+            if (extNodes.size() > slotLimit) {
                 throw new IllegalStateException(
                         "too many external density subtrees (" + extNodes.size()
-                                + " distinct > " + MAX_EXTERNAL_NODES
+                                + " distinct > " + slotLimit
+                                + (deviceSlots > 0
+                                        ? "; the device holds " + deviceSlots
+                                                + " slots for this shape"
+                                        : "; device limit unknown")
                                 + ") for GPU acceleration");
             }
             WgpuBatchCoordinator coord = new WgpuBatchCoordinator(world, extNodes,

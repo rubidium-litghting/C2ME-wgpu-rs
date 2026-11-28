@@ -586,10 +586,19 @@ pub extern "C" fn c2me_wgpu_compile_progress() -> i64 {
 /// executor's ceiling)`; the executor clamps itself with the same derivation,
 /// so the two cannot drift.
 ///
+/// `external_nodes` is the number of CPU-evaluated slots per chunk binding 6
+/// will carry. The payload is `nodes × cells × batch × 4` bytes, so it is
+/// solved together with the output buffers here rather than in Java: a node
+/// count the outputs would accept can still force a smaller batch.
+///
 /// Returns `-1` when no device exists yet (the caller falls back to its own
 /// conservative cap) or when the limit does not fit an `i32`.
 #[unsafe(no_mangle)]
-pub extern "C" fn c2me_wgpu_batch_limit(cells_per_chunk: u32, blocks_per_chunk: u32) -> i32 {
+pub extern "C" fn c2me_wgpu_batch_limit(
+    cells_per_chunk: u32,
+    blocks_per_chunk: u32,
+    external_nodes: u32,
+) -> i32 {
     let Ok(instance) = WgpuInstance::instance() else {
         return -1;
     };
@@ -597,12 +606,33 @@ pub extern "C" fn c2me_wgpu_batch_limit(cells_per_chunk: u32, blocks_per_chunk: 
         &instance.device.limits(),
         cells_per_chunk.max(1) as usize,
         blocks_per_chunk.max(1) as usize,
+        external_nodes as usize,
     );
     let existing = EXECUTOR.read().as_ref().map(|e| e.max_batch_size());
     let capped = clamp_batch_limit(
         ExecutorConfig::default().max_batch_size, limit.allows, existing);
 
     if capped > i32::MAX as usize { -1 } else { capped as i32 }
+}
+
+/// Largest number of external slots per chunk the live device can hold for a
+/// single chunk, i.e. the device-side ceiling for the node cap.
+///
+/// Read-only and shape-derived, like [`c2me_wgpu_batch_limit`]: the payload is
+/// `nodes × cells × 4` bytes, so the ceiling depends on the dimension's corner
+/// grid. Java uses it to reject a dimension whose external node count cannot
+/// fit at all, instead of discovering that when the first buffer is created.
+///
+/// Returns `-1` when no device exists yet.
+#[unsafe(no_mangle)]
+pub extern "C" fn c2me_wgpu_external_limit(cells_per_chunk: u32) -> i32 {
+    let Ok(instance) = WgpuInstance::instance() else {
+        return -1;
+    };
+    let limit = BatchLimit::external_slot_limit(
+        &instance.device.limits(), cells_per_chunk.max(1) as usize);
+
+    if limit > i32::MAX as usize { -1 } else { limit as i32 }
 }
 
 // ---------------------------------------------------------------------------

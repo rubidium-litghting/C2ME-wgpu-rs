@@ -88,6 +88,7 @@ public class WgpuThinBinding {
      * own cap, not disable GPU acceleration.
      */
     private static MethodHandle MH_batch_limit;
+    private static MethodHandle MH_external_limit;
 
     /** Non-null when the FFM downcall linking failed (e.g. a symbol is
      *  missing from the native library). Lets callers report the real cause
@@ -386,11 +387,23 @@ public class WgpuThinBinding {
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,        // -> i32 chunks, -1 unknown
                                 ValueLayout.JAVA_INT,        // cells_per_chunk
-                                ValueLayout.JAVA_INT         // blocks_per_chunk
+                                ValueLayout.JAVA_INT,        // blocks_per_chunk
+                                ValueLayout.JAVA_INT         // external slots per chunk
                         )
                 );
             } catch (Throwable t) {
                 MH_batch_limit = null;
+            }
+            try {
+                MH_external_limit = NativeLoader.linker.downcallHandle(
+                        NativeLoader.lookup.find("c2me_wgpu_external_limit").orElseThrow(),
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,        // -> i32 slots, -1 unknown
+                                ValueLayout.JAVA_INT         // cells_per_chunk
+                        )
+                );
+            } catch (Throwable t) {
+                MH_external_limit = null;
             }
         } catch (Throwable t) {
             System.err.println("[c2me-wgpu] FFM link failed: " + t);
@@ -653,17 +666,47 @@ public class WgpuThinBinding {
      * The executor clamps its buffers with the same derivation, so a batch at
      * or below this number is guaranteed to fit.
      *
+     * <p>{@code externalNodes} is the number of CPU-evaluated slots per chunk
+     * that binding 6 will carry. It is part of the same derivation because
+     * that payload is {@code nodes × cells × batch × 4} bytes: solving the two
+     * separately would produce batches that fit the outputs and overrun the
+     * external binding.
+     *
      * @return the limit, or {@code -1} when no device exists or the native
      *         library predates the query (callers should use a conservative
      *         fallback)
      */
-    public static int batchLimit(int cellsPerChunk, int blocksPerChunk) {
+    public static int batchLimit(int cellsPerChunk, int blocksPerChunk,
+                                 int externalNodes) {
         MethodHandle mh = MH_batch_limit;
         if (mh == null) return -1;
         try {
-            return (int) mh.invokeExact(cellsPerChunk, blocksPerChunk);
+            return (int) mh.invokeExact(cellsPerChunk, blocksPerChunk, externalNodes);
         } catch (Throwable t) {
             LOGGER.warn("[c2me-wgpu] batch_limit query failed", t);
+            return -1;
+        }
+    }
+
+    /**
+     * Largest number of external slots per chunk the live device can hold for
+     * a single chunk.
+     *
+     * <p>Same shape-derived source as {@link #batchLimit}: the payload is
+     * {@code slots × cells × 4} bytes, so the ceiling depends on the
+     * dimension's corner grid. Java uses it to reject a dimension whose node
+     * count cannot fit at all, before any buffer is created.
+     *
+     * @return the limit, or {@code -1} when no device exists or the native
+     *         library predates the query
+     */
+    public static int externalLimit(int cellsPerChunk) {
+        MethodHandle mh = MH_external_limit;
+        if (mh == null) return -1;
+        try {
+            return (int) mh.invokeExact(cellsPerChunk);
+        } catch (Throwable t) {
+            LOGGER.warn("[c2me-wgpu] external_limit query failed", t);
             return -1;
         }
     }

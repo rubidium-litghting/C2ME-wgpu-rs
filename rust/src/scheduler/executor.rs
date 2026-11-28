@@ -283,6 +283,9 @@ pub struct BatchLimit {
     pub binding_allows: usize,
     /// What the whole-buffer limit alone allows.
     pub buffer_allows: usize,
+    /// What the external-inputs payload (binding 6) alone allows, or
+    /// `usize::MAX` when the shape has no external slots.
+    pub external_allows: usize,
 }
 
 impl BatchLimit {
@@ -291,7 +294,21 @@ impl BatchLimit {
     /// Must use the device's limits, not the adapter's: the device is requested
     /// with `Limits::default()`, so that is the real ceiling no matter what the
     /// adapter advertises.
-    pub fn derive(limits: &wgpu::Limits, cells_per_chunk: usize, blocks_per_chunk: usize) -> Self {
+    ///
+    /// `external_nodes` is the number of CPU-evaluated slots per chunk that
+    /// binding 6 will carry (0 when the dimension has none). It has to be part
+    /// of the same derivation as the outputs: the payload is
+    /// `nodes × cells × batch × 4` bytes, so a node count the outputs would
+    /// happily accept can still be too large for a full batch. Callers that
+    /// know the node count (the Java query) get the joint answer; the executor
+    /// passes 0 because it sizes only its own buffers and its result is then
+    /// clamped by the caller's joint number.
+    pub fn derive(
+        limits: &wgpu::Limits,
+        cells_per_chunk: usize,
+        blocks_per_chunk: usize,
+        external_nodes: usize,
+    ) -> Self {
         let per_chunk_out = (TOTAL_CHANNELS * cells_per_chunk.max(1) * 4) as u64;
         let per_chunk_block = (blocks_per_chunk.max(1) * 4) as u64;
 
@@ -304,14 +321,38 @@ impl BatchLimit {
             .max(1);
         // The staging slot holds the two outputs back to back.
         let buffer_allows = (buffer / (per_chunk_out + per_chunk_block)).max(1);
-        let allows = binding_allows.min(buffer_allows).max(1);
+        // Binding 6 is its own storage buffer, so it is bounded by the binding
+        // limit on its own, and by the buffer limit when it is created.
+        let external_allows = if external_nodes == 0 {
+            usize::MAX
+        } else {
+            let per_chunk_ext = (external_nodes as u64) * (cells_per_chunk.max(1) as u64) * 4;
+            let allows = (binding / per_chunk_ext).min(buffer / per_chunk_ext).max(1);
+            allows.min(usize::MAX as u64) as usize
+        };
+        let allows = binding_allows
+            .min(buffer_allows)
+            .min(external_allows as u64)
+            .max(1);
 
         let to_usize = |v: u64| v.min(usize::MAX as u64) as usize;
         Self {
             allows: to_usize(allows),
             binding_allows: to_usize(binding_allows),
             buffer_allows: to_usize(buffer_allows),
+            external_allows,
         }
+    }
+
+    /// Largest number of external slots per chunk that fits binding 6 for a
+    /// single chunk. This is the device-side ceiling for `MAX_EXTERNAL_NODES`;
+    /// anything above it cannot be dispatched at all.
+    pub fn external_slot_limit(limits: &wgpu::Limits, cells_per_chunk: usize) -> usize {
+        let per_slot = (cells_per_chunk.max(1) as u64) * 4;
+        let allows = (limits.max_storage_buffer_binding_size / per_slot)
+            .min(limits.max_buffer_size / per_slot)
+            .max(1);
+        allows.min(usize::MAX as u64) as usize
     }
 }
 
@@ -364,7 +405,7 @@ impl SingleBatchExecutor {
         // garbage block data.
         let requested_batch = config.max_batch_size.max(1);
         let limit = BatchLimit::derive(
-            &device.limits(), config.cells_per_chunk, config.blocks_per_chunk);
+            &device.limits(), config.cells_per_chunk, config.blocks_per_chunk, 0);
         config.max_batch_size = clamp_batch_limit(requested_batch, limit.allows, None);
 
         // Sized for the shape this config was built for: `cells_per_chunk` and
@@ -1560,19 +1601,19 @@ mod tests {
 
         // Vanilla 384: 5×97×5 corner cells, 16×384×16 blocks. 64 chunks need
         // 85 MiB for b2_out, so the default limits leave the configured 64.
-        let vanilla = BatchLimit::derive(&limits, 5 * 97 * 5, 16 * 384 * 16);
+        let vanilla = BatchLimit::derive(&limits, 5 * 97 * 5, 16 * 384 * 16, 0);
         assert_eq!(vanilla.binding_allows, 96);
         assert!(vanilla.buffer_allows >= 64);
         assert_eq!(vanilla.allows, 96);
 
         // Tectonic 832 with cell_height=8: 5×105×5 cells. 64 chunks need
         // 92 MiB, still under 128.
-        let tectonic = BatchLimit::derive(&limits, 5 * 105 * 5, 16 * 832 * 16);
+        let tectonic = BatchLimit::derive(&limits, 5 * 105 * 5, 16 * 832 * 16, 0);
         assert!(tectonic.allows >= 64, "{}", tectonic.allows);
 
         // The same height with cell_height=4: 5×209×5 cells makes b2_out
         // 192 MB at 64 chunks. The binding limit now binds at 44.
-        let tall = BatchLimit::derive(&limits, 5 * 209 * 5, 16 * 832 * 16);
+        let tall = BatchLimit::derive(&limits, 5 * 209 * 5, 16 * 832 * 16, 0);
         assert_eq!(tall.allows, 44);
         assert_eq!(tall.allows, tall.binding_allows);
         assert!(tall.allows < 64);
@@ -1587,7 +1628,42 @@ mod tests {
             max_buffer_size: 1024,
             ..wgpu::Limits::default()
         };
-        assert_eq!(BatchLimit::derive(&tiny, 5225, 212_992).allows, 1);
+        assert_eq!(BatchLimit::derive(&tiny, 5225, 212_992, 0).allows, 1);
+    }
+
+    /// Binding 6 is solved together with the outputs: 200 external slots on a
+    /// dense shape force a smaller batch than the output buffers alone would
+    /// allow, and a node count that cannot fit a single chunk still leaves one
+    /// chunk dispatchable (Java rejects the dimension at init in that case).
+    #[test]
+    fn external_slots_shrink_the_batch() {
+        let limits = wgpu::Limits::default();
+        let cells = 5 * 209 * 5; // 5225, 832 blocks at cell_height=4
+        let blocks = 16 * 832 * 16; // 212_992
+
+        let none = BatchLimit::derive(&limits, cells, blocks, 0);
+        assert_eq!(none.external_allows, usize::MAX);
+
+        // 128 MiB / (200 * 5225 * 4) = 32.1 -> 32 chunks.
+        let with = BatchLimit::derive(&limits, cells, blocks, 200);
+        assert_eq!(with.external_allows, 32);
+        assert_eq!(with.allows, 32);
+
+        let huge = BatchLimit::derive(&limits, cells, blocks, 100_000);
+        assert_eq!(huge.allows, 1);
+    }
+
+    /// The node cap Java applies is the same shape-derived number, so a
+    /// dimension that passes init can always dispatch at least one chunk.
+    #[test]
+    fn external_slot_limit_follows_the_shape() {
+        let limits = wgpu::Limits::default();
+        // 128 MiB / (5*97*5 * 4) = 13,836 slots on vanilla's grid.
+        assert_eq!(BatchLimit::external_slot_limit(&limits, 5 * 97 * 5), 13_836);
+        assert_eq!(
+            BatchLimit::external_slot_limit(&limits, 5 * 209 * 5),
+            (128 * 1024 * 1024) / (5 * 209 * 5 * 4)
+        );
     }
 
     /// The requested cap, the shape derivation and a reused executor's fixed
